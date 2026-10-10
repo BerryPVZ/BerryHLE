@@ -46,7 +46,8 @@ use crate::frameworks::foundation::{ns_string, ns_url, NSInteger, NSUInteger};
 use crate::frameworks::uikit::ui_device::UIDeviceOrientation;
 use crate::mem::MutPtr;
 use crate::objc::{
-    id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
+    id, msg, msg_class, msg_super, nil, objc_classes, release, retain, ClassExports, HostObject,
+    NSZonePtr,
 };
 use crate::Environment;
 use std::collections::{HashMap, VecDeque};
@@ -126,6 +127,12 @@ pub struct State {
     /// Video decoders for players that are currently playing (see
     /// [super::movie_video]).
     videos: HashMap<id, MovieVideo>,
+    /// The `MPMoviePlayerController` owned by each live
+    /// `MPMoviePlayerViewController` (its `moviePlayer` property). Each value
+    /// is retained and released when the view controller is deallocated.
+    /// `UIViewController`'s host object is shared with every subclass, so the
+    /// link lives here rather than in a host-object field.
+    view_controller_players: HashMap<id, id>,
 }
 impl State {
     fn get(env: &mut Environment) -> &mut Self {
@@ -318,7 +325,13 @@ struct MPMoviePlayerControllerHostObject {
     source_type: MPMovieSourceType,
     repeat_mode: MPMovieRepeatMode,
     should_autoplay: bool,
+    /// `initialPlaybackTime`: where a play run that starts from the stopped
+    /// state begins, in seconds. Negative (the default, -1) means "from the
+    /// natural start of the movie".
     initial_playback_time: f64,
+    /// `endPlaybackTime`: where playback ends, in seconds. Negative (the
+    /// default, -1) means "at the natural end of the movie".
+    end_playback_time: f64,
     playback_state: MPMoviePlaybackState,
     load_state: MPMovieLoadState,
     /// Natural dimensions reported by the supported H.264 video track.
@@ -326,6 +339,9 @@ struct MPMoviePlayerControllerHostObject {
     /// Placeholder dimensions used when the movie has no supported video track.
     natural_size: CGSize,
     duration: f64,
+    /// `true` once `duration` holds the movie's real (encoded) duration
+    /// rather than [PLACEHOLDER_DURATION].
+    duration_known: bool,
     /// Playback clock: position (seconds) accumulated before the current
     /// play run, and when the current run started (`None` unless playing).
     /// We can't decode the video, but apps still time their UI against
@@ -425,19 +441,49 @@ pub(super) fn read_mp4_duration<F: Read + Seek>(file: &mut F) -> Option<f64> {
     }
 }
 
+/// The explicit `endPlaybackTime`, if one is set and lies inside the movie.
+///
+/// Per Apple's `MPMoviePlayerController` reference, `endPlaybackTime` is "the
+/// end time (measured in seconds) for playback of the movie"; the default,
+/// -1, plays to the natural end. An end time at or past the movie's known
+/// duration is the same as the natural end.
+fn explicit_end_time(host: &MPMoviePlayerControllerHostObject) -> Option<f64> {
+    let end = host.end_playback_time;
+    if !end.is_finite() || end <= 0.0 {
+        return None;
+    }
+    if host.duration_known && host.duration > 0.0 && end >= host.duration {
+        return None;
+    }
+    Some(end)
+}
+
+/// Where the current play-through stops: the explicit `endPlaybackTime` if
+/// set, otherwise the movie's duration.
+fn effective_end_time(host: &MPMoviePlayerControllerHostObject) -> f64 {
+    explicit_end_time(host).unwrap_or(host.duration)
+}
+
 /// Current position of the player's playback clock, in seconds. Wraps around
-/// for `MPMovieRepeatModeOne`, otherwise stops at the end of the movie.
+/// for `MPMovieRepeatModeOne`, otherwise stops at the end of the movie (or at
+/// `endPlaybackTime`, if set).
 fn playback_position(host: &MPMoviePlayerControllerHostObject) -> f64 {
     let elapsed = host
         .clock_started
         .map_or(0.0, |started| started.elapsed().as_secs_f64());
     let position = host.clock_offset + elapsed;
-    if host.duration <= 0.0 {
+    if host.duration <= 0.0 && explicit_end_time(host).is_none() {
         position
     } else if host.repeat_mode == MPMovieRepeatModeOne {
-        position % host.duration
+        // The video decoder loops over the whole file, so the clock has to
+        // as well; `endPlaybackTime` only ends non-repeating playback.
+        if host.duration > 0.0 {
+            position % host.duration
+        } else {
+            position
+        }
     } else {
-        position.min(host.duration)
+        position.min(effective_end_time(host))
     }
 }
 
@@ -539,12 +585,15 @@ fn schedule_playback_finish(
 ) {
     let finish_at = {
         let host = env.objc.borrow::<MPMoviePlayerControllerHostObject>(player);
+        let end = effective_end_time(host);
+        // An explicit `endPlaybackTime` is honoured even when we can't decode
+        // the video track: the app asked for playback to stop at that time.
         if use_media_duration
-            && host.video_info.is_some()
-            && host.duration.is_finite()
-            && host.duration > 0.0
+            && (host.video_info.is_some() || explicit_end_time(host).is_some())
+            && end.is_finite()
+            && end > 0.0
         {
-            let remaining = (host.duration - playback_position(host))
+            let remaining = (end - playback_position(host))
                 .max(0.0)
                 .min(31_536_000.0);
             start_at + Duration::from_secs_f64(remaining)
@@ -619,9 +668,11 @@ fn schedule_preload_sequence(env: &mut Environment, this: id) {
                     path.as_str(),
                     duration
                 );
-                env.objc
-                    .borrow_mut::<MPMoviePlayerControllerHostObject>(this)
-                    .duration = duration;
+                let host = env
+                    .objc
+                    .borrow_mut::<MPMoviePlayerControllerHostObject>(this);
+                host.duration = duration;
+                host.duration_known = true;
             }
             if let Some(info) = MovieVideo::probe(&bytes) {
                 log_dbg!(
@@ -715,7 +766,17 @@ fn schedule_playback(env: &mut Environment, this: id, start_at: Instant) {
         let host = env
             .objc
             .borrow_mut::<MPMoviePlayerControllerHostObject>(this);
+        let starting_from_stop = host.playback_state == MPMoviePlaybackStateStopped
+            && host.clock_started.is_none();
         host.playback_state = MPMoviePlaybackStatePlaying;
+        if starting_from_stop
+            && host.initial_playback_time.is_finite()
+            && host.initial_playback_time > 0.0
+        {
+            // `initialPlaybackTime`: "The time, specified in seconds within
+            // the video timeline, when playback should start."
+            host.clock_offset = host.initial_playback_time;
+        }
         if host.clock_started.is_none() {
             host.clock_started = Some(start_at);
         }
@@ -756,11 +817,13 @@ pub const CLASSES: ClassExports = objc_classes! {
         should_autoplay: true,
 
         initial_playback_time: -1.0,
+        end_playback_time: -1.0,
         playback_state: MPMoviePlaybackStateStopped,
         load_state: MPMovieLoadStateUnknown,
         video_info: None,
         natural_size: PLACEHOLDER_NATURAL_SIZE,
         duration: PLACEHOLDER_DURATION,
+        duration_known: false,
         clock_offset: 0.0,
         clock_started: None,
         ready_for_display: false,
@@ -815,6 +878,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         host.video_info = None;
         host.natural_size = PLACEHOLDER_NATURAL_SIZE;
         host.duration = PLACEHOLDER_DURATION;
+        host.duration_known = false;
         host.clock_offset = 0.0;
         host.clock_started = None;
         host.preload_scheduled = false;
@@ -1045,6 +1109,26 @@ pub const CLASSES: ClassExports = objc_classes! {
         .initial_playback_time = time;
 }
 
+- (f64)endPlaybackTime {
+    env.objc
+        .borrow::<MPMoviePlayerControllerHostObject>(this)
+        .end_playback_time
+}
+- (())setEndPlaybackTime:(f64)time {
+    let playing = {
+        let host = env.objc.borrow_mut::<MPMoviePlayerControllerHostObject>(this);
+        host.end_playback_time = time;
+        host.playback_state == MPMoviePlaybackStatePlaying
+    };
+    // If the movie is already playing, move the pending end-of-playback to
+    // the new end time (or back to the natural end for a negative value).
+    if playing {
+        let start_at = Instant::now();
+        cancel_pending_playback_finish(env, this);
+        schedule_playback_finish(env, this, start_at, true);
+    }
+}
+
 - (f64)duration {
     env.objc
         .borrow::<MPMoviePlayerControllerHostObject>(this)
@@ -1159,21 +1243,38 @@ pub const CLASSES: ClassExports = objc_classes! {
     // https://developer.apple.com/documentation/mediaplayer/mpmovieplayerviewcontroller
     let player: id = msg_class![env; MPMoviePlayerController alloc];
     let player: id = msg![env; player initWithContentURL:url];
-    // Store as associated value via a dynamic property slot.
-    // We use setValue:forKey: with a special key.
-    let key = ns_string::get_static_str(env, "_touchHLE_moviePlayer");
-    () = msg![env; this setValue:player forKey:key];
-    release(env, player); // setValue:forKey: retains
+    // The +1 reference from alloc/init is owned by the view controller and
+    // given up in -dealloc. This deliberately isn't stored through KVC: an
+    // app subclass has no setter for a private key, so KVC would fall back
+    // to its never-freed dynamic storage (and warn about it).
+    if this != nil {
+        let old = State::get(env).view_controller_players.insert(this, player);
+        if let Some(old) = old {
+            release(env, old);
+        }
+    } else {
+        release(env, player);
+    }
 
     this
+}
+
+- (())dealloc {
+    if let Some(player) = State::get(env).view_controller_players.remove(&this) {
+        release(env, player);
+    }
+    msg_super![env; this dealloc]
 }
 
 // Apple docs: "The movie player controller object used to present the movie."
 // @property(nonatomic, readonly) MPMoviePlayerController *moviePlayer
 // https://developer.apple.com/documentation/mediaplayer/mpmovieplayerviewcontroller/1619165-movieplayer
 - (id)moviePlayer {
-    let key = ns_string::get_static_str(env, "_touchHLE_moviePlayer");
-    msg![env; this valueForKey:key]
+    State::get(env)
+        .view_controller_players
+        .get(&this)
+        .copied()
+        .unwrap_or(nil)
 }
 
 - (())viewDidLoad {
