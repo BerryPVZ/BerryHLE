@@ -492,8 +492,10 @@ Other options:
         view handling. This fixes GTA III's fullscreen movie rendering and
         skip behavior, but can break other games that expect movie content to
         preload immediately or unparented movie views to be presented
-        automatically. Disabled by default; enable it only for GTA III (for
-        example, touchHLE GTA3.app --gta3-movie-player-fix).
+        automatically. Disabled globally; the bundled default-options file
+        enables it for GTA III. To enable it manually for a run, pass this
+        flag after the app path. For example:
+        touchHLE GTA3.app --gta3-movie-player-fix
 
     --no-gta3-movie-player-fix
         Use the legacy MPMoviePlayerController behavior, even if the fix was
@@ -504,7 +506,8 @@ Other options:
         extra 180-degree presentation compensation. This fixes iPad games that
         should only get the compensation when UIKit really rotated their root
         view. Without this flag, HyperHLE keeps the legacy iPad/non-portrait
-        heuristic. Disabled by default.
+        heuristic. Disabled globally; the bundled default-options file enables
+        this together with --gta3-movie-player-fix for GTA III.
 
     --no-rotation-fix
         Explicitly use the legacy iPad/non-portrait rotation heuristic, even if
