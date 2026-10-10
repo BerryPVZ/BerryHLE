@@ -350,4 +350,4 @@ com.lego.ninjago.thefinalbattle: --landscape-left --fix-texture-min-filter
 
 # Grand Theft Auto III
 # Use the GTA III movie-player and transform-aware iPad rotation fixes.
-com.rockstargames.gta3: --gta3-movie-player-fix --rotation-fix
+com.rockstargames.gta3: --fix-movie-player --rotation-fix

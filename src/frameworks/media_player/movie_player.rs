@@ -11,15 +11,15 @@
 //! controller also reproduces Apple's asynchronous load and playback lifecycle.
 //!
 //! 1. By default, `initWithContentURL:` starts the legacy asynchronous preload
-//!    sequence immediately. Pass `--gta3-movie-player-fix` to defer loading
+//!    sequence immediately. Pass `--fix-movie-player` to defer loading
 //!    until `prepareToPlay` or `play`, matching the behavior that fixes GTA III.
 //! 2. Once the content is determined playable, the player posts
 //!    `MPMoviePlayerLoadStateDidChangeNotification`, followed by
 //!    `MPMovieNaturalSizeAvailableNotification` and
 //!    `MPMovieDurationAvailableNotification`.
 //! 3. In legacy mode, `readyForDisplay` also becomes true after metadata loads
-//!    when there is no supported video track. With the GTA III fix enabled it
-//!    remains false until a decoded video frame is presented; the movie view
+//!    when there is no supported video track. With the movie-player fix enabled
+//!    it remains false until a decoded video frame is presented; the movie view
 //!    stays hidden until then and is not automatically presented fullscreen.
 //! 4. For backwards compatibility with apps written against the
 //!    `MPMoviePlayerController` introduced in iPhone OS 2 the player also
@@ -493,8 +493,8 @@ fn playback_position(host: &MPMoviePlayerControllerHostObject) -> f64 {
 
 /// Whether to use the opt-in movie-player behavior that fixes GTA III while
 /// preserving the legacy lifecycle for other games by default.
-fn gta3_movie_player_fix_enabled(env: &Environment) -> bool {
-    env.options.gta3_movie_player_fix
+fn fix_movie_player_enabled(env: &Environment) -> bool {
+    env.options.fix_movie_player
 }
 
 /// Ensure the player has a valid dummy view, creating one lazily if needed.
@@ -509,7 +509,7 @@ fn ensure_view(env: &mut Environment, this: id) -> id {
     }
     let view_alloc: id = msg_class![env; UIView alloc];
     let view: id = msg![env; view_alloc init];
-    if gta3_movie_player_fix_enabled(env) {
+    if fix_movie_player_enabled(env) {
         () = msg![env; view setHidden:true];
     }
     retain(env, view);
@@ -873,7 +873,7 @@ fn schedule_preload_sequence(env: &mut Environment, this: id) {
         PendingNotification::DurationAvailable(this),
         metadata_at,
     );
-    if !video_supported && !gta3_movie_player_fix_enabled(env) {
+    if !video_supported && !fix_movie_player_enabled(env) {
         env.objc
             .borrow_mut::<MPMoviePlayerControllerHostObject>(this)
             .ready_for_display = true;
@@ -997,7 +997,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     ensure_view(env, this);
     ensure_background_view(env, this);
 
-    if !gta3_movie_player_fix_enabled(env) {
+    if !fix_movie_player_enabled(env) {
         // Legacy behavior: loading starts as soon as the controller is created.
         schedule_preload_sequence(env, this);
     }
@@ -1015,13 +1015,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     cancel_pending_playback_finish(env, this);
     State::get(env).videos.remove(&this);
-    let use_gta3_fix = gta3_movie_player_fix_enabled(env);
-    if use_gta3_fix {
+    let use_movie_player_fix = fix_movie_player_enabled(env);
+    if use_movie_player_fix {
         clear_movie_frame(env, this);
         set_movie_view_hidden(env, this, true);
     }
     stop_movie_audio(env, this);
-    if !use_gta3_fix {
+    if !use_movie_player_fix {
         dismiss_unparented_movie_view(env, this);
     }
 
@@ -1061,13 +1061,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     State::get(env).videos.remove(&this);
-    let use_gta3_fix = gta3_movie_player_fix_enabled(env);
-    if use_gta3_fix {
+    let use_movie_player_fix = fix_movie_player_enabled(env);
+    if use_movie_player_fix {
         clear_movie_frame(env, this);
         set_movie_view_hidden(env, this, true);
     }
     stop_movie_audio(env, this);
-    if !use_gta3_fix {
+    if !use_movie_player_fix {
         dismiss_unparented_movie_view(env, this);
     }
 
@@ -1181,7 +1181,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (bool)isFullscreen {
-    if gta3_movie_player_fix_enabled(env) {
+    if fix_movie_player_enabled(env) {
         env.objc
             .borrow::<MPMoviePlayerControllerHostObject>(this)
             .fullscreen
@@ -1192,13 +1192,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setFullscreen:(bool)fullscreen {
-    if gta3_movie_player_fix_enabled(env) {
+    if fix_movie_player_enabled(env) {
         set_movie_fullscreen(env, this, fullscreen);
     }
 }
 
 - (())setFullscreen:(bool)fullscreen animated:(bool)_animated {
-    if gta3_movie_player_fix_enabled(env) {
+    if fix_movie_player_enabled(env) {
         set_movie_fullscreen(env, this, fullscreen);
     }
 }
@@ -1380,13 +1380,13 @@ pub const CLASSES: ClassExports = objc_classes! {
         host.playback_state = MPMoviePlaybackStateStopped;
     }
     State::get(env).videos.remove(&this);
-    let use_gta3_fix = gta3_movie_player_fix_enabled(env);
-    if use_gta3_fix {
+    let use_movie_player_fix = fix_movie_player_enabled(env);
+    if use_movie_player_fix {
         clear_movie_frame(env, this);
         set_movie_view_hidden(env, this, true);
     }
     enqueue(env, PendingNotification::PlaybackStateChange(this), Instant::now());
-    if !use_gta3_fix {
+    if !use_movie_player_fix {
         dismiss_unparented_movie_view(env, this);
     }
     if env
@@ -1644,21 +1644,21 @@ fn set_view_frame_if_needed(env: &mut Environment, view: id, frame: CGRect) {
 }
 
 fn update_movie_view_frame(env: &mut Environment, player: id, view: id) {
-    let use_gta3_fix = gta3_movie_player_fix_enabled(env);
+    let use_movie_player_fix = fix_movie_player_enabled(env);
     let (video_info, scaling_mode, fullscreen, has_original_frame) = {
         let host = env.objc.borrow::<MPMoviePlayerControllerHostObject>(player);
         (
             host.video_info,
             host.scaling_mode,
-            if use_gta3_fix {
+            if use_movie_player_fix {
                 host.fullscreen
             } else {
                 host.presentation_view_controller != nil
             },
-            use_gta3_fix && host.fullscreen_original_frame.is_some(),
+            use_movie_player_fix && host.fullscreen_original_frame.is_some(),
         )
     };
-    if !use_gta3_fix && video_info.is_none() {
+    if !use_movie_player_fix && video_info.is_none() {
         return;
     }
     let parent: id = msg![env; view superview];
@@ -1667,7 +1667,7 @@ fn update_movie_view_frame(env: &mut Environment, player: id, view: id) {
     }
     let bounds: CGRect = msg![env; parent bounds];
     if fullscreen {
-        if use_gta3_fix && !has_original_frame {
+        if use_movie_player_fix && !has_original_frame {
             let original_frame: CGRect = msg![env; view frame];
             env.objc
                 .borrow_mut::<MPMoviePlayerControllerHostObject>(player)
@@ -1717,7 +1717,7 @@ fn update_movie_view_frame(env: &mut Environment, player: id, view: id) {
 
 /// Show the latest decoded frame of each playing movie in its player's view.
 fn present_video_frames(env: &mut Environment) {
-    let use_gta3_fix = gta3_movie_player_fix_enabled(env);
+    let use_movie_player_fix = fix_movie_player_enabled(env);
     let players: Vec<id> = State::get(env).videos.keys().copied().collect();
     let mut frames = Vec::new();
     for player in players {
@@ -1743,7 +1743,7 @@ fn present_video_frames(env: &mut Environment) {
         if view == nil {
             continue;
         }
-        if !use_gta3_fix {
+        if !use_movie_player_fix {
             present_unparented_movie_view(env, player, view);
             let superview: id = msg![env; view superview];
             if superview == nil {
@@ -1771,7 +1771,7 @@ fn present_video_frames(env: &mut Environment) {
                 true
             }
         };
-        if use_gta3_fix {
+        if use_movie_player_fix {
             set_movie_view_hidden(env, player, false);
         }
         if became_ready {
@@ -1780,7 +1780,7 @@ fn present_video_frames(env: &mut Environment) {
                 PendingNotification::ReadyForDisplayChange(player),
                 Instant::now(),
             );
-            if !use_gta3_fix {
+            if !use_movie_player_fix {
                 log!(
                     "MPMoviePlayerController {:?}: first video frame presented at {:.3}s",
                     player,
@@ -1845,7 +1845,7 @@ pub(super) fn handle_players(env: &mut Environment) {
         // For PlaybackDidFinish we must update playbackState BEFORE posting,
         // so observers that read [player playbackState] see Stopped.
         if matches!(notif, PendingNotification::PlaybackDidFinish { .. }) {
-            let use_gta3_fix = gta3_movie_player_fix_enabled(env);
+            let use_movie_player_fix = fix_movie_player_enabled(env);
             let host = env
                 .objc
                 .borrow_mut::<MPMoviePlayerControllerHostObject>(player);
@@ -1854,12 +1854,12 @@ pub(super) fn handle_players(env: &mut Environment) {
             host.clock_started = None;
             host.finish_scheduled = false;
             State::get(env).videos.remove(&player);
-            if use_gta3_fix {
+            if use_movie_player_fix {
                 clear_movie_frame(env, player);
                 set_movie_view_hidden(env, player, true);
             }
             stop_movie_audio(env, player);
-            if !use_gta3_fix {
+            if !use_movie_player_fix {
                 dismiss_unparented_movie_view(env, player);
             }
         }
