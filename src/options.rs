@@ -188,6 +188,10 @@ pub struct Options {
     /// rotation turns the picture sideways; `--present-rotate=0` presents it
     /// as-is. `None` keeps the automatic behaviour.
     pub present_rotate: Option<u32>,
+    /// Use UIKit's actual autorotation transform when deciding whether to add
+    /// EAGL's 180-degree presentation compensation. Off by default to retain
+    /// the legacy iPad/non-portrait heuristic; opt in with `--rotation-fix`.
+    pub rotation_fix: bool,
     /// Force EAGL `initWithAPI:` to create an OpenGL ES 1.1 (fixed-function)
     /// context even when the app requested an OpenGL ES 2.0/3.x context.
     ///
@@ -309,6 +313,7 @@ impl Default for Options {
             prefer_gles2_context: false,
             mach_semaphore_spurious_wake_ms: None,
             present_rotate: None,
+            rotation_fix: false,
             force_gles1_context: std::env::var("TOUCHHLE_FORCE_GLES1_CONTEXT")
                 .map(|value| {
                     let value = value.trim();
@@ -587,6 +592,10 @@ impl Options {
                 return Err("Invalid value for --present-rotate= (expected 0, 90, 180 or 270)".to_string());
             }
             self.present_rotate = Some(deg);
+        } else if arg == "--rotation-fix" {
+            self.rotation_fix = true;
+        } else if arg == "--no-rotation-fix" {
+            self.rotation_fix = false;
         } else if arg == "--perf-hints" {
             self.perf_hints = true;
         } else if arg == "--no-perf-hints" {
@@ -747,5 +756,17 @@ mod option_parsing_tests {
 
         assert!(options.parse_argument("--no-gta3-movie-player-fix").unwrap());
         assert!(!options.gta3_movie_player_fix);
+    }
+
+    #[test]
+    fn rotation_fix_is_opt_in_and_can_be_disabled() {
+        let mut options = Options::default();
+        assert!(!options.rotation_fix);
+
+        assert!(options.parse_argument("--rotation-fix").unwrap());
+        assert!(options.rotation_fix);
+
+        assert!(options.parse_argument("--no-rotation-fix").unwrap());
+        assert!(!options.rotation_fix);
     }
 }

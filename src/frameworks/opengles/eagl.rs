@@ -2453,15 +2453,20 @@ unsafe fn present_renderbuffer(
     // games (e.g. Plants vs. Zombies, the iPhone version) typically rotate
     // their drawing themselves, so we must NOT apply the extra rotation
     // for them.
-    // FIXME: A cleaner solution would be to read the actual transform from
-    //        the EAGL layer's view hierarchy and apply it here, instead of
-    //        using a device-family heuristic.
-    let needs_autorotation_compensation =
+    // By default, retain the legacy iPad/non-portrait heuristic. The opt-in
+    // `--rotation-fix` path instead checks whether UIKit actually applied the
+    // autorotation transform, avoiding an extra 180-degree turn for apps that
+    // do not rotate their root view.
+    let rotation_compensation_trigger = if env.options.rotation_fix {
         env.framework_state.uikit.autorotation_transform_applied
-            && !matches!(
-                device_orientation,
-                crate::window::DeviceOrientation::Portrait
-            );
+    } else {
+        device_family.is_ipad()
+    };
+    let needs_autorotation_compensation = rotation_compensation_trigger
+        && !matches!(
+            device_orientation,
+            crate::window::DeviceOrientation::Portrait
+        );
     // PERF: cached read-once flag; present_renderbuffer runs every frame.
     let rotation_matrix = if crate::env_flag_cached!("TOUCHHLE_DISABLE_PRESENT_ROTATION") {
         log_once!(
