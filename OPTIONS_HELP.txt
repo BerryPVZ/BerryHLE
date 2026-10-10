@@ -486,3 +486,29 @@ Other options:
         stack and branch based on the stack's content. There is normally
         no reason to enable this option. The number of bytes must be
         chosen carefully on a per-app basis.
+
+    --fix-movie-player
+        Opt in to the newer MPMoviePlayerController lifecycle and fullscreen
+        view handling. This fixes GTA III's fullscreen movie rendering and
+        skip behavior, but can break other games that expect movie content to
+        preload immediately or unparented movie views to be presented
+        automatically. Disabled globally; the bundled default-options file
+        enables it for GTA III. To enable it manually for a run, pass this
+        flag after the app path. For example:
+        touchHLE GTA3.app --fix-movie-player
+
+    --no-fix-movie-player
+        Use the legacy MPMoviePlayerController behavior, even if the fix was
+        enabled by an app-specific options file.
+
+    --rotation-fix
+        Use UIKit's actual autorotation state to decide whether EAGL needs an
+        extra 180-degree presentation compensation. This fixes iPad games that
+        should only get the compensation when UIKit really rotated their root
+        view. Without this flag, HyperHLE keeps the legacy iPad/non-portrait
+        heuristic. Disabled globally; the bundled default-options file enables
+        this together with --fix-movie-player for GTA III.
+
+    --no-rotation-fix
+        Explicitly use the legacy iPad/non-portrait rotation heuristic, even if
+        the fix was enabled by an app-specific options file.
