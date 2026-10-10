@@ -486,3 +486,15 @@ Other options:
         stack and branch based on the stack's content. There is normally
         no reason to enable this option. The number of bytes must be
         chosen carefully on a per-app basis.
+
+    --gta3-movie-player-fix
+        Opt in to the newer MPMoviePlayerController lifecycle and fullscreen
+        view handling. This fixes GTA III's fullscreen movie rendering and
+        skip behavior, but can break other games that expect movie content to
+        preload immediately or unparented movie views to be presented
+        automatically. Disabled by default; enable it only for GTA III (for
+        example, touchHLE GTA3.app --gta3-movie-player-fix).
+
+    --no-gta3-movie-player-fix
+        Use the legacy MPMoviePlayerController behavior, even if the fix was
+        enabled by an app-specific options file.

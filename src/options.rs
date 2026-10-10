@@ -253,6 +253,11 @@ pub struct Options {
     // TODO: flip to opt-out once track-switch/pause/reset handling is
     // validated against a real run of the game.
     pub gd_music_bypass: bool,
+    /// Opt in to the newer `MPMoviePlayerController` lifecycle and view
+    /// presentation behaviour that fixes GTA III's fullscreen movie panel.
+    /// Off by default because some other games rely on the legacy eager-load
+    /// and automatic fullscreen presentation behaviour.
+    pub gta3_movie_player_fix: bool,
 }
 
 impl Default for Options {
@@ -341,6 +346,7 @@ impl Default for Options {
             gd_music_bypass: std::env::var_os("TOUCHHLE_GD_MUSIC_BYPASS")
                 .map(|value| value != "0")
                 .unwrap_or(false),
+            gta3_movie_player_fix: false,
         }
     }
 }
@@ -364,6 +370,10 @@ impl Options {
             self.fullscreen = true;
         } else if arg == "--fix-music" {
             self.gd_music_bypass = true;
+        } else if arg == "--gta3-movie-player-fix" {
+            self.gta3_movie_player_fix = true;
+        } else if arg == "--no-gta3-movie-player-fix" {
+            self.gta3_movie_player_fix = false;
         } else if arg == "--landscape-left" {
             self.initial_orientation = DeviceOrientation::LandscapeLeft;
         } else if arg == "--landscape-right" {
@@ -712,7 +722,7 @@ fn parse_dump_options(options: &str) -> Result<DumpingOptions, String> {
 }
 
 #[cfg(test)]
-mod force_composition_option_tests {
+mod option_parsing_tests {
     use super::*;
 
     #[test]
@@ -725,5 +735,17 @@ mod force_composition_option_tests {
 
         assert!(options.parse_argument("--no-force-composition").unwrap());
         assert!(!options.force_composition);
+    }
+
+    #[test]
+    fn gta3_movie_player_fix_is_opt_in_and_can_be_disabled() {
+        let mut options = Options::default();
+        assert!(!options.gta3_movie_player_fix);
+
+        assert!(options.parse_argument("--gta3-movie-player-fix").unwrap());
+        assert!(options.gta3_movie_player_fix);
+
+        assert!(options.parse_argument("--no-gta3-movie-player-fix").unwrap());
+        assert!(!options.gta3_movie_player_fix);
     }
 }
