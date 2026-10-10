@@ -33,7 +33,7 @@ The titles below have been tested with HyperHLE-Fork and are known to run. Compa
 - Minecraft 0.14.2-0.16.2 (Playable)
 - Oceanhorn (Unplayable)
 - Asphalt 8 (1.0.0 + Playable)
-- GTA 3 (Buggy)
+- GTA 3 (Unplayable)
 - And more more games
 
 ## Build and documentation
