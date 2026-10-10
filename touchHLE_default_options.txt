@@ -348,6 +348,7 @@ com.disney.SwampyGame: --device-family=iphone-3gs
 # force the compatibility texture filter on strict mobile GLES drivers.
 com.lego.ninjago.thefinalbattle: --landscape-left --fix-texture-min-filter
 
-# Grand Theft Auto III
-# Use the GTA III movie-player and transform-aware iPad rotation fixes.
+# Grand Theft Auto III (both known bundle identifiers)
+# Use the movie-player and transform-aware iPad rotation fixes.
 com.rockstargames.gta3: --fix-movie-player --rotation-fix
+com.rockstargames.gta3ios: --fix-movie-player --rotation-fix
