@@ -10,9 +10,12 @@ use crate::frameworks::core_graphics::cg_bitmap_context::{
     CGBitmapContextCreate, CGBitmapContextCreateImage,
 };
 use crate::frameworks::core_graphics::cg_context::{
-    CGContextRef, CGContextRelease, CGContextRetain,
+    CGContextRef, CGContextRelease, CGContextRetain, CGContextScaleCTM, CGContextTranslateCTM,
 };
 use crate::frameworks::core_graphics::{CGFloat, CGRect, CGSize};
+use crate::frameworks::core_graphics::cg_image::{
+    kCGImageAlphaNoneSkipLast, kCGImageAlphaPremultipliedLast, kCGImageByteOrder32Big,
+};
 use crate::mem::MutVoidPtr;
 use crate::objc::{id, msg_class, nil};
 use crate::Environment;
@@ -55,11 +58,11 @@ pub fn UIGraphicsGetCurrentContext(env: &mut Environment) -> CGContextRef {
 
 /// Begin an offscreen bitmap context sized `size` at `scale`.
 /// Pass `scale` = 0.0 to use the main screen scale (we treat that as 1.0).
-/// `opaque` = true omits the alpha channel (we always use RGBA for simplicity).
+/// `opaque` = true ignores the alpha byte in the four-byte pixel storage.
 fn UIGraphicsBeginImageContextWithOptions(
     env: &mut Environment,
     size: CGSize,
-    _opaque: bool,
+    opaque: bool,
     scale: CGFloat,
 ) {
     let effective_scale = if scale == 0.0 { 1.0 } else { scale };
@@ -76,9 +79,9 @@ fn UIGraphicsBeginImageContextWithOptions(
     }
 
     let bytes_per_row = width * 4;
-    let data: MutVoidPtr = env.mem.alloc(bytes_per_row * height).cast();
+    let data = MutVoidPtr::null();
 
-    // kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big = 0x00020008
+    // Use a valid RGBA bitmap format and let the context own its storage.
     let context = CGBitmapContextCreate(
         env,
         data,
@@ -87,7 +90,12 @@ fn UIGraphicsBeginImageContextWithOptions(
         8,
         bytes_per_row as _,
         nil, // device RGB
-        0x0002_0008,
+        kCGImageByteOrder32Big
+            | if opaque {
+                kCGImageAlphaNoneSkipLast
+            } else {
+                kCGImageAlphaPremultipliedLast
+            },
     );
 
     if context.is_null() {
@@ -95,6 +103,8 @@ fn UIGraphicsBeginImageContextWithOptions(
         return;
     }
 
+    CGContextTranslateCTM(env, context, 0.0, height as CGFloat);
+    CGContextScaleCTM(env, context, effective_scale, -effective_scale);
     UIGraphicsPushContext(env, context);
     // CGBitmapContextCreate returns a +1 ref; we transferred ownership to the
     // stack via push (which also retains), so release the creation ref.

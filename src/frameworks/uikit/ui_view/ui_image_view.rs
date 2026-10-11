@@ -83,6 +83,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 // NSCoding implementation
 - (id)initWithCoder:(id)coder {
     let this: id = msg_super![env; this initWithCoder:coder];
+    () = msg![env; this setOpaque:false];
 
     let key_ns_string = get_static_str(env, "UIImage");
     let image: id = msg![env; coder decodeObjectForKey:key_ns_string];

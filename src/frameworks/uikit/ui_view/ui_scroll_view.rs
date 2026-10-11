@@ -124,6 +124,21 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
 
+- (id)initWithFrame:(CGRect)frame {
+    let this: id = crate::objc::msg_super![env; this initWithFrame:frame];
+    () = msg![env; this setClipsToBounds:true];
+    this
+}
+- (id)initWithCoder:(id)coder {
+    let this: id = crate::objc::msg_super![env; this initWithCoder:coder];
+    let key = crate::frameworks::foundation::ns_string::get_static_str(env, "UIClipsToBounds");
+    let has_clips: bool = msg![env; coder containsValueForKey:key];
+    if !has_clips {
+        () = msg![env; this setClipsToBounds:true];
+    }
+    this
+}
+
 // MARK: - Delegate
 
 - (id)delegate {

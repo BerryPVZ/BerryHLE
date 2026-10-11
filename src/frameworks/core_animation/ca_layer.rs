@@ -69,6 +69,7 @@ pub(crate) struct CALayerHostObject {
     pub(super) sublayer_transform: CATransform3D,
     pub(super) hidden: bool,
     pub(super) opaque: bool,
+    pub(super) masks_to_bounds: bool,
     pub(super) opacity: f32,
     pub(super) background_color: Option<CGColorHostObject>,
     /// CGImageRef for pattern backgrounds (set via colorWithPatternImage:)
@@ -397,6 +398,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         sublayer_transform: CATransform3DIdentity,
         hidden: false,
         opaque: false,
+        masks_to_bounds: false,
         opacity: 1.0,
         background_color: None,
         background_pattern_cg_image: nil,
@@ -603,6 +605,11 @@ pub const CLASSES: ClassExports = objc_classes! {
             release(env, this);
         }
     }
+}
+
+- (bool)masksToBounds { env.objc.borrow::<CALayerHostObject>(this).masks_to_bounds }
+- (())setMasksToBounds:(bool)clips {
+    env.objc.borrow_mut::<CALayerHostObject>(this).masks_to_bounds = clips;
 }
 
 - (CGRect)bounds { env.objc.borrow::<CALayerHostObject>(this).bounds }

@@ -3,7 +3,10 @@
  */
 
 use crate::dyld::{export_c_func, FunctionExports};
-use crate::frameworks::core_graphics::cg_context::CGContextDrawImage;
+use crate::frameworks::core_graphics::cg_context::{
+    CGContextDrawImage, CGContextRef, CGContextRestoreGState, CGContextSaveGState,
+    CGContextScaleCTM, CGContextTranslateCTM,
+};
 use crate::frameworks::core_graphics::cg_image::{
     self, CGImageGetHeight, CGImageGetWidth, CGImageRef, CGImageRelease, CGImageRetain,
 };
@@ -20,6 +23,29 @@ use crate::objc::{
 };
 use crate::Environment;
 use std::collections::HashMap;
+
+// UIImage uses UIKit's downward image axis; CGContextDrawImage uses Quartz's
+// upward axis. Reflect only this draw, preserving the caller's transform.
+fn draw_ui_image(env: &mut Environment, context: CGContextRef, rect: CGRect, image: CGImageRef) {
+    CGContextSaveGState(env, context);
+    CGContextTranslateCTM(
+        env,
+        context,
+        rect.origin.x,
+        rect.origin.y + rect.size.height,
+    );
+    CGContextScaleCTM(env, context, 1.0, -1.0);
+    CGContextDrawImage(
+        env,
+        context,
+        CGRect {
+            origin: CGPoint::default(),
+            size: rect.size,
+        },
+        image,
+    );
+    CGContextRestoreGState(env, context);
+}
 
 const CACHE_SIZE: usize = 60;
 
@@ -296,7 +322,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             height: CGImageGetHeight(env, image) as CGFloat,
         }
     };
-    CGContextDrawImage(env, context, rect, image);
+    draw_ui_image(env, context, rect, image);
 }
 
 - (())drawInRect:(CGRect)rect {
@@ -310,7 +336,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let image = env.objc.borrow::<UIImageHostObject>(this).cg_image;
     // Drawing a nil image is a no-op, not a crash.
     if image == nil { return; }
-    CGContextDrawImage(env, context, rect, image);
+    draw_ui_image(env, context, rect, image);
 }
 
 // `blendMode` and `alpha` arguments are accepted and validated, but applying
@@ -324,7 +350,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let image = env.objc.borrow::<UIImageHostObject>(this).cg_image;
     // Drawing a nil image is a no-op, not a crash.
     if image == nil { return; }
-    CGContextDrawImage(env, context, rect, image);
+    draw_ui_image(env, context, rect, image);
 }
 
 - (())drawAtPoint:(CGPoint)point blendMode:(i32)_blend_mode alpha:(CGFloat)_alpha {
@@ -340,7 +366,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             height: CGImageGetHeight(env, image) as CGFloat,
         }
     };
-    CGContextDrawImage(env, context, rect, image);
+    draw_ui_image(env, context, rect, image);
 }
 
 // Apple: "Draws the image, tiled, in a rectangle." The receiver's CGImage is
