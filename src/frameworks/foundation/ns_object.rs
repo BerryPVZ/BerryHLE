@@ -368,20 +368,27 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.class_has_method(this, selector)
 }
 
-// ИЗМЕНЕНО: Ищем _objc_msgSend через create_proc_address (без логов)
-+ (u32)instanceMethodForSelector:(SEL)_selector {
-    let dyld = &mut env.dyld;
-    let mem = &mut env.mem;
-    let cpu = &mut env.cpu;
-    match dyld.create_proc_address(mem, cpu, "_objc_msgSend") {
-        Ok(guest_func) => guest_func.addr_with_thumb_bit(),
-        Err(_) => {
-            log!("Error: _objc_msgSend not found! Returning dummy IMP.");
-            let ptr: crate::mem::MutPtr<u16> = mem.alloc(2).cast();
-            mem.write(ptr, 0x4770);
-            ptr.to_bits() | 1
-        }
-    }
+// `+instanceMethodForSelector:` must resolve the selector to the same IMP
+// an instance would use — i.e. it has to agree with `-methodForSelector:`
+// for the same class+selector. Objective-Chipmunk's override detection
+// (`ChipmunkBody methodIsOverriden:`) compares
+// `[self methodForSelector:sel]` against
+// `[[self class] instanceMethodForSelector:sel]`; when the two disagree it
+// concludes the method is overridden. The old implementation ignored the
+// selector and always handed back the `_objc_msgSend` trampoline, so the
+// comparison never matched the real IMP returned by `-methodForSelector:`.
+// Every physics body then looked as if it overrode its velocity/position
+// integrator, and Chipmunk installed an ObjC-dispatch update callback that
+// was invoked with the C `cpBody*` calling convention, branching into
+// garbage (an `UndefinedInstruction` at the image base / heap) on the very
+// first physics step. Resolving the selector here — exactly like
+// `-methodForSelector:` — keeps the two in agreement. In a class method
+// `this` is the class itself, which is what `class_getMethodImplementation`
+// expects. Host-implemented methods still come back as the `_objc_msgSend`
+// trampoline via `class_getMethodImplementation`, preserving the previous
+// behaviour for them.
++ (u32)instanceMethodForSelector:(SEL)selector {
+    crate::objc::class_getMethodImplementation(env, this, selector).to_bits()
 }
 
 + (id)instanceMethodSignatureForSelector:(SEL)selector {
