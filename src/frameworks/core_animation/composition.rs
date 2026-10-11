@@ -100,12 +100,23 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
             .borrow::<CALayerHostObject>(fullscreen_eagl_layer)
             .presented_pixels
             .is_some();
-        if (!force || !has_presented_pixels)
+        if has_presented_pixels
+            && !force
             && !crate::frameworks::media_player::has_active_video(env)
         {
             // EAGLContext normally presents the fullscreen drawable directly.
             // Native ES1 readback and movie overlays are the exceptions that
             // need the Core Animation compositor.
+            //
+            // The fast path is only valid once the EAGL layer has actually
+            // presented at least one frame. Some apps (e.g. Doodle Jump) sit
+            // on a UIKit screen — menus, cross-promo/"prize" popups — while the
+            // fullscreen EAGL layer stays idle and never presents. In that
+            // state the fast path would skip composition and leave the screen
+            // blank, so fall through to the Core Animation compositor and draw
+            // the UIKit view/layer tree instead. Once the app starts driving
+            // GL (presentRenderbuffer sets presented_pixels), the fast path
+            // takes over again.
             log_dbg!("Using CAEAGLLayer fast path, skipping composition");
             return None;
         }
