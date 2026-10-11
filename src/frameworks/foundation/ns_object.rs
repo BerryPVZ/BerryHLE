@@ -1449,6 +1449,48 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @end
 
+// `_touchHLE_NSBlock` is the ObjC class used as the `isa` of guest block
+// objects (`__NSConcreteStackBlock` / `__NSConcreteGlobalBlock` /
+// `__NSConcreteMallocBlock`; see `dyld::do_non_lazy_linking`). Blocks are
+// allocated by guest code (block literals) and are NOT touchHLE host objects,
+// so they must NOT use the host-object refcount table. Instead their memory
+// management routes to the Blocks runtime in `libc::blocks`. Without this,
+// `[someBlock copy]` / `[someBlock retain]` (used pervasively by cocos2d v3's
+// scheduler and CCBReader to store callback blocks) would hit a dummy class
+// with no methods and return nil, leaving e.g. `CCTimer._block` nil and
+// crashing the scheduler when it later invokes the (nil/garbage) callback.
+@implementation _touchHLE_NSBlock: NSObject
+
+- (id)retain {
+    let blk = crate::mem::ConstVoidPtr::from_bits(this.to_bits());
+    let copied = crate::libc::blocks::_Block_copy(env, blk);
+    crate::mem::Ptr::from_bits(copied.to_bits())
+}
+
+- (id)copy {
+    msg![env; this copyWithZone:(MutVoidPtr::null())]
+}
+
+- (id)copyWithZone:(NSZonePtr)_zone {
+    let blk = crate::mem::ConstVoidPtr::from_bits(this.to_bits());
+    let copied = crate::libc::blocks::_Block_copy(env, blk);
+    crate::mem::Ptr::from_bits(copied.to_bits())
+}
+
+- (())release {
+    let blk = crate::mem::ConstVoidPtr::from_bits(this.to_bits());
+    crate::libc::blocks::_Block_release(env, blk);
+}
+
+- (id)autorelease {
+    // Blocks that outlive the current scope are retained via copy by their
+    // owner, so a no-op autorelease is safe here and avoids routing a
+    // non-host-object block through the autorelease pool's release path.
+    this
+}
+
+@end
+
 };
 
 #[cfg(test)]
