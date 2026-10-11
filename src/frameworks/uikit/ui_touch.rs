@@ -708,6 +708,75 @@ fn touchhle_send_cocos_touch_aliases_to_hierarchy(
 }
 
 
+/// Whether a window contains any real content, i.e. at least one view nested
+/// below the window's own root view(s). Empty helper windows left behind by
+/// completed modal flows (age gate, ATT prompt, …) have only a bare, childless
+/// root view and must not intercept touches meant for the window underneath.
+fn touchhle_window_has_content(env: &mut Environment, window: id) -> bool {
+    let subviews: id = msg![env; window subviews];
+    let count: NSUInteger = msg![env; subviews count];
+    for i in 0..count {
+        let root: id = msg![env; subviews objectAtIndex:i];
+        let root_subviews: id = msg![env; root subviews];
+        let root_count: NSUInteger = msg![env; root_subviews count];
+        if root_count > 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns true for a view that cannot itself be a meaningful touch target:
+/// a plain `UIView` (not a `UIControl` subclass) with no subviews. Some apps
+/// (and some nib setups) leave such an empty, fully transparent view on top of
+/// the real content; because it is `userInteractionEnabled` by default it
+/// swallows every touch under the standard `hitTest:` even though there is
+/// nothing there to interact with. Doodle Jump's launch cross-promo is covered
+/// by exactly such an empty sibling view, which otherwise makes its close
+/// button unreachable.
+fn touchhle_is_empty_overlay(env: &mut Environment, view: id) -> bool {
+    let class: crate::objc::Class = msg![env; view class];
+    if env.objc.get_class_name(class) != "UIView" {
+        return false;
+    }
+    let subviews: id = msg![env; view subviews];
+    let count: NSUInteger = msg![env; subviews count];
+    count == 0
+}
+
+/// Depth-first search for the frontmost interactive descendant of `root` that
+/// contains `point` (expressed in `root`'s coordinate space), ignoring empty
+/// transparent overlay views (see [touchhle_is_empty_overlay]). Used as a
+/// fallback when the standard `hitTest:` lands on such an overlay so touches
+/// still reach the real content underneath.
+fn touchhle_hit_test_skipping_overlays(env: &mut Environment, root: id, point: CGPoint) -> id {
+    let hidden: bool = msg![env; root isHidden];
+    let uie: bool = msg![env; root isUserInteractionEnabled];
+    let alpha: f32 = msg![env; root alpha];
+    if hidden || !uie || alpha < 0.01 {
+        return nil;
+    }
+    if !msg![env; root pointInside:point withEvent:(nil)] {
+        return nil;
+    }
+    let subviews: id = msg![env; root subviews];
+    let count: NSUInteger = msg![env; subviews count];
+    for i in (0..count).rev() {
+        let child: id = msg![env; subviews objectAtIndex:i];
+        let child_point: CGPoint = msg![env; root convertPoint:point toView:child];
+        let hit = touchhle_hit_test_skipping_overlays(env, child, child_point);
+        if hit != nil {
+            return hit;
+        }
+    }
+    // No descendant matched. Only claim the touch if this view is itself a
+    // meaningful target; empty transparent overlays fall through.
+    if touchhle_is_empty_overlay(env, root) {
+        return nil;
+    }
+    root
+}
+
 fn touchhle_find_cocos_touch_target(env: &mut Environment, root: id) -> id {
     if root == nil {
         return nil;
@@ -829,6 +898,29 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
 
         let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
         let found_window = windows.iter().rev().find_map(|&window| {
+            // A hidden window must never receive touches, even if it is the
+            // topmost window containing the point. (iOS routes touches only to
+            // visible windows.) This matters when an app leaves an empty
+            // helper window — e.g. the dedicated UIWindow Doodle Jump creates
+            // to host its age gate — on screen: once hidden it must stop
+            // swallowing touches meant for the game window underneath.
+            let hidden: bool = msg![env; window isHidden];
+            if hidden {
+                return None;
+            }
+            // Skip empty overlay windows that carry no content. Doodle Jump
+            // (and other apps) present launch popups — age gate, ATT tracking
+            // prompt, etc. — each in its own dedicated UIWindow. When those
+            // flows are completed synchronously the app can leave the now-empty
+            // helper window on screen as the key/top window; without this it
+            // would swallow every touch meant for the game window beneath it.
+            // A window whose view tree bottoms out in contentless root views is
+            // never a legitimate touch target, so fall through to the window
+            // below (the primary search below still falls back to the topmost
+            // window if every candidate is empty).
+            if !touchhle_window_has_content(env, window) {
+                return None;
+            }
             let location_in_window: CGPoint = msg![env; window
                 convertPoint:location fromWindow:nil];
             if msg![env; window pointInside:location_in_window withEvent:event] {
@@ -862,6 +954,18 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             continue;
         };
         let mut view: id = msg![env; window hitTest:location_in_window withEvent:event];
+
+        // If the standard hitTest landed on an empty, transparent overlay view
+        // (no subviews, not a control), retry while skipping such overlays so
+        // the touch reaches the real interactive content underneath. This is
+        // what lets Doodle Jump's launch cross-promo close button — hidden
+        // behind an empty full-screen sibling view — actually receive taps.
+        if view != nil && touchhle_is_empty_overlay(env, view) {
+            let deep = touchhle_hit_test_skipping_overlays(env, window, location_in_window);
+            if deep != nil {
+                view = deep;
+            }
+        }
 
         if view != nil {
             let view_class: crate::objc::Class = msg![env; view class];
