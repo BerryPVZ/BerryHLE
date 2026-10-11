@@ -43,7 +43,10 @@ impl_HostObject_with_superclass!(UILabelHostObject);
 impl Default for UILabelHostObject {
     fn default() -> Self {
         UILabelHostObject {
-            superclass: Default::default(),
+            superclass: super::UIViewHostObject {
+                user_interaction_enabled: false,
+                ..Default::default()
+            },
             text: nil,
             font: nil,
             text_color: nil,

@@ -902,6 +902,11 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             );
         }
 
+        if crate::env_flag_cached!("TOUCHHLE_TRACE_TOUCHES") {
+            let class = msg![env; view class];
+            log!("Touch target {} {:?} at {:?}", env.objc.get_class_name(class), view, location_in_window);
+        }
+
         let is_multi_touch_enabled: bool = msg![env; view isMultipleTouchEnabled];
         if !is_multi_touch_enabled
             && !touchhle_cocos_should_allow_multitouch(env, view)

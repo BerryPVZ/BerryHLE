@@ -355,3 +355,7 @@ hu.BV.BTC-Olympic: --landscape-left --present-mode=readback
 
 # Break the Cookie Free uses the same CCDirector drawable and startup checks.
 hu.BV.BreakTheCookieFree: --landscape-left --present-mode=readback
+
+# Food Fight mixes NIB-based UIKit menus with a MashEAGLView. Keep the
+# compositor active while the game's GL renderer is idle on menu screens.
+com.tomatoflix.foodfight: --force-composition

@@ -180,9 +180,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)initWithContentsOfFile:(id)path { // NSString*
+    // A failed load must return nil: callers may then try bundled artwork
+    // after checking for a downloaded replacement (for example Food Fight).
     if path == nil {
-        env.objc.borrow_mut::<UIImageHostObject>(this).cg_image = get_dummy_cg_image(env);
-        return this;
+        release(env, this);
+        return nil;
     }
     let path_str = ns_string::to_rust_string(env, path);
     let bytes = env.fs.read(GuestPath::new(&path_str));
@@ -203,12 +205,12 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
     }
     let Ok(bytes) = bytes else {
-        env.objc.borrow_mut::<UIImageHostObject>(this).cg_image = get_dummy_cg_image(env);
-        return this;
+        release(env, this);
+        return nil;
     };
     let Ok(image) = Image::from_bytes(&bytes) else {
-        env.objc.borrow_mut::<UIImageHostObject>(this).cg_image = get_dummy_cg_image(env);
-        return this;
+        release(env, this);
+        return nil;
     };
 
     env.objc.borrow_mut::<UIImageHostObject>(this).cg_image = cg_image::from_image(env, image);

@@ -50,7 +50,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 @implementation UIImageView: UIView
 
 + (id)allocWithZone:(NSZonePtr)_zone {
-    let host_object = Box::<UIImageViewHostObject>::default();
+    let mut host_object = Box::<UIImageViewHostObject>::default();
+    host_object.superclass.user_interaction_enabled = false;
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
 
