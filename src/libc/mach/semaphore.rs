@@ -224,9 +224,18 @@ fn semaphore_wait(env: &mut Environment, semaphore: semaphore_t) -> kern_return_
     // By default this is a true blocking wait: it returns only once a real
     // signal arrives. The spurious-wake deadlock-breaker is opt-in per app
     // (see the doc comment above `--mach-semaphore-spurious-wake=`).
+    //
+    // IMPORTANT: apply the breaker ONLY to the main thread (thread 0). The
+    // blanket version spuriously wakes the FMOD/Wwise *worker* threads, which
+    // then loop on an empty command queue and leak memory until OOM (observed
+    // in Deus Ex: The Fall: host RSS climbs to 5+ GB). Waking only the main
+    // thread lets it time out of a blocking audio call (e.g. a FaceFX dialogue
+    // waiting on VO whose Wwise .wem could not be decoded) and continue, while
+    // the idle audio workers keep blocking normally and never spin/leak.
     let spurious_wake_after = env
         .options
         .mach_semaphore_spurious_wake_ms
+        .filter(|_| env.current_thread == 0)
         .map(Duration::from_millis);
     let deadline = spurious_wake_after.map(|after| env.guest_clock.now() + after);
     let result = loop {
