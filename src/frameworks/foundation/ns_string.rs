@@ -512,7 +512,7 @@ impl CodeUnitIterator<'_> {
 
 pub fn with_format(env: &mut Environment, format: id, args: VaList) -> String {
     let format_string = to_rust_string(env, format);
-    println!("Formatting {:?} ({:?})", format, format_string);
+    log_dbg!("Formatting {:?} ({:?})", format, format_string);
 
     let res = crate::libc::stdio::printf::printf_inner::<true, _>(
         env,
@@ -704,7 +704,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if this == nil { return 0; }
     let host_object = env.objc.borrow_mut::<StringHostObject>(this);
     let (utf16, did_convert) = host_object.convert_to_utf16_inplace();
-    if did_convert { println!("[{:?} length]: converted string to UTF-16", this); }
+    if did_convert { log_dbg!("[{:?} length]: converted string to UTF-16", this); }
     utf16.len().try_into().unwrap()
 }
 
@@ -724,7 +724,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (u16)characterAtIndex:(NSUInteger)index {
     let host_object = env.objc.borrow_mut::<StringHostObject>(this);
     let (utf16, did_convert) = host_object.convert_to_utf16_inplace();
-    if did_convert { println!("[{:?} characterAtIndex:{:?}]: converted string to UTF-16", this, index); }
+    if did_convert { log_dbg!("[{:?} characterAtIndex:{:?}]: converted string to UTF-16", this, index); }
 
     let idx = index as usize;
     if idx >= utf16.len() {
@@ -1230,7 +1230,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())getCharacters:(MutPtr<unichar>)buffer {
     let host_object = env.objc.borrow_mut::<StringHostObject>(this);
     let (utf16, did_convert) = host_object.convert_to_utf16_inplace();
-    if did_convert { println!("[{:?} getCharacters:{:?}]: converted string to UTF-16", this, buffer); }
+    if did_convert { log_dbg!("[{:?} getCharacters:{:?}]: converted string to UTF-16", this, buffer); }
 
     let len: GuestUSize = guest_size_of::<unichar>() * utf16.len() as GuestUSize;
     let tmp_vec: Vec<u8> = utf16.iter().flat_map(|c| u16::to_le_bytes(*c)).collect();
@@ -1988,7 +1988,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)mergeWithPrevious:(id)previous {
-    println!(
+    log_dbg!(
         "NSMutableString mergeWithPrevious: previous={:?} — returning self",
         previous
     );
@@ -2133,7 +2133,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let bytes_u8: ConstPtr<u8> = bytes.cast();
     let length: NSUInteger = msg![env; data length];
     let new = msg![env; this initWithBytes:bytes_u8 length:length encoding:encoding];
-    println!("initWithData:encoding: {}", to_rust_string(env, new));
+    log_dbg!("initWithData:encoding: {}", to_rust_string(env, new));
     new
 }
 
@@ -2460,7 +2460,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let string = {
         let host_object = env.objc.borrow_mut::<StringHostObject>(this);
         let (orig_string, did_convert) = host_object.convert_to_utf16_inplace();
-        if did_convert { println!("[{:?} componentsSeparatedByCharactersInSet]: converted string to UTF-16", this); }
+        if did_convert { log_dbg!("[{:?} componentsSeparatedByCharactersInSet]: converted string to UTF-16", this); }
         orig_string.clone()
     };
     let substrings: Vec<&[u16]> = { string.split(|&c| msg![env; cset characterIsMember:c]).collect() };
@@ -2472,7 +2472,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)substringWithRange:(NSRange)range {
     let host_object = env.objc.borrow_mut::<StringHostObject>(this);
     let (orig_string, did_convert) = host_object.convert_to_utf16_inplace();
-    if did_convert { println!("[{:?} substringWithRange]: converted string to UTF-16", this); }
+    if did_convert { log_dbg!("[{:?} substringWithRange]: converted string to UTF-16", this); }
 
     let start = range.location as usize;
     let end = start.saturating_add(range.length as usize);
@@ -2491,7 +2491,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (NSRange)lineRangeForRange:(NSRange)range {
     let host_object = env.objc.borrow_mut::<StringHostObject>(this);
     let (orig_string, did_convert) = host_object.convert_to_utf16_inplace();
-    if did_convert { println!("[{:?} lineRangeForRange]: converted string to UTF-16", this); }
+    if did_convert { log_dbg!("[{:?} lineRangeForRange]: converted string to UTF-16", this); }
     let (start, end, _) = line_range_helper(orig_string, range, true, true);
     NSRange { location: start, length: end - start }
 }
@@ -2512,7 +2512,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())getLineStart:(MutPtr<NSUInteger>)start_ptr end:(MutPtr<NSUInteger>)end_ptr contentsEnd:(MutPtr<NSUInteger>)contents_end_ptr forRange:(NSRange)range {
     let host_object = env.objc.borrow_mut::<StringHostObject>(this);
     let (orig_string, did_convert) = host_object.convert_to_utf16_inplace();
-    if did_convert { println!("[{:?} getLineStart]: converted string to UTF-16", this); }
+    if did_convert { log_dbg!("[{:?} getLineStart]: converted string to UTF-16", this); }
     let get_start = !start_ptr.is_null();
     let get_end = !end_ptr.is_null() || !contents_end_ptr.is_null();
     let (start, end, contents_end) = line_range_helper(orig_string, range, get_start, get_end);
@@ -2693,7 +2693,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)substringWithRange:(NSRange)range {
     let host_object = env.objc.borrow_mut::<StringHostObject>(this);
     let (orig_string, did_convert) = host_object.convert_to_utf16_inplace();
-    if did_convert { println!("[{:?} substringWithRange]: converted string to UTF-16", this); }
+    if did_convert { log_dbg!("[{:?} substringWithRange]: converted string to UTF-16", this); }
 
     let start = range.location as usize;
     let end = start.saturating_add(range.length as usize);

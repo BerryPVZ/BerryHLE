@@ -1613,7 +1613,7 @@ fn try_nsarray_indexed_subscript_interpose(
 
     let obj: id = msg_send_no_type_checking(env, (receiver, sel_object_at_index, index));
 
-    log!(
+    log_dbg!(
         "NSArray compat: [{} objectAtIndexedSubscript:{}] => {:?}",
         class_name,
         index,
