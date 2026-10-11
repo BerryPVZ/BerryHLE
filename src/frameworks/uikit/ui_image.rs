@@ -45,6 +45,11 @@ struct UIImageHostObject {
     orientation: NSInteger, // UIImageOrientation
     left_cap_width: NSInteger,
     top_cap_height: NSInteger,
+    /// Image scale factor (`1.0` for standard, `2.0` for @2x, `3.0` for @3x).
+    /// UIKit reports `-[UIImage size]` in points (pixels / scale); honouring
+    /// this keeps layout and hit-testing correct when a Retina-only app's
+    /// @2x/@3x asset is loaded on touchHLE's 1x device.
+    scale: CGFloat,
 }
 impl HostObject for UIImageHostObject {}
 
@@ -70,6 +75,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         orientation: 0, // UIImageOrientationUp
         left_cap_width: 0,
         top_cap_height: 0,
+        scale: 1.0,
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -79,23 +85,41 @@ pub const CLASSES: ClassExports = objc_classes! {
     let mut path: id = msg![env; bundle pathForResource:name ofType:nil];
     let name_str = ns_string::to_rust_string(env, name).to_string();
     // Like UIKit, accept names without an extension (".png" is implied) and
-    // fall back to the "~iphone" and @2x variants.
-    if path == nil && !name_str.contains('.') {
-        let device_suffix = "~iphone";
+    // fall back to the "~iphone" and @2x/@3x variants.
+    //
+    // The @2x/@3x fallback is important even though touchHLE emulates a 1x
+    // device: modern iPhone-only apps (iOS 7+) frequently ship ONLY the
+    // Retina (@2x/@3x) assets and no 1x copy at all, because every device
+    // they support is Retina. Without this fallback those apps fail to load
+    // almost all of their artwork (buttons, popups, HUD) and appear broken.
+    // The @2x suffix must be inserted before the file extension, i.e.
+    // "news-close.png" -> "news-close@2x.png", not "news-close.png@2x".
+    if path == nil {
+        // Split "foo.png" into stem "foo" and extension "png"; a name with no
+        // extension implies "png" like UIKit does.
+        let (stem, ext) = match name_str.rfind('.') {
+            Some(dot) => (
+                name_str[..dot].to_string(),
+                name_str[dot + 1..].to_string(),
+            ),
+            None => (name_str.clone(), "png".to_string()),
+        };
+        let ext_ns = ns_string::from_rust_string(env, ext);
         for candidate in [
-            format!("{}{}", name_str, device_suffix),
-            name_str.clone(),
-            format!("{}@2x{}", name_str, device_suffix),
-            format!("{}@2x", name_str),
+            format!("{}~iphone", stem),
+            format!("{}@2x~iphone", stem),
+            format!("{}@3x~iphone", stem),
+            format!("{}@2x", stem),
+            format!("{}@3x", stem),
         ] {
             let candidate = ns_string::from_rust_string(env, candidate);
-            let png = ns_string::get_static_str(env, "png");
-            path = msg![env; bundle pathForResource:candidate ofType:png];
+            path = msg![env; bundle pathForResource:candidate ofType:ext_ns];
             release(env, candidate);
             if path != nil {
                 break;
             }
         }
+        release(env, ext_ns);
     }
     if path == nil {
         log!("UIImage imageNamed: {:?} not found in bundle", name_str);
@@ -211,7 +235,22 @@ pub const CLASSES: ClassExports = objc_classes! {
         return this;
     };
 
-    env.objc.borrow_mut::<UIImageHostObject>(this).cg_image = cg_image::from_image(env, image);
+    // Infer the scale factor from the Retina filename suffix so that
+    // `-[UIImage size]` reports points, not pixels. This matters for
+    // Retina-only apps (see the `@2x`/`@3x` fallback in `imageNamed:`):
+    // without it a 60x60-pixel `foo@2x.png` would report a 60x60-point
+    // size and lay out (and hit-test) at twice its intended size.
+    let scale: CGFloat = if lower_path.contains("@3x.") {
+        3.0
+    } else if lower_path.contains("@2x.") {
+        2.0
+    } else {
+        1.0
+    };
+    let cg = cg_image::from_image(env, image);
+    let host = env.objc.borrow_mut::<UIImageHostObject>(this);
+    host.cg_image = cg;
+    host.scale = scale;
     this
 }
 
@@ -239,10 +278,19 @@ pub const CLASSES: ClassExports = objc_classes! {
         return CGSize { width: 0.0, height: 0.0 };
     }
     let (width, height) = cg_image::borrow_image(&env.objc, image).dimensions();
+    // UIKit reports the size in points: pixels divided by the image scale.
+    // For a @2x asset loaded on this 1x-emulated device the CGImage is twice
+    // the point size, so a view that sizes itself to `image.size` (and the
+    // close buttons that depend on it for hit-testing) must see points.
+    let scale = env.objc.borrow::<UIImageHostObject>(this).scale.max(1.0);
     CGSize {
-        width: width as _,
-        height: height as _,
+        width: width as CGFloat / scale,
+        height: height as CGFloat / scale,
     }
+}
+
+- (CGFloat)scale {
+    env.objc.borrow::<UIImageHostObject>(this).scale.max(1.0)
 }
 
 - (CGImageRef)CGImage {
@@ -287,11 +335,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     let image = env.objc.borrow::<UIImageHostObject>(this).cg_image;
     // Drawing a nil image is a no-op, not a crash.
     if image == nil { return; }
+    // Draw at the image's point size (pixels / scale) so @2x assets are not
+    // drawn at double size.
+    let scale = env.objc.borrow::<UIImageHostObject>(this).scale.max(1.0);
     let rect = CGRect {
         origin: point,
         size: CGSize {
-            width: CGImageGetWidth(env, image) as CGFloat,
-            height: CGImageGetHeight(env, image) as CGFloat,
+            width: CGImageGetWidth(env, image) as CGFloat / scale,
+            height: CGImageGetHeight(env, image) as CGFloat / scale,
         }
     };
     CGContextDrawImage(env, context, rect, image);
@@ -331,11 +382,12 @@ pub const CLASSES: ClassExports = objc_classes! {
     let image = env.objc.borrow::<UIImageHostObject>(this).cg_image;
     // Drawing a nil image is a no-op, not a crash.
     if image == nil { return; }
+    let scale = env.objc.borrow::<UIImageHostObject>(this).scale.max(1.0);
     let rect = CGRect {
         origin: point,
         size: CGSize {
-            width: CGImageGetWidth(env, image) as CGFloat,
-            height: CGImageGetHeight(env, image) as CGFloat,
+            width: CGImageGetWidth(env, image) as CGFloat / scale,
+            height: CGImageGetHeight(env, image) as CGFloat / scale,
         }
     };
     CGContextDrawImage(env, context, rect, image);
