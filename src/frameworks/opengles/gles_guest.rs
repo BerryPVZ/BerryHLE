@@ -7614,16 +7614,13 @@ fn glFenceSync(env: &mut Environment, condition: GLenum, flags: GLbitfield) -> G
     if !has_current_ctx(env) {
         return 0;
     }
+    // Some guests poll fences with a zero timeout and do not yield while
+    // waiting. Complete the queued host work synchronously and represent the
+    // guest fence as already signalled; host sync-object support is not
+    // required for this synchronous emulation path.
     let host = with_ctx_and_mem(env, |gles, _mem| unsafe {
-        if gles.supports_sync_objects() {
-            match gles.FenceSync(condition, flags) {
-                0 => None,
-                host => Some(Some(host)),
-            }
-        } else {
-            gles.Finish();
-            Some(None)
-        }
+        gles.Finish();
+        Some(None)
     });
     let Some(host) = host else {
         return 0;

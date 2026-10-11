@@ -1502,7 +1502,9 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         _nib_archive_decoder::CLASSES,
         ab_people_picker_navigation_controller::CLASSES,
         asidentifier_manager::CLASSES,
-        chipmunk_space::CLASSES,
+        // Drive Ahead bundles its own Objective-Chipmunk classes. Registering
+        // these host placeholders shadows the app's implementations, so leave
+        // them unregistered and let the bundled classes link normally.
         ns_array::CLASSES,
         ns_attributed_string::CLASSES,
         ns_assertion_handler::CLASSES,

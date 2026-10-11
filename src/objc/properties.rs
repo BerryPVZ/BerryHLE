@@ -398,6 +398,42 @@ pub fn object_getIvar(env: &mut Environment, object: id, ivar: MutVoidPtr) -> id
     value
 }
 
+/// `void object_setIvar(id obj, Ivar ivar, id value)`
+///
+/// Classic/ARC runtime primitive that stores an object pointer directly into
+/// an instance variable (bypassing any synthesized setter). This is used by
+/// code that wires outlets or callback objects through runtime ivar metadata.
+///
+/// Like Apple's `object_setIvar`, this does not retain `value` or release the
+/// previous value; it just stores the raw pointer at the ivar's offset.
+pub fn object_setIvar(env: &mut Environment, object: id, ivar: MutVoidPtr, value: id) {
+    if object == nil || ivar.is_null() {
+        return;
+    }
+    let class = ObjC::read_isa(object, &env.mem);
+    let class_name = env.objc.get_class_name(class).to_string();
+    let Some(offset_pointer) = env
+        .objc
+        .class_lookup_ivar_offset_by_metadata(class, ivar.cast_const())
+    else {
+        trace_ivar_access(&format!(
+            "object_setIvar class={} object={:?} ivar={:?} value={:?} — unknown ivar, ignored",
+            class_name, object, ivar, value
+        ));
+        return;
+    };
+    if offset_pointer.is_null() {
+        return;
+    }
+    let offset: GuestUSize = env.mem.read(offset_pointer);
+    let field_address = object.to_bits().wrapping_add(offset);
+    let field_ptr: MutPtr<id> = Ptr::from_bits(field_address);
+    env.mem.write(field_ptr, value);
+    trace_ivar_access(&format!(
+        "object_setIvar class={} object={:?} ivar={:?} offset={} value={:?}",
+        class_name, object, ivar, offset, value
+    ));
+}
 /// Acquire the per-object recursive mutex used to protect `atomic`
 /// property accesses. Lazily creates the mutex on first use.
 ///
