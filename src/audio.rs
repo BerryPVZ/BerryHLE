@@ -7,6 +7,7 @@
 
 //! Audio file decoding and OpenAL bindings.
 
+mod aifc_decoder;
 mod caf_decoder;
 mod ima4;
 pub mod music_bypass;
@@ -203,6 +204,10 @@ impl AudioFile {
             // demuxer (`symphonia-bundle-flac`/`symphonia-format-wav`) supports
             // every PCM WAVE bit depth Apple's iPhone-OS Core Audio accepts
             // and produces the i16 stream the rest of the pipeline expects.
+        }
+
+        if let Ok(pcm) = aifc_decoder::decode_aifc_ima4(&bytes) {
+            return Ok(AudioFileInner::Symphonia(pcm));
         }
 
         if is_adts_aac(&bytes) {

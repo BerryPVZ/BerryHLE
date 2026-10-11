@@ -102,7 +102,6 @@ pub(crate) struct UIViewHostObject {
     delegate: id,
     animation_interval: f64,
     is_animating: bool,
-    clips_to_bounds: bool,
     is_uncontrolled: bool,
     /// Strong refs to attached `UIGestureRecognizer*` instances. Used by
     /// `addGestureRecognizer:` / `removeGestureRecognizer:` /
@@ -158,7 +157,6 @@ impl Default for UIViewHostObject {
             delegate: nil,
             animation_interval: 1.0 / 60.0,
             is_animating: false,
-            clips_to_bounds: false,
             is_uncontrolled: false,
             gesture_recognizers: Vec::new(),
             is_accessibility_element: false,
@@ -362,6 +360,63 @@ fn ultrahle_minionjump_landscape_rect() -> CGRect {
             width: 1024.0,
             height: 768.0,
         },
+    }
+}
+
+// Distribute only the parent's size delta among flexible segments, in
+// proportion to their original lengths. Fixed segments retain their size.
+fn autoresize_axis(origin: f32, size: f32, old: f32, new: f32, mask: u32) -> (f32, f32) {
+    let lengths = [origin, size, old - origin - size];
+    let weights = lengths.map(|v| v.max(0.0));
+    let total: f32 = (0..3)
+        .filter(|i| mask & (1 << i) != 0)
+        .map(|i| weights[i])
+        .sum();
+    let count = (mask & 7).count_ones() as f32;
+    let delta = new - old;
+    let share = |i: usize| {
+        if mask & (1 << i) == 0 {
+            0.0
+        } else if total > 0.0 {
+            delta * weights[i] / total
+        } else {
+            delta / count
+        }
+    };
+    (origin + share(0), (size + share(1)).max(0.0))
+}
+
+fn autoresize_subviews(env: &mut Environment, view: id, old: CGSize, new: CGSize) {
+    if old == new {
+        return;
+    }
+    let host = env.objc.borrow::<UIViewHostObject>(view);
+    if !host.autoresizes_subviews {
+        return;
+    }
+    let children = host.subviews.clone();
+    for child in children {
+        let mask: NSUInteger = msg![env; child autoresizingMask];
+        if mask == 0 {
+            continue;
+        }
+        let frame: CGRect = msg![env; child frame];
+        let (x, width) =
+            autoresize_axis(frame.origin.x, frame.size.width, old.width, new.width, mask);
+        let (y, height) = autoresize_axis(
+            frame.origin.y,
+            frame.size.height,
+            old.height,
+            new.height,
+            mask >> 3,
+        );
+        let resized = CGRect {
+            origin: CGPoint { x, y },
+            size: CGSize { width, height },
+        };
+        if resized != frame {
+            () = msg![env; child setFrame:resized];
+        }
     }
 }
 
@@ -794,6 +849,12 @@ pub const CLASSES: ClassExports = objc_classes! {
         () = msg![env; this setAlpha:alpha];
     }
 
+    let key_clips = get_static_str(env, "UIClipsToBounds");
+    if msg![env; coder containsValueForKey:key_clips] {
+        let clips: bool = msg![env; coder decodeBoolForKey:key_clips];
+        () = msg![env; this setClipsToBounds:clips];
+    }
+
     let key_opaque = get_static_str(env, "UIOpaque");
     let opaque: bool = if msg![env; coder containsValueForKey:key_opaque] { msg![env; coder decodeBoolForKey:key_opaque] } else { false };
 
@@ -1100,121 +1161,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())layoutSubviews {
-    // Apple docs: "The default implementation uses any constraints you have
-    // set to determine the size and position of any subviews." For legacy
-    // autoresizing mask-based layout (iOS ≤ 5 era), the default implementation
-    // adjusts subviews based on their autoresizingMask relative to changes
-    // in the receiver's bounds.
-    //
-    // Autoresizing mask bits:
-    //   UIViewAutoresizingFlexibleLeftMargin   = 1 << 0
-    //   UIViewAutoresizingFlexibleWidth        = 1 << 1
-    //   UIViewAutoresizingFlexibleRightMargin  = 1 << 2
-    //   UIViewAutoresizingFlexibleTopMargin    = 1 << 3
-    //   UIViewAutoresizingFlexibleHeight       = 1 << 4
-    //   UIViewAutoresizingFlexibleBottomMargin = 1 << 5
-    //
-    // We only apply autoresizing if `autoresizesSubviews` is YES (default).
-    let autoresizes: bool = msg![env; this autoresizesSubviews];
-    if !autoresizes {
-        return;
-    }
-
-    let bounds: CGRect = msg![env; this bounds];
-    let subviews = env.objc.borrow::<UIViewHostObject>(this).subviews.clone();
-
-    for subview in subviews {
-        let mask: NSUInteger = msg![env; subview autoresizingMask];
-        if mask == 0 {
-            continue;
-        }
-
-        let frame: CGRect = msg![env; subview frame];
-        let parent_w = bounds.size.width;
-        let parent_h = bounds.size.height;
-
-        // Determine how to distribute extra space horizontally.
-        let flex_left = (mask & (1 << 0)) != 0;
-        let flex_width = (mask & (1 << 1)) != 0;
-        let flex_right = (mask & (1 << 2)) != 0;
-
-        let mut new_x = frame.origin.x;
-        let mut new_w = frame.size.width;
-
-        let right_margin = parent_w - (frame.origin.x + frame.size.width);
-        let h_flex_count =
-            flex_left as i32 + flex_width as i32 + flex_right as i32;
-        if h_flex_count > 0 {
-            // For flexible width, expand to fill; for flexible margins, center.
-            if flex_width && !flex_left && !flex_right {
-                new_w = parent_w - frame.origin.x - right_margin;
-            } else if flex_width && flex_left && flex_right {
-                // All three flexible: distribute proportionally based on
-                // original ratios. Simplified: just stretch width to fill.
-                let total = frame.origin.x + frame.size.width + right_margin;
-                if total > 0.0 {
-                    let ratio_x = frame.origin.x / total;
-                    let ratio_w = frame.size.width / total;
-                    new_x = parent_w * ratio_x;
-                    new_w = parent_w * ratio_w;
-                }
-            } else if flex_left && flex_right && !flex_width {
-                // Flexible margins, fixed width: center.
-                new_x = (parent_w - frame.size.width) / 2.0;
-            } else if flex_width && flex_left {
-                new_x = parent_w - new_w - right_margin;
-                new_w = parent_w - new_x - right_margin;
-            } else if flex_width && flex_right {
-                new_w = parent_w - frame.origin.x - right_margin;
-            } else if flex_left && !flex_width {
-                new_x = parent_w - frame.size.width - right_margin;
-            }
-            // flex_right only: x and width stay the same
-        }
-
-        // Determine how to distribute extra space vertically.
-        let flex_top = (mask & (1 << 3)) != 0;
-        let flex_height = (mask & (1 << 4)) != 0;
-        let flex_bottom = (mask & (1 << 5)) != 0;
-
-        let mut new_y = frame.origin.y;
-        let mut new_h = frame.size.height;
-
-        let bottom_margin = parent_h - (frame.origin.y + frame.size.height);
-        let v_flex_count =
-            flex_top as i32 + flex_height as i32 + flex_bottom as i32;
-        if v_flex_count > 0 {
-            if flex_height && !flex_top && !flex_bottom {
-                new_h = parent_h - frame.origin.y - bottom_margin;
-            } else if flex_height && flex_top && flex_bottom {
-                let total = frame.origin.y + frame.size.height + bottom_margin;
-                if total > 0.0 {
-                    let ratio_y = frame.origin.y / total;
-                    let ratio_h = frame.size.height / total;
-                    new_y = parent_h * ratio_y;
-                    new_h = parent_h * ratio_h;
-                }
-            } else if flex_top && flex_bottom && !flex_height {
-                new_y = (parent_h - frame.size.height) / 2.0;
-            } else if flex_height && flex_top {
-                new_y = parent_h - new_h - bottom_margin;
-                new_h = parent_h - new_y - bottom_margin;
-            } else if flex_height && flex_bottom {
-                new_h = parent_h - frame.origin.y - bottom_margin;
-            } else if flex_top && !flex_height {
-                new_y = parent_h - frame.size.height - bottom_margin;
-            }
-        }
-
-        let new_frame = CGRect {
-            origin: CGPoint { x: new_x, y: new_y },
-            size: CGSize { width: new_w.max(0.0), height: new_h.max(0.0) },
-        };
-
-        if new_frame != frame {
-            () = msg![env; subview setFrame:new_frame];
-        }
-    }
+    // Springs-and-struts resizing happens when bounds size changes. A layout
+    // pass alone must not recenter views with flexible opposing margins.
 }
 
 // Per Apple docs: "Use this method to force the view to update its layout
@@ -1518,8 +1466,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; layer setHidden:hidden]
 }
 
-- (bool)clipsToBounds { env.objc.borrow::<UIViewHostObject>(this).clips_to_bounds }
-- (())setClipsToBounds:(bool)clips { env.objc.borrow_mut::<UIViewHostObject>(this).clips_to_bounds = clips; }
+- (bool)clipsToBounds {
+    let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+    msg![env; layer masksToBounds]
+}
+- (())setClipsToBounds:(bool)clips {
+    let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+    () = msg![env; layer setMasksToBounds:clips];
+}
 
 - (())setStyle:(u32)_style { }
 - (id)context { nil }
@@ -1678,7 +1632,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
-    msg![env; layer setBounds:bounds]
+    let old_bounds: CGRect = msg![env; layer bounds];
+    () = msg![env; layer setBounds:bounds];
+    autoresize_subviews(env, this, old_bounds.size, bounds.size);
 }
 - (CGPoint)center {
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
@@ -1734,7 +1690,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
-    msg![env; layer setFrame:frame]
+    let old_bounds: CGRect = msg![env; layer bounds];
+    () = msg![env; layer setFrame:frame];
+    let new_bounds: CGRect = msg![env; layer bounds];
+    autoresize_subviews(env, this, old_bounds.size, new_bounds.size);
 }
 - (CGAffineTransform)transform {
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
@@ -2010,4 +1969,25 @@ fn invoke_bool_block(env: &mut Environment, block: MutPtr<()>, arg: bool) {
     <crate::abi::GuestFunction as CallFromHost<(), (crate::mem::ConstVoidPtr, bool)>>::call_from_host(
         &func, env, (block_arg, arg),
     );
+}
+
+#[cfg(test)]
+mod autoresizing_tests {
+    use super::autoresize_axis;
+    #[test]
+    fn confirmation_buttons_keep_their_distinct_positions() {
+        // FFDialog.nib has these two frames and flexible left/right margins.
+        assert_eq!(autoresize_axis(30.0, 81.0, 290.0, 290.0, 5), (30.0, 81.0));
+        assert_eq!(autoresize_axis(179.0, 81.0, 290.0, 290.0, 5), (179.0, 81.0));
+        let left = autoresize_axis(30.0, 81.0, 290.0, 390.0, 5);
+        let right = autoresize_axis(179.0, 81.0, 290.0, 390.0, 5);
+        assert!(left.0 + left.1 < right.0);
+        assert!((left.0 - (390.0 - right.0 - right.1)).abs() < 0.001);
+    }
+    #[test]
+    fn flexible_width_and_zero_length_springs() {
+        assert_eq!(autoresize_axis(10.0, 80.0, 100.0, 140.0, 2), (10.0, 120.0));
+        assert_eq!(autoresize_axis(0.0, 100.0, 100.0, 140.0, 5), (20.0, 100.0));
+        assert_eq!(autoresize_axis(10.0, 80.0, 100.0, 140.0, 0), (10.0, 80.0));
+    }
 }

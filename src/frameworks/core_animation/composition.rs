@@ -523,6 +523,9 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
                 root_layer,
                 cumulative_transform,
                 opacity,
+                [0.0, 0.0, screen_bounds.size.width, screen_bounds.size.height],
+                [fb_width as f32 / screen_bounds.size.width, fb_height as f32 / screen_bounds.size.height],
+                fb_height as i32,
             );
         }
     }
@@ -551,6 +554,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     // Present our rendered frame (bound to TEXTURE_2D). This copies it to the
     // default framebuffer (0) so we need to unbind our internal framebuffer.
     unsafe {
+        gles.Disable(gles11::SCISSOR_TEST);
         gles.BindTexture(gles11::TEXTURE_2D, texture);
         gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, 0);
         present_frame(
@@ -602,6 +606,33 @@ fn display_layers(env: &mut Environment, root_layer: id) {
     }
 }
 
+// Axis-aligned clipping in compositor space. Arbitrary rotated masks use
+// their bounding rectangle; rectangular UI and quarter-turns remain exact.
+fn intersect_layer_clip(parent: [f32; 4], bounds: CGRect, transform: Matrix<4>) -> [f32; 4] {
+    let x = bounds.origin.x;
+    let y = bounds.origin.y;
+    let r = x + bounds.size.width;
+    let b = y + bounds.size.height;
+    let points =
+        [[x, y], [r, y], [x, b], [r, b]].map(|[x, y]| transform.transform([x, y, 0.0, 1.0]));
+    let left = points.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min);
+    let top = points.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min);
+    let right = points
+        .iter()
+        .map(|p| p[0])
+        .fold(f32::NEG_INFINITY, f32::max);
+    let bottom = points
+        .iter()
+        .map(|p| p[1])
+        .fold(f32::NEG_INFINITY, f32::max);
+    [
+        parent[0].max(left),
+        parent[1].max(top),
+        parent[2].min(right),
+        parent[3].min(bottom),
+    ]
+}
+
 /// Traverses the layer tree and draws each layer.
 unsafe fn composite_layer_recursive(
     env: &mut Environment,
@@ -609,6 +640,9 @@ unsafe fn composite_layer_recursive(
     layer: id,
     cumulative_transform: Matrix<4>,
     opacity: CGFloat,
+    inherited_clip: [f32; 4],
+    pixel_scale: [f32; 2],
+    framebuffer_height: i32,
 ) {
     // TODO: this can't handle zPosition among other things, but it is not
     //       supported yet :)
@@ -664,6 +698,22 @@ unsafe fn composite_layer_recursive(
 
         cumulative_transform
     };
+
+    // Intersect ancestor clips in screen space, after applying the layer's
+    // transform. Scissoring also covers 90-degree landscape rotations.
+    let clip = if host_obj.masks_to_bounds {
+        intersect_layer_clip(inherited_clip, host_obj.bounds, cumulative_transform)
+    } else {
+        inherited_clip
+    };
+    let [left, top, right, bottom] = clip;
+    if right <= left || bottom <= top { return; }
+    let x = (left * pixel_scale[0]).floor() as i32;
+    let y_top = (top * pixel_scale[1]).floor() as i32;
+    let x_end = (right * pixel_scale[0]).ceil() as i32;
+    let y_end = (bottom * pixel_scale[1]).ceil() as i32;
+    gles.Enable(gles11::SCISSOR_TEST);
+    gles.Scissor(x, framebuffer_height - y_end, x_end - x, y_end - y_top);
 
     // Draw background color, if any
     let have_background = if let Some(background_color) = host_obj.background_color {
@@ -919,7 +969,7 @@ unsafe fn composite_layer_recursive(
             .unwrap();
 
         gles.Color4f(opacity, opacity, opacity, opacity);
-        if opacity == 1.0 && host_obj.opaque && !have_background {
+        if opacity == 1.0 && host_obj.opaque && !have_background && host_obj.contents == nil {
             gles.Disable(gles11::BLEND);
         } else {
             gles.Enable(gles11::BLEND);
@@ -976,6 +1026,9 @@ unsafe fn composite_layer_recursive(
             child_layer,
             cumulative_transform,
             opacity,
+            clip,
+            pixel_scale,
+            framebuffer_height,
         )
     }
 }
@@ -1108,4 +1161,17 @@ unsafe fn upload_rgba8_pixels(
         gles11::CLAMP_TO_EDGE as _,
     );
     dimensions
+}
+
+#[cfg(test)]
+mod clipping_tests {
+    use super::*;
+    use crate::frameworks::core_graphics::{CGPoint, CGSize};
+    #[test]
+    fn intersects_nested_clips_and_landscape_rotation() {
+        let bounds = CGRect { origin: CGPoint { x: 10.0, y: 20.0 }, size: CGSize { width: 100.0, height: 50.0 } };
+        assert_eq!(intersect_layer_clip([30.0, 0.0, 200.0, 60.0], bounds, Matrix::identity()), [30.0, 20.0, 110.0, 60.0]);
+        let rotation = Matrix::from_columns([[0.0, 1.0, 0.0, 0.0], [-1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [320.0, 0.0, 0.0, 1.0]]);
+        assert_eq!(intersect_layer_clip([0.0, 0.0, 320.0, 480.0], bounds, rotation), [250.0, 10.0, 300.0, 110.0]);
+    }
 }

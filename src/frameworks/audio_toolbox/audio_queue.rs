@@ -1797,7 +1797,6 @@ pub fn handle_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
     let &mut AudioQueueHostObject {
         callback_proc,
         callback_user_data,
-        is_running,
         ..
     } = host_object;
 
@@ -1815,16 +1814,16 @@ pub fn handle_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
 
     prime_audio_queue(env, in_aq);
 
-    // The guest callback we just invoked above is allowed to call
-    // AudioQueueDispose on `in_aq`. If it did, the queue is gone and there
-    // is nothing left to do here.
-    if State::get(&mut env.framework_state)
-        .audio_queues
-        .get(&in_aq)
-        .is_none()
-    {
+    // A refill callback can stop, pause, dispose, or replace this queue's
+    // source. Never restart from the state captured before that callback.
+    let Some(host) = State::get(&mut env.framework_state).audio_queues.get_mut(&in_aq) else {
         return;
-    }
+    };
+    let is_running = host.is_running;
+    let Some(al_source) = host.al_source else {
+        host.is_running_handler = false;
+        return;
+    };
 
     let context = env
         .framework_state
@@ -1837,7 +1836,13 @@ pub fn handle_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
 
             context.GetSourcei(al_source, al::AL_SOURCE_STATE, &mut al_source_state);
             assert!(context.GetError() == 0);
-            if al_source_state == al::AL_STOPPED {
+            let mut queued = 0;
+            let mut processed = 0;
+            context.GetSourcei(al_source, al::AL_BUFFERS_QUEUED, &mut queued);
+            context.GetSourcei(al_source, al::AL_BUFFERS_PROCESSED, &mut processed);
+            // Restart only an underrun with fresh audio. Replaying processed
+            // buffers repeats the tail when a track is draining.
+            if al_source_state == al::AL_STOPPED && queued > processed {
                 context.SourcePlay(al_source);
                 log_dbg!("Restarted OpenAL source for queue {:?}", in_aq);
             }
