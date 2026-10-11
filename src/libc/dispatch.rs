@@ -15,8 +15,11 @@ use crate::abi::{CallFromHost, GuestFunction};
 use crate::dyld::{
     export_c_func, export_c_func_aliased, ConstantExports, FunctionExports, HostConstant,
 };
+use crate::frameworks::foundation::ns_dictionary::dict_from_keys_and_objects;
+use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::libc::semaphore::{host_create_semaphore, host_destroy_semaphore, sem_t};
 use crate::mem::{ConstVoidPtr, MutPtr, MutVoidPtr, Ptr};
+use crate::objc::{id, msg, msg_class, objc_classes, Class, ClassExports};
 use crate::Environment;
 use std::collections::HashMap;
 
@@ -356,29 +359,137 @@ fn dispatch_apply_f(
 
 // MARK: - dispatch_after
 
+/// Convert a `dispatch_time_t` into a delay in seconds, relative to now.
+///
+/// touchHLE's `dispatch_time(DISPATCH_TIME_NOW, delta)` and
+/// `dispatch_walltime(_, delta)` both return the nanosecond `delta` directly
+/// (because `DISPATCH_TIME_NOW` is 0), so a `when` produced by them is simply
+/// "nanoseconds from now". We clamp to a sane range: never negative, and at
+/// most 60s so a bogus/absolute value can't wedge a timer decades out.
+fn dispatch_after_delay_secs(when: u64) -> f64 {
+    if when == DISPATCH_TIME_FOREVER {
+        return 60.0;
+    }
+    let secs = (when as f64) / 1_000_000_000.0;
+    secs.clamp(0.0, 60.0)
+}
+
+/// `dispatch_after(when, queue, block)`
+///
+/// Crucially this must be *asynchronous*: the block has to run on a later run
+/// loop turn, not inline. Calling it synchronously (as touchHLE used to) breaks
+/// the extremely common pattern of a method re-arming itself with
+/// `dispatch_after` (blink/poll/retry animations) — that recurses into itself
+/// without bound and either overflows the native stack or, with the
+/// objc_msgSend recursion guard, corrupts state and starves the render loop.
+/// Doodle Jump's `-[JumpAppDelegate blinkTournamentButton:]` is one such case.
+///
+/// We schedule the (heap-copied) block on an NSTimer, mirroring the existing
+/// `+[UIView animateWithDuration:…completion:]` deferral mechanism.
 fn dispatch_after(
     env: &mut Environment,
-    _when: u64, // dispatch_time_t
+    when: u64, // dispatch_time_t
     _queue: dispatch_queue_t,
     block: dispatch_block_t,
 ) {
-    log_dbg!("dispatch_after: calling block immediately (timer not supported)");
-    if !block.is_null() {
-        call_void_block(env, block);
+    if block.is_null() {
+        return;
     }
+    let delay = dispatch_after_delay_secs(when);
+    // Promote the (possibly stack-allocated) block to the heap so it survives
+    // until the timer fires. Balanced by `_Block_release` in the fire method.
+    let block = crate::libc::blocks::_Block_copy(env, block.cast_void().cast_const());
+    log_dbg!("dispatch_after: scheduling block {:?} in {}s", block, delay);
+    let num: id = msg_class![env; NSNumber numberWithUnsignedInt:(block.to_bits())];
+    let key: id = get_static_str(env, "_touchHLE_dispatch_after_block");
+    let dict: id = dict_from_keys_and_objects(env, &[(key, num)]);
+    let sel = env
+        .objc
+        .lookup_selector("_touchHLE_dispatchAfterFireBlock:")
+        .unwrap();
+    let cls: Class = env.objc.get_known_class("_touchHLE_DispatchAfter", &mut env.mem);
+    let _: id = msg_class![env;
+        NSTimer scheduledTimerWithTimeInterval:delay
+                                       target:cls
+                                     selector:sel
+                                     userInfo:dict
+                                      repeats:false
+    ];
 }
 
 fn dispatch_after_f(
     env: &mut Environment,
-    _when: u64,
+    when: u64,
     _queue: dispatch_queue_t,
     context: MutVoidPtr,
     work: GuestFunction,
 ) {
+    if work == GuestFunction::null_ptr() {
+        return;
+    }
+    let delay = dispatch_after_delay_secs(when);
+    log_dbg!("dispatch_after_f: scheduling fn {:?} in {}s", work, delay);
+    let ctx_num: id = msg_class![env; NSNumber numberWithUnsignedInt:(context.to_bits())];
+    let work_num: id = msg_class![env; NSNumber numberWithUnsignedInt:(work.addr_with_thumb_bit())];
+    let ctx_key: id = get_static_str(env, "_touchHLE_dispatch_after_ctx");
+    let work_key: id = get_static_str(env, "_touchHLE_dispatch_after_work");
+    let dict: id = dict_from_keys_and_objects(env, &[(ctx_key, ctx_num), (work_key, work_num)]);
+    let sel = env
+        .objc
+        .lookup_selector("_touchHLE_dispatchAfterFireFunc:")
+        .unwrap();
+    let cls: Class = env.objc.get_known_class("_touchHLE_DispatchAfter", &mut env.mem);
+    let _: id = msg_class![env;
+        NSTimer scheduledTimerWithTimeInterval:delay
+                                       target:cls
+                                     selector:sel
+                                     userInfo:dict
+                                      repeats:false
+    ];
+}
+
+/// Host-only helper class that owns the NSTimer callbacks used to implement
+/// an asynchronous `dispatch_after`.
+pub const CLASSES: ClassExports = objc_classes! {
+(env, this, _cmd);
+
+@implementation _touchHLE_DispatchAfter: NSObject
+
++ (())_touchHLE_dispatchAfterFireBlock:(id)timer {
+    let dict: id = msg![env; timer userInfo];
+    let key: id = get_static_str(env, "_touchHLE_dispatch_after_block");
+    let num: id = msg![env; dict objectForKey:key];
+    if num == crate::objc::nil {
+        return;
+    }
+    let bits: u32 = msg![env; num unsignedIntValue];
+    let block: dispatch_block_t = Ptr::from_bits(bits);
+    if !block.is_null() {
+        call_void_block(env, block);
+        crate::libc::blocks::_Block_release(env, block.cast_void().cast_const());
+    }
+}
+
++ (())_touchHLE_dispatchAfterFireFunc:(id)timer {
+    let dict: id = msg![env; timer userInfo];
+    let ctx_key: id = get_static_str(env, "_touchHLE_dispatch_after_ctx");
+    let work_key: id = get_static_str(env, "_touchHLE_dispatch_after_work");
+    let ctx_num: id = msg![env; dict objectForKey:ctx_key];
+    let work_num: id = msg![env; dict objectForKey:work_key];
+    if work_num == crate::objc::nil {
+        return;
+    }
+    let ctx_bits: u32 = msg![env; ctx_num unsignedIntValue];
+    let work_bits: u32 = msg![env; work_num unsignedIntValue];
+    let context: MutVoidPtr = Ptr::from_bits(ctx_bits);
+    let work = GuestFunction::from_addr_with_thumb_bit(work_bits);
     if work != GuestFunction::null_ptr() {
         let _: () = work.call_from_host(env, (context,));
     }
 }
+
+@end
+};
 
 // MARK: - dispatch_time
 

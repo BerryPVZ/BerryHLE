@@ -75,7 +75,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         "./libc.bundle",
         "libc",
     ],
-    class_exports: &[],
+    class_exports: &[dispatch::CLASSES],
     constant_exports: &[
         ctype::CONSTANTS,
         dispatch::CONSTANTS,
