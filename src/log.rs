@@ -73,7 +73,7 @@ macro_rules! log_once {
 macro_rules! echo {
     ($($arg:tt)+) => {
         {
-            let formatted_str = format!($($arg)+);
+            let mut formatted_str = format!($($arg)+);
 
             #[cfg(target_os = "android")]
             {
@@ -83,9 +83,11 @@ macro_rules! echo {
             eprintln!("{}", formatted_str);
 
             if let Ok(mut log_file) = $crate::log::get_log_file().lock() {
+                // Append the newline into the same buffer so the line reaches
+                // the file in a single write syscall (halves per-line I/O; this
+                // matters on slow storage such as Android's app sandbox).
+                formatted_str.push('\n');
                 let _ = std::io::Write::write_all(&mut *log_file, formatted_str.as_bytes());
-                let _ = std::io::Write::write_all(&mut *log_file, b"\n");
-                let _ = std::io::Write::flush(&mut *log_file);
             }
         }
     };
