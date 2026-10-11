@@ -72,8 +72,8 @@ use crate::objc::classes::{objc_msgForward, objc_msgForward_stret};
 use crate::Environment;
 use classes::{ClassHostObject, FakeClass, UnimplementedClass};
 use messages::{
-    objc_msgSendSuper2, objc_msgSendSuper2_stret, objc_msgSend_stret, MsgSendSignature,
-    MsgSendSuperSignature,
+    objc_enumerationMutation, objc_msgSendSuper2, objc_msgSendSuper2_stret, objc_msgSend_stret,
+    MsgSendSignature, MsgSendSuperSignature,
 };
 use methods::method_list_t;
 use objects::{objc_object, HostObjectEntry};
