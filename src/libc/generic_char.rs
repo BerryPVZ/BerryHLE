@@ -44,6 +44,29 @@ impl<T: Copy + Default + Eq + Ord + SafeRead + Debug> GenericChar<T> {
         } else {
             count
         };
+        // Sanity guard against a size underflow. A guest allocator computing a
+        // fill length as `size - header` can wrap to a near-UINT32_MAX value
+        // (e.g. memset(_, 0xAA, (size_t)-3) seen in Deus Ex: The Fall's debug
+        // heap poison when size < header). On real hardware that write faults
+        // on the first unmapped page; here `env.mem.write` lazily commits pages,
+        // so it would silently fill ~4 GB of 0xAA across ALL of guest memory
+        // (heap, stacks, everything) and corrupt the process instead of
+        // crashing. Such a length can never fit a real buffer on the emulated
+        // devices (<=1 GB RAM), so treat it like the __chk truncation path:
+        // skip the bogus fill, log loudly, and let the guest keep running.
+        let byte_len = (actual as u64) * (guest_size_of::<T>() as u64);
+        let dest_bits = dest.to_bits() as u64;
+        if byte_len > 0x1000_0000 || dest_bits + byte_len > 0x1_0000_0000 {
+            log!(
+                "Warning: memset of {} bytes at {:#x} is implausibly large \
+                 (almost certainly a guest size underflow, e.g. size-N with \
+                 size<N); skipping the fill instead of writing across all of \
+                 guest memory. On real hardware this would fault.",
+                byte_len,
+                dest_bits
+            );
+            return dest;
+        }
         for i in 0..actual {
             env.mem.write(dest + i, ch);
         }

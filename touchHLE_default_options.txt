@@ -334,6 +334,13 @@ com.blackstoneaudio.enhancedaudioplayer.bsa-Animal-Farm: --device-family=ipad --
 # Minecraft: Story Mode
 com.telltalegames.MC100: --device-family=ipad --landscape-left --prefer-gles2-context --landscape-uiscreen-bounds --present-rotate=0 --mach-semaphore-spurious-wake=100
 
+# Deus Ex: The Fall (Unity 4.2 + Mono + Wwise). The spurious-wake breaker (now
+# main-thread-only) times the main thread out of the Wwise/FMOD audio calls that
+# otherwise deadlock whenever the game plays a sound (its .wem audio can't be
+# decoded here); the idle audio workers keep blocking normally so they don't
+# spin or leak. Lets it reach the main menu and first-person gameplay.
+com.squareenix.dxm: --mach-semaphore-spurious-wake=100
+
 # Drive Ahead! / Crash On Wheels requests an ES1 EAGL context but uses the Cocos2d GLES2 shader pipeline.
 com.dodreams.crashonwheels: --landscape-left --prefer-gles2-context --force-composition
 
