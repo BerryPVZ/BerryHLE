@@ -780,6 +780,20 @@ pub const CLASSES: ClassExports = objc_classes! {
     let key_hidden = get_static_str(env, "UIHidden");
     let hidden: bool = if msg![env; coder containsValueForKey:key_hidden] { msg![env; coder decodeBoolForKey:key_hidden] } else { false };
 
+    // NIBs encode the inverse flag. Decorative labels and image overlays
+    // must not capture touches intended for the controls underneath them.
+    let key_interaction_disabled = get_static_str(env, "UIUserInteractionDisabled");
+    let interaction_disabled: bool = if msg![env; coder containsValueForKey:key_interaction_disabled] {
+        msg![env; coder decodeBoolForKey:key_interaction_disabled]
+    } else { false };
+    () = msg![env; this setUserInteractionEnabled:(!interaction_disabled)];
+
+    let key_alpha = get_static_str(env, "UIAlpha");
+    if msg![env; coder containsValueForKey:key_alpha] {
+        let alpha: f32 = msg![env; coder decodeFloatForKey:key_alpha];
+        () = msg![env; this setAlpha:alpha];
+    }
+
     let key_opaque = get_static_str(env, "UIOpaque");
     let opaque: bool = if msg![env; coder containsValueForKey:key_opaque] { msg![env; coder decodeBoolForKey:key_opaque] } else { false };
 
