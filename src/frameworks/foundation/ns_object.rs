@@ -26,7 +26,8 @@ use std::sync::Mutex;
 #[path = "ns_object_kvc.rs"]
 mod kvc_helpers;
 use self::kvc_helpers::{
-    kvc_setter_argument_encoding, send_numeric_kvc_setter, send_nsvalue_kvc_setter,
+    box_kvc_getter_result, kvc_setter_argument_encoding, send_numeric_kvc_setter,
+    send_nsvalue_kvc_setter,
 };
 
 // Хранилище для отмененных таймеров (target, имя селектора в виде строки)
@@ -1101,18 +1102,27 @@ pub const CLASSES: ClassExports = objc_classes! {
     // 1. Поиск геттеров (get<Key>, <key>, is<Key>)
     if let Some(sel) = env.objc.lookup_selector(&key_str) {
         if env.objc.object_has_method(&env.mem, this, sel) {
+            if let Some(boxed) = box_kvc_getter_result(env, this, sel) {
+                return boxed;
+            }
             return msg_send(env, (this, sel));
         }
     }
     let is_sel_name = format!("is{camel_case_key_string}");
     if let Some(sel) = env.objc.lookup_selector(&is_sel_name) {
         if env.objc.object_has_method(&env.mem, this, sel) {
+            if let Some(boxed) = box_kvc_getter_result(env, this, sel) {
+                return boxed;
+            }
             return msg_send(env, (this, sel));
         }
     }
     let get_sel_name = format!("get{camel_case_key_string}");
     if let Some(sel) = env.objc.lookup_selector(&get_sel_name) {
         if env.objc.object_has_method(&env.mem, this, sel) {
+            if let Some(boxed) = box_kvc_getter_result(env, this, sel) {
+                return boxed;
+            }
             return msg_send(env, (this, sel));
         }
     }

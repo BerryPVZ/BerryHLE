@@ -4,7 +4,10 @@ use crate::frameworks::core_graphics::cg_affine_transform::CGAffineTransform;
 use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::NSUInteger;
 use crate::mem::{SafeRead, guest_size_of};
-use crate::objc::{Class, SEL, class_getInstanceMethod, id, method_getTypeEncoding, msg, msg_send};
+use crate::objc::{
+    Class, SEL, class_getInstanceMethod, id, method_getTypeEncoding, msg, msg_class, msg_send,
+};
+use crate::mem::SafeWrite;
 
 pub(super) fn objc_argument_encoding(encoding: &[u8], argument_index: usize) -> Option<&[u8]> {
     crate::objc::type_encoding::method_argument_type(encoding, argument_index)
@@ -31,6 +34,132 @@ pub(super) fn kvc_setter_argument_encoding(
     }
     let encoding = env.mem.cstr_at(encoding.cast()).to_vec();
     objc_argument_encoding(&encoding, 2).map(<[u8]>::to_vec)
+}
+
+/// Return-type encoding of a (getter) selector on `class`, e.g. `b"f"` for a
+/// method returning `float` or `b"{CGPoint=ff}"` for one returning `CGPoint`.
+pub(super) fn kvc_getter_return_encoding(
+    env: &mut Environment,
+    class: Class,
+    selector: SEL,
+) -> Option<Vec<u8>> {
+    let method = class_getInstanceMethod(env, class, selector);
+    if method.is_null() {
+        return None;
+    }
+    let encoding = method_getTypeEncoding(env, method);
+    if encoding.is_null() {
+        return None;
+    }
+    let encoding = env.mem.cstr_at(encoding.cast()).to_vec();
+    crate::objc::type_encoding::method_return_type(&encoding).map(<[u8]>::to_vec)
+}
+
+fn box_struct_getter<T: SafeRead + SafeWrite + crate::abi::GuestRet + 'static>(
+    env: &mut Environment,
+    object: id,
+    selector: SEL,
+    encoding: &[u8],
+) -> id {
+    let value: T = msg_send(env, (object, selector));
+    let bytes_ptr = env.mem.alloc(guest_size_of::<T>());
+    env.mem.write(bytes_ptr.cast(), value);
+    let type_ptr: crate::mem::ConstVoidPtr =
+        env.mem.alloc_and_write_cstr(encoding).cast_const().cast();
+    let bytes_const: crate::mem::ConstVoidPtr = bytes_ptr.cast_const();
+    let boxed: id = msg_class![env; NSValue valueWithBytes:bytes_const objCType:type_ptr];
+    env.mem.free(bytes_ptr);
+    boxed
+}
+
+/// KVC getter boxing: a `-valueForKey:` getter that returns a scalar or struct
+/// must be wrapped in `NSNumber`/`NSValue` (Apple's KVC contract). Returns
+/// `Some(boxed)` for scalar/struct return types and `None` for object-typed
+/// (`@`/`#`/`:`) or `void` getters, where the caller should dispatch normally.
+///
+/// Dispatching with the correct Rust return type here is also what makes a
+/// `float`/`double` getter read back from the VFP registers instead of `r0`;
+/// returning the raw `r0` bits as an `id` (the old behaviour) handed callers a
+/// float bit-pattern as an object pointer, which SpriteBuilder's CCBReader then
+/// messaged, corrupting the object graph.
+pub(super) fn box_kvc_getter_result(
+    env: &mut Environment,
+    object: id,
+    selector: SEL,
+) -> Option<id> {
+    let class: Class = msg![env; object class];
+    let encoding = kvc_getter_return_encoding(env, class, selector)?;
+    let boxed: id = match encoding.first().copied()? {
+        b'@' | b'#' | b':' | b'v' => return None,
+        b'B' => {
+            let v: bool = msg_send(env, (object, selector));
+            msg_class![env; NSNumber numberWithBool:v]
+        }
+        b'c' => {
+            let v: i8 = msg_send(env, (object, selector));
+            msg_class![env; NSNumber numberWithChar:v]
+        }
+        b'C' => {
+            let v: u8 = msg_send(env, (object, selector));
+            msg_class![env; NSNumber numberWithUnsignedChar:v]
+        }
+        b's' => {
+            let v: i16 = msg_send(env, (object, selector));
+            msg_class![env; NSNumber numberWithShort:v]
+        }
+        b'S' => {
+            let v: u16 = msg_send(env, (object, selector));
+            msg_class![env; NSNumber numberWithUnsignedShort:v]
+        }
+        b'i' => {
+            let v: i32 = msg_send(env, (object, selector));
+            msg_class![env; NSNumber numberWithInt:v]
+        }
+        b'I' => {
+            let v: u32 = msg_send(env, (object, selector));
+            msg_class![env; NSNumber numberWithUnsignedInt:v]
+        }
+        b'l' => {
+            let v: i32 = msg_send(env, (object, selector));
+            msg_class![env; NSNumber numberWithLong:v]
+        }
+        b'L' => {
+            let v: u32 = msg_send(env, (object, selector));
+            msg_class![env; NSNumber numberWithUnsignedLong:v]
+        }
+        b'q' => {
+            let v: i64 = msg_send(env, (object, selector));
+            msg_class![env; NSNumber numberWithLongLong:v]
+        }
+        b'Q' => {
+            let v: u64 = msg_send(env, (object, selector));
+            msg_class![env; NSNumber numberWithUnsignedLongLong:v]
+        }
+        b'f' => {
+            let v: f32 = msg_send(env, (object, selector));
+            msg_class![env; NSNumber numberWithFloat:v]
+        }
+        b'd' => {
+            let v: f64 = msg_send(env, (object, selector));
+            msg_class![env; NSNumber numberWithDouble:v]
+        }
+        b'{' => match encoding.as_slice() {
+            b"{CGPoint=ff}" => box_struct_getter::<CGPoint>(env, object, selector, &encoding),
+            b"{CGSize=ff}" => box_struct_getter::<CGSize>(env, object, selector, &encoding),
+            b"{CGRect={CGPoint=ff}{CGSize=ff}}" => {
+                box_struct_getter::<CGRect>(env, object, selector, &encoding)
+            }
+            b"{CGAffineTransform=ffffff}" => {
+                box_struct_getter::<CGAffineTransform>(env, object, selector, &encoding)
+            }
+            b"{CATransform3D=ffffffffffffffff}" => {
+                box_struct_getter::<CATransform3D>(env, object, selector, &encoding)
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(boxed)
 }
 
 pub(super) fn kvc_setter_argument_type(
