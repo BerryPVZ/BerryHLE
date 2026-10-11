@@ -1166,6 +1166,24 @@ impl Mem {
         let bytes = self.cstr_at(ptr);
         std::str::from_utf8(bytes).map_err(|_| bytes)
     }
+    /// Compare a null-terminated guest C string against an expected byte
+    /// string, returning true iff they are exactly equal. `expected` must not
+    /// contain an interior NUL.
+    ///
+    /// Unlike [Self::cstr_at_utf8], this allocates nothing, performs no UTF-8
+    /// validation, and early-exits at the first mismatching byte. It is meant
+    /// for very hot paths (e.g. the per-message-send selector probes) where
+    /// the usual outcome is a mismatch on the first byte, so scanning the
+    /// whole string just to reject it is pure overhead.
+    pub fn cstr_eq<const MUT: bool>(&self, ptr: Ptr<u8, MUT>, expected: &[u8]) -> bool {
+        for (i, &b) in expected.iter().enumerate() {
+            if self.read(ptr + i as u32) != b {
+                return false;
+            }
+        }
+        // Equal so far: it's a true match only if the string ends exactly here.
+        self.read(ptr + expected.len() as u32) == b'\0'
+    }
 
     pub fn wcstr_at<const MUT: bool>(&self, ptr: Ptr<wchar_t, MUT>) -> String {
         const MAX_WCSTR_LEN: u32 = 16384; // 16K chars safety limit

@@ -73,6 +73,12 @@ impl SEL {
             Err(_) => "<invalid-selector-utf8>",
         }
     }
+    /// Fast equality check against an expected selector name, without
+    /// allocating or validating UTF-8. See [Mem::cstr_eq]. Intended for hot
+    /// paths that probe for one specific selector on every message send.
+    pub fn name_eq(self, mem: &Mem, expected: &[u8]) -> bool {
+        mem.cstr_eq(self.0, expected)
+    }
     pub fn is_null(self) -> bool {
         self.0.is_null()
     }
