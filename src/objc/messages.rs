@@ -1593,9 +1593,10 @@ fn try_nsarray_indexed_subscript_interpose(
     orig_class: Class,
 ) -> bool {
     // PERF: this probe runs on *every* guest message send, before the real
-    // method lookup. Compare in place instead of allocating selector and
-    // class-name Strings each time.
-    if selector.as_str(&env.mem) != "objectAtIndexedSubscript:" {
+    // method lookup. Reject with a zero-allocation, early-exiting byte compare
+    // (the usual case mismatches on the first byte) instead of reading and
+    // UTF-8-validating the whole selector name every time.
+    if !selector.name_eq(&env.mem, b"objectAtIndexedSubscript:") {
         return false;
     }
 
