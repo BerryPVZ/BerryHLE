@@ -312,6 +312,112 @@ impl ObjC {
             }
         }
     }
+    /// Like [Self::object_lookup_ivar] but also returns the ivar's `@encode`
+    /// type string (read from its `ivar_t` metadata), so KVC can box a scalar
+    /// or struct ivar correctly instead of reading its raw bits as an `id`.
+    pub fn object_lookup_ivar_encoding(
+        &self,
+        mem: &Mem,
+        obj: id,
+        name: &String,
+    ) -> Option<(MutPtr<GuestUSize>, Vec<u8>)> {
+        let mut class = ObjC::read_isa(obj, mem);
+        loop {
+            let &ClassHostObject {
+                superclass,
+                ref ivars,
+                ..
+            } = self.borrow(class);
+            if let Some(ivar) = ivars.get(name) {
+                let ivar_offset = mem.read(ivar.offset);
+                let address = obj.to_bits().checked_add(ivar_offset)?;
+                let ptr: MutPtr<GuestUSize> = MutVoidPtr::from_bits(address).cast();
+                let encoding = if ivar.metadata.is_null() {
+                    Vec::new()
+                } else {
+                    let ivar_t { type_, .. } = mem.read(ivar.metadata.cast());
+                    if type_.is_null() {
+                        Vec::new()
+                    } else {
+                        mem.cstr_at(type_).to_vec()
+                    }
+                };
+                return Some((ptr, encoding));
+            } else if superclass == nil {
+                return None;
+            } else {
+                class = superclass;
+            }
+        }
+    }
+
+    /// Like [Self::object_lookup_ivar] but returns the ivar's `@encode` type
+    /// string (from the binary's `ivar_t`), used by KVC to box a direct ivar
+    /// read of a scalar/struct into NSNumber/NSValue.
+    pub fn object_lookup_ivar_type(&self, mem: &Mem, obj: id, name: &String) -> Option<Vec<u8>> {
+        let mut class = ObjC::read_isa(obj, mem);
+        loop {
+            let &ClassHostObject {
+                superclass,
+                ref ivars,
+                ..
+            } = self.borrow(class);
+            if let Some(ivar) = ivars.get(name) {
+                if ivar.metadata.is_null() {
+                    return None;
+                }
+                let ivar_t { type_, .. } = mem.read(ivar.metadata.cast());
+                if type_.is_null() {
+                    return None;
+                }
+                return Some(mem.cstr_at(type_).to_vec());
+            } else if superclass == nil {
+                return None;
+            } else {
+                class = superclass;
+            }
+        }
+    }
+
+    /// Like [Self::object_lookup_ivar], but also returns the ivar's `@encode`
+    /// type string (read from its `ivar_t` metadata). Used by KVC to box
+    /// scalar/struct ivars read directly.
+    pub fn object_lookup_ivar_with_type(
+        &self,
+        mem: &Mem,
+        obj: id,
+        name: &String,
+    ) -> Option<(MutPtr<GuestUSize>, Vec<u8>)> {
+        let mut class = ObjC::read_isa(obj, mem);
+        loop {
+            let &ClassHostObject {
+                superclass,
+                ref ivars,
+                ..
+            } = self.borrow(class);
+            if let Some(ivar) = ivars.get(name) {
+                let ivar_offset = mem.read(ivar.offset);
+                let address = obj.to_bits().checked_add(ivar_offset)?;
+                let ptr: MutPtr<GuestUSize> = MutVoidPtr::from_bits(address).cast();
+                let encoding = if ivar.metadata.is_null() {
+                    Vec::new()
+                } else {
+                    let ivar_t_rec: ivar_t = mem.read(ivar.metadata.cast());
+                    let type_ptr = ivar_t_rec.type_;
+                    if type_ptr.is_null() {
+                        Vec::new()
+                    } else {
+                        mem.cstr_at(type_ptr).to_vec()
+                    }
+                };
+                return Some((ptr, encoding));
+            } else if superclass == nil {
+                return None;
+            } else {
+                class = superclass;
+            }
+        }
+    }
 
     pub fn debug_all_class_ivars_as_strings(&self, class: Class) -> Vec<String> {
         let mut class = class;

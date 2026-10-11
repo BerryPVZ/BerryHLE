@@ -26,8 +26,8 @@ use std::sync::Mutex;
 #[path = "ns_object_kvc.rs"]
 mod kvc_helpers;
 use self::kvc_helpers::{
-    box_kvc_getter_result, kvc_setter_argument_encoding, send_numeric_kvc_setter,
-    send_nsvalue_kvc_setter,
+    box_kvc_getter_result, box_kvc_ivar_value, kvc_setter_argument_encoding,
+    send_numeric_kvc_setter, send_nsvalue_kvc_setter,
 };
 
 // Хранилище для отмененных таймеров (target, имя селектора в виде строки)
@@ -1133,12 +1133,17 @@ pub const CLASSES: ClassExports = objc_classes! {
         if env.objc.class_has_method(class, access_sel) {
             let access_ivars: bool = msg_send(env, (class, access_sel));
             if access_ivars {
-                if let Some(ivar_ptr) = env.objc
-                    .object_lookup_ivar(&env.mem, this, &format!("_{key_str}"))
-                    .or_else(|| env.objc.object_lookup_ivar(&env.mem, this, &format!("_is{camel_case_key_string}")))
-                    .or_else(|| env.objc.object_lookup_ivar(&env.mem, this, &format!("{key_str}")))
-                    .or_else(|| env.objc.object_lookup_ivar(&env.mem, this, &format!("is{camel_case_key_string}")))
+                if let Some((ivar_ptr, encoding)) = env.objc
+                    .object_lookup_ivar_with_type(&env.mem, this, &format!("_{key_str}"))
+                    .or_else(|| env.objc.object_lookup_ivar_with_type(&env.mem, this, &format!("_is{camel_case_key_string}")))
+                    .or_else(|| env.objc.object_lookup_ivar_with_type(&env.mem, this, &format!("{key_str}")))
+                    .or_else(|| env.objc.object_lookup_ivar_with_type(&env.mem, this, &format!("is{camel_case_key_string}")))
                 {
+                    if !encoding.is_empty() {
+                        if let Some(boxed) = box_kvc_ivar_value(env, ivar_ptr, &encoding) {
+                            return boxed;
+                        }
+                    }
                     let val: id = env.mem.read(ivar_ptr.cast());
                     return val;
                 }

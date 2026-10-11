@@ -162,6 +162,144 @@ pub(super) fn box_kvc_getter_result(
     Some(boxed)
 }
 
+/// Box the value stored at a direct ivar (`accessInstanceVariablesDirectly`
+/// path of `-valueForKey:`) into NSNumber/NSValue according to its `@encode`
+/// type. Returns `None` for object-typed ivars (`@`/`#`/`:`), where the caller
+/// should read the raw `id`.
+pub(super) fn box_kvc_ivar_result(
+    env: &mut Environment,
+    ivar_ptr: crate::mem::MutPtr<crate::mem::GuestUSize>,
+    encoding: &[u8],
+) -> Option<id> {
+    let boxed: id = match encoding.first().copied()? {
+        b'@' | b'#' | b':' => return None,
+        b'B' | b'c' => {
+            let v: i8 = env.mem.read(ivar_ptr.cast());
+            msg_class![env; NSNumber numberWithChar:v]
+        }
+        b'C' => {
+            let v: u8 = env.mem.read(ivar_ptr.cast());
+            msg_class![env; NSNumber numberWithUnsignedChar:v]
+        }
+        b's' => {
+            let v: i16 = env.mem.read(ivar_ptr.cast());
+            msg_class![env; NSNumber numberWithShort:v]
+        }
+        b'S' => {
+            let v: u16 = env.mem.read(ivar_ptr.cast());
+            msg_class![env; NSNumber numberWithUnsignedShort:v]
+        }
+        b'i' | b'l' => {
+            let v: i32 = env.mem.read(ivar_ptr.cast());
+            msg_class![env; NSNumber numberWithInt:v]
+        }
+        b'I' | b'L' => {
+            let v: u32 = env.mem.read(ivar_ptr.cast());
+            msg_class![env; NSNumber numberWithUnsignedInt:v]
+        }
+        b'q' => {
+            let v: i64 = env.mem.read(ivar_ptr.cast());
+            msg_class![env; NSNumber numberWithLongLong:v]
+        }
+        b'Q' => {
+            let v: u64 = env.mem.read(ivar_ptr.cast());
+            msg_class![env; NSNumber numberWithUnsignedLongLong:v]
+        }
+        b'f' => {
+            let v: f32 = env.mem.read(ivar_ptr.cast());
+            msg_class![env; NSNumber numberWithFloat:v]
+        }
+        b'd' => {
+            let v: f64 = env.mem.read(ivar_ptr.cast());
+            msg_class![env; NSNumber numberWithDouble:v]
+        }
+        b'{' => {
+            let type_ptr: crate::mem::ConstVoidPtr =
+                env.mem.alloc_and_write_cstr(encoding).cast_const().cast();
+            let bytes_const: crate::mem::ConstVoidPtr = ivar_ptr.cast_const().cast();
+            msg_class![env; NSValue valueWithBytes:bytes_const objCType:type_ptr]
+        }
+        _ => return None,
+    };
+    Some(boxed)
+}
+
+/// KVC direct-ivar boxing. When `-valueForKey:` falls back to reading an ivar
+/// directly (no getter method), a scalar or struct ivar must still be wrapped
+/// in `NSNumber`/`NSValue` rather than returned as its raw bits reinterpreted
+/// as an `id`. `ivar_ptr` is the in-memory address of the ivar and `encoding`
+/// its `@encode` string. Returns `None` for object-typed ivars (`@`/`#`), so
+/// the caller reads the stored `id` directly.
+pub(super) fn box_kvc_ivar_value(
+    env: &mut Environment,
+    ivar_ptr: crate::mem::MutPtr<crate::mem::GuestUSize>,
+    encoding: &[u8],
+) -> Option<id> {
+    let addr = crate::mem::ConstVoidPtr::from_bits(ivar_ptr.to_bits());
+    let boxed: id = match encoding.first().copied()? {
+        b'@' | b'#' | b':' | b'v' => return None,
+        b'B' | b'c' => {
+            let v: i8 = env.mem.read(addr.cast());
+            if encoding[0] == b'B' {
+                msg_class![env; NSNumber numberWithBool:(v != 0)]
+            } else {
+                msg_class![env; NSNumber numberWithChar:v]
+            }
+        }
+        b'C' => {
+            let v: u8 = env.mem.read(addr.cast());
+            msg_class![env; NSNumber numberWithUnsignedChar:v]
+        }
+        b's' => {
+            let v: i16 = env.mem.read(addr.cast());
+            msg_class![env; NSNumber numberWithShort:v]
+        }
+        b'S' => {
+            let v: u16 = env.mem.read(addr.cast());
+            msg_class![env; NSNumber numberWithUnsignedShort:v]
+        }
+        b'i' => {
+            let v: i32 = env.mem.read(addr.cast());
+            msg_class![env; NSNumber numberWithInt:v]
+        }
+        b'I' => {
+            let v: u32 = env.mem.read(addr.cast());
+            msg_class![env; NSNumber numberWithUnsignedInt:v]
+        }
+        b'l' => {
+            let v: i32 = env.mem.read(addr.cast());
+            msg_class![env; NSNumber numberWithLong:v]
+        }
+        b'L' => {
+            let v: u32 = env.mem.read(addr.cast());
+            msg_class![env; NSNumber numberWithUnsignedLong:v]
+        }
+        b'q' => {
+            let v: i64 = env.mem.read(addr.cast());
+            msg_class![env; NSNumber numberWithLongLong:v]
+        }
+        b'Q' => {
+            let v: u64 = env.mem.read(addr.cast());
+            msg_class![env; NSNumber numberWithUnsignedLongLong:v]
+        }
+        b'f' => {
+            let v: f32 = env.mem.read(addr.cast());
+            msg_class![env; NSNumber numberWithFloat:v]
+        }
+        b'd' => {
+            let v: f64 = env.mem.read(addr.cast());
+            msg_class![env; NSNumber numberWithDouble:v]
+        }
+        b'{' => {
+            let type_ptr: crate::mem::ConstVoidPtr =
+                env.mem.alloc_and_write_cstr(encoding).cast_const().cast();
+            msg_class![env; NSValue valueWithBytes:addr objCType:type_ptr]
+        }
+        _ => return None,
+    };
+    Some(boxed)
+}
+
 pub(super) fn kvc_setter_argument_type(
     env: &mut Environment,
     class: Class,
