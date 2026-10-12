@@ -151,9 +151,27 @@ impl Transaction {
     fn commit(self, env: &mut Environment) {
         for (layer, animation) in self.animations {
             if !self.disable_actions {
+                // An explicit animation already drives this property. Do not
+                // install a second, anonymous default action over its path.
+                let key_path: id = msg![env; animation keyPath];
+                let key_path_string = to_rust_string(env, key_path);
+                let attached: Vec<id> = {
+                    let host = env.objc.borrow::<super::ca_layer::CALayerHostObject>(layer);
+                    host.animations.values().chain(host.anonymous_animations.iter()).copied().collect()
+                };
+                let has_explicit_animation = attached.into_iter().any(|anim| {
+                    let path: id = msg![env; anim keyPath];
+                    path != nil && !super::ca_animation::is_implicit(env, anim)
+                        && to_rust_string(env, path) == key_path_string
+                });
+                if has_explicit_animation {
+                    release(env, layer);
+                    release(env, animation);
+                    continue;
+                }
                 () = msg![env; animation setDuration: (self.animation_duration)];
                 () = msg![env; animation setTimingFunction: (self.animation_timing_function)];
-                () = msg![env; layer addAnimation: animation forKey: nil];
+                () = msg![env; layer addAnimation: animation forKey: key_path];
             }
             release(env, layer);
             release(env, animation);
