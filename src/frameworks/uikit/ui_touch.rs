@@ -140,8 +140,18 @@ struct UITouchIvars {
 fn touch_ivars<R>(env: &mut Environment, this: id, f: impl FnOnce(&mut UITouchIvars) -> R) -> R {
     let size = std::mem::size_of::<UITouchIvars>();
     let bytes = env.mem.bytes_at_mut(this.cast(), size as GuestUSize);
-    let ivars = unsafe { &mut *(bytes.as_mut_ptr() as *mut UITouchIvars) };
-    f(ivars)
+    let ptr = bytes.as_mut_ptr() as *mut UITouchIvars;
+    // `this` is a guest address and may not be 8-byte aligned, but
+    // `UITouchIvars` contains f64 fields (timestamp/CGPoint) that need
+    // 8-byte alignment. Forming a `&mut UITouchIvars` from a misaligned host
+    // pointer is undefined behaviour and aborts in debug builds ("misaligned
+    // pointer dereference") — which crashed Where's My Water on the first
+    // touch. Round-trip the struct through unaligned reads/writes instead so
+    // alignment of the backing guest allocation doesn't matter.
+    let mut ivars = unsafe { ptr.read_unaligned() };
+    let r = f(&mut ivars);
+    unsafe { ptr.write_unaligned(ivars) };
+    r
 }
 
 #[derive(Default)]

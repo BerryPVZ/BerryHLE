@@ -347,8 +347,10 @@ com.dodreams.crashonwheels: --landscape-left --prefer-gles2-context --force-comp
 # Green Lantern: native 480x320 landscape OpenGL ES 2 profile.
 com.wb.GreenLantern: --landscape-left --prefer-gles2-context
 
-# Where's My Water?: iPhone portrait OpenGL ES 1 profile.
-com.disney.SwampyGame: --device-family=iphone-3gs
+# Where's My Water?: iPhone portrait OpenGL ES 1 profile. Needs the libxml2
+# guest DOM mirror (the game reads xmlNode struct fields directly), else every
+# asset XML root reads as null and the game renders empty.
+com.disney.SwampyGame: --device-family=iphone-3gs --xml-dom-mirror
 
 # LEGO Ninjago: The Final Battle
 # Uses OpenAL streaming audio; keep its fixed-function landscape profile and

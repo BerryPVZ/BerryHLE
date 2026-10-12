@@ -53,6 +53,19 @@ struct HandleTable {
     next_id: u32,
     by_id: HashMap<u32, *mut c_void>,
     by_ptr: HashMap<usize, u32>,
+    /// Guest-memory DOM mirror. Some guests (e.g. Where's My Water /
+    /// `com.disney.SwampyGame`) read libxml2 node struct fields directly
+    /// (`node->name`, `node->children`, `node->type`, …) instead of only using
+    /// the API accessors. Opaque handles can't satisfy that, so for nodes we
+    /// hand the guest a real guest-memory struct laid out like 32-bit
+    /// `xmlNode`, and map it back to the host node here.
+    mirror_host_to_guest: HashMap<usize, u32>,
+    mirror_guest_to_host: HashMap<u32, usize>,
+    /// Per host-doc list of (guest_struct_addr, owned guest allocations) so a
+    /// freed document's mirror is torn down (and its host pointers un-mapped,
+    /// which matters because libxml2 reuses freed node addresses).
+    mirror_doc_allocs: HashMap<usize, Vec<u32>>,
+    mirror_doc_hosts: HashMap<usize, Vec<usize>>,
 }
 
 // `*mut c_void` is not Send/Sync by default; we only ever access the table
@@ -76,6 +89,10 @@ where
             next_id: HANDLE_BASE,
             by_id: HashMap::new(),
             by_ptr: HashMap::new(),
+            mirror_host_to_guest: HashMap::new(),
+            mirror_guest_to_host: HashMap::new(),
+            mirror_doc_allocs: HashMap::new(),
+            mirror_doc_hosts: HashMap::new(),
         });
     }
     f(g.as_mut().unwrap())
@@ -129,13 +146,13 @@ fn is_handle(id: u32) -> bool {
 
 // Convenience casts.
 fn h2doc(id: u32) -> *mut xml::xmlDoc {
-    ptr_for(id) as *mut xml::xmlDoc
+    mirror_host_ptr(id).unwrap_or_else(|| ptr_for(id)) as *mut xml::xmlDoc
 }
 fn h2node(id: u32) -> *mut xml::xmlNode {
-    ptr_for(id) as *mut xml::xmlNode
+    mirror_host_ptr(id).unwrap_or_else(|| ptr_for(id)) as *mut xml::xmlNode
 }
 fn h2attr(id: u32) -> *mut xml::xmlAttr {
-    ptr_for(id) as *mut xml::xmlAttr
+    mirror_host_ptr(id).unwrap_or_else(|| ptr_for(id)) as *mut xml::xmlAttr
 }
 fn h2ns(id: u32) -> *mut xml::xmlNs {
     ptr_for(id) as *mut xml::xmlNs
@@ -207,6 +224,194 @@ fn h2html_ctxt(id: u32) -> *mut xml::htmlParserCtxt {
 }
 fn h2error(id: u32) -> *mut xml::xmlError {
     ptr_for(id) as *mut xml::xmlError
+}
+
+// ============================================================================
+// Guest-memory DOM mirror.
+//
+// Some guests read libxml2 node struct fields directly (`node->name`,
+// `node->children`, `node->type`, `node->next`, …) instead of only using API
+// accessors. Opaque handles can't satisfy that, so when a *node* is handed to
+// the guest we materialise a real guest-memory struct laid out like a 32-bit
+// `xmlNode`, populated from the host tree, and map it back to the host node for
+// the API functions.
+// ============================================================================
+
+/// Host (64-bit) libxml2 node/doc/attr common prefix. `_xmlNode`, `_xmlDoc` and
+/// `_xmlAttr` all share this stable public layout up through `properties`. We
+/// only ever read these fields.
+#[repr(C)]
+struct HostXmlNode {
+    _private: *mut c_void,
+    type_: c_int,
+    name: *const u8,
+    children: *mut HostXmlNode,
+    last: *mut HostXmlNode,
+    parent: *mut HostXmlNode,
+    next: *mut HostXmlNode,
+    prev: *mut HostXmlNode,
+    doc: *mut c_void,
+    ns: *mut c_void,
+    content: *const u8,
+    properties: *mut HostXmlNode,
+}
+
+// Guest 32-bit `xmlNode` field offsets (what the guest reads).
+const G_TYPE: u32 = 4;
+const G_NAME: u32 = 8;
+const G_CHILDREN: u32 = 12;
+const G_LAST: u32 = 16;
+const G_PARENT: u32 = 20;
+const G_NEXT: u32 = 24;
+const G_PREV: u32 = 28;
+const G_CONTENT: u32 = 40;
+const G_PROPERTIES: u32 = 44;
+const GUEST_NODE_SIZE: u32 = 60;
+
+/// Map a guest mirror-struct address back to its host libxml2 node, if any.
+fn mirror_host_ptr(guest_addr: u32) -> Option<*mut c_void> {
+    with_state(|s| {
+        s.mirror_guest_to_host
+            .get(&guest_addr)
+            .map(|&p| p as *mut c_void)
+    })
+}
+
+fn wq(env: &mut Environment, addr: u32, off: u32, val: u32) {
+    env.mem.write(MutPtr::<u32>::from_bits(addr + off), val);
+}
+
+fn track_alloc(doc_key: usize, g: u32) {
+    with_state(|s| s.mirror_doc_allocs.entry(doc_key).or_default().push(g));
+}
+
+/// Mirror one host node (its own fields + recursively its children and
+/// attributes) into a guest struct. Sibling chains are walked iteratively (not
+/// recursively) so wide XML can't overflow the host stack. Returns the guest
+/// address (0 for null).
+fn mirror_one(env: &mut Environment, host: *mut c_void, parent_guest: u32, doc_key: usize) -> u32 {
+    if host.is_null() {
+        return 0;
+    }
+    // Count every call (not just newly-created nodes) toward the cap, so a
+    // cyclic/looping host chain — which would otherwise keep hitting the
+    // "already mirrored" fast path without progress — can't pin the host
+    // thread forever.
+    if MIRROR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= MIRROR_NODE_CAP {
+        return 0;
+    }
+    let host_key = host as usize;
+    if let Some(addr) = with_state(|s| s.mirror_host_to_guest.get(&host_key).copied()) {
+        return addr;
+    }
+    let g: u32 = env.mem.alloc(GUEST_NODE_SIZE).to_bits();
+    with_state(|s| {
+        s.mirror_host_to_guest.insert(host_key, g);
+        s.mirror_guest_to_host.insert(g, host_key);
+        s.mirror_doc_allocs.entry(doc_key).or_default().push(g);
+        s.mirror_doc_hosts.entry(doc_key).or_default().push(host_key);
+    });
+    for off in (0..GUEST_NODE_SIZE).step_by(4) {
+        wq(env, g, off, 0);
+    }
+    let hn = unsafe { &*(host as *const HostXmlNode) };
+    wq(env, g, G_TYPE, hn.type_ as u32);
+    wq(env, g, G_PARENT, parent_guest);
+    if !hn.name.is_null() {
+        let bytes = unsafe { xml::read_xml_str(hn.name as *const xml::xmlChar) };
+        let name_g = write_to_guest(env, &bytes);
+        track_alloc(doc_key, name_g);
+        wq(env, g, G_NAME, name_g);
+    }
+    // `content` (offset 80) and `properties` (offset 88) are only valid fields
+    // of `_xmlNode`. An `_xmlAttr` (XML_ATTRIBUTE_NODE = 2) has a different
+    // layout past `ns`, so reading those offsets as pointers would dereference
+    // garbage. An attribute's value is its children (a text node), which we
+    // mirror below, and attributes have no properties.
+    const XML_ATTRIBUTE_NODE: c_int = 2;
+    if hn.type_ != XML_ATTRIBUTE_NODE && !hn.content.is_null() {
+        let bytes = unsafe { xml::read_xml_str(hn.content as *const xml::xmlChar) };
+        let content_g = write_to_guest(env, &bytes);
+        track_alloc(doc_key, content_g);
+        wq(env, g, G_CONTENT, content_g);
+    }
+    let (first_child, last_child) = mirror_siblings(env, hn.children as *mut c_void, g, doc_key);
+    wq(env, g, G_CHILDREN, first_child);
+    wq(env, g, G_LAST, last_child);
+    if hn.type_ != XML_ATTRIBUTE_NODE {
+        let (first_prop, _) = mirror_siblings(env, hn.properties as *mut c_void, g, doc_key);
+        wq(env, g, G_PROPERTIES, first_prop);
+    }
+    g
+}
+
+/// Mirror a `next`-linked sibling chain iteratively, wiring up each struct's
+/// `next`/`prev`. Returns (first, last) guest addresses.
+fn mirror_siblings(
+    env: &mut Environment,
+    first_host: *mut c_void,
+    parent_guest: u32,
+    doc_key: usize,
+) -> (u32, u32) {
+    let mut cur = first_host;
+    let mut first_g = 0u32;
+    let mut prev_g = 0u32;
+    while !cur.is_null() {
+        if MIRROR_COUNT.load(std::sync::atomic::Ordering::Relaxed) >= MIRROR_NODE_CAP {
+            break;
+        }
+        let next_host = unsafe { (*(cur as *const HostXmlNode)).next } as *mut c_void;
+        let g = mirror_one(env, cur, parent_guest, doc_key);
+        if first_g == 0 {
+            first_g = g;
+        }
+        if prev_g != 0 {
+            wq(env, prev_g, G_NEXT, g);
+            wq(env, g, G_PREV, prev_g);
+        }
+        prev_g = g;
+        cur = next_host;
+    }
+    (first_g, prev_g)
+}
+
+/// Entry point: mirror a node (and its subtree) and return the guest handle.
+fn mirror_node(env: &mut Environment, host: *mut c_void, doc_key: usize) -> u32 {
+    MIRROR_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    let r = mirror_one(env, host, 0, doc_key);
+    let n = MIRROR_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    log_dbg!("XMLMIRROR built {} nodes for doc {:#x} -> {:#x}", n, doc_key, r);
+    r
+}
+
+
+static MIRROR_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Safety cap: a well-formed document tree is bounded, but guard against a
+/// pathological/looping input pinning the host thread forever.
+const MIRROR_NODE_CAP: u32 = 2_000_000;
+
+/// Tear down the guest DOM mirror for a freed host document: free the guest
+/// allocations and drop the host↔guest mappings (libxml2 reuses freed node
+/// addresses, so a stale mapping would corrupt the next parse).
+fn free_doc_mirror(env: &mut Environment, host_doc: usize) {
+    let (allocs, hosts) = with_state(|s| {
+        (
+            s.mirror_doc_allocs.remove(&host_doc).unwrap_or_default(),
+            s.mirror_doc_hosts.remove(&host_doc).unwrap_or_default(),
+        )
+    });
+    for g in allocs {
+        if g != 0 {
+            env.mem.free(MutPtr::<u8>::from_bits(g).cast());
+        }
+    }
+    with_state(|s| {
+        for h in hosts {
+            if let Some(g) = s.mirror_host_to_guest.remove(&h) {
+                s.mirror_guest_to_host.remove(&g);
+            }
+        }
+    });
 }
 
 // ============================================================================
@@ -600,17 +805,29 @@ fn xmlNewDoc(env: &mut Environment, version: u32) -> u32 {
 }
 
 #[allow(non_snake_case)]
-fn xmlFreeDoc(_env: &mut Environment, doc: u32) {
+fn xmlFreeDoc(env: &mut Environment, doc: u32) {
     let p = release_handle(doc) as *mut xml::xmlDoc;
     if !p.is_null() {
+        // Tear down the guest DOM mirror for this doc before freeing it, so the
+        // host↔guest node mappings don't dangle onto reused addresses.
+        free_doc_mirror(env, p as usize);
         unsafe { xml::xmlFreeDoc(p) };
     }
 }
 
 #[allow(non_snake_case)]
-fn xmlDocGetRootElement(_env: &mut Environment, doc: u32) -> u32 {
-    let r = unsafe { xml::xmlDocGetRootElement(h2doc(doc)) };
-    id_for(r as *mut c_void)
+fn xmlDocGetRootElement(env: &mut Environment, doc: u32) -> u32 {
+    let p = h2doc(doc);
+    let root = unsafe { xml::xmlDocGetRootElement(p) };
+    // Guest DOM mirror: hand the guest a real guest-memory `xmlNode` struct it
+    // can walk by direct field access (`node->name`/`children`/`next`/…), which
+    // games like Where's My Water (com.disney.SwampyGame) require. Opt-in via
+    // `--xml-dom-mirror` / `TOUCHHLE_XML_MIRROR=1`; off by default so API-only
+    // guests (which read nodes only through libxml2 accessors) are unaffected.
+    if env.options.xml_dom_mirror {
+        return mirror_node(env, root as *mut c_void, p as usize);
+    }
+    id_for(root as *mut c_void)
 }
 
 #[allow(non_snake_case)]
@@ -2620,7 +2837,7 @@ fn xmlXPathCastToString(env: &mut Environment, obj: u32) -> u32 {
 }
 
 #[allow(non_snake_case)]
-fn xmlFree(env: &mut Environment, ptr: u32) {
+fn xmlFreeImpl(env: &mut Environment, ptr: u32) {
     // If the guest is freeing one of our object handles, drop it from the
     // table (libxml2 itself would have called the appropriate xmlFreeFoo).
     if is_handle(ptr) {
@@ -2692,6 +2909,28 @@ pub const CONSTANTS: ConstantExports = &[
     // installs its own handler simply sees no generic errors reported.
     ("_xmlGenericError", HostConstant::NullPtr),
     ("_xmlGenericErrorContext", HostConstant::NullPtr),
+    // libxml2's `xmlFree` is NOT a function — it is a global function-pointer
+    // VARIABLE (`xmlFreeFunc xmlFree;`, libxml/globals.h). Code frees memory via
+    // `xmlFree(ptr)`, which the compiler emits as `tmp = *xmlFree; tmp(ptr)` —
+    // a load of the pointer VARIABLE followed by an indirect call. If we export
+    // `xmlFree` as a host function, the guest's `*xmlFree` reads the first word
+    // of our call stub as a function pointer and branches into garbage (Where's
+    // My Water hung exactly here: TextureManager::_loadedTextureSettings frees
+    // an xmlGetProp result via `(*xmlFree)(name)`). So expose `xmlFree` as the
+    // variable it really is: a 4-byte guest slot holding the address of our
+    // `_xmlFreeImpl` call stub, so `*xmlFree` is a valid callable pointer.
+    (
+        "_xmlFree",
+        HostConstant::Custom(|env| {
+            let stub = env
+                .dyld
+                .create_proc_address_no_inval(&mut env.mem, "_xmlFreeImpl")
+                .expect("libxml2 _xmlFreeImpl stub");
+            let slot: crate::mem::MutPtr<u32> = env.mem.alloc(4).cast();
+            env.mem.write(slot, stub.addr_with_thumb_bit());
+            slot.cast().cast_const()
+        }),
+    ),
 ];
 
 const FUNCTIONS: FunctionExports = &[
@@ -2976,5 +3215,5 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(xmlAttrName(_)),
     export_c_func!(xmlAttrNext(_)),
     // ---- memory ----
-    export_c_func!(xmlFree(_)),
+    export_c_func!(xmlFreeImpl(_)),
 ];
