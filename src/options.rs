@@ -262,6 +262,12 @@ pub struct Options {
     /// enable it for GTA III. Off globally because some other games rely on
     /// the legacy eager-load and automatic fullscreen presentation behaviour.
     pub fix_movie_player: bool,
+    /// Expose a real guest-memory `xmlNode` struct tree ("DOM mirror") from
+    /// libxml2 instead of opaque handles, for games that read node struct
+    /// fields directly (`node->name`/`children`/`next`/…). Needed by Where's My
+    /// Water (`com.disney.SwampyGame`). Opt in with `--xml-dom-mirror` or
+    /// `TOUCHHLE_XML_MIRROR=1`; off by default so API-only guests are unaffected.
+    pub xml_dom_mirror: bool,
 }
 
 impl Default for Options {
@@ -352,6 +358,9 @@ impl Default for Options {
                 .map(|value| value != "0")
                 .unwrap_or(false),
             fix_movie_player: false,
+            xml_dom_mirror: std::env::var_os("TOUCHHLE_XML_MIRROR")
+                .map(|value| value != "0")
+                .unwrap_or(false),
         }
     }
 }
@@ -375,6 +384,8 @@ impl Options {
             self.fullscreen = true;
         } else if arg == "--fix-music" {
             self.gd_music_bypass = true;
+        } else if arg == "--xml-dom-mirror" {
+            self.xml_dom_mirror = true;
         } else if arg == "--fix-movie-player" {
             self.fix_movie_player = true;
         } else if arg == "--no-fix-movie-player" {
