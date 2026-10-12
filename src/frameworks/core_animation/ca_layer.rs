@@ -47,6 +47,8 @@ pub(crate) struct CALayerHostObject {
     pub(crate) metal_drawable_size: CGSize,
     pub(crate) metal_framebuffer_only: bool,
     delegate: id,
+    /// Retained model for a detached presentation snapshot; nil for model layers.
+    presentation_model: id,
     pub(super) sublayers: Vec<id>,
     superlayer: id,
     pub(super) bounds: CGRect,
@@ -384,6 +386,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         },
         metal_framebuffer_only: false,
         delegate: nil,
+        presentation_model: nil,
         sublayers: Vec::new(),
         superlayer: nil,
         bounds: CGRect {
@@ -443,6 +446,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let &mut CALayerHostObject {
         drawable_properties,
         contents,
+        presentation_model,
         superlayer,
         cg_context,
         mask,
@@ -451,6 +455,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     } = env.objc.borrow_mut(this);
     let sublayers = std::mem::take(sublayers);
 
+    if presentation_model != nil { release(env, presentation_model); }
     if drawable_properties != nil { release(env, drawable_properties); }
     if contents != nil { release(env, contents); }
     if mask != nil { release(env, mask); }
@@ -497,23 +502,36 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)superlayer { env.objc.borrow::<CALayerHostObject>(this).superlayer }
 
-// https://developer.apple.com/documentation/quartzcore/calayer/1410744-presentationlayer
-// Apple returns a copy of the layer holding the values that are currently
-// "in flight" (i.e. the state as displayed on screen mid-animation), or nil if
-// the layer has not yet been committed for rendering. touchHLE has no separate
-// presentation-layer tree — the model layer doubles as the render/presentation
-// layer (see core_animation::composition) — so the correct approximation is to
-// return the layer itself rather than nil. Games query this (e.g. to read
-// `[[layer presentationLayer] position]` for hit-testing during a move
-// animation), and returning nil would make them dereference a null object.
-- (id)presentationLayer { this }
+// Snapshot the same interpolated geometry used by the compositor. Returning
+// the model here makes moving objects hit-test and collect at their destination.
+- (id)presentationLayer {
+    if env.objc.borrow::<CALayerHostObject>(this).presentation_model != nil {
+        return this;
+    }
+    let mut snapshot = super::animation::State::sample_presentation_layer(env, this);
+    snapshot.presentation_model = this;
+    snapshot.superlayer = nil;
+    snapshot.sublayers.clear();
+    snapshot.animations.clear();
+    snapshot.anonymous_animations.clear();
+    snapshot.cg_context = None;
+    snapshot.presented_pixels = None;
+    snapshot.gles_texture = None;
+    snapshot.background_pattern_gles_texture = None;
+    snapshot.use_implicit_animations = false;
+    retain(env, this);
+    for object in [snapshot.contents, snapshot.drawable_properties, snapshot.mask] {
+        if object != nil { retain(env, object); }
+    }
+    let class = env.objc.get_known_class("CALayer", &mut env.mem);
+    let layer = env.objc.alloc_object(class, Box::new(snapshot), &mut env.mem);
+    autorelease(env, layer)
+}
 
-// https://developer.apple.com/documentation/quartzcore/calayer/1410631-modellayer
-// When sent to a presentation layer this returns the underlying model layer;
-// when sent to a model layer it returns the layer itself. Since our model
-// layer is its own presentation layer, returning `this` is correct in both
-// cases.
-- (id)modelLayer { this }
+- (id)modelLayer {
+    let model = env.objc.borrow::<CALayerHostObject>(this).presentation_model;
+    if model == nil { this } else { model }
+}
 
 - (())addSublayer:(id)layer {
     if layer == nil { return; }
@@ -1031,6 +1049,30 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())addAnimation:(id)anim forKey:(id)key {
+    if key == nil && env.objc.borrow::<CALayerHostObject>(this).anonymous_animations.contains(&anim) {
+        return;
+    }
+    // Keep the incoming object alive even when replacing itself under a key.
+    retain(env, anim);
+    super::ca_animation::reset_playback(env, anim);
+    if !super::ca_animation::is_implicit(env, anim) {
+        let path: id = msg![env; anim keyPath];
+        if path != nil {
+            let path = to_rust_string(env, path).into_owned();
+            let attached: Vec<(String, id)> = env.objc
+                .borrow::<CALayerHostObject>(this).animations.iter()
+                .map(|(key, animation)| (key.clone(), *animation)).collect();
+            for (key, animation) in attached {
+                if super::ca_animation::is_implicit(env, animation) {
+                    let other_path: id = msg![env; animation keyPath];
+                    if to_rust_string(env, other_path) == path {
+                        env.objc.borrow_mut::<CALayerHostObject>(this).animations.remove(&key);
+                        release(env, animation);
+                    }
+                }
+            }
+        }
+    }
     let duration: CFTimeInterval = msg![env; anim duration];
     if duration == 0.0 {
         let duration: CFTimeInterval = msg_class![env; CATransaction animationDuration];
@@ -1062,6 +1104,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
         retain(env, anim);
     }
+    release(env, anim);
 }
 
 - (())removeAnimationForKey:(id)key {
@@ -1363,6 +1406,7 @@ fn add_default_implied_basic_animation(
     let animation = msg_class![env; CABasicAnimation animationWithKeyPath:key_path];
     () = msg![env; animation setFromValue: from_value];
     () = msg![env; animation setToValue: to_value];
+    super::ca_animation::mark_implicit(env, animation);
     ca_transaction::State::add_animation(env, layer, animation);
 }
 
