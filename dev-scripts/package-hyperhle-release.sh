@@ -78,11 +78,14 @@ if [ ! -f "$ios_zip" ]; then
 fi
 
 if [ -z "$CHANGELOG_FROM" ]; then
-    patch="${VERSION#v1.0.}"
-    if [ "$patch" = "0" ]; then
+    # The newest release tag older than VERSION (versions roll over at 12, see
+    # hyperhle-should-release.sh, so it can't simply be computed).
+    CHANGELOG_FROM="$(
+        { git tag -l 'v[0-9]*.[0-9]*.[0-9]*'; echo "$VERSION"; } |
+            sort -u -V | grep -x -B 1 -F "$VERSION" | grep -v -x -F "$VERSION" || true
+    )"
+    if [ -z "$CHANGELOG_FROM" ]; then
         CHANGELOG_FROM="$(git rev-list -n 1 HEAD -- dev-scripts/hyperhle-should-release.sh)"
-    else
-        CHANGELOG_FROM="v1.0.$((patch - 1))"
     fi
 fi
 

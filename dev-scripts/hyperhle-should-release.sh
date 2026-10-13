@@ -1,18 +1,35 @@
 #!/bin/sh
-# Decide whether to publish a HyperHLE release and which v1.0.x tag to use.
-# A release is due every 5 commits on HEAD since the latest v1.0.* tag, or since
-# the commit that introduced hyperhle release automation when no tag exists yet.
+# Decide whether to publish a HyperHLE release and which vMAJOR.MINOR.PATCH tag
+# to use. A release is due every 5 commits on HEAD since the latest release
+# tag, or since the commit that introduced hyperhle release automation when no
+# tag exists yet.
+#
+# Each of the three numbers counts from 0 up to 12 and then carries into the
+# next one: v1.0.12 is followed by v1.1.0, and v1.12.12 by v2.0.0. Older tags
+# from before this scheme (e.g. v1.0.121) carry over the same way, so the next
+# release after v1.0.121 is v1.1.0.
 set -eu
 
 RELEASE_EVERY=5
+VERSION_PART_MAX=12
 WORKFLOW_MARKER="dev-scripts/hyperhle-should-release.sh"
 
-latest_tag="$(git tag -l 'v1.0.*' --sort=-v:refname | head -n 1 || true)"
+latest_tag="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1 || true)"
 
 if [ -n "$latest_tag" ]; then
     commits_since="$(git rev-list --count "${latest_tag}..HEAD")"
-    patch="${latest_tag#v1.0.}"
-    next_patch=$((patch + 1))
+    IFS=. read -r major minor patch <<EOT
+${latest_tag#v}
+EOT
+    patch=$((patch + 1))
+    if [ "$patch" -gt "$VERSION_PART_MAX" ]; then
+        patch=0
+        minor=$((minor + 1))
+    fi
+    if [ "$minor" -gt "$VERSION_PART_MAX" ]; then
+        minor=0
+        major=$((major + 1))
+    fi
 else
     baseline="$(git rev-list -n 1 HEAD -- "$WORKFLOW_MARKER" 2>/dev/null || true)"
     if [ -n "$baseline" ]; then
@@ -20,10 +37,12 @@ else
     else
         commits_since=0
     fi
-    next_patch=0
+    major=1
+    minor=0
+    patch=0
 fi
 
-version="v1.0.${next_patch}"
+version="v${major}.${minor}.${patch}"
 
 if [ "${FORCE_HYPERHLE_RELEASE:-}" = "true" ]; then
     should_release=true
