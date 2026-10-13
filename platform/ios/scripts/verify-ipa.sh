@@ -146,7 +146,7 @@ BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INFO")
 VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO")
 BUILD=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO")
 
-if [ "$BUNDLE_ID" != "io.github.goodvids56.hyperhle" ]; then
+if [ "$BUNDLE_ID" != "com.klugklug.hyperhle" ]; then
     echo "Unexpected bundle identifier: $BUNDLE_ID" >&2
     exit 1
 fi
