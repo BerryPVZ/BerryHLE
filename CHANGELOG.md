@@ -184,6 +184,8 @@ Quality and performance:
 
 Usability:
 
+- Opening the app picker now plays the iOS 4-style home screen unlock animation: the app icons and their labels fly in radially from outside the screen into their grid slots, with inner icons leading and outer corners settling right after.
+
 - The app picker has been reworked to feel like iOS. Opening an app animates its icon to the middle of the screen while the screen fades to black. Pressing the arrow tiles or the ← and → keys slides the icon grid to the next or previous page. The "Quick options" button is gone; a new "Settings" app icon in the grid opens a full-screen Settings screen with grouped sections, switches, and a "Done" button. It holds the same options as before.
 
 - Long-pressing an app icon in the app picker opens an iOS-style “Delete” dialog. Deleting an app removes its bundle, its saved data in `touchHLE_sandbox`, and its SQLite databases in `touchHLE_sqlite`.
