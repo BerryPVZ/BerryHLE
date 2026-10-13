@@ -4,13 +4,15 @@
 # tag, or since the commit that introduced hyperhle release automation when no
 # tag exists yet.
 #
-# Each of the three numbers counts from 0 up to 12 and then carries into the
-# next one: v1.0.12 is followed by v1.1.0, and v1.12.12 by v2.0.0. Older tags
-# from before this scheme (e.g. v1.0.121) carry over the same way, so the next
-# release after v1.0.121 is v1.1.0.
+# The second and third numbers count from 0 up to 12 and then carry into the
+# number before them: v1.0.12 is followed by v1.1.0, and v1.12.12 by v2.0.0.
+# The first number has no limit (v12.12.12 -> v13.0.0). Older tags from before
+# this scheme (e.g. v1.0.121) carry over the same way, so the next release
+# after v1.0.121 is v1.1.0.
 set -eu
 
 RELEASE_EVERY=5
+# Highest value of the second and third numbers; the first is unbounded.
 VERSION_PART_MAX=12
 WORKFLOW_MARKER="dev-scripts/hyperhle-should-release.sh"
 
