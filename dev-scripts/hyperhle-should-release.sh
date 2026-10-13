@@ -1,6 +1,6 @@
 #!/bin/sh
 # Decide whether to publish a HyperHLE release and which vMAJOR.MINOR.PATCH tag
-# to use. A release is due every 5 commits on HEAD since the latest release
+# to use. A release is due every 6 commits on HEAD since the latest release
 # tag, or since the commit that introduced hyperhle release automation when no
 # tag exists yet.
 #
@@ -11,7 +11,7 @@
 # after v1.0.121 is v1.1.0.
 set -eu
 
-RELEASE_EVERY=5
+RELEASE_EVERY=6
 # Highest value of the second and third numbers; the first is unbounded.
 VERSION_PART_MAX=12
 WORKFLOW_MARKER="dev-scripts/hyperhle-should-release.sh"

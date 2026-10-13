@@ -508,6 +508,8 @@ jobs:
         run: sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pandoc zip
       - name: Package HyperHLE release files
         env:
+          # Lets the changelog look up each commit author's GitHub username.
+          GH_TOKEN: ${{ github.token }}
           GITHUB_SERVER_URL: ${{ github.server_url }}
           FORCE_HYPERHLE_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_hyperhle_release && 'true' || '' }}
           VERSION: ${{ needs.check-hyperhle-release.outputs.version }}
