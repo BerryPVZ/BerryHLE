@@ -106,6 +106,16 @@ pub struct Options {
     pub initial_orientation: DeviceOrientation,
     /// iOS version reported to guest applications. `None` uses the latest compatibility version.
     pub ios_version: Option<(i32, i32, i32)>,
+    /// On iOS, present an OpenGL ES 2.0 renderbuffer directly even when its
+    /// CAEAGLayer is not the fullscreen layer, instead of going through the
+    /// Core Animation composition path.
+    ///
+    /// This is what makes apps like The Sims Medieval display at all, but it
+    /// costs a `glFinish` plus a full renderbuffer readback and re-upload every
+    /// frame on the main thread, which starves UIKit of the run-loop time it
+    /// needs to dispatch touches. Off by default so apps that worked without it
+    /// keep working; enable per app in the options file.
+    pub ios_es2_direct_present: bool,
     pub scale_hack: NonZeroU32,
     /// `--ui-scale=N`: resolution multiplier for UIKit/Core Animation UI
     /// (app picker, in-game UIKit HUDs). Layer bitmaps and the compositor
@@ -280,6 +290,7 @@ impl Default for Options {
             host_screen_size: None,
             initial_orientation: DeviceOrientation::Portrait,
             ios_version: None,
+            ios_es2_direct_present: false,
             scale_hack: NonZeroU32::new(1).unwrap(),
             ui_scale: NonZeroU32::new(2).unwrap(),
             analog_stick_tilt_controls: true,
@@ -396,6 +407,10 @@ impl Options {
             self.initial_orientation = DeviceOrientation::LandscapeRight;
         } else if arg == "--upside-down" {
             self.initial_orientation = DeviceOrientation::PortraitUpsideDown;
+        } else if arg == "--ios-es2-direct-present" {
+            self.ios_es2_direct_present = true;
+        } else if arg == "--no-ios-es2-direct-present" {
+            self.ios_es2_direct_present = false;
         } else if let Some(value) = arg.strip_prefix("--device-family=") {
             if value == "auto" {
                 self.auto_device_family = true;

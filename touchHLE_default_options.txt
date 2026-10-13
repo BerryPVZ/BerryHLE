@@ -361,3 +361,10 @@ com.lego.ninjago.thefinalbattle: --landscape-left --fix-texture-min-filter
 # Use the movie-player and transform-aware iPad rotation fixes.
 com.rockstargames.gta3: --fix-movie-player --rotation-fix
 com.rockstargames.gta3ios: --fix-movie-player --rotation-fix
+
+# The Sims Medieval: draws through an OpenGL ES 2.0 context on a CAEAGLayer
+# that is not the fullscreen layer. Without the iOS direct presenter the frame
+# is composited but never reaches the screen, so the game plays audio over a
+# black screen. The direct presenter costs a readback every frame, so it stays
+# opt-in and is enabled per app here.
+com.ea.simsmedieval.bv: --ios-es2-direct-present

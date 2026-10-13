@@ -148,4 +148,11 @@ macro_rules! echo_no_panic {
 /// Put modules to enable [log_dbg] for here, e.g. "touchHLE::mem" to see when
 /// memory is allocated and freed. Keep the default empty to avoid hot-path log
 /// traffic in normal builds.
+#[cfg(not(target_os = "ios"))]
 pub const ENABLED_MODULES: &[&str] = &["touchHLE::frameworks::media_player::movie_player"];
+// NOTE: keep this EMPTY for builds that run on an iOS device. Every
+// `log_dbg!` does two blocking writes (stderr, which the iOS host redirects to
+// a file, and touchHLE_log.txt). On the main thread that starves UIKit of the
+// run-loop time it needs to dispatch touches.
+#[cfg(target_os = "ios")]
+pub const ENABLED_MODULES: &[&str] = &[];

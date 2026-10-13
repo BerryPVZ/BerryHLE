@@ -71,6 +71,11 @@ if [ -z "$linux_bin" ]; then
     echo "Missing build artifact (all platform builds must succeed): artifacts/linux/touchHLE" >&2
     exit 1
 fi
+ios_zip="artifacts/ios/HyperHLE_iOS_unsigned_IPAs.zip"
+if [ ! -f "$ios_zip" ]; then
+    echo "Missing build artifact (all platform builds must succeed): $ios_zip" >&2
+    exit 1
+fi
 
 if [ -z "$CHANGELOG_FROM" ]; then
     patch="${VERSION#v1.0.}"
@@ -136,3 +141,5 @@ prefix="HyperHLE"
 ./prepare-release.sh --create-zip-linux \
     "$ROOT/$linux_bin" \
     -o "$ROOT/release/${prefix}_Linux_x86_64.zip"
+# The iOS job already zips its IPAs (see build-ios in HyperHLE_release.yml).
+cp "$ROOT/$ios_zip" "$ROOT/release/${prefix}_iOS_unsigned_IPAs.zip"

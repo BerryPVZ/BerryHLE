@@ -35,7 +35,10 @@ pub(super) unsafe fn allocate_memory(size: usize) -> std::io::Result<*mut core::
 
 #[cfg(unix)]
 pub(super) unsafe fn allocate_memory(size: usize) -> std::io::Result<*mut core::ffi::c_void> {
-    use libc::{mmap, sysconf, _SC_PAGESIZE, MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE};
+    use libc::{
+        mmap, mprotect, sysconf, _SC_PAGESIZE, MAP_ANONYMOUS, MAP_NORESERVE, MAP_PRIVATE,
+        PROT_NONE, PROT_READ, PROT_WRITE,
+    };
 
     const PAGE_SIZE: usize = crate::mem::PAGE_SIZE as usize;
     let host_page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
@@ -45,20 +48,53 @@ pub(super) unsafe fn allocate_memory(size: usize) -> std::io::Result<*mut core::
         "Hosts with smaller than 4KiB pages are not supported."
     );
 
-    let ptr = unsafe {
-        mmap(
-            std::ptr::null_mut(),
-            size,
-            PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANONYMOUS,
-            -1,
-            0,
-        )
+    let attempt = |prot: i32, flags: i32| -> std::io::Result<*mut core::ffi::c_void> {
+        let ptr = unsafe { mmap(std::ptr::null_mut(), size, prot, flags, -1, 0) };
+        if ptr == libc::MAP_FAILED {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(ptr)
+        }
     };
 
-    if ptr == libc::MAP_FAILED {
-        return Err(std::io::Error::last_os_error());
+    // The guest address space is one flat 4GiB mapping. Desktop kernels
+    // overcommit, so asking for it read-write up front costs nothing until the
+    // pages are touched. iOS does not overcommit anonymous memory, so on
+    // devices with less RAM than the mapping this fails outright with ENOMEM
+    // before the guest app ever starts. Fall back to progressively weaker
+    // requests, ending with a pure PROT_NONE reservation that commits nothing
+    // and is then widened with mprotect.
+    let first_error = match attempt(PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS) {
+        Ok(ptr) => return Ok(ptr),
+        Err(error) => error,
+    };
+
+    log!(
+        "Could not map {} MiB of guest address space read-write ({}); retrying.",
+        size / (1024 * 1024),
+        first_error
+    );
+
+    if let Ok(ptr) = attempt(
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+    ) {
+        log!("Mapped guest address space with MAP_NORESERVE.");
+        return Ok(ptr);
     }
+
+    let ptr = attempt(PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE)
+        .or_else(|_| attempt(PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS))
+        // Report the original read-write failure: it is the informative one.
+        .map_err(|_| first_error)?;
+
+    if unsafe { mprotect(ptr, size, PROT_READ | PROT_WRITE) } != 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe { libc::munmap(ptr, size) };
+        return Err(error);
+    }
+
+    log!("Mapped guest address space as a reservation widened with mprotect.");
     Ok(ptr)
 }
 

@@ -291,6 +291,95 @@ jobs:
         name: HyperHLE_Android_AArch64  
         path: HyperHLE-Fork.apk
 
+  build-ios:
+    # The iOS app (platform/ios) and its packaging come from Applesauce
+    # (https://github.com/johnny901901901/Applesauce). This builds the three
+    # unsigned/fakesigned IPAs it ships and uploads them together as one zip.
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout touchHLE
+        uses: actions/checkout@main
+        with:
+          submodules: recursive
+
+      - name: Select the newest installed Xcode
+        run: |
+          set -eu
+          xcode=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -n 1 || true)
+          if [ -n "$xcode" ]; then
+            sudo xcode-select -s "$xcode/Contents/Developer"
+          fi
+          echo "DEVELOPER_DIR=$(xcode-select -p)" >> "$GITHUB_ENV"
+          xcodebuild -version
+
+      - name: Install build tools
+        run: brew install ninja ldid
+
+      - name: Install AArch64 iOS Rust toolchain
+        run: rustup target add aarch64-apple-ios
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@master
+        with:
+          workspaces: ". -> build/rust-ios-native"
+
+      - name: Try to get cached copy of Boost
+        id: cache-boost
+        uses: actions/cache@main
+        with:
+          path: vendor/boost
+          key: boost_1_81_0_macos
+
+      - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+        name: Download Boost
+        run: curl -L -O "https://archives.boost.io/release/1.81.0/source/boost_1_81_0.tar.gz"
+
+      - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+        name: Extract Boost
+        run: mkdir -p vendor && tar xzf boost_1_81_0.tar.gz -C vendor && mv vendor/boost_1_81_0 vendor/boost
+
+      - name: Setup CMake
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: "~3.29.0"
+
+      - name: Build shared SDL2 for iOS
+        run: sh platform/ios/scripts/build-sdl-shared.sh iphoneos
+
+      - name: Build the iOS app
+        run: sh platform/ios/scripts/build-host.sh iphoneos Release
+
+      - name: Package the IPAs
+        run: |
+          set -eu
+          sh platform/ios/scripts/package-ipa.sh
+          sh platform/ios/scripts/package-ipa.sh --trollstore
+          sh platform/ios/scripts/package-ipa.sh --trollstore-permanent-jit
+
+      - name: Verify the IPAs
+        run: |
+          set -eu
+          sh platform/ios/scripts/verify-ipa.sh dist/HyperHLE-iOS-unsigned.ipa
+          sh platform/ios/scripts/verify-ipa.sh --trollstore dist/HyperHLE-iOS-trollstore.ipa
+          sh platform/ios/scripts/verify-ipa.sh --trollstore-permanent-jit dist/HyperHLE-iOS-trollstore-permanent-jit.ipa
+
+      - name: Zip the IPAs
+        run: |
+          set -eu
+          cd dist
+          zip -q ../HyperHLE_iOS_unsigned_IPAs.zip \
+            HyperHLE-iOS-unsigned.ipa HyperHLE-iOS-unsigned.ipa.sha256 \
+            HyperHLE-iOS-trollstore.ipa HyperHLE-iOS-trollstore.ipa.sha256 \
+            HyperHLE-iOS-trollstore-permanent-jit.ipa HyperHLE-iOS-trollstore-permanent-jit.ipa.sha256
+          cd ..
+          unzip -l HyperHLE_iOS_unsigned_IPAs.zip
+
+      - uses: actions/upload-artifact@main
+        with:
+          name: HyperHLE_iOS_AArch64
+          path: HyperHLE_iOS_unsigned_IPAs.zip
+
   build-win:
     runs-on: windows-2022  
 
@@ -358,14 +447,15 @@ jobs:
         run: ./dev-scripts/hyperhle-should-release.sh
 
   publish-hyperhle-release:
-    needs: [check-hyperhle-release, build-osx, build-linux, build-android, build-win]
+    needs: [check-hyperhle-release, build-osx, build-linux, build-android, build-win, build-ios]
     if: >-
       needs.check-hyperhle-release.result == 'success' &&
       needs.check-hyperhle-release.outputs.should_release == 'true' &&
       needs.build-osx.result == 'success' &&
       needs.build-linux.result == 'success' &&
       needs.build-android.result == 'success' &&
-      needs.build-win.result == 'success'
+      needs.build-win.result == 'success' &&
+      needs.build-ios.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -396,6 +486,11 @@ jobs:
         with:
           name: HyperHLE_Linux_x86_64
           path: artifacts/linux
+      - name: Download iOS artifact
+        uses: actions/download-artifact@main
+        with:
+          name: HyperHLE_iOS_AArch64
+          path: artifacts/ios
       - name: Install packaging tools
         run: sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pandoc zip
       - name: Package HyperHLE release files

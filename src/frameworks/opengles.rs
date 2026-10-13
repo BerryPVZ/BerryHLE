@@ -12,7 +12,7 @@
 mod eagl;
 mod gles_guest;
 
-use touchHLE_gl_bindings::gles11::types::{GLenum, GLuint};
+use touchHLE_gl_bindings::gles11::types::{GLenum, GLint, GLsizei, GLuint};
 
 use crate::mem::ConstPtr;
 
@@ -40,11 +40,83 @@ pub struct State {
     sync_objects: std::collections::HashMap<GLuint, gles_guest::GuestSyncObject>,
     /// Next candidate guest `GLsync` handle (0 is never handed out).
     next_sync_handle: GLuint,
+    /// The framebuffer object the guest currently has bound, per thread.
+    bound_framebuffers: std::collections::HashMap<crate::ThreadId, GLuint>,
+    /// Framebuffer objects whose colour attachment is a *texture*.
+    ///
+    /// The scale hack enlarges renderbuffers (both the EAGL drawable's and any
+    /// the app allocates via `glRenderbufferStorage`), so scaling a viewport
+    /// aimed at those is correct. Textures are never enlarged, so a viewport
+    /// aimed at a texture-backed framebuffer must be left alone — otherwise the
+    /// app draws `scale_hack` times too large into an unscaled target and you
+    /// see a magnified bottom-left corner (Flappy Bird renders through a
+    /// 288x512 texture FBO and did exactly that).
+    texture_backed_framebuffers: std::collections::HashSet<GLuint>,
+    /// The last viewport the guest asked for, in guest (unscaled) co-ordinates.
+    ///
+    /// The GL viewport is global state rather than per-framebuffer, and apps
+    /// are free to call `glViewport` *before* binding the framebuffer they mean
+    /// it for (Flappy Bird does). Whether the scale hack applies therefore
+    /// cannot be decided when `glViewport` is called — we remember the request
+    /// and re-apply it with the right scaling whenever the binding changes.
+    guest_viewports: std::collections::HashMap<crate::ThreadId, (GLint, GLint, GLsizei, GLsizei)>,
 }
 impl State {
     fn current_ctx_for_thread(&mut self, thread: crate::ThreadId) -> &mut Option<crate::objc::id> {
         // PERF: this runs on every guest GL call; one hash lookup, not two.
         self.current_ctxs.entry(thread).or_insert(None)
+    }
+
+    pub fn set_bound_framebuffer(&mut self, thread: crate::ThreadId, framebuffer: GLuint) {
+        self.bound_framebuffers.insert(thread, framebuffer);
+    }
+
+    /// Record what kind of colour attachment a framebuffer was given, so
+    /// `glViewport` can tell whether the scale hack applies to it.
+    pub fn set_colour_attachment_is_texture(&mut self, thread: crate::ThreadId, is_texture: bool) {
+        let framebuffer = self
+            .bound_framebuffers
+            .get(&thread)
+            .copied()
+            .unwrap_or_default();
+        // Framebuffer 0 is the window/drawable itself and is always scaled.
+        if framebuffer == 0 {
+            return;
+        }
+        if is_texture {
+            self.texture_backed_framebuffers.insert(framebuffer);
+        } else {
+            self.texture_backed_framebuffers.remove(&framebuffer);
+        }
+    }
+
+    /// Whether the scale hack should be applied to `glViewport` right now.
+    ///
+    /// Defaults to `true` (the historical behaviour) unless we positively know
+    /// the bound framebuffer is texture-backed, so anything we failed to track
+    /// keeps working exactly as before.
+    pub fn set_guest_viewport(
+        &mut self,
+        thread: crate::ThreadId,
+        viewport: (GLint, GLint, GLsizei, GLsizei),
+    ) {
+        self.guest_viewports.insert(thread, viewport);
+    }
+
+    pub fn guest_viewport(
+        &self,
+        thread: crate::ThreadId,
+    ) -> Option<(GLint, GLint, GLsizei, GLsizei)> {
+        self.guest_viewports.get(&thread).copied()
+    }
+
+    pub fn scale_hack_applies_to_viewport(&self, thread: crate::ThreadId) -> bool {
+        let framebuffer = self
+            .bound_framebuffers
+            .get(&thread)
+            .copied()
+            .unwrap_or_default();
+        !self.texture_backed_framebuffers.contains(&framebuffer)
     }
 }
 

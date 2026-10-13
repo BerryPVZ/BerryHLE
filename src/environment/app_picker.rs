@@ -472,9 +472,13 @@ const CLASSES: ClassExports = objc_classes! {
 };
 
 fn show_app_picker_gui(
-    options: Options,
+    mut options: Options,
     apps: Result<Vec<AppInfo>, String>,
 ) -> Result<(PathBuf, Vec<String>), String> {
+    if std::env::consts::OS == "ios" && options.scale_hack.get() == 1 {
+        options.scale_hack = NonZeroU32::new(3).unwrap();
+    }
+
     let icon = {
         let bytes: &[u8] = match crate::branding() {
             "" => include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/icon.png")),

@@ -763,8 +763,31 @@ fn glViewport(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height:
         }
     }
     let factor = env.options.scale_hack.get() as GLsizei;
-    let (x, y) = (x * factor, y * factor);
-    let (width, height) = (width * factor, height * factor);
+    // The scale hack only enlarges the EAGL drawable's renderbuffer, not the
+    // framebuffer objects an app creates for itself. Scaling a viewport aimed
+    // at one of those draws the app's content `factor` times too large inside
+    // an unscaled target, which is why Flappy Bird (which renders through a
+    // 288x512 offscreen buffer at its native art size) appeared hugely zoomed
+    // in at any scale above 1, while apps that draw straight to the drawable
+    // (e.g. Touch & Go) were unaffected.
+    //
+    // GL_FRAMEBUFFER_BINDING_OES and GL_FRAMEBUFFER_BINDING are both 0x8CA6, so
+    // this single query is correct for ES 1.1 and ES 2.0 alike.
+    let thread = env.current_thread;
+    // Remember the request so it can be re-applied if the guest binds a
+    // different framebuffer afterwards (see glBindFramebufferOES).
+    env.framework_state
+        .opengles
+        .set_guest_viewport(thread, (x, y, width, height));
+    let apply_scale_hack = env
+        .framework_state
+        .opengles
+        .scale_hack_applies_to_viewport(thread);
+    let (x, y, width, height) = if apply_scale_hack {
+        (x * factor, y * factor, width * factor, height * factor)
+    } else {
+        (x, y, width, height)
+    };
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.Viewport(x, y, width, height)
     })
@@ -3365,8 +3388,33 @@ fn glIsRenderbufferOES(env: &mut Environment, renderbuffer: GLuint) -> GLboolean
     })
 }
 fn glBindFramebufferOES(env: &mut Environment, target: GLenum, framebuffer: GLuint) {
+    let thread = env.current_thread;
+    env.framework_state
+        .opengles
+        .set_bound_framebuffer(thread, framebuffer);
+    // The viewport is global GL state, so a viewport the guest set while a
+    // different framebuffer was bound may need different scale-hack treatment
+    // now. Re-apply the guest's last request against the new binding. Without
+    // the scale hack both treatments are identical, so there is nothing to do.
+    let factor = env.options.scale_hack.get() as GLsizei;
+    let viewport = if factor != 1 {
+        env.framework_state.opengles.guest_viewport(thread)
+    } else {
+        None
+    };
+    let apply_scale_hack = env
+        .framework_state
+        .opengles
+        .scale_hack_applies_to_viewport(thread);
     with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.BindFramebufferOES(target, framebuffer)
+        gles.BindFramebufferOES(target, framebuffer);
+        if let Some((x, y, width, height)) = viewport {
+            if apply_scale_hack {
+                gles.Viewport(x * factor, y * factor, width * factor, height * factor)
+            } else {
+                gles.Viewport(x, y, width, height)
+            }
+        }
     })
 }
 fn glBindRenderbufferOES(env: &mut Environment, target: GLenum, renderbuffer: GLuint) {
@@ -3394,6 +3442,14 @@ fn glFramebufferRenderbufferOES(
     renderbuffertarget: GLenum,
     renderbuffer: GLuint,
 ) {
+    if attachment == gles11::COLOR_ATTACHMENT0_OES {
+        // Renderbuffers are enlarged by the scale hack, so a viewport aimed at
+        // this framebuffer should be scaled as usual.
+        let thread = env.current_thread;
+        env.framework_state
+            .opengles
+            .set_colour_attachment_is_texture(thread, false);
+    }
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.FramebufferRenderbufferOES(target, attachment, renderbuffertarget, renderbuffer);
         // When an iOS app attaches its drawable color renderbuffer to an FBO,
@@ -3474,6 +3530,12 @@ fn glFramebufferTexture2DOES(
     texture: GLuint,
     level: i32,
 ) {
+    if attachment == gles11::COLOR_ATTACHMENT0_OES {
+        let thread = env.current_thread;
+        env.framework_state
+            .opengles
+            .set_colour_attachment_is_texture(thread, texture != 0);
+    }
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.FramebufferTexture2DOES(target, attachment, textarget, texture, level)
     })
