@@ -12,9 +12,10 @@ fork, so report problems here rather than there.
 
 ## Downloads
 
-Every run of the [HyperHLE CI workflow](../../.github/workflows/HyperHLE_release.yml)
-uploads an `HyperHLE_iOS_AArch64` artifact containing
-`HyperHLE_iOS_unsigned_IPAs.zip`, and releases attach the same zip. It holds:
+Every run of the [HyperHLE CI workflow](https://github.com/KlugKlugTG/HyperHLE-Fork/actions/workflows/HyperHLE_release.yml)
+uploads the three IPAs below as separate artifacts, and
+[releases](https://github.com/KlugKlugTG/HyperHLE-Fork/releases) attach them
+too:
 
 | Your iOS | IPA | How JIT gets enabled |
 | --- | --- | --- |
@@ -23,7 +24,9 @@ uploads an `HyperHLE_iOS_AArch64` artifact containing
 | 15.0–17.0, TrollStore, **A11 or older** | `HyperHLE-iOS-trollstore-permanent-jit.ipa` | Already on, and stays on |
 | 17.0.1–17.3 | — | Only AltJIT with a computer attached |
 
-Each IPA has a matching `.sha256` file.
+The app's version follows the repository's release tags: a release build
+carries that release's version (e.g. `1.1.0`), and other builds carry the latest
+tag's. The build number is the commit count.
 
 - The plain IPA is fully unsigned. Your install tool signs it with your own
   Apple account.

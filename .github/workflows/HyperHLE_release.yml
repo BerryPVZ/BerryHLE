@@ -294,14 +294,26 @@ jobs:
   build-ios:
     # The iOS app (platform/ios) and its packaging come from Applesauce
     # (https://github.com/johnny901901901/Applesauce). This builds the three
-    # unsigned/fakesigned IPAs it ships and uploads them together as one zip.
+    # unsigned/fakesigned IPAs it ships and uploads each one on its own.
+    #
+    # It waits for check-hyperhle-release only to learn the version a release
+    # build will be tagged with; that job is skipped outside trunk pushes and
+    # manual runs, and the iOS build runs regardless.
+    needs: [check-hyperhle-release]
+    if: ${{ !cancelled() }}
     runs-on: macos-latest
+    env:
+      HYPERHLE_VERSION: ${{ needs.check-hyperhle-release.outputs.should_release == 'true' && needs.check-hyperhle-release.outputs.version || '' }}
 
     steps:
       - name: Checkout touchHLE
         uses: actions/checkout@main
         with:
           submodules: recursive
+          # Full history and tags: the app version comes from the latest
+          # release tag and the build number from the commit count.
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Select the newest installed Xcode
         run: |
@@ -364,21 +376,21 @@ jobs:
           sh platform/ios/scripts/verify-ipa.sh --trollstore dist/HyperHLE-iOS-trollstore.ipa
           sh platform/ios/scripts/verify-ipa.sh --trollstore-permanent-jit dist/HyperHLE-iOS-trollstore-permanent-jit.ipa
 
-      - name: Zip the IPAs
-        run: |
-          set -eu
-          cd dist
-          zip -q ../HyperHLE_iOS_unsigned_IPAs.zip \
-            HyperHLE-iOS-unsigned.ipa HyperHLE-iOS-unsigned.ipa.sha256 \
-            HyperHLE-iOS-trollstore.ipa HyperHLE-iOS-trollstore.ipa.sha256 \
-            HyperHLE-iOS-trollstore-permanent-jit.ipa HyperHLE-iOS-trollstore-permanent-jit.ipa.sha256
-          cd ..
-          unzip -l HyperHLE_iOS_unsigned_IPAs.zip
+      # Each IPA is uploaded as-is rather than wrapped in a zip.
+      - uses: actions/upload-artifact@main
+        with:
+          path: dist/HyperHLE-iOS-unsigned.ipa
+          archive: false
 
       - uses: actions/upload-artifact@main
         with:
-          name: HyperHLE_iOS_AArch64
-          path: HyperHLE_iOS_unsigned_IPAs.zip
+          path: dist/HyperHLE-iOS-trollstore.ipa
+          archive: false
+
+      - uses: actions/upload-artifact@main
+        with:
+          path: dist/HyperHLE-iOS-trollstore-permanent-jit.ipa
+          archive: false
 
   build-win:
     runs-on: windows-2022  
@@ -486,11 +498,12 @@ jobs:
         with:
           name: HyperHLE_Linux_x86_64
           path: artifacts/linux
-      - name: Download iOS artifact
+      - name: Download iOS artifacts
         uses: actions/download-artifact@main
         with:
-          name: HyperHLE_iOS_AArch64
+          pattern: HyperHLE-iOS-*.ipa
           path: artifacts/ios
+          merge-multiple: true
       - name: Install packaging tools
         run: sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pandoc zip
       - name: Package HyperHLE release files
@@ -509,4 +522,5 @@ jobs:
           body_path: release/RELEASE_NOTES.md
           files: |
             release/HyperHLE_*.zip
+            release/HyperHLE-iOS-*.ipa
           fail_on_unmatched_files: true

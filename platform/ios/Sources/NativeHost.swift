@@ -1448,7 +1448,7 @@ private struct AboutView: View {
                 Section("About") {
                     Text("HyperHLE plays older 32-bit iPhone games on modern devices, without including any Apple software. It is an experimental community project, and no games are included.")
 
-                    Link(destination: URL(string: "https://github.com/goodvids56/Hypertelye")!) {
+                    Link(destination: URL(string: "https://github.com/KlugKlugTG/HyperHLE-Fork")!) {
                         Label("HyperHLE-Fork on GitHub", systemImage: "chevron.left.forwardslash.chevron.right")
                     }
                 }

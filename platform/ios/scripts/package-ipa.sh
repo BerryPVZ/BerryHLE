@@ -132,10 +132,3 @@ if [ -n "$ENTITLEMENTS" ]; then
 else
     echo "Created unsigned IPA: $OUTPUT"
 fi
-CHECKSUM="$OUTPUT.sha256"
-(
-    cd "$(dirname -- "$OUTPUT")"
-    shasum -a 256 "$(basename -- "$OUTPUT")" >"$(basename -- "$CHECKSUM")"
-)
-cat "$CHECKSUM"
-echo "Created checksum: $CHECKSUM"
