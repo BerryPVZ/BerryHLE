@@ -19,7 +19,7 @@ The repository does not distribute commercial apps or iOS firmware. Put an app b
 The titles below have been tested with HyperHLE-Fork and are known to run. Compatibility may still vary with the app version, virtual device profile, host GPU/driver, and settings; this list does not guarantee that every feature or a full playthrough works.
 
 - N.O.V.A. 3 (Playable)
-- Gangstar Vegas (Unplayable)
+- Gangstar Vegas (Unplayable on adreno)
 - Geometry Dash (2.11 and 1.0 + playable)
 - Terraria (1.0 + playable)
 - Modern Combat 3 (1.5.0 + playable)
