@@ -83,7 +83,7 @@ if [ -z "$CHANGELOG_FROM" ]; then
     # The newest release tag older than VERSION (versions roll over at 12, see
     # hyperhle-should-release.sh, so it can't simply be computed).
     CHANGELOG_FROM="$(
-        { git tag -l 'v[0-9]*.[0-9]*.[0-9]*'; echo "$VERSION"; } |
+        { git tag -l 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$'; echo "$VERSION"; } |
             sort -u -V | grep -x -B 1 -F "$VERSION" | grep -v -x -F "$VERSION" || true
     )"
     if [ -z "$CHANGELOG_FROM" ]; then
@@ -150,7 +150,7 @@ write_changelog() {
 {
     printf '%s\n\n' "HyperHLE ${VERSION}"
     if [ "${FORCE_HYPERHLE_RELEASE:-}" = "true" ]; then
-        printf '%s\n\n' "_Manual release — changelog shows the latest 5 commits._"
+        printf '%s\n\n' "_Manual release — changelog shows the latest 6 commits._"
     fi
     printf '%s\n\n' "## Changelog"
     if [ -n "$CHANGELOG_LIMIT" ]; then

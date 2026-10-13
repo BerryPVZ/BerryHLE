@@ -18,7 +18,11 @@ env:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Runs on trunk queue instead of cancelling each other: a cancelled run never
+  # publishes its release, so frequent pushes could otherwise hold releases
+  # back indefinitely. Queued runs start after the previous one finishes and
+  # so see any tag it published.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/trunk' }}
 
 jobs:
   build-osx:
@@ -498,12 +502,23 @@ jobs:
         with:
           name: HyperHLE_Linux_x86_64
           path: artifacts/linux
-      - name: Download iOS artifacts
+      # Unzipped artifacts (upload-artifact archive: false) are documented to
+      # download by their exact file name, so fetch each IPA by name.
+      - name: Download iOS unsigned IPA
         uses: actions/download-artifact@main
         with:
-          pattern: HyperHLE-iOS-*.ipa
+          name: HyperHLE-iOS-unsigned.ipa
           path: artifacts/ios
-          merge-multiple: true
+      - name: Download iOS TrollStore IPA
+        uses: actions/download-artifact@main
+        with:
+          name: HyperHLE-iOS-trollstore.ipa
+          path: artifacts/ios
+      - name: Download iOS TrollStore permanent-JIT IPA
+        uses: actions/download-artifact@main
+        with:
+          name: HyperHLE-iOS-trollstore-permanent-jit.ipa
+          path: artifacts/ios
       - name: Install packaging tools
         run: sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pandoc zip
       - name: Package HyperHLE release files
@@ -520,6 +535,8 @@ jobs:
         uses: softprops/action-gh-release@master
         with:
           tag_name: ${{ needs.check-hyperhle-release.outputs.version }}
+          # Tag the commit that was built, not whatever trunk points at by now.
+          target_commitish: ${{ github.sha }}
           name: HyperHLE ${{ needs.check-hyperhle-release.outputs.version }}
           body_path: release/RELEASE_NOTES.md
           files: |

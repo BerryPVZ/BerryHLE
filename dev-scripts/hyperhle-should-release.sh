@@ -16,7 +16,10 @@ RELEASE_EVERY=6
 VERSION_PART_MAX=12
 WORKFLOW_MARKER="dev-scripts/hyperhle-should-release.sh"
 
-latest_tag="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1 || true)"
+# Only plain vMAJOR.MINOR.PATCH tags count; anything else (V1, v1.2.3-beta,
+# hyperhle-test-fix-…) would break the arithmetic below.
+latest_tag="$(git tag -l 'v[0-9]*' --sort=-v:refname |
+    grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)"
 
 if [ -n "$latest_tag" ]; then
     commits_since="$(git rev-list --count "${latest_tag}..HEAD")"
@@ -62,9 +65,9 @@ fi
 
 if [ "$should_release" = true ]; then
     if [ "${FORCE_HYPERHLE_RELEASE:-}" = "true" ]; then
-        # Manual release: publish script uses git log -n 5 (see changelog_limit).
+        # Manual release: publish script uses git log -n 6 (see changelog_limit).
         changelog_from=""
-        changelog_limit=5
+        changelog_limit=6
     elif [ -n "$latest_tag" ]; then
         changelog_from="$latest_tag"
     elif [ -n "${baseline:-}" ]; then
