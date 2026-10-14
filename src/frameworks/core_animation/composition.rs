@@ -96,15 +96,10 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     let fullscreen_eagl_layer = find_fullscreen_eagl_layer(env);
     if fullscreen_eagl_layer != nil {
         let has_presented = {
-            let host_obj = env
-                .objc
-                .borrow::<CALayerHostObject>(fullscreen_eagl_layer);
+            let host_obj = env.objc.borrow::<CALayerHostObject>(fullscreen_eagl_layer);
             host_obj.presented_pixels.is_some() || host_obj.presented_directly
         };
-        if has_presented
-            && !force
-            && !crate::frameworks::media_player::has_active_video(env)
-        {
+        if has_presented && !force && !crate::frameworks::media_player::has_active_video(env) {
             // EAGLContext normally presents the fullscreen drawable directly.
             // Native ES1 readback and movie overlays are the exceptions that
             // need the Core Animation compositor.
