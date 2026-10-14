@@ -42,3 +42,8 @@ touchHLE_apps/
 target/
 *.ipa
 touchHLE_pvrtc_cache/
+
+# iOS build (platform/ios)
+/dist
+xcuserdata/
+*.xcuserstate

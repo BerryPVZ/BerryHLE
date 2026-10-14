@@ -36,6 +36,14 @@ struct EaglPresentOptions {
     trace_gl_errors: bool,
     present_mode: PresentMode,
     present_finish: bool,
+    /// The framebuffer that draws to the window. This is 0 everywhere except
+    /// iOS, where SDL2 renders the window through a framebuffer object of its
+    /// own (see `EAGLContextHostObject::drawable_framebuffer`).
+    window_framebuffer: GLuint,
+    /// Present without the device-rotation matrix. Only used by the iOS ES 2.0
+    /// direct presenter (see `--ios-es2-direct-present`), whose frames are
+    /// already in display orientation.
+    skip_rotation: bool,
 }
 
 // These are used by the EAGLDrawable protocol implemented by CAEAGLayer.
@@ -305,6 +313,11 @@ pub(super) struct EAGLContextHostObject {
     /// [super::gles_guest] dispatches calls and how the present-renderbuffer
     /// path saves and restores state.
     pub(super) api: EAGLRenderingAPI,
+    /// The framebuffer that was bound when this context was created. On iOS,
+    /// SDL2 draws the window through a framebuffer object of its own rather
+    /// than framebuffer 0, so presenting has to target this one. Always 0 on
+    /// other platforms.
+    drawable_framebuffer: GLuint,
     /// Mapping of OpenGL ES renderbuffer names to `EAGLDrawable` instances
     /// (always `CAEAGLLayer*`). Retains the instance so it won't dangle.
     renderbuffer_drawable_bindings: Rc<RefCell<HashMap<GLuint, id>>>,
@@ -357,6 +370,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         gles_ctx: None,
         shadow: GLShadowState::default(),
         api: kEAGLRenderingAPIOpenGLES1,
+        drawable_framebuffer: 0,
         renderbuffer_drawable_bindings: Rc::new(RefCell::new(HashMap::new())),
         fps_counter: None,
         next_frame_due: None,
@@ -429,14 +443,24 @@ pub const CLASSES: ClassExports = objc_classes! {
     };
 
     let window = env.window.as_mut().expect("OpenGL ES is not supported in headless mode");
-    {
-        let gles_ctx = gles_ins.make_current(window);
+    let drawable_framebuffer = {
+        #[allow(unused_mut)]
+        let mut gles_ctx = gles_ins.make_current(window);
         log!("Driver info: {}", unsafe { gles_ctx.driver_description() });
         log_fix_min_filter_status(env.options.fix_texture_min_filter);
-    }
+        #[allow(unused_mut)]
+        let mut framebuffer: GLint = 0;
+        #[cfg(target_os = "ios")]
+        unsafe {
+            gles_ctx.GetIntegerv(gles11::FRAMEBUFFER_BINDING_OES, &mut framebuffer);
+        }
+        framebuffer as GLuint
+    };
 
-    env.objc.borrow_mut::<EAGLContextHostObject>(this).gles_ctx = Some(gles_ins);
-    env.objc.borrow_mut::<EAGLContextHostObject>(this).api = effective_api;
+    let host_object = env.objc.borrow_mut::<EAGLContextHostObject>(this);
+    host_object.gles_ctx = Some(gles_ins);
+    host_object.api = effective_api;
+    host_object.drawable_framebuffer = drawable_framebuffer;
 
     env.window.as_mut().unwrap().set_share_with_current_context(false);
 
@@ -469,14 +493,24 @@ pub const CLASSES: ClassExports = objc_classes! {
     };
 
     let window = env.window.as_mut().expect("OpenGL ES is not supported in headless mode");
-    {
-        let gles_ctx = gles_ins.make_current(window);
+    let drawable_framebuffer = {
+        #[allow(unused_mut)]
+        let mut gles_ctx = gles_ins.make_current(window);
         log!("Driver info: {}", unsafe { gles_ctx.driver_description() });
         log_fix_min_filter_status(env.options.fix_texture_min_filter);
-    }
+        #[allow(unused_mut)]
+        let mut framebuffer: GLint = 0;
+        #[cfg(target_os = "ios")]
+        unsafe {
+            gles_ctx.GetIntegerv(gles11::FRAMEBUFFER_BINDING_OES, &mut framebuffer);
+        }
+        framebuffer as GLuint
+    };
 
-    env.objc.borrow_mut::<EAGLContextHostObject>(this).gles_ctx = Some(gles_ins);
-    env.objc.borrow_mut::<EAGLContextHostObject>(this).api = effective_api;
+    let host_object = env.objc.borrow_mut::<EAGLContextHostObject>(this);
+    host_object.gles_ctx = Some(gles_ins);
+    host_object.api = effective_api;
+    host_object.drawable_framebuffer = drawable_framebuffer;
 
     this
 }
@@ -918,13 +952,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     // delayed, so this needs to be checked before returning.
     let frame_due = limit_framerate(&mut env.objc.borrow_mut::<EAGLContextHostObject>(this).next_frame_due, &env.options, env.guest_clock.speed().multiplier());
 
-    if env.options.print_fps {
+    // The iOS host always counts frames so it can show its own FPS overlay.
+    if env.options.print_fps || cfg!(target_os = "ios") {
         env
             .objc
             .borrow_mut::<EAGLContextHostObject>(this)
             .fps_counter
             .get_or_insert_with(FpsCounter::start)
-            .count_frame(format_args!("EAGLContext {this:?}"));
+            .count_frame(format_args!("EAGLContext {this:?}"), env.options.print_fps);
     }
 
     let mut fullscreen_layer = find_fullscreen_eagl_layer(env);
@@ -1035,7 +1070,18 @@ pub const CLASSES: ClassExports = objc_classes! {
     // old code treated "this isn't the one layer I found" as "skip the frame",
     // which left the window black. Presenting the drawable the game just
     // rendered is the correct, visible choice.
-    if drawable == fullscreen_layer || fullscreen_layer != nil {
+    // On iOS, `--ios-es2-direct-present` (enabled per app in the default
+    // options file) presents an OpenGL ES 2.0 drawable directly even when it is
+    // not the fullscreen layer. The Sims Medieval needs this to show anything.
+    let use_ios_es2_direct_path = cfg!(target_os = "ios")
+        && env.options.ios_es2_direct_present
+        && fullscreen_layer == nil
+        && env.objc.borrow::<EAGLContextHostObject>(this).api == kEAGLRenderingAPIOpenGLES2;
+    if use_ios_es2_direct_path {
+        log_once!("Using the iOS ES2 direct presenter for a non-fullscreen CAEAGLLayer.");
+    }
+
+    if drawable == fullscreen_layer || fullscreen_layer != nil || use_ios_es2_direct_path {
         // Decide between presenting on the GPU (copy the renderbuffer into a
         // texture and draw it into the window — cheap) and reading the frame
         // back to RAM and pushing it through the compositor (a full pipeline
@@ -1117,6 +1163,11 @@ pub const CLASSES: ClassExports = objc_classes! {
                 trace_gl_errors: env.options.trace_gl_errors,
                 present_mode: env.options.present_mode,
                 present_finish: env.options.present_finish,
+                window_framebuffer: env
+                    .objc
+                    .borrow::<EAGLContextHostObject>(this)
+                    .drawable_framebuffer,
+                skip_rotation: use_ios_es2_direct_path,
             };
             unsafe {
                 present_renderbuffer(env, renderbuffer, drawable, options, this.to_bits() as usize);
@@ -1604,6 +1655,7 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, renderbuffer: GLuint, mut pixel
 unsafe fn present_renderbuffer_es2(
     gles: &mut dyn GLES,
     renderbuffer: GLuint,
+    window_framebuffer: GLuint,
     viewport: (u32, u32, u32, u32),
     rotation_matrix: crate::matrix::Matrix<2>,
     virtual_cursor_visible_at: Option<(f32, f32, bool)>,
@@ -1770,7 +1822,7 @@ unsafe fn present_renderbuffer_es2(
     gles.ActiveTexture(gles2::TEXTURE0);
     gles.BindTexture(gles2::TEXTURE_2D, present_objects.texture);
     gles.BindBuffer(gles2::ARRAY_BUFFER, present_objects.quad_vbo);
-    gles.BindFramebuffer(gles2::FRAMEBUFFER, 0);
+    gles.BindFramebuffer(gles2::FRAMEBUFFER, window_framebuffer);
 
     // Configure the destination viewport (the window) and clear.
     gles.Viewport(
@@ -2497,6 +2549,14 @@ unsafe fn present_renderbuffer(
         Some("270") => crate::matrix::Matrix::z_rotation(-std::f32::consts::FRAC_PI_2),
         _ => rotation_matrix,
     };
+    // The iOS ES 2.0 direct presenter bypasses Core Animation, which is where
+    // the rotation would otherwise have been applied, and the guest has already
+    // drawn in display orientation, so rotating again would turn it sideways.
+    let rotation_matrix = if options.skip_rotation && rotate_override.is_none() {
+        crate::matrix::Matrix::<2>::identity()
+    } else {
+        rotation_matrix
+    };
     let virtual_cursor_visible_at = env.window.as_mut().unwrap().virtual_cursor_visible_at();
 
     if crate::env_flag_cached!("TOUCHHLE_TRACE_PRESENT") {
@@ -2617,6 +2677,7 @@ unsafe fn present_renderbuffer(
         present_renderbuffer_es2(
             gles,
             renderbuffer,
+            options.window_framebuffer,
             viewport,
             rotation_matrix,
             virtual_cursor_visible_at,
@@ -3117,6 +3178,11 @@ unsafe fn present_renderbuffer(
         gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, 0);
     } else {
         gles.DeleteFramebuffersOES(1, &src_framebuffer);
+    }
+    // On iOS the window is not framebuffer 0 (see
+    // `EaglPresentOptions::window_framebuffer`).
+    if options.window_framebuffer != 0 {
+        gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, options.window_framebuffer);
     }
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

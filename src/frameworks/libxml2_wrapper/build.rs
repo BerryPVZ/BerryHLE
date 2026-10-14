@@ -65,6 +65,7 @@ fn main() {
         build.define("LIBXML2_WITH_PYTHON", "OFF");
         build.define("LIBXML2_WITH_MODULES", "OFF");
         build.define("LIBXML2_WITH_LEGACY", "ON");
+        build.define("CMAKE_INSTALL_SYSCONFDIR", "/etc");
 
         // Optional third-party dependencies — turn them off so the build is
         // hermetic and produces no link-time references to iconv/icu/zlib/lzma.

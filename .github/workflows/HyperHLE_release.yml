@@ -18,7 +18,11 @@ env:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Runs on trunk queue instead of cancelling each other: a cancelled run never
+  # publishes its release, so frequent pushes could otherwise hold releases
+  # back indefinitely. Queued runs start after the previous one finishes and
+  # so see any tag it published.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/trunk' }}
 
 jobs:
   build-osx:
@@ -291,6 +295,107 @@ jobs:
         name: HyperHLE_Android_AArch64  
         path: HyperHLE-Fork.apk
 
+  build-ios:
+    # The iOS app (platform/ios) and its packaging come from Applesauce
+    # (https://github.com/johnny901901901/Applesauce). This builds the three
+    # unsigned/fakesigned IPAs it ships and uploads each one on its own.
+    #
+    # It waits for check-hyperhle-release only to learn the version a release
+    # build will be tagged with; that job is skipped outside trunk pushes and
+    # manual runs, and the iOS build runs regardless.
+    needs: [check-hyperhle-release]
+    if: ${{ !cancelled() }}
+    runs-on: macos-latest
+    env:
+      HYPERHLE_VERSION: ${{ needs.check-hyperhle-release.outputs.should_release == 'true' && needs.check-hyperhle-release.outputs.version || '' }}
+
+    steps:
+      - name: Checkout touchHLE
+        uses: actions/checkout@main
+        with:
+          submodules: recursive
+          # Full history and tags: the app version comes from the latest
+          # release tag and the build number from the commit count.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Select the newest installed Xcode
+        run: |
+          set -eu
+          xcode=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -n 1 || true)
+          if [ -n "$xcode" ]; then
+            sudo xcode-select -s "$xcode/Contents/Developer"
+          fi
+          echo "DEVELOPER_DIR=$(xcode-select -p)" >> "$GITHUB_ENV"
+          xcodebuild -version
+
+      - name: Install build tools
+        run: brew install ninja ldid
+
+      - name: Install AArch64 iOS Rust toolchain
+        run: rustup target add aarch64-apple-ios
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@master
+        with:
+          workspaces: ". -> build/rust-ios-native"
+
+      - name: Try to get cached copy of Boost
+        id: cache-boost
+        uses: actions/cache@main
+        with:
+          path: vendor/boost
+          key: boost_1_81_0_macos
+
+      - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+        name: Download Boost
+        run: curl -L -O "https://archives.boost.io/release/1.81.0/source/boost_1_81_0.tar.gz"
+
+      - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+        name: Extract Boost
+        run: mkdir -p vendor && tar xzf boost_1_81_0.tar.gz -C vendor && mv vendor/boost_1_81_0 vendor/boost
+
+      - name: Setup CMake
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: "~3.29.0"
+
+      - name: Build shared SDL2 for iOS
+        run: sh platform/ios/scripts/build-sdl-shared.sh iphoneos
+
+      - name: Build the iOS app
+        run: sh platform/ios/scripts/build-host.sh iphoneos Release
+
+      - name: Package the IPAs
+        run: |
+          set -eu
+          sh platform/ios/scripts/package-ipa.sh
+          sh platform/ios/scripts/package-ipa.sh --trollstore
+          sh platform/ios/scripts/package-ipa.sh --trollstore-permanent-jit
+
+      - name: Verify the IPAs
+        run: |
+          set -eu
+          sh platform/ios/scripts/verify-ipa.sh dist/HyperHLE-iOS-unsigned.ipa
+          sh platform/ios/scripts/verify-ipa.sh --trollstore dist/HyperHLE-iOS-trollstore.ipa
+          sh platform/ios/scripts/verify-ipa.sh --trollstore-permanent-jit dist/HyperHLE-iOS-trollstore-permanent-jit.ipa
+
+      # Each IPA is uploaded as-is rather than wrapped in a zip.
+      - uses: actions/upload-artifact@main
+        with:
+          path: dist/HyperHLE-iOS-unsigned.ipa
+          archive: false
+
+      - uses: actions/upload-artifact@main
+        with:
+          path: dist/HyperHLE-iOS-trollstore.ipa
+          archive: false
+
+      - uses: actions/upload-artifact@main
+        with:
+          path: dist/HyperHLE-iOS-trollstore-permanent-jit.ipa
+          archive: false
+
   build-win:
     runs-on: windows-2022  
 
@@ -358,14 +463,15 @@ jobs:
         run: ./dev-scripts/hyperhle-should-release.sh
 
   publish-hyperhle-release:
-    needs: [check-hyperhle-release, build-osx, build-linux, build-android, build-win]
+    needs: [check-hyperhle-release, build-osx, build-linux, build-android, build-win, build-ios]
     if: >-
       needs.check-hyperhle-release.result == 'success' &&
       needs.check-hyperhle-release.outputs.should_release == 'true' &&
       needs.build-osx.result == 'success' &&
       needs.build-linux.result == 'success' &&
       needs.build-android.result == 'success' &&
-      needs.build-win.result == 'success'
+      needs.build-win.result == 'success' &&
+      needs.build-ios.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -396,10 +502,29 @@ jobs:
         with:
           name: HyperHLE_Linux_x86_64
           path: artifacts/linux
+      # Unzipped artifacts (upload-artifact archive: false) are documented to
+      # download by their exact file name, so fetch each IPA by name.
+      - name: Download iOS unsigned IPA
+        uses: actions/download-artifact@main
+        with:
+          name: HyperHLE-iOS-unsigned.ipa
+          path: artifacts/ios
+      - name: Download iOS TrollStore IPA
+        uses: actions/download-artifact@main
+        with:
+          name: HyperHLE-iOS-trollstore.ipa
+          path: artifacts/ios
+      - name: Download iOS TrollStore permanent-JIT IPA
+        uses: actions/download-artifact@main
+        with:
+          name: HyperHLE-iOS-trollstore-permanent-jit.ipa
+          path: artifacts/ios
       - name: Install packaging tools
         run: sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pandoc zip
       - name: Package HyperHLE release files
         env:
+          # Lets the changelog look up each commit author's GitHub username.
+          GH_TOKEN: ${{ github.token }}
           GITHUB_SERVER_URL: ${{ github.server_url }}
           FORCE_HYPERHLE_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_hyperhle_release && 'true' || '' }}
           VERSION: ${{ needs.check-hyperhle-release.outputs.version }}
@@ -410,8 +535,11 @@ jobs:
         uses: softprops/action-gh-release@master
         with:
           tag_name: ${{ needs.check-hyperhle-release.outputs.version }}
+          # Tag the commit that was built, not whatever trunk points at by now.
+          target_commitish: ${{ github.sha }}
           name: HyperHLE ${{ needs.check-hyperhle-release.outputs.version }}
           body_path: release/RELEASE_NOTES.md
           files: |
             release/HyperHLE_*.zip
+            release/HyperHLE-iOS-*.ipa
           fail_on_unmatched_files: true

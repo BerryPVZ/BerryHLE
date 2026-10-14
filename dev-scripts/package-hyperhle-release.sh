@@ -71,51 +71,92 @@ if [ -z "$linux_bin" ]; then
     echo "Missing build artifact (all platform builds must succeed): artifacts/linux/touchHLE" >&2
     exit 1
 fi
+ios_ipas="HyperHLE-iOS-unsigned.ipa HyperHLE-iOS-trollstore.ipa HyperHLE-iOS-trollstore-permanent-jit.ipa"
+for ipa in $ios_ipas; do
+    if [ ! -f "artifacts/ios/$ipa" ]; then
+        echo "Missing build artifact (all platform builds must succeed): artifacts/ios/$ipa" >&2
+        exit 1
+    fi
+done
 
 if [ -z "$CHANGELOG_FROM" ]; then
-    patch="${VERSION#v1.0.}"
-    if [ "$patch" = "0" ]; then
+    # The newest release tag older than VERSION (versions roll over at 12, see
+    # hyperhle-should-release.sh, so it can't simply be computed).
+    CHANGELOG_FROM="$(
+        { git tag -l 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$'; echo "$VERSION"; } |
+            sort -u -V | grep -x -B 1 -F "$VERSION" | grep -v -x -F "$VERSION" || true
+    )"
+    if [ -z "$CHANGELOG_FROM" ]; then
         CHANGELOG_FROM="$(git rev-list -n 1 HEAD -- dev-scripts/hyperhle-should-release.sh)"
-    else
-        CHANGELOG_FROM="v1.0.$((patch - 1))"
     fi
 fi
 
 rm -rf release
 mkdir -p release
 
+# GitHub username for a commit's author, as "@login", for the changelog.
+# Asks the GitHub API (works in the release job, where GH_TOKEN is set), then
+# falls back to the login inside a GitHub no-reply email, then to the git
+# author name.
+author_mention() {
+    hash="$1"
+    email="$2"
+    name="$3"
+    login=""
+    if [ -n "${GH_TOKEN:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ] &&
+        command -v gh >/dev/null 2>&1; then
+        # On failure gh prints the error body to stdout, so only keep the
+        # output of a successful call, and only if it looks like a login.
+        if api_login="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${hash}" \
+            --jq '.author.login // empty' </dev/null 2>/dev/null)"; then
+            login="$api_login"
+        fi
+    fi
+    case "$login" in
+        *[!A-Za-z0-9[\]-]*) login="" ;;
+    esac
+    if [ -z "$login" ]; then
+        case "$email" in
+            *@users.noreply.github.com)
+                login="${email%@users.noreply.github.com}"
+                login="${login#*+}"
+                ;;
+        esac
+    fi
+    if [ -n "$login" ]; then
+        printf '@%s' "$login"
+    else
+        printf '%s' "$name"
+    fi
+}
+
+# Changelog lines look like: - `abc1234` **@user**: Commit message
+write_changelog() {
+    git log "$@" --reverse --format='%H%x1f%s%x1f%an%x1f%ae' |
+        while IFS="$(printf '\037')" read -r hash subject author email; do
+            [ -z "$hash" ] && continue
+            short_hash="$(printf '%.7s' "$hash")"
+            mention="$(author_mention "$hash" "$email" "$author")"
+            if [ -n "${GITHUB_SERVER_URL:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
+                printf -- '- [`%s`](%s/%s/commit/%s) **%s**: %s\n' \
+                    "$short_hash" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$hash" \
+                    "$mention" "$subject"
+            else
+                printf -- '- `%s` **%s**: %s\n' "$short_hash" "$mention" "$subject"
+            fi
+        done
+}
+
 {
     printf '%s\n\n' "HyperHLE ${VERSION}"
     if [ "${FORCE_HYPERHLE_RELEASE:-}" = "true" ]; then
-        printf '%s\n\n' "_Manual release — changelog shows the latest 5 commits._"
+        printf '%s\n\n' "_Manual release — changelog shows the latest 6 commits._"
     fi
     printf '%s\n\n' "## Changelog"
     if [ -n "$CHANGELOG_LIMIT" ]; then
-        git log -n "$CHANGELOG_LIMIT" HEAD --reverse --format='%H%x1f%s%x1f%an' |
-            while IFS="$(printf '\037')" read -r hash subject author; do
-                [ -z "$hash" ] && continue
-                short_hash="$(printf '%.7s' "$hash")"
-                if [ -n "${GITHUB_SERVER_URL:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
-                    printf -- '- [`%s`](%s/%s/commit/%s) %s (%s)\n' \
-                        "$short_hash" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$hash" \
-                        "$subject" "$author"
-                else
-                    printf -- '- `%s` %s (%s)\n' "$short_hash" "$subject" "$author"
-                fi
-            done
+        write_changelog -n "$CHANGELOG_LIMIT" HEAD
     elif [ -n "$CHANGELOG_FROM" ]; then
-        git log "${CHANGELOG_FROM}..HEAD" --reverse --format='%H%x1f%s%x1f%an' |
-            while IFS="$(printf '\037')" read -r hash subject author; do
-                [ -z "$hash" ] && continue
-                short_hash="$(printf '%.7s' "$hash")"
-                if [ -n "${GITHUB_SERVER_URL:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
-                    printf -- '- [`%s`](%s/%s/commit/%s) %s (%s)\n' \
-                        "$short_hash" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$hash" \
-                        "$subject" "$author"
-                else
-                    printf -- '- `%s` %s (%s)\n' "$short_hash" "$subject" "$author"
-                fi
-            done
+        write_changelog "${CHANGELOG_FROM}..HEAD"
     else
         printf '%s\n' "_No commit range available._"
     fi
@@ -136,3 +177,7 @@ prefix="HyperHLE"
 ./prepare-release.sh --create-zip-linux \
     "$ROOT/$linux_bin" \
     -o "$ROOT/release/${prefix}_Linux_x86_64.zip"
+# The iOS IPAs are attached as they are (see build-ios in HyperHLE_release.yml).
+for ipa in $ios_ipas; do
+    cp "$ROOT/artifacts/ios/$ipa" "$ROOT/release/$ipa"
+done

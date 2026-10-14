@@ -122,13 +122,16 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         }
     }
 
-    if env.options.print_fps {
+    if env.options.print_fps || cfg!(target_os = "ios") {
         env.framework_state
             .core_animation
             .composition
             .fps_counter
             .get_or_insert_with(FpsCounter::start)
-            .count_frame(format_args!("Core Animation compositor"));
+            .count_frame(
+                format_args!("Core Animation compositor"),
+                env.options.print_fps,
+            );
     }
 
     let now = Instant::now();
@@ -202,6 +205,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         env.window().rotation_matrix(),
         env.window().virtual_cursor_visible_at(),
     );
+    let host_framebuffer = env.window().host_framebuffer();
 
     // TODO: draw status bar if it's not hidden
 
@@ -237,6 +241,32 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         );
         let _ = gles.GetError();
     }
+
+    // On iOS, SDL2 draws into a framebuffer object of its own rather than 0,
+    // and it recreates that object whenever the window leaves and re-enters
+    // fullscreen — which is exactly what rotating the device does (see
+    // `Window::rotate_device`). The value cached at window creation can
+    // therefore be stale by now, and compositing into a stale framebuffer
+    // produces a black screen. Ask for the current one while it is still bound,
+    // before the render-to-texture setup below replaces the binding.
+    let host_framebuffer = if cfg!(target_os = "ios") {
+        let mut current = 0;
+        unsafe {
+            gles.GetIntegerv(gles11::FRAMEBUFFER_BINDING_OES, &mut current);
+        }
+        let current = current as u32;
+        if current != host_framebuffer {
+            log!(
+                "Note: the host framebuffer changed since window creation ({} -> {}); \
+                 compositing into the current one.",
+                host_framebuffer,
+                current
+            );
+        }
+        current
+    } else {
+        host_framebuffer
+    };
 
     // Set up GL objects needed for render-to-texture. We could draw directly
     // to the screen instead, but this way we can reuse the code for scaling and
@@ -569,10 +599,10 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     }
 
     // Present our rendered frame (bound to TEXTURE_2D). This copies it to the
-    // default framebuffer (0) so we need to unbind our internal framebuffer.
+    // host window framebuffer, so we need to unbind our internal framebuffer.
     unsafe {
         gles.BindTexture(gles11::TEXTURE_2D, texture);
-        gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, 0);
+        gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, host_framebuffer);
         present_frame(
             gles.as_mut(),
             present_frame_args.0,
