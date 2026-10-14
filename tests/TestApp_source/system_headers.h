@@ -320,6 +320,26 @@ void CGContextSetRGBFillColor(CGContextRef c, CGFloat r, CGFloat g, CGFloat b,
                               CGFloat a);
 void CGContextFillRect(CGContextRef c, CGRect rect);
 
+typedef enum {
+  kCGBlendModeNormal,
+  kCGBlendModeMultiply,
+  kCGBlendModeScreen,
+  kCGBlendModeOverlay,
+  kCGBlendModeDarken,
+  kCGBlendModeLighten,
+  kCGBlendModeColorDodge,
+  kCGBlendModeColorBurn,
+  kCGBlendModeSoftLight,
+  kCGBlendModeHardLight,
+  kCGBlendModeDifference,
+  kCGBlendModeExclusion,
+  kCGBlendModeHue,
+  kCGBlendModeSaturation,
+  kCGBlendModeColor,
+  kCGBlendModeLuminosity,
+} CGBlendMode;
+void CGContextSetBlendMode(CGContextRef c, CGBlendMode mode);
+
 // `CGFont.h` and `CGContext.h` text functions.
 
 typedef struct _CGFont *CGFontRef;

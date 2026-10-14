@@ -727,6 +727,8 @@ impl Dyld {
     /// The dump format is Objective-C code (with meaningless types) that can be
     /// compiled to generate stub libraries that can be linked against, with
     /// comments providing the paths each library would be installed to.
+    /// Each library ends with an empty line, so that a library with no
+    /// exports is not mistaken for aliases of the next one.
     /// This is used for building the integration tests.
     pub fn dump_host_symbols(file: &mut std::fs::File) -> Result<(), std::io::Error> {
         use std::io::Write;
@@ -771,6 +773,7 @@ impl Dyld {
                     function_symbol.strip_prefix("_").unwrap()
                 )?;
             }
+            writeln!(file)?;
         }
         Ok(())
     }
