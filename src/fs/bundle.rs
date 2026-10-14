@@ -67,6 +67,22 @@ impl FsNodeBuilder {
     }
 }
 
+/// Returns the path of a zip entry.
+///
+/// Entries without the zip "UTF-8 filename" flag are supposed to be CP437,
+/// and that is how the `zip` crate decodes them. But many IPAs (zipped on
+/// macOS or by IPA tools) store UTF-8 names without setting the flag. Decoding
+/// those as CP437 garbles any non-ASCII name, e.g. an Arabic app bundle name,
+/// which then no longer matches the `CFBundleExecutable` in the Info.plist and
+/// the executable can't be found. Real CP437 names with non-ASCII characters
+/// are almost never valid UTF-8, so prefer UTF-8 whenever the bytes allow it.
+fn zip_entry_name(file: &zip::read::ZipFile) -> String {
+    match std::str::from_utf8(file.name_raw()) {
+        Ok(name) => name.to_string(),
+        Err(_) => file.name().to_string(),
+    }
+}
+
 /// Represents an open app bundle, either a directory or a zip file.
 pub enum BundleData {
     HostDirectory(PathBuf),
@@ -84,7 +100,7 @@ impl BundleData {
             // Some IPAs found in the wild contain entries whose local file
             // header is corrupt (even though the central directory is fine).
             // Skipping such entries is better than rejecting the whole IPA.
-            let path = match zip.by_index(i).map(|file| file.name().to_string()) {
+            let path = match zip.by_index(i).map(|file| zip_entry_name(&file)) {
                 Ok(path) => path,
                 Err(e) => {
                     log!(
@@ -170,7 +186,7 @@ impl BundleData {
                     // return an empty file and log a warning.
                     let (name, is_dir) = match archive_guard
                         .by_index(i)
-                        .map(|file| (file.name().to_string(), file.is_dir()))
+                        .map(|file| (zip_entry_name(&file), file.is_dir()))
                     {
                         Ok(name_and_dir) => name_and_dir,
                         Err(e) => {
@@ -212,8 +228,20 @@ impl BundleData {
                 })
             }
             BundleData::Zip { zip, bundle_path } => {
+                // Look the entry up by our own decoding of the names (see
+                // zip_entry_name()) rather than with ZipArchive::by_name(),
+                // which only knows the CP437-decoded names.
+                let plist_path = format!("{bundle_path}/Info.plist");
+                let index = (0..zip.len())
+                    .find(|&i| {
+                        zip.by_index_raw(i)
+                            .is_ok_and(|file| zip_entry_name(&file) == plist_path)
+                    })
+                    .ok_or_else(|| {
+                        "Could not open Info.plist from the IPA archive: file not found".to_string()
+                    })?;
                 let mut file = zip
-                    .by_name(&format!("{bundle_path}/Info.plist"))
+                    .by_index(index)
                     .map_err(|e| format!("Could not open Info.plist from the IPA archive: {e}"))?;
                 let mut buf = Vec::new();
                 file.read_to_end(&mut buf)
@@ -481,6 +509,60 @@ mod tests {
         };
         assert!(children.contains_key("Info.plist"));
         assert!(!children.contains_key("broken.bin"));
+    }
+
+    /// Many IPAs store UTF-8 entry names without setting the zip UTF-8 flag.
+    /// Those names must not be decoded as CP437, or a non-ASCII bundle name
+    /// (e.g. Arabic) stops matching the executable name from Info.plist.
+    #[test]
+    fn test_ipa_with_unflagged_utf8_names() {
+        let dir = std::env::temp_dir().join("touchHLE_test_unflagged_utf8_ipa");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ipa_path = dir.join("TestApp.ipa");
+
+        let app = "الابراج الفلكية";
+        let file = std::fs::File::create(&ipa_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file(format!("Payload/{app}.app/Info.plist"), options)
+            .unwrap();
+        zip.write_all(b"plist").unwrap();
+        zip.start_file(format!("Payload/{app}.app/{app}"), options)
+            .unwrap();
+        zip.write_all(b"exec").unwrap();
+        zip.finish().unwrap();
+
+        // The writer sets the UTF-8 flag (bit 11) for these names; clear it in
+        // every local file header and central directory header.
+        let mut bytes = std::fs::read(&ipa_path).unwrap();
+        for i in 0..bytes.len().saturating_sub(10) {
+            let flags_offset = match &bytes[i..i + 4] {
+                b"PK\x03\x04" => 6,
+                b"PK\x01\x02" => 8,
+                _ => continue,
+            };
+            bytes[i + flags_offset + 1] &= !0x08;
+        }
+        std::fs::write(&ipa_path, bytes).unwrap();
+        {
+            let mut zip = ZipArchive::new(std::fs::File::open(&ipa_path).unwrap()).unwrap();
+            // Sanity check: the zip crate itself now sees CP437 mojibake.
+            assert_ne!(
+                zip.by_index(0).unwrap().name(),
+                format!("Payload/{app}.app/Info.plist")
+            );
+        }
+
+        let mut bundle = BundleData::open_any(&ipa_path).unwrap();
+        assert_eq!(bundle.bundle_name(), app);
+        assert_eq!(bundle.read_plist().unwrap(), b"plist");
+        let node = bundle.into_fs_node();
+        let FsNode::Directory { children, .. } = &node else {
+            panic!("expected directory");
+        };
+        assert!(children.contains_key("Info.plist"));
+        assert!(children.contains_key(app));
     }
 
     /// A central-directory entry can be listed successfully but fail its CRC

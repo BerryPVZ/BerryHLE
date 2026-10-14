@@ -7,7 +7,8 @@
 
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
 use crate::frameworks::core_animation::ca_eagl_layer::{
-    find_fullscreen_eagl_layer, get_pixels_vec_for_presenting, present_pixels,
+    find_fullscreen_eagl_layer, get_pixels_vec_for_presenting, mark_presented_directly,
+    present_pixels,
 };
 use crate::frameworks::core_graphics::{CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::get_static_str;
@@ -1169,6 +1170,13 @@ pub const CLASSES: ClassExports = objc_classes! {
                     .drawable_framebuffer,
                 skip_rotation: use_ios_es2_direct_path,
             };
+            // Tell the Core Animation compositor this layer is live, so it
+            // takes its CAEAGLLayer fast path instead of compositing (and
+            // swapping) a frame with a black EAGL layer in between ours.
+            mark_presented_directly(env, drawable);
+            if fullscreen_layer != nil && fullscreen_layer != drawable {
+                mark_presented_directly(env, fullscreen_layer);
+            }
             unsafe {
                 present_renderbuffer(env, renderbuffer, drawable, options, this.to_bits() as usize);
             }
