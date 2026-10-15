@@ -960,15 +960,22 @@ impl Dyld {
                 mem.write(fn_ptr + 1, encode_a32_trap());
                 log_dbg!("Stubbed dyld_stub_binder at {:?}", fn_ptr);
                 fn_ptr.cast().cast_const()
-            } else if name == "__NSConcreteGlobalBlock" || name == "__NSConcreteStackBlock" {
-                // Blocks runtime class descriptor. Allocate a small dummy
-                // object in guest memory so isa != NULL. All sites for the
-                // same symbol share one address (cached above).
-                let addr = *block_class_addrs
-                    .entry(name.clone())
-                    .or_insert_with(|| mem.alloc(16).to_bits());
-                log_dbg!("Patched block class descriptor {} -> {:#x}", name, addr);
-                Ptr::from_bits(addr)
+            } else if name == "__NSConcreteGlobalBlock"
+                || name == "__NSConcreteStackBlock"
+                || name == "__NSConcreteMallocBlock"
+            {
+                // Blocks runtime class descriptor. Point the block `isa` at
+                // the real `_touchHLE_NSBlock` class (see ns_object.rs) so
+                // that `[block copy]` / `[block retain]` / `[block release]`
+                // route to the Blocks runtime instead of hitting a dummy
+                // class with no methods (which returned nil and left callback
+                // blocks, e.g. cocos2d v3 `CCTimer._block`, nil). All block
+                // symbols share this one class; `_Block_copy` uses the block's
+                // flags (not its isa) to distinguish stack/global/malloc.
+                let _ = &mut block_class_addrs;
+                objc.get_known_class("_touchHLE_NSBlock", mem)
+                    .cast()
+                    .cast_const()
             } else if name == "__ZTVN10__cxxabiv117__class_type_infoE"
                 || name == "__ZTVN10__cxxabiv120__si_class_type_infoE"
                 || name == "__ZTVN10__cxxabiv121__vmi_class_type_infoE"
@@ -1362,14 +1369,16 @@ impl Dyld {
             // Must be non-null so block->isa != NULL; otherwise the
             // first retain/release of any stack block causes a
             // NULL-page read at 0x0.
-            if symbol == "__NSConcreteStackBlock" || symbol == "__NSConcreteGlobalBlock" {
-                let dummy = mem.alloc(16);
-                mem.write(ptr_ptr, dummy.cast().cast_const());
-                log_dbg!(
-                    "Patched non-lazy block class {} -> {:#x}",
-                    symbol,
-                    dummy.to_bits()
-                );
+            if symbol == "__NSConcreteStackBlock"
+                || symbol == "__NSConcreteGlobalBlock"
+                || symbol == "__NSConcreteMallocBlock"
+            {
+                // Point the block `isa` at the real `_touchHLE_NSBlock` class
+                // so block copy/retain/release work (see ns_object.rs and the
+                // matching branch in the external-relocation loop above).
+                let cls = objc.get_known_class("_touchHLE_NSBlock", mem);
+                mem.write(ptr_ptr, cls.cast().cast_const());
+                log_dbg!("Patched non-lazy block class {} -> {:?}", symbol, cls);
                 continue;
             }
 

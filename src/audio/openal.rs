@@ -32,7 +32,8 @@ pub use al_sys::al_types;
 pub use al_sys::alc_defines::*;
 pub use al_sys::alc_types;
 pub use al_sys::{
-    alcCloseDevice, alcGetEnumValue, alcGetError, alcGetIntegerv, alcGetString,
+    alcCaptureCloseDevice, alcCaptureOpenDevice, alcCaptureSamples, alcCaptureStart,
+    alcCaptureStop, alcCloseDevice, alcGetEnumValue, alcGetError, alcGetIntegerv, alcGetString,
     alcIsExtensionPresent, alcOpenDevice,
 };
 

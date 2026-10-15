@@ -1497,7 +1497,7 @@ const kAudioTimeStampRateScalarValid: u32 = 1 << 2;
 /// FMOD's AudioUnit output — the engine Geometry Dash 2.11 uses for both its
 /// music and its sound effects — is such a mixer; with no timestamp at all it
 /// has nothing to synchronise its stream buffer against.
-fn alloc_render_timestamp(env: &mut Environment, sample_time: f64) -> MutVoidPtr {
+pub(crate) fn alloc_render_timestamp(env: &mut Environment, sample_time: f64) -> MutVoidPtr {
     let host_time: u64 = env
         .guest_clock
         .now()
