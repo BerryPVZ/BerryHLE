@@ -2,8 +2,7 @@ use std::env;
 use std::env::current_dir;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
-use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -235,6 +234,55 @@ fn copy_dir_all(source: PathBuf, destination: PathBuf) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Splits the output of `--dump=symbols` into (canonical path, source) pairs,
+/// one per dylib. A dylib starts with comments giving its paths, the first
+/// one canonical, and ends with an empty line (see `dump_host_symbols`).
+fn split_symbol_dump(dump: &str) -> Vec<(String, String)> {
+    let mut dylibs = Vec::<(String, String)>::new();
+    let mut at_dylib_start = true;
+    for line in dump.lines() {
+        if line.is_empty() {
+            at_dylib_start = true;
+        } else if let Some(dylib_path) = line.strip_prefix("// ") {
+            // Ignore the non-canonical dylib names for now.
+            if at_dylib_start {
+                dylibs.push((dylib_path.to_string(), String::new()));
+                at_dylib_start = false;
+            }
+        } else if let Some((_, source)) = dylibs.last_mut() {
+            source.push_str(line);
+            source.push('\n');
+        }
+    }
+    dylibs
+}
+
+#[test]
+fn test_split_symbol_dump() {
+    // An empty dylib must not take the next one as an alias.
+    let dump = "\
+// /usr/lib/libEmpty.dylib
+// /usr/lib/libEmptyAlias.dylib
+
+// /usr/lib/libAlsoEmpty.dylib
+
+// /usr/lib/libFoo.dylib
+// /usr/lib/libFooAlias.dylib
+int foo;
+void bar() {}
+
+";
+    let dylib = |path: &str, source: &str| (path.to_string(), source.to_string());
+    assert_eq!(
+        split_symbol_dump(dump),
+        vec![
+            dylib("/usr/lib/libEmpty.dylib", ""),
+            dylib("/usr/lib/libAlsoEmpty.dylib", ""),
+            dylib("/usr/lib/libFoo.dylib", "int foo;\nvoid bar() {}\n"),
+        ]
+    );
+}
+
 #[test]
 fn test_app() -> Result<(), Box<dyn Error>> {
     let tests_dir = current_dir()?.join("tests");
@@ -265,6 +313,10 @@ fn test_app() -> Result<(), Box<dyn Error>> {
         // ARC is not available until IOS 5, so it can't be used.
         "-fno-objc-arc",
         "-fno-objc-arc-exceptions",
+        // `@"..."` literals refer to this symbol. touchHLE's dyld resolves it
+        // itself (see ns_string::register_constant_strings), so no stub
+        // exports it.
+        "-Wl,-U,___CFConstantStringClassReference",
     ];
 
     // Generate symbol stubs.
@@ -285,35 +337,44 @@ fn test_app() -> Result<(), Box<dyn Error>> {
 
     std::fs::create_dir(&stubs_src_dir).unwrap();
     let mut files_to_compile = Vec::<(String, PathBuf)>::new();
-    {
-        let mut in_body = false;
-        let mut current_file = None::<BufWriter<File>>;
-        for line in BufReader::new(File::open(symbols_path).unwrap()).lines() {
-            let line = line.unwrap();
-            if let Some(dylib_path) = line.strip_prefix("// ") {
-                // First comment after a series of non-comment lines, or first
-                // comment in the file: this is the canonical name of the dylib.
-                if in_body || current_file.is_none() {
-                    let dylib_name = dylib_path.rsplit_once("/").unwrap().1;
-                    let stub_src_path = stubs_src_dir.join(format!("{}.m", dylib_name));
-                    current_file = Some(BufWriter::new(File::create(&stub_src_path).unwrap()));
-                    files_to_compile.push((dylib_path.to_string(), stub_src_path));
-                    in_body = false;
-                }
-                // Ignore the non-canonical dylib names for now.
-            } else if let Some(ref mut current_file) = current_file {
-                in_body = true;
-                writeln!(current_file, "{}", line).unwrap();
-            }
-        }
-        // current_file dropping out of scope here flushes it.
+    let symbols = std::fs::read_to_string(symbols_path).unwrap();
+    for (dylib_path, body) in split_symbol_dump(&symbols) {
+        let dylib_name = dylib_path.rsplit_once("/").unwrap().1;
+        let stub_src_path = stubs_src_dir.join(format!("{}.m", dylib_name));
+        std::fs::write(&stub_src_path, body).unwrap();
+        files_to_compile.push((dylib_path, stub_src_path));
     }
+
+    // Every stub but libobjc's links against libobjc (for classes), so build
+    // libobjc first, then the other libs, then the frameworks.
+    const LIBOBJC_PATH: &str = "/usr/lib/libobjc.A.dylib";
+    files_to_compile.sort_by_key(|(dylib_path, _)| {
+        (
+            dylib_path != LIBOBJC_PATH,
+            dylib_path.starts_with("/System/Library/Frameworks/"),
+        )
+    });
 
     // Build the stub libraries and ensure TestApp will link to them.
 
     for (dylib_path, stub_src_path) in files_to_compile {
         if dylib_path.starts_with("/.touchHLE") {
             // skip the fake app picker library
+            continue;
+        }
+        let is_framework = dylib_path
+            .strip_prefix("/System/Library/Frameworks/")
+            .and_then(|path| path.split_once(".framework/"))
+            .is_some_and(|(name, binary)| name == binary);
+        let is_lib = dylib_path
+            .strip_prefix("/usr/lib/lib")
+            .is_some_and(|name| name.ends_with(".dylib") && !name.contains('/'));
+        if !is_framework && !is_lib {
+            // Stubs are only built for /System/Library/Frameworks/Foo.framework/Foo
+            // and /usr/lib/libfoo.dylib. TestApp doesn't use the others:
+            // private frameworks, frameworks bundled with apps (@rpath/...)
+            // and CaptiveNetwork in SystemConfiguration.framework.
+            println!("Not building a stub for {}", dylib_path);
             continue;
         }
         let compile_args = [
@@ -327,10 +388,8 @@ fn test_app() -> Result<(), Box<dyn Error>> {
             "-lobjc.A",
         ];
         let dylib_name = dylib_path.rsplit_once("/").unwrap().1;
-        // - The only non-framework libs should be libSystem and libobjc, which
-        //   we expect to appear in the list before all the frameworks, and need
-        //   to be compiled first.
-        // - The frameworks have bare filenames, and usually need libobjc.
+        // - The non-framework libs are compiled first, see above.
+        // - The frameworks have bare filenames.
         let (compile_args, out_path) =
             if let Some(framework_path) = dylib_path.strip_prefix("/System/Library/Frameworks/") {
                 extra_linker_args.push(format!("-framework"));
@@ -345,11 +404,13 @@ fn test_app() -> Result<(), Box<dyn Error>> {
                         .strip_suffix(".dylib")
                         .unwrap()
                 ));
-                (
+                let compile_args = if dylib_path == LIBOBJC_PATH {
                     // skip "-Ltests/stubs/lib/" and "-lobjc.A"
-                    &compile_args[..compile_args.len() - 2],
-                    stubs_lib_dir.join(dylib_name),
-                )
+                    &compile_args[..compile_args.len() - 2]
+                } else {
+                    &compile_args[..]
+                };
+                (compile_args, stubs_lib_dir.join(dylib_name))
             };
         // Ensure that stubs/Frameworks/FooBarKit/ or stubs/lib/ exists
         std::fs::create_dir_all(out_path.parent().unwrap()).unwrap();
