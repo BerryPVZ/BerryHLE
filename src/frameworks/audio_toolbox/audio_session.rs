@@ -226,7 +226,14 @@ pub fn AudioSessionGetProperty(
             );
         }
         kAudioSessionProperty_CurrentHardwareInputNumberChannels => {
-            env.mem.write(out_data.cast::<u32>(), 0);
+            // 1 channel (mono) when the host microphone is usable, like a
+            // real device with a built-in mic; 0 when there is none.
+            let value: u32 = if crate::android_media::has_microphone() {
+                1
+            } else {
+                0
+            };
+            env.mem.write(out_data.cast(), value);
         }
         kAudioSessionProperty_CurrentHardwareOutputNumberChannels => {
             env.mem.write(
@@ -241,8 +248,15 @@ pub fn AudioSessionGetProperty(
             );
         }
         kAudioSessionProperty_AudioInputAvailable => {
-            // touchHLE currently does not emulate microphone input.
-            let value: u32 = 0;
+            // Real answer from the host microphone (see crate::audio::mic:
+            // OpenAL capture on desktop, AudioRecord via JNI on Android).
+            // Apps gate their voice features on this; reporting 0 made every
+            // C-API game disable the microphone.
+            let value: u32 = if crate::android_media::has_microphone() {
+                1
+            } else {
+                0
+            };
             env.mem.write(out_data.cast(), value);
         }
         kAudioSessionProperty_CurrentHardwareIOBufferDuration => {

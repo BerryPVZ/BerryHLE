@@ -74,6 +74,11 @@ pub mod alc_defines {
     pub const ALC_SYNC: ALCint = 0x1009;
     pub const ALC_MONO_SOURCES: ALCint = 0x1010;
     pub const ALC_STEREO_SOURCES: ALCint = 0x1011;
+
+    // Capture (alc.h "Capture extension")
+    /// `ALC_CAPTURE_SAMPLES`: number of capture samples available on the
+    /// capture device, queried with `alcGetIntegerv`.
+    pub const ALC_CAPTURE_SAMPLES: ALCenum = 0x312;
 }
 
 extern "C" {
@@ -102,6 +107,19 @@ extern "C" {
     );
     pub fn alcIsExtensionPresent(device: *mut ALCdevice, extName: *const ALCchar) -> ALCboolean;
     pub fn alcGetEnumValue(device: *mut ALCdevice, enumName: *const ALCchar) -> ALCenum;
+
+    // === alc.h "Capture extension" ===
+    pub fn alcCaptureOpenDevice(
+        devicename: *const ALCchar,
+        frequency: ALCuint,
+        format: ALCenum,
+        buffersize: ALCsizei,
+    ) -> *mut ALCdevice;
+    pub fn alcCaptureCloseDevice(device: *mut ALCdevice) -> ALCboolean;
+    pub fn alcCaptureStart(device: *mut ALCdevice);
+    pub fn alcCaptureStop(device: *mut ALCdevice);
+    pub fn alcCaptureSamples(device: *mut ALCdevice, buffer: *mut ALCvoid, samples: ALCsizei);
+
 }
 
 // === al.h ===

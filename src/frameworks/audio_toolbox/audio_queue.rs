@@ -10,7 +10,12 @@
 
 use crate::abi::{CallFromHost, GuestFunction};
 use crate::audio::decode_ima4;
-use crate::frameworks::audio_toolbox::audio_converter::AudioStreamPacketDescription;
+use crate::audio::encode_ima4;
+use crate::audio::mic;
+use crate::frameworks::audio_toolbox::audio_converter::{
+    convert_pcm, pcm_shape_from_asbd, AudioStreamPacketDescription, PcmShape,
+};
+use crate::frameworks::audio_toolbox::audio_unit::alloc_render_timestamp;
 use crate::audio::openal as al;
 use crate::audio::openal::al_types::*;
 use crate::audio::openal::{OpenAL, OpenALManager};
@@ -99,7 +104,16 @@ struct AudioQueueHostObject {
     )>,
     is_running_handler: bool,
     is_input: bool,
+    /// Whether this input queue currently holds a reference on the shared
+    /// host capture stream ([mic::start]/[mic::stop]). Pause keeps it; stop
+    /// and dispose release it, like iOS powers the input hardware down.
+    input_capture_ref: bool,
     input_delay: u32,
+    /// For input queues: read position into the host microphone stream (see
+    /// `crate::audio::mic`), in host samples since the capture was last
+    /// (re)started. Fractional when the queue's sample rate differs from the
+    /// host rate so that no drift accumulates.
+    input_host_cursor: f64,
     /// Stored `kAudioQueueProperty_HardwareCodecPolicy` value. Defaults to
     /// `kAudioQueueHardwareCodecPolicy_Default` (0). touchHLE has no hardware
     /// codecs, so this is informational only.
@@ -176,6 +190,21 @@ const kAudioQueueProperty_MagicCookie: AudioQueuePropertyID = fourcc(b"aqmc");
 const kAudioQueueProperty_StreamDescription: AudioQueuePropertyID = fourcc(b"aqft");
 const kAudioQueueProperty_MaximumOutputPacketSize: AudioQueuePropertyID = fourcc(b"aqmv");
 const kAudioQueueProperty_EnableLevelMetering: AudioQueuePropertyID = fourcc(b"aqme");
+/// `kAudioQueueProperty_CurrentLevelMeterDB` ('aqmd') from Apple's
+/// `AudioQueue.h`: an array of [AudioQueueLevelMeterState], one element per
+/// channel of the queue, with values in decibels. Backed by the host
+/// microphone stream for input queues (see `crate::audio::mic`) and by the
+/// OpenAL output level for output queues.
+const kAudioQueueProperty_CurrentLevelMeterDB: AudioQueuePropertyID = fourcc(b"aqmd");
+
+/// `AudioQueueLevelMeterState` from Apple's `AudioQueue.h`: one entry per
+/// audio channel of the queue, holding the average and peak power in dB.
+#[repr(C, packed)]
+pub struct AudioQueueLevelMeterState {
+    pub mAveragePower: f32,
+    pub mPeakPower: f32,
+}
+unsafe impl SafeRead for AudioQueueLevelMeterState {}
 /// `kAudioQueueDeviceProperty_SampleRate` ('devr') from Apple's
 /// `AudioQueue.h`: the hardware sample rate the queue plays at. We always
 /// play at the format's native rate, so this reports the queue's format
@@ -191,6 +220,7 @@ const kAudioQueueProperty_DeviceNumberChannels: AudioQueuePropertyID = fourcc(b"
 /// stored as a hint and the codec choice never changes.
 const kAudioQueueProperty_HardwareCodecPolicy: AudioQueuePropertyID = fourcc(b"aqcp");
 type AudioQueuePropertyListenerProc = GuestFunction;
+
 
 /// `AudioQueueHardwareCodecPolicy` from Apple's `AudioQueue.h`.
 #[allow(dead_code)]
@@ -209,6 +239,9 @@ const kAudioQueueErr_InvalidProperty: OSStatus = -66684;
 /// `kAudioQueueErr_QueueNotStopped` from Apple's `AudioQueue.h`. Returned by
 /// `AudioQueueSetOfflineRenderFormat` when the queue is currently running.
 const kAudioQueueErr_QueueNotStopped: OSStatus = -66677;
+/// Floor for `AudioQueueLevelMeterState` values (Apple clamps meters at
+/// -160 dB).
+const MIN_LEVEL_METER_DB: f32 = -160.0;
 
 pub fn AudioQueueNewOutput(
     env: &mut Environment,
@@ -291,7 +324,9 @@ pub fn AudioQueueNewOutput(
         property_listeners: Vec::new(),
         is_running_handler: false,
         is_input: false,
+        input_capture_ref: false,
         input_delay: 0,
+        input_host_cursor: 0.0,
         hardware_codec_policy: codec_policy::DEFAULT,
         offline_render_format: None,
     };
@@ -741,20 +776,38 @@ fn AudioQueueGetPropertySize(
 ) -> OSStatus {
     return_if_null!(in_aq);
 
-    match property_size(in_property_id) {
-        Some(size) => {
-            env.mem.write(out_data_size, size);
-            0 // success
-        }
-        None => {
+    // The level meter array is sized "one entry per channel", so it needs the
+    // queue at hand; everything else has a fixed size.
+    let size = if in_property_id == kAudioQueueProperty_CurrentLevelMeterDB {
+        let Some(host_object) = State::get(&mut env.framework_state)
+            .audio_queues
+            .get(&in_aq)
+        else {
             log!(
-                "TODO: AudioQueueGetPropertySize({:?}, {}): unknown property, returning error",
-                in_aq,
-                debug_fourcc(in_property_id)
+                "Warning: AudioQueueGetPropertySize({:?}): unknown / disposed queue.",
+                in_aq
             );
-            kAudioQueueErr_InvalidProperty
+            return kAudioQueueErr_InvalidProperty;
+        };
+        guest_size_of::<AudioQueueLevelMeterState>()
+            .wrapping_mul(host_object.format.channels_per_frame.max(1) as GuestUSize)
+    } else {
+        match property_size(in_property_id) {
+            Some(size) => size,
+            None => {
+                log!(
+                    "TODO: AudioQueueGetPropertySize({:?}, {}): unknown property, returning error",
+                    in_aq,
+                    debug_fourcc(in_property_id)
+                );
+                return kAudioQueueErr_InvalidProperty;
+            }
         }
-    }
+    };
+
+    env.mem.write(out_data_size, size as u32);
+
+    0 // success
 }
 
 fn AudioQueueGetProperty(
@@ -766,15 +819,32 @@ fn AudioQueueGetProperty(
 ) -> OSStatus {
     return_if_null!(in_aq);
 
-    let required_size = match property_size(in_property_id) {
-        Some(size) => size,
-        None => {
+    // The level meter array is sized "one entry per channel" and needs the
+    // queue at hand; everything else has a fixed size.
+    let required_size = if in_property_id == kAudioQueueProperty_CurrentLevelMeterDB {
+        let Some(host_object) = State::get(&mut env.framework_state)
+            .audio_queues
+            .get(&in_aq)
+        else {
             log!(
-                "TODO: AudioQueueGetProperty({:?}, {}): unknown property, returning error",
-                in_aq,
-                debug_fourcc(in_property_id)
+                "Warning: AudioQueueGetProperty({:?}): unknown / disposed queue.",
+                in_aq
             );
             return kAudioQueueErr_InvalidProperty;
+        };
+        guest_size_of::<AudioQueueLevelMeterState>()
+            .wrapping_mul(host_object.format.channels_per_frame.max(1) as GuestUSize)
+    } else {
+        match property_size(in_property_id) {
+            Some(size) => size,
+            None => {
+                log!(
+                    "TODO: AudioQueueGetProperty({:?}, {}): unknown property, returning error",
+                    in_aq,
+                    debug_fourcc(in_property_id)
+                );
+                return kAudioQueueErr_InvalidProperty;
+            }
         }
     };
     let provided_size = env.mem.read(io_data_size);
@@ -857,6 +927,28 @@ fn AudioQueueGetProperty(
                 out_property_data.cast::<u32>(),
                 host_object.hardware_codec_policy,
             );
+        }
+        kAudioQueueProperty_CurrentLevelMeterDB => {
+            // One meter per channel. Only the host microphone stream has a
+            // measurable level; playback metering would require tapping the
+            // OpenAL source, so output queues report silence.
+            let channels = host_object.format.channels_per_frame;
+            let (avg_db, peak_db) = if host_object.is_input {
+                mic::levels_db()
+            } else {
+                (MIN_LEVEL_METER_DB, MIN_LEVEL_METER_DB)
+            };
+            for channel in 0..channels {
+                let entry = AudioQueueLevelMeterState {
+                    // Mono capture duplicated to N channels reports the same
+                    // level on each channel, like a mono device feeding a
+                    // multi-tap meter on real hardware.
+                    mAveragePower: avg_db,
+                    mPeakPower: peak_db,
+                };
+                let dst: MutPtr<AudioQueueLevelMeterState> = out_property_data.cast();
+                env.mem.write(dst + channel, entry);
+            }
         }
         _ => {
             // We only advertise known properties as readable via
@@ -1565,6 +1657,13 @@ fn prime_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
         return;
     };
 
+    // Input queues have no OpenAL source; they are driven by the host
+    // microphone (see handle_input_audio_queue). Don't waste a source on
+    // them — some games create many queues, and the source pool is finite.
+    if host_object.is_input {
+        return;
+    }
+
     if !is_supported_audio_format(&host_object.format) {
         return;
     }
@@ -1752,7 +1851,345 @@ fn unqueue_buffers<F: FnMut(ALuint)>(al_source: ALuint, context: &OpenAL<'_>, mu
     }
 }
 
+/// One prepared microphone delivery: prepared while the queue's state is
+/// still borrowed, executed once the borrow is dropped (the guest callback
+/// may call any AudioQueue API, including `AudioQueueDispose` on this queue).
+struct InputBufferDelivery {
+    buffer_ref: AudioQueueBufferRef,
+    /// Absolute host-sample position (a [mic::total_samples] cursor) of the
+    /// first sample copied into the buffer.
+    from_host: u64,
+    /// How many host samples to copy (may be less than a full buffer while
+    /// flushing the queue during an asynchronous stop).
+    host_sample_count: usize,
+    /// Sample time (in queue frames) of the first frame in the buffer, used
+    /// for the callback's `inStartTime`.
+    sample_time: f64,
+}
+
+/// Whether [fill_input_buffer] can encode the host microphone stream into
+/// the queue's format. Linear PCM of any shape [pcm_shape_from_asbd] accepts
+/// works, as does mono/stereo Apple IMA4 (the two formats iOS 2/3 hardware
+/// could record). Queues with any other format still exist, but like output
+/// queues with an unsupported format they stay silent.
+fn is_supported_input_format(format: &AudioStreamBasicDescription) -> bool {
+    match format.format_id {
+        kAudioFormatLinearPCM => pcm_shape_from_asbd(format).is_some(),
+        kAudioFormatAppleIMA4 => {
+            // Each IMA4 packet holds 64 frames of ONE channel; multi-channel
+            // audio interleaves whole packets (L packet, R packet, ...).
+            format.channels_per_frame == 1 || format.channels_per_frame == 2
+        }
+        _ => false,
+    }
+}
+
+/// Frames per packet for an input queue's format (see
+/// [is_supported_input_format]): 64 for IMA4, 1 for linear PCM.
+fn input_frames_per_packet(format: &AudioStreamBasicDescription) -> u32 {
+    match format.format_id {
+        kAudioFormatAppleIMA4 => 64,
+        _ => 1,
+    }
+}
+
+/// Bytes per packet for an input queue's format: 34 per channel for IMA4,
+/// `bytes_per_packet` (== bytes per frame) for linear PCM.
+fn input_bytes_per_packet(format: &AudioStreamBasicDescription) -> u32 {
+    match format.format_id {
+        kAudioFormatAppleIMA4 => 34 * format.channels_per_frame,
+        _ => format.bytes_per_packet.max(1),
+    }
+}
+
+/// Capacity of an input buffer in whole packets (the queue's currency).
+fn input_packet_capacity(
+    buffer: &AudioQueueBuffer,
+    format: &AudioStreamBasicDescription,
+) -> u32 {
+    // Trailing partial packets are unusable.
+    buffer.audio_data_bytes_capacity / input_bytes_per_packet(format)
+}
+
+/// Converts mono 16-bit host-microphone samples at [mic::MIC_SAMPLE_RATE]
+/// into interleaved 16-bit PCM in the queue's channel count and sample rate.
+fn convert_mic_to_pcm(
+    format: &AudioStreamBasicDescription,
+    host_samples: &[i16],
+) -> Vec<u8> {
+    let src_shape = PcmShape {
+        sample_rate: f64::from(mic::MIC_SAMPLE_RATE),
+        channels: 1,
+        bits: 16,
+        is_float: false,
+        is_big_endian: false,
+        bytes_per_frame: 2,
+    };
+    let channels = format.channels_per_frame.max(1);
+    let dst_shape = PcmShape {
+        sample_rate: format.sample_rate.max(1.0),
+        channels,
+        bits: 16,
+        is_float: false,
+        is_big_endian: false,
+        bytes_per_frame: 2 * channels,
+    };
+    let src: Vec<u8> = host_samples
+        .iter()
+        .flat_map(|sample| sample.to_le_bytes())
+        .collect();
+    convert_pcm(&src, &src_shape, &dst_shape)
+}
+
+/// Encodes `host_samples` (mono 16-bit at [mic::MIC_SAMPLE_RATE]) into the
+/// queue's format and stores the result in the guest `AudioQueueBuffer`
+/// (`mAudioData` / `mAudioDataByteSize`). Only whole packets are written and
+/// only as many as fit `mAudioDataBytesCapacity`. Returns the packet count
+/// for the callback's `inNumberPackets`.
+fn fill_input_buffer(
+    env: &mut Environment,
+    buffer_ref: AudioQueueBufferRef,
+    format: &AudioStreamBasicDescription,
+    host_samples: &[i16],
+) -> u32 {
+    let buffer = env.mem.read(buffer_ref);
+    let capacity = buffer.audio_data_bytes_capacity as usize;
+    let channels = format.channels_per_frame.max(1) as usize;
+
+    let encoded: Vec<u8> = match format.format_id {
+        kAudioFormatAppleIMA4 => {
+            let pcm = convert_mic_to_pcm(format, host_samples);
+            let frames = pcm.len() / 2 / channels;
+            let periods = frames / 64;
+            // A multi-channel period is one 34-byte packet per channel.
+            let bytes_per_period = 34 * channels;
+            let periods = periods.min(capacity / bytes_per_period);
+            let mut out = Vec::with_capacity(periods * bytes_per_period);
+            for period in 0..periods {
+                for channel in 0..channels {
+                    let mut block = [0i16; 64];
+                    for (frame, slot) in block.iter_mut().enumerate() {
+                        let sample = (period * 64 + frame) * channels + channel;
+                        let bytes: [u8; 2] =
+                            [pcm[sample * 2], pcm[sample * 2 + 1]];
+                        *slot = i16::from_le_bytes(bytes);
+                    }
+                    out.extend_from_slice(&encode_ima4(&block));
+                }
+            }
+            out
+        }
+        _ => {
+            // Linear PCM: convert to the queue's exact shape (rate, channels,
+            // bit depth, float, endianness) via the AudioConverter code used
+            // on the playback path.
+            let shape = pcm_shape_from_asbd(format);
+            let src_shape = PcmShape {
+                sample_rate: f64::from(mic::MIC_SAMPLE_RATE),
+                channels: 1,
+                bits: 16,
+                is_float: false,
+                is_big_endian: false,
+                bytes_per_frame: 2,
+            };
+            let src: Vec<u8> = host_samples
+                .iter()
+                .flat_map(|sample| sample.to_le_bytes())
+                .collect();
+            let mut out = match shape {
+                Some(shape) => convert_pcm(&src, &src_shape, &shape),
+                // is_supported_input_format() should prevent this; fall back
+                // to raw mono LE 16-bit rather than crash.
+                None => src,
+            };
+            // Truncate to whole frames within the buffer's capacity.
+            let bytes_per_frame = shape.map(|s| s.bytes_per_frame as usize).unwrap_or(2).max(1);
+            let usable = (capacity / bytes_per_frame) * bytes_per_frame;
+            out.truncate(usable);
+            out
+        }
+    };
+
+    let num_packets = if format.format_id == kAudioFormatAppleIMA4 {
+        (encoded.len() / (34 * channels)) as u32 * format.channels_per_frame.max(1)
+    } else {
+        let bytes_per_packet = input_bytes_per_packet(format) as usize;
+        (encoded.len() / bytes_per_packet) as u32
+    };
+
+    // Write the payload and the final byte size back into the guest buffer.
+    if !encoded.is_empty() {
+        let dst = buffer.audio_data.cast::<u8>();
+        env.mem
+            .bytes_at_mut(dst, encoded.len() as GuestUSize)
+            .copy_from_slice(&encoded);
+    }
+    env.mem.write(
+        buffer_ref.cast(),
+        AudioQueueBuffer {
+            audio_data_bytes_capacity: buffer.audio_data_bytes_capacity,
+            audio_data: buffer.audio_data,
+            audio_data_byte_size: encoded.len() as u32,
+            user_data: buffer.user_data,
+            packet_description_capacity: buffer.packet_description_capacity,
+            _packet_descriptions: buffer._packet_descriptions,
+            _packet_description_count: 0,
+        },
+    );
+
+    num_packets
+}
+
+/// Run-loop tick for an input (recording) queue: fills guest buffers from
+/// the host microphone stream and hands them back via the guest's input
+/// callback, exactly like the output path recycles played-out buffers.
+///
+/// While the queue is meant to be running, buffers are only handed back when
+/// a full buffer's worth of fresh audio is available, which keeps
+/// `mAudioDataByteSize == mAudioDataBytesCapacity` (apps like blow/gesture
+/// detectors rely on the fixed chunk size). During an asynchronous stop
+/// (`AudioQueueStop(inImmediate: false)`) the queue instead flushes what it
+/// has — partial buffers included — and then finishes stopping, mirroring the
+/// output queue's drain behaviour.
+fn handle_input_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
+    // Phase 1: decide what can be delivered while the state is borrowed.
+    // Reading guest buffer structs (env.mem) while the state map is borrowed
+    // is fine: they are disjoint fields of `env`.
+    let (format, is_stopping, deliveries, callback_proc, callback_user_data) = {
+        let Some(host_object) = State::get(&mut env.framework_state)
+            .audio_queues
+            .get_mut(&in_aq)
+        else {
+            // ns_run_loop can hold a stale reference for one tick after
+            // AudioQueueDispose.
+            return;
+        };
+        if host_object.is_running_handler
+            || host_object.is_running == AudioQueueIsRunning::Stopped
+            || !is_supported_input_format(&host_object.format)
+        {
+            return;
+        }
+        host_object.is_running_handler = true;
+
+        let format = host_object.format;
+        let guest_rate = format.sample_rate.max(1.0);
+        // Host samples per queue frame; fractional so no drift accumulates.
+        let host_per_frame = f64::from(mic::MIC_SAMPLE_RATE) / guest_rate;
+        let frames_per_packet = input_frames_per_packet(&format) as f64;
+        let total_host = mic::total_samples() as f64;
+        let is_stopping = host_object.is_running == AudioQueueIsRunning::Stopping;
+
+        let mut deliveries = Vec::new();
+        let mut cursor = host_object.input_host_cursor;
+
+        while let Some(&buffer_ref) = host_object.buffer_queue.front() {
+            let buffer = env.mem.read(buffer_ref);
+            let packet_capacity =
+                input_packet_capacity(&buffer, &format);
+            let frames_capacity =
+                (packet_capacity as f64) * frames_per_packet;
+            let needed = frames_capacity * host_per_frame;
+
+            if is_stopping {
+                // Flushing: deliver whatever remains (>= 0 bytes), then stop.
+                if cursor >= total_host {
+                    break; // nothing left to flush
+                }
+                let available = total_host - cursor;
+                let take = available.min(needed).ceil() as usize;
+                let sample_time = cursor * guest_rate / f64::from(mic::MIC_SAMPLE_RATE);
+                deliveries.push(InputBufferDelivery {
+                    buffer_ref,
+                    from_host: cursor as u64,
+                    host_sample_count: take,
+                    sample_time,
+                });
+                host_object.buffer_queue.pop_front();
+                cursor += available.min(needed);
+            } else {
+                // Normal operation: wait for a full buffer's worth of audio.
+                if cursor + needed > total_host {
+                    break;
+                }
+                let sample_time = cursor * guest_rate / f64::from(mic::MIC_SAMPLE_RATE);
+                deliveries.push(InputBufferDelivery {
+                    buffer_ref,
+                    from_host: cursor as u64,
+                    host_sample_count: needed.ceil() as usize,
+                    sample_time,
+                });
+                host_object.buffer_queue.pop_front();
+                cursor += needed;
+            }
+        }
+        host_object.input_host_cursor = cursor;
+
+        (
+            format,
+            is_stopping,
+            deliveries,
+            host_object.callback_proc,
+            host_object.callback_user_data,
+        )
+    };
+
+    // Phase 2: fill buffers and call the guest callback. No state borrows may
+    // be live here: the callback can call any AudioQueue API.
+    for delivery in deliveries {
+        let host_samples =
+            mic::take_samples(delivery.from_host, delivery.host_sample_count);
+        let num_packets =
+            fill_input_buffer(env, delivery.buffer_ref, &format, &host_samples);
+        let timestamp = alloc_render_timestamp(env, delivery.sample_time);
+        let () = callback_proc.call_from_host(
+            env,
+            (
+                callback_user_data,
+                in_aq,
+                delivery.buffer_ref,
+                timestamp.cast_const(),
+                num_packets,
+                ConstPtr::<AudioStreamPacketDescription>::null(),
+            ),
+        );
+        env.mem.free(timestamp);
+    }
+
+    // Phase 3: finish an asynchronous stop now that every queued buffer has
+    // been flushed. (The callback may have disposed the queue already.)
+    let queue_exists = State::get(&mut env.framework_state)
+        .audio_queues
+        .get(&in_aq)
+        .is_some();
+    if queue_exists {
+        let state = State::get(&mut env.framework_state);
+        if let Some(host_object) = state.audio_queues.get_mut(&in_aq) {
+            host_object.is_running_handler = false;
+        }
+    }
+    if is_stopping && queue_exists {
+        finish_stopping_audio_queue(env, in_aq);
+    }
+}
+
 pub fn handle_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
+    // Input queues never get an OpenAL source; they are driven by the host
+    // microphone stream (crate::audio::mic) instead of the OpenAL buffer
+    // lifecycle. Note: handle_input_audio_queue re-checks that the queue is
+    // still alive, so a stale run-loop entry after AudioQueueDispose is
+    // harmless.
+    {
+        let is_input_queue = State::get(&mut env.framework_state)
+            .audio_queues
+            .get(&in_aq)
+            .is_some_and(|host_object| host_object.is_input);
+        if is_input_queue {
+            handle_input_audio_queue(env, in_aq);
+            return;
+        }
+    }
+
     let (state, context) =
         State::get_with_context(&mut env.framework_state, &mut env.openal_manager);
 
@@ -1953,6 +2390,12 @@ pub fn AudioQueueStart(
 ) -> OSStatus {
     return_if_null!(in_aq);
 
+    // Input (recording) queues have no OpenAL side: starting one opens the
+    // host microphone stream and arms the delivery loop.
+    if let Some(result) = start_input_audio_queue(env, in_aq) {
+        return result;
+    }
+
     prime_audio_queue(env, in_aq);
 
     let (state, context) =
@@ -2021,10 +2464,63 @@ fn finish_stopping_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
         .audio_queues
         .get_mut(&in_aq)
     {
+        // Stopping an input queue releases its hold on the host microphone
+        // stream, like iOS powers the capture hardware down when the last
+        // active recorder stops.
+        if host_object.is_input && host_object.input_capture_ref {
+            host_object.input_capture_ref = false;
+            mic::stop();
+        }
         host_object.is_running = AudioQueueIsRunning::Stopped;
     }
 
     notify_aq_is_running(env, in_aq);
+}
+
+/// AudioQueueStart for input queues. Returns `Some(status)` when the queue
+/// is an input queue (the caller returns that status), `None` when it is an
+/// output queue (the normal OpenAL path takes over).
+fn start_input_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) -> Option<OSStatus> {
+    let host_object = State::get(&mut env.framework_state)
+        .audio_queues
+        .get_mut(&in_aq)?;
+
+    if !host_object.is_input {
+        return None;
+    }
+
+    if !is_supported_input_format(&host_object.format) {
+        log!(
+            "Warning: AudioQueueStart({:?}): input format {:?} is not supported \
+             by our HLE; the queue will not deliver audio.",
+            in_aq,
+            host_object.format
+        );
+        return Some(kAudioQueueErr_InvalidProperty);
+    }
+
+    // Pause + Start also lands here (AudioQueuePause keeps the capture
+    // reference), so only acquire the stream once per Stop..Start cycle.
+    host_object.is_running = AudioQueueIsRunning::Running;
+    // Recording starts "now": skip anything captured before this moment.
+    host_object.input_host_cursor =
+        mic::total_samples() as f64 + f64::from(host_object.input_delay);
+    if !host_object.input_capture_ref {
+        host_object.input_capture_ref = true;
+        if !mic::start() {
+            log_dbg!(
+                "AudioQueueStart({:?}): no host microphone available; input \
+                 will be silence.",
+                in_aq
+            );
+        }
+    }
+
+    // The state borrow ends with the last use of host_object, so guest
+    // code (the property listeners) can run now.
+    notify_aq_is_running(env, in_aq);
+
+    Some(0)
 }
 
 pub fn AudioQueueStop(env: &mut Environment, in_aq: AudioQueueRef, in_immediate: bool) -> OSStatus {
@@ -2098,6 +2594,13 @@ fn AudioQueueReset(env: &mut Environment, in_aq: AudioQueueRef) -> OSStatus {
 
     host_object.buffer_queue.clear();
 
+    if host_object.is_input {
+        // Drop pending data: delivery resumes from the current capture
+        // position (the ring keeps advancing, so stale samples between the
+        // old cursor and now are simply skipped, like re-primed hardware).
+        host_object.input_host_cursor = mic::total_samples() as f64;
+    }
+
     0 // success
 }
 
@@ -2161,6 +2664,14 @@ pub fn AudioQueueDispose(
         return 0;
     };
     log_dbg!("Disposing of audio queue {:?}", in_aq);
+
+    // Input queues: release the host microphone stream even if the queue was
+    // disposed while still running (mic::stop() is a no-op when this queue
+    // holds no reference).
+    if host_object.is_input && host_object.input_capture_ref {
+        host_object.input_capture_ref = false;
+        mic::stop();
+    }
 
     env.mem.free(in_aq.cast());
 
@@ -2264,7 +2775,9 @@ pub fn AudioQueueNewInput(
         property_listeners: Vec::new(),
         is_running_handler: false,
         is_input: true,
+        input_capture_ref: false,
         input_delay: 0,
+        input_host_cursor: 0.0,
         hardware_codec_policy: codec_policy::DEFAULT,
         offline_render_format: None,
     };
@@ -2309,6 +2822,12 @@ pub const FUNCTIONS: FunctionExports = &[
 #[cfg(test)]
 mod tests {
     use super::downmix_i16_to_mono;
+    use super::{
+        input_bytes_per_packet, input_packet_capacity, is_supported_input_format,
+        AudioQueueBuffer, AudioStreamBasicDescription, Ptr, kAudioFormatAppleIMA4,
+        kAudioFormatFlagIsFloat, kAudioFormatFlagIsPacked, kAudioFormatLinearPCM,
+        kAudioFormatMPEG4AAC,
+    };
 
     #[test]
     fn downmix_averages_each_interleaved_frame() {
@@ -2329,5 +2848,110 @@ mod tests {
     fn downmix_drops_incomplete_frames() {
         let input = [0x01, 0x00, 0x02];
         assert!(downmix_i16_to_mono(&input, 2).is_empty());
+    }
+
+    #[test]
+    fn input_capacity_counts_whole_packets_only() {
+        let mono_ima4 = AudioStreamBasicDescription {
+            format_id: kAudioFormatAppleIMA4,
+            channels_per_frame: 1,
+            bytes_per_packet: 34,
+            frames_per_packet: 64,
+            bytes_per_frame: 34,
+            ..pcm_test_shape()
+        };
+        // 3 full packets + 10 trailing bytes: only 3 packets are usable.
+        let buffer = AudioQueueBuffer {
+            audio_data_bytes_capacity: 3 * 34 + 10,
+            ..test_buffer()
+        };
+        assert_eq!(input_packet_capacity(&buffer, &mono_ima4), 3);
+        assert_eq!(input_bytes_per_packet(&mono_ima4), 34);
+
+        let stereo_ima4 = AudioStreamBasicDescription {
+            channels_per_frame: 2,
+            ..mono_ima4
+        };
+        // A stereo "packet" is one L and one R channel packet (68 bytes).
+        assert_eq!(input_bytes_per_packet(&stereo_ima4), 68);
+        let buffer = AudioQueueBuffer {
+            audio_data_bytes_capacity: 68 + 67,
+            ..test_buffer()
+        };
+        assert_eq!(input_packet_capacity(&buffer, &stereo_ima4), 1);
+
+        let stereo_pcm = AudioStreamBasicDescription {
+            format_id: kAudioFormatLinearPCM,
+            channels_per_frame: 2,
+            bytes_per_packet: 4,
+            frames_per_packet: 1,
+            bytes_per_frame: 4,
+            ..pcm_test_shape()
+        };
+        let buffer = AudioQueueBuffer {
+            audio_data_bytes_capacity: 4 * 5 + 3,
+            ..test_buffer()
+        };
+        assert_eq!(input_packet_capacity(&buffer, &stereo_pcm), 5);
+    }
+
+    #[test]
+    fn input_format_support_matches_ios_recording_formats() {
+        let lpcm_float_stereo = AudioStreamBasicDescription {
+            format_id: kAudioFormatLinearPCM,
+            format_flags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+            channels_per_frame: 2,
+            bytes_per_packet: 8,
+            frames_per_packet: 1,
+            bytes_per_frame: 8,
+            bits_per_channel: 32,
+            ..pcm_test_shape()
+        };
+        assert!(is_supported_input_format(&lpcm_float_stereo));
+
+        let ima4_mono = AudioStreamBasicDescription {
+            format_id: kAudioFormatAppleIMA4,
+            channels_per_frame: 1,
+            ..pcm_test_shape()
+        };
+        assert!(is_supported_input_format(&ima4_mono));
+
+        // 3-channel IMA4 and AAC input cannot be encoded for the guest.
+        let ima4_three_channel = AudioStreamBasicDescription {
+            channels_per_frame: 3,
+            ..ima4_mono
+        };
+        assert!(!is_supported_input_format(&ima4_three_channel));
+        let aac = AudioStreamBasicDescription {
+            format_id: kAudioFormatMPEG4AAC,
+            ..pcm_test_shape()
+        };
+        assert!(!is_supported_input_format(&aac));
+    }
+
+    fn pcm_test_shape() -> AudioStreamBasicDescription {
+        AudioStreamBasicDescription {
+            sample_rate: 44100.0,
+            format_id: kAudioFormatLinearPCM,
+            format_flags: kAudioFormatFlagIsPacked,
+            bytes_per_packet: 2,
+            frames_per_packet: 1,
+            bytes_per_frame: 2,
+            channels_per_frame: 1,
+            bits_per_channel: 16,
+            _reserved: 0,
+        }
+    }
+
+    fn test_buffer() -> AudioQueueBuffer {
+        AudioQueueBuffer {
+            audio_data_bytes_capacity: 0,
+            audio_data: Ptr::null(),
+            audio_data_byte_size: 0,
+            user_data: Ptr::null(),
+            packet_description_capacity: 0,
+            _packet_descriptions: Ptr::null(),
+            _packet_description_count: 0,
+        }
     }
 }

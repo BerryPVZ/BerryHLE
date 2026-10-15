@@ -9,11 +9,12 @@
 
 mod caf_decoder;
 mod ima4;
+pub mod mic;
 pub mod music_bypass;
 pub mod openal;
 pub mod symphonia_formats;
 
-pub use ima4::decode_ima4;
+pub use ima4::{decode_ima4, encode_ima4};
 
 use crate::fs::{Fs, GuestPath};
 use std::io::Cursor;

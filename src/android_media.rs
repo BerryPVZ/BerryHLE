@@ -533,20 +533,33 @@ mod imp {
     pub fn take_photo(_front: bool) -> Option<Vec<u8>> {
         None
     }
-    pub fn has_microphone() -> bool {
-        false
-    }
-    pub fn start_mic() -> bool {
-        false
-    }
-    pub fn stop_mic() {}
-    pub fn read_mic_chunk() -> Vec<i16> {
-        Vec::new()
-    }
 }
 
-pub use imp::*;
+pub use imp::{has_camera, populate_jni_cache, take_photo};
 
-/// Sample rate of chunks returned by [read_mic_chunk] (matches
-/// `HostMedia.MIC_SAMPLE_RATE` on Android; unused elsewhere).
+// The raw JNI mic bridge, for the shared implementation in
+// `crate::audio::mic` (Android only).
+#[cfg(target_os = "android")]
+pub(crate) use imp::{
+    has_microphone as jni_has_microphone, read_mic_chunk as jni_read_mic_chunk,
+    start_mic as jni_start_mic, stop_mic as jni_stop_mic,
+};
+
+// Public microphone API: thin wrappers over the shared host implementation
+// so existing callers (Audio Toolbox, AVFoundation) keep working unchanged.
+pub fn has_microphone() -> bool {
+    crate::audio::mic::has_microphone()
+}
+pub fn start_mic() -> bool {
+    crate::audio::mic::start()
+}
+pub fn stop_mic() {
+    crate::audio::mic::stop()
+}
+pub fn read_mic_chunk() -> Vec<i16> {
+    crate::audio::mic::read_mic_chunk()
+}
+
+/// Sample rate of the shared host capture stream (mono 16-bit PCM); matches
+/// `HostMedia.MIC_SAMPLE_RATE` on Android.
 pub const MIC_SAMPLE_RATE: u32 = 44100;
