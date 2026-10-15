@@ -178,6 +178,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     () = msg![env; this setTextColor:nil];
     () = msg![env; this setBackgroundColor:nil];
     () = msg_super![env; this setOpaque:false];
+    // Like UIKit, labels don't take touches by default, so that a label drawn
+    // over a button doesn't block it.
+    () = msg![env; this setUserInteractionEnabled:false];
     this
 }
 

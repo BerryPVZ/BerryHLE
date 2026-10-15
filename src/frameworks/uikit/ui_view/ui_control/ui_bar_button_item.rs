@@ -9,9 +9,9 @@
 
 use crate::abi::{GuestArg, GuestRet};
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
-use crate::frameworks::foundation::ns_string::{from_rust_string, to_rust_string};
+use crate::frameworks::foundation::ns_string::{from_rust_string, get_static_str, to_rust_string};
 use crate::frameworks::uikit::ui_font::UITextAlignmentCenter;
-use crate::frameworks::uikit::ui_view::ui_control::UIControlEventTouchUpInside;
+use crate::frameworks::uikit::ui_view::ui_control::{UIControlEventTouchUpInside, UIControlEvents};
 use crate::objc::{
     autorelease, id, impl_HostObject_with_superclass, msg, msg_class, msg_super, nil, objc_classes,
     release, retain, ClassExports, NSZonePtr, SEL,
@@ -204,6 +204,30 @@ impl Default for UIBarButtonItemHostObject {
             width: 0.0,
         }
     }
+}
+
+/// Create the label that draws a titled bar button item.
+fn make_title_label(env: &mut crate::Environment, title: id) -> id {
+    let font: id = msg_class![env; UIFont systemFontOfSize:17_f32];
+    let title_color: id = msg_class![env; UIColor blackColor];
+    let item_bg_color: id = msg_class![env; UIColor whiteColor];
+    let frame = CGRect {
+        origin: CGPoint { x: 0.0, y: 0.0 },
+        size: CGSize {
+            width: 0.0,
+            height: 44.0,
+        },
+    };
+    let title_label: id = msg_class![env; UILabel new];
+    let title_label: id = msg![env; title_label initWithFrame:frame];
+    () = msg![env; title_label setTextAlignment:UITextAlignmentCenter];
+    () = msg![env; title_label setText:title];
+    () = msg![env; title_label setTextColor:title_color];
+    () = msg![env; title_label setFont:font];
+    () = msg![env; title_label setBackgroundColor:item_bg_color];
+    let layer: id = msg![env; title_label layer];
+    () = msg![env; layer setCornerRadius:(10.0 as CGFloat)];
+    title_label
 }
 
 pub const CLASSES: ClassExports = objc_classes! {
@@ -401,6 +425,103 @@ pub const CLASSES: ClassExports = objc_classes! {
     this
 }
 
+// Bar button items archived in a nib (e.g. the items of a UIToolbar).
+- (id)initWithCoder:(id)coder {
+    let this: id = msg_super![env; this initWithCoder:coder];
+
+    let title_key = get_static_str(env, "UITitle");
+    let title: id = msg![env; coder decodeObjectForKey:title_key];
+    let image_key = get_static_str(env, "UIImage");
+    let image: id = msg![env; coder decodeObjectForKey:image_key];
+    let custom_view_key = get_static_str(env, "UICustomView");
+    let custom_view: id = msg![env; coder decodeObjectForKey:custom_view_key];
+    let style_key = get_static_str(env, "UIStyle");
+    let style: i32 = msg![env; coder decodeIntForKey:style_key];
+    let width_key = get_static_str(env, "UIWidth");
+    let width: f32 = msg![env; coder decodeFloatForKey:width_key];
+    let is_system_key = get_static_str(env, "UIIsSystemItem");
+    let is_system: bool = msg![env; coder decodeBoolForKey:is_system_key];
+    let system_item_key = get_static_str(env, "UISystemItemIdentifier");
+    let system_item: i32 = msg![env; coder decodeIntForKey:system_item_key];
+    let enabled_key = get_static_str(env, "UIEnabled");
+    let has_enabled: bool = msg![env; coder containsValueForKey:enabled_key];
+    let enabled: bool = !has_enabled || msg![env; coder decodeBoolForKey:enabled_key];
+
+    let system_item = if is_system {
+        UIBarButtonSystemItem::try_from(system_item).unwrap_or(UIBarButtonSystemItem::Done)
+    } else {
+        UIBarButtonSystemItem::Done
+    };
+    let is_space = is_system
+        && matches!(
+            system_item,
+            UIBarButtonSystemItem::FlexibleSpace | UIBarButtonSystemItem::FixedSpace
+        );
+
+    // Build the same subviews as the programmatic initialisers.
+    let (label, image_view) = if custom_view != nil || is_space {
+        (nil, nil)
+    } else if image != nil {
+        let iv: id = msg_class![env; UIImageView alloc];
+        let iv: id = msg![env; iv initWithImage:image];
+        (nil, iv)
+    } else if title != nil {
+        (make_title_label(env, title), nil)
+    } else if is_system {
+        let system_title = from_rust_string(env, system_item.to_string());
+        autorelease(env, system_title);
+        (make_title_label(env, system_title), nil)
+    } else {
+        (nil, nil)
+    };
+
+    retain(env, title);
+    retain(env, image);
+    retain(env, custom_view);
+    {
+        let host = env.objc.borrow_mut::<UIBarButtonItemHostObject>(this);
+        host.title = title;
+        host.image = image;
+        host.style = UIBarButtonItemStyle::try_from(style).unwrap_or(UIBarButtonItemStyle::Plain);
+        host.system_item = system_item;
+        host.width = width;
+        host.label = label;
+        host.custom_view = if custom_view != nil { custom_view } else { image_view };
+    }
+    if label != nil {
+        () = msg![env; this addSubview:label];
+    }
+    if image_view != nil {
+        () = msg![env; this addSubview:image_view];
+    }
+    if custom_view != nil {
+        () = msg![env; this addSubview:custom_view];
+    }
+    () = msg![env; this setEnabled:enabled];
+    this
+}
+
+// Nib connections give a bar button item its target and action without an
+// event mask: the action fires when the item is tapped.
+- (())addTarget:(id)target
+         action:(SEL)action
+forControlEvents:(UIControlEvents)events {
+    let events = if events == 0 {
+        if target != nil {
+            retain(env, target);
+        }
+        let old_target = env.objc.borrow::<UIBarButtonItemHostObject>(this).target;
+        release(env, old_target);
+        let host = env.objc.borrow_mut::<UIBarButtonItemHostObject>(this);
+        host.target = target;
+        host.action = Some(action);
+        UIControlEventTouchUpInside
+    } else {
+        events
+    };
+    msg_super![env; this addTarget:target action:action forControlEvents:events]
+}
+
 // MARK: - НОВЫЙ МЕТОД: initWithCustomView:
 
 - (id)initWithCustomView:(id)custom_view {
@@ -472,7 +593,17 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setTitle:(id)title {
+    let old = env.objc.borrow::<UIBarButtonItemHostObject>(this).title;
+    retain(env, title);
+    release(env, old);
     env.objc.borrow_mut::<UIBarButtonItemHostObject>(this).title = title;
+    // Apps rename items on the fly (e.g. "Clear" becoming "OK"); the label is
+    // what's drawn, so update it too.
+    let label = env.objc.borrow::<UIBarButtonItemHostObject>(this).label;
+    if label != nil {
+        () = msg![env; label setText:title];
+        () = msg![env; this layoutSubviews];
+    }
 }
 
 - (UIBarButtonItemStyle)style {
@@ -509,7 +640,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     // Если есть custom_view, берём размеры от него
     if custom_view != nil {
-        () = msg![env; custom_view sizeToFit];
+        // Like UIKit, a custom view keeps its own width (e.g. a text field
+        // from a nib); only size it to fit if it has none.
+        let cv_frame: CGRect = msg![env; custom_view frame];
+        if cv_frame.size.width <= 0.0 {
+            () = msg![env; custom_view sizeToFit];
+        }
         let cv_frame: CGRect = msg![env; custom_view frame];
         CGSize {
             width: cv_frame.size.width + 16.0,
@@ -540,7 +676,24 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     // Устанавливаем фрейм для custom_view, если он есть
     if custom_view != nil {
-        () = msg![env; custom_view setFrame:bounds];
+        // Centre the custom view at its own size (the item is wider by the
+        // padding added in -sizeThatFits:, so filling it would grow the view
+        // on every layout pass).
+        let cv_frame: CGRect = msg![env; custom_view frame];
+        let width = cv_frame.size.width.min(bounds.size.width);
+        let height = if cv_frame.size.height > 0.0 {
+            cv_frame.size.height.min(bounds.size.height)
+        } else {
+            bounds.size.height
+        };
+        let frame = CGRect {
+            origin: CGPoint {
+                x: ((bounds.size.width - width) / 2.0).round(),
+                y: ((bounds.size.height - height) / 2.0).round(),
+            },
+            size: CGSize { width, height },
+        };
+        () = msg![env; custom_view setFrame:frame];
     } else if label != nil {
         () = msg![env; label setFrame:bounds];
     }
