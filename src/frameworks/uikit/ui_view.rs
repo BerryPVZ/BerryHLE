@@ -787,6 +787,12 @@ pub const CLASSES: ClassExports = objc_classes! {
     let key_autoresizes_subviews = get_static_str(env, "UIAutoresizesSubviews");
     let autoresizes_subviews: bool = if msg![env; coder containsValueForKey:key_autoresizes_subviews] { msg![env; coder decodeBoolForKey:key_autoresizes_subviews] } else { true };
 
+    // Interface Builder archives this for views whose "User Interaction
+    // Enabled" box is unchecked, which is the default for labels and image
+    // views. Without it, a label laid over a button swallows its taps.
+    let key_interaction_disabled = get_static_str(env, "UIUserInteractionDisabled");
+    let user_interaction_disabled: bool = if msg![env; coder containsValueForKey:key_interaction_disabled] { msg![env; coder decodeBoolForKey:key_interaction_disabled] } else { false };
+
     let key_multi_touch = get_static_str(env, "UIMultipleTouchEnabled");
     let multi_touch_enabled: bool = if msg![env; coder containsValueForKey:key_multi_touch] { msg![env; coder decodeBoolForKey:key_multi_touch] } else { false };
 
@@ -818,6 +824,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     () = msg![env; this setAutoresizingMask:autoresizing_mask];
     () = msg![env; this setAutoresizesSubviews:autoresizes_subviews];
     () = msg![env; this setMultipleTouchEnabled:multi_touch_enabled];
+    if user_interaction_disabled {
+        () = msg![env; this setUserInteractionEnabled:false];
+    }
 
     for i in 0..subview_count {
         let subview: id = msg![env; subviews objectAtIndex:i];

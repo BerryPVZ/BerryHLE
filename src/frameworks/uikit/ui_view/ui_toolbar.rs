@@ -15,6 +15,7 @@
 //! that view as the subview instead.
 
 use crate::abi::{GuestArg, GuestRet};
+use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::frameworks::uikit::ui_view::ui_control::ui_bar_button_item::UIBarButtonSystemItem;
 use crate::frameworks::{
     core_graphics::{CGFloat, CGPoint, CGRect, CGSize},
@@ -192,6 +193,32 @@ pub const CLASSES: ClassExports = objc_classes! {
     this
 }
 
+- (id)initWithCoder:(id)coder {
+    let this: id = msg_super![env; this initWithCoder:coder];
+
+    let style_key = get_static_str(env, "UIBarStyle");
+    let style: i32 = msg![env; coder decodeIntForKey:style_key];
+    let style = UIBarStyle::try_from(style).unwrap_or(UIBarStyle::UIBarStyleDefault);
+    let translucent_key = get_static_str(env, "UITranslucent");
+    let translucent: bool = msg![env; coder decodeBoolForKey:translucent_key];
+    {
+        let host = env.objc.borrow_mut::<UIToolbarHostObject>(this);
+        host.bar_style = style;
+        host.is_translucent = translucent;
+    }
+    () = msg![env; this setOpaque:false];
+    apply_toolbar_background(env, this, style, translucent);
+
+    // Without the items, a toolbar from a nib is an empty bar and its buttons
+    // can't be used.
+    let items_key = get_static_str(env, "UIItems");
+    let items: id = msg![env; coder decodeObjectForKey:items_key];
+    if items != nil {
+        () = msg![env; this setItems:items animated:false];
+    }
+    this
+}
+
 // MARK: Deallocation
 
 - (())dealloc {
@@ -273,7 +300,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         () = msg![env; this addSubview:bv];
     }
 
-    () = msg![env; this setNeedsLayout];
+    // touchHLE's -setNeedsLayout doesn't schedule a layout pass, so lay the
+    // items out now; otherwise they keep a zero-size frame.
+    () = msg![env; this layoutSubviews];
 }
 
 - (id)items {
@@ -370,6 +399,8 @@ pub const CLASSES: ClassExports = objc_classes! {
             size:   CGSize  { width: w, height: h },
         };
         () = msg![env; bv setFrame:frame];
+        // Let the item position its own label or custom view.
+        () = msg![env; bv layoutSubviews];
         x += w;
     }
 }
