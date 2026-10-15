@@ -347,8 +347,10 @@ com.dodreams.crashonwheels: --landscape-left --prefer-gles2-context --force-comp
 # Green Lantern: native 480x320 landscape OpenGL ES 2 profile.
 com.wb.GreenLantern: --landscape-left --prefer-gles2-context
 
-# Where's My Water?: iPhone portrait OpenGL ES 1 profile.
-com.disney.SwampyGame: --device-family=iphone-3gs
+# Where's My Water?: iPhone portrait OpenGL ES 1 profile. Needs the libxml2
+# guest DOM mirror (the game reads xmlNode struct fields directly), else every
+# asset XML root reads as null and the game renders empty.
+com.disney.SwampyGame: --device-family=iphone-3gs --xml-dom-mirror
 
 # LEGO Ninjago: The Final Battle
 # Uses OpenAL streaming audio; keep its fixed-function landscape profile and
@@ -359,3 +361,15 @@ com.lego.ninjago.thefinalbattle: --landscape-left --fix-texture-min-filter
 # Use the movie-player and transform-aware iPad rotation fixes.
 com.rockstargames.gta3: --fix-movie-player --rotation-fix
 com.rockstargames.gta3ios: --fix-movie-player --rotation-fix
+
+# The Sims Medieval: draws through an OpenGL ES 2.0 context on a CAEAGLayer
+# that is not the fullscreen layer. Without the iOS direct presenter the frame
+# is composited but never reaches the screen, so the game plays audio over a
+# black screen. The direct presenter costs a readback every frame, so it stays
+# opt-in and is enabled per app here.
+com.ea.simsmedieval.bv: --ios-es2-direct-present
+
+# Wiki for Minecraft (Unity 4.6 uGUI): the UI is laid out in fixed pixels for a
+# Retina screen. On the 320x480 iPhone 3GS every label and icon is twice too
+# big for its row, so the title and text overflow. Emulate a Retina iPhone.
+com.anarchyent.mcwikipaid: --device-family=iphone-4

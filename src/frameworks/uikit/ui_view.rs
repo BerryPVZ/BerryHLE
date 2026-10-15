@@ -787,6 +787,12 @@ pub const CLASSES: ClassExports = objc_classes! {
     let key_autoresizes_subviews = get_static_str(env, "UIAutoresizesSubviews");
     let autoresizes_subviews: bool = if msg![env; coder containsValueForKey:key_autoresizes_subviews] { msg![env; coder decodeBoolForKey:key_autoresizes_subviews] } else { true };
 
+    // Interface Builder archives this for views whose "User Interaction
+    // Enabled" box is unchecked, which is the default for labels and image
+    // views. Without it, a label laid over a button swallows its taps.
+    let key_interaction_disabled = get_static_str(env, "UIUserInteractionDisabled");
+    let user_interaction_disabled: bool = if msg![env; coder containsValueForKey:key_interaction_disabled] { msg![env; coder decodeBoolForKey:key_interaction_disabled] } else { false };
+
     let key_multi_touch = get_static_str(env, "UIMultipleTouchEnabled");
     let multi_touch_enabled: bool = if msg![env; coder containsValueForKey:key_multi_touch] { msg![env; coder decodeBoolForKey:key_multi_touch] } else { false };
 
@@ -818,6 +824,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     () = msg![env; this setAutoresizingMask:autoresizing_mask];
     () = msg![env; this setAutoresizesSubviews:autoresizes_subviews];
     () = msg![env; this setMultipleTouchEnabled:multi_touch_enabled];
+    if user_interaction_disabled {
+        () = msg![env; this setUserInteractionEnabled:false];
+    }
 
     for i in 0..subview_count {
         let subview: id = msg![env; subviews objectAtIndex:i];
@@ -1280,6 +1289,58 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())addSubview:(id)view {
     if view == nil { return; }
+
+    // Doodle Jump launch cross-promo workaround.
+    //
+    // At startup Doodle Jump runs a queue of popups (age gate, ATT tracking,
+    // "what's new"). Only after the last one closes does it call
+    // `continueInitializationAfterPopups`, which creates the cocos2d game
+    // scene and starts the render loop. The "what's new" popup is an
+    // `ImagePopUpView` whose close button only un-hides once its embedded
+    // `UIWebView` finishes loading remote content. With no web backend (and
+    // offline) that content never arrives, so the close button stays hidden,
+    // the popup can never be dismissed, and the game is left on a black menu
+    // with the cocos2d scene never created.
+    //
+    // Mirror the `AgeGateView` auto-complete: the first time the popup is
+    // added, schedule its removal and the initialization continuation on the
+    // run loop so the game proceeds to its real (fully rendered) menu.
+    if env.bundle.bundle_identifier() == "com.yourcompany.DoodleJump" {
+        let view_class: Class = msg![env; view class];
+        if env.objc.get_class_name(view_class) == "ImagePopUpView" {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static DISMISSED: AtomicBool = AtomicBool::new(false);
+            if !DISMISSED.swap(true, Ordering::Relaxed) {
+                let app: id = msg_class![env; UIApplication sharedApplication];
+                let delegate: id = msg![env; app delegate];
+                if delegate != nil
+                    && env.objc.object_has_method_named(
+                        &env.mem,
+                        delegate,
+                        "continueInitializationAfterPopups",
+                    )
+                {
+                    if let Some(cont) =
+                        env.objc.lookup_selector("continueInitializationAfterPopups")
+                    {
+                        log!(
+                            "Doodle Jump: auto-dismissing offline cross-promo popup and \
+                             continuing initialization"
+                        );
+                        if let Some(remove) = env.objc.lookup_selector("removeFromSuperview") {
+                            () = msg![env; view performSelector:remove
+                                                       withObject:nil
+                                                        afterDelay:2.5f64];
+                        }
+                        () = msg![env; delegate performSelector:cont
+                                                       withObject:nil
+                                                        afterDelay:2.6f64];
+                    }
+                }
+            }
+        }
+    }
+
     if env.objc.borrow::<UIViewHostObject>(view).superview == this {
         () = msg![env; this bringSubviewToFront:view];
     } else {

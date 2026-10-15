@@ -463,8 +463,22 @@ fn rotate_fullscreen_size(orientation: DeviceOrientation, screen_size: (u32, u32
         }
     }
 }
-/// Tell SDL2 what orientation we want. Only useful on Android.
+/// Tell SDL2 what orientation we want. Only useful on Android and iOS.
 fn set_sdl2_orientation(orientation: DeviceOrientation) {
+    // On iOS the host UI decides the actual interface orientation, so only
+    // tell SDL2 which family of orientations the current game may use.
+    if cfg!(target_os = "ios") {
+        sdl2::hint::set(
+            "SDL_IOS_ORIENTATIONS",
+            match orientation {
+                DeviceOrientation::Portrait | DeviceOrientation::PortraitUpsideDown => "Portrait",
+                DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight => {
+                    "LandscapeLeft LandscapeRight"
+                }
+            },
+        );
+        return;
+    }
     // Despite the name, this hint works on Android too.
     sdl2::hint::set(
         "SDL_IOS_ORIENTATIONS",
@@ -754,6 +768,7 @@ pub struct Window {
     /// native driver such as Qualcomm Adreno) so that driver-specific
     /// workarounds can be auto-enabled. See [Window::gl_driver_description].
     gl_driver_description: String,
+    host_framebuffer: u32,
     splash_image: Option<Image>,
     /// Whether the selected image already targets the startup orientation.
     splash_image_is_orientation_specific: bool,
@@ -785,9 +800,9 @@ pub struct Window {
 impl Window {
     /// Returns [true] if touchHLE is running on a device where we should always
     /// display fullscreen, but SDL2 will let us control the orientation, i.e.
-    /// Android devices.
+    /// Android and iOS devices.
     pub fn rotatable_fullscreen() -> bool {
-        env::consts::OS == "android"
+        matches!(env::consts::OS, "android" | "ios")
     }
 
     fn toggle_fullscreen(&mut self) {
@@ -980,10 +995,12 @@ impl Window {
                 .map_err(|err| format!("Could not query the display bounds: {}", err))?
                 .size();
             let (width, height) = rotate_fullscreen_size(device_orientation, screen_size);
-            let window = video_ctx
-                .window(title, width, height)
-                .fullscreen()
-                .opengl()
+            let mut window_builder = video_ctx.window(title, width, height);
+            window_builder.fullscreen().opengl();
+            // Render at the device's native (Retina) resolution.
+            #[cfg(target_os = "ios")]
+            window_builder.allow_highdpi();
+            let window = window_builder
                 .build()
                 .map_err(|err| format!("Could not create the SDL OpenGL window: {}", err))?;
             window
@@ -1129,6 +1146,7 @@ impl Window {
             host_screen_size,
             internal_gl_ins: None,
             gl_driver_description: String::new(),
+            host_framebuffer: 0,
             splash_image,
             splash_image_is_orientation_specific,
             device_family,
@@ -1179,11 +1197,36 @@ impl Window {
                 verbose: options.trace_gl_errors || options.verbose_gles,
             });
         }
-        let gl_driver_description = {
-            let gl_ctx = gl_ins.make_current(&mut window);
-            unsafe { gl_ctx.driver_description() }
+        let (gl_driver_description, host_framebuffer) = {
+            #[allow(unused_mut)]
+            let mut gl_ctx = gl_ins.make_current(&mut window);
+            #[allow(unused_mut)]
+            let mut framebuffer = 0;
+            // On iOS, SDL2 draws the window through a framebuffer object of
+            // its own rather than framebuffer 0.
+            #[cfg(target_os = "ios")]
+            unsafe {
+                gl_ctx.GetIntegerv(
+                    crate::gles::gles11_raw::FRAMEBUFFER_BINDING_OES,
+                    &mut framebuffer,
+                );
+            }
+            (unsafe { gl_ctx.driver_description() }, framebuffer as u32)
         };
         log!("Driver info: {}", gl_driver_description);
+        window.host_framebuffer = host_framebuffer;
+        if env::consts::OS == "ios" {
+            let (window_width, window_height) = window.window.size();
+            let (drawable_width, drawable_height) = window.window.drawable_size();
+            log!(
+                "iOS host framebuffer: {}, window: {}×{}, Retina drawable: {}×{}",
+                host_framebuffer,
+                window_width,
+                window_height,
+                drawable_width,
+                drawable_height,
+            );
+        }
         window.gl_driver_description = gl_driver_description;
         window.internal_gl_ins = Some(gl_ins);
 
@@ -2498,17 +2541,28 @@ impl Window {
             // on a fullscreen window, so it must be temporarily stop being
             // fulscreen.
             // Apparently, doing this does result in resizing the window.
-            self.window
-                .set_fullscreen(sdl2::video::FullscreenType::Off)
-                .unwrap();
+            // None of this is allowed to be fatal. On iOS the host UI decides
+            // whether the interface may rotate, and if it has not rotated yet,
+            // SDL2 rejects the new display mode with "Screen orientation does
+            // not match display mode size". That used to panic and take the
+            // whole game down mid-play; a rotation that does not happen is far
+            // better than that, and the next attempt can still succeed.
+            if let Err(err) = self.window.set_fullscreen(sdl2::video::FullscreenType::Off) {
+                log!("Warning: couldn't leave fullscreen to rotate: {}", err);
+            }
             unsafe {
                 let window_raw = self.window.raw();
                 sdl2_sys::SDL_SetWindowResizable(window_raw, sdl2_sys::SDL_bool::SDL_FALSE);
                 sdl2_sys::SDL_SetWindowResizable(window_raw, sdl2_sys::SDL_bool::SDL_TRUE);
             }
-            self.window
-                .set_fullscreen(sdl2::video::FullscreenType::True)
-                .unwrap();
+            if let Err(err) = self.window.set_fullscreen(sdl2::video::FullscreenType::True) {
+                log!(
+                    "Warning: couldn't return to fullscreen after rotating to {:?}: {}. \
+                     The host UI may not permit this orientation.",
+                    new_orientation,
+                    err
+                );
+            }
         }
 
         self.device_orientation = new_orientation;
@@ -2632,6 +2686,10 @@ impl Window {
         let pw = (w * sx).round() as i32;
         let ph = (h * sy).round() as i32;
         (px, py, pw.max(0), ph.max(0))
+    }
+
+    pub fn host_framebuffer(&self) -> u32 {
+        self.host_framebuffer
     }
 
     /// Special offset to add to y co-ordinates, only when drawing to screen.

@@ -2,6 +2,7 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 [workspace]
+members = ["platform/ios/rust-entry"]
 
 [workspace.package]
 version = "0.2.3"
@@ -29,6 +30,14 @@ default = ["static"]
 static = [
     "sdl2/bundled",
     "sdl2/static-link",
+    "touchHLE_openal_soft_wrapper/static",
+    "touchHLE_libxml2_wrapper/static",
+]
+# Like "static", but SDL2 is linked dynamically against a shared library
+# supplied by the host. The iOS host app loads a core as a dylib at runtime, and
+# SDL owns the process entry point and the UIApplicationDelegate, so the app and
+# the core have to be the same SDL — a core cannot bring its own copy.
+dynamic-sdl = [
     "touchHLE_openal_soft_wrapper/static",
     "touchHLE_libxml2_wrapper/static",
 ]

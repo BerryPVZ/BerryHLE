@@ -179,6 +179,31 @@ impl FsNode {
 /// Path of the applications directory in the guest filesystem.
 pub const APPLICATIONS: &GuestPath = GuestPath::new_const("/var/mobile/Applications");
 
+/// Fonts from [paths::FONTS_DIR] that are also exposed to the guest in
+/// `/System/Library/Fonts/Cache`, where the real iPhone OS keeps its fonts.
+const SYSTEM_FONT_FILES: &[&str] = &[
+    "Arial.ttf",
+    "helvetica-bold.ttf",
+    "LiberationSans-Regular.ttf",
+    "LiberationSans-Bold.ttf",
+    "LiberationSans-Italic.ttf",
+    "LiberationSans-BoldItalic.ttf",
+    "LiberationSerif-Regular.ttf",
+    "LiberationSerif-Bold.ttf",
+    "LiberationSerif-Italic.ttf",
+    "LiberationSerif-BoldItalic.ttf",
+    "LiberationMono-Regular.ttf",
+    "LiberationMono-Bold.ttf",
+    "LiberationMono-Italic.ttf",
+    "LiberationMono-BoldItalic.ttf",
+    "NotoSansArabic-Regular.ttf",
+    "NotoSansArabic-Bold.ttf",
+    "NotoSansJP-Regular.otf",
+    "NotoSansJP-Bold.otf",
+    "NotoSansSC-Regular.otf",
+    "NotoSansSC-Bold.otf",
+];
+
 /// Like [Path] but for the virtual filesystem.
 #[repr(transparent)]
 #[derive(Debug)]
@@ -993,6 +1018,19 @@ impl Fs {
                 FsNode::resource_file(format!("{DYLIBS_DIR}/libsqlite3.dylib")),
             );
 
+        // iPhone OS keeps its system fonts in /System/Library/Fonts/Cache.
+        // Some engines read them directly instead of going through UIKit:
+        // Unity's dynamic fonts scan this directory for the font backing its
+        // built-in "Arial" (and as a fallback for missing glyphs). Without it,
+        // every Unity UI text label renders empty. Expose touchHLE's bundled
+        // fonts there.
+        use paths::FONTS_DIR;
+        let mut system_fonts = FsNode::dir();
+        for font in SYSTEM_FONT_FILES {
+            system_fonts =
+                system_fonts.with_child(font, FsNode::resource_file(format!("{FONTS_DIR}/{font}")));
+        }
+
         let mut app_dir_children = HashMap::new();
         app_dir_children.insert(bundle_dir_name, app_bundle.into_fs_node());
         for (dir, host_path) in directories.iter().zip(host_path_directories.iter()) {
@@ -1067,7 +1105,15 @@ impl Fs {
                         .with_child("Library", library_node),
                 ),
             )
-            .with_child("usr", FsNode::dir().with_child("lib", usr_lib));
+            .with_child("usr", FsNode::dir().with_child("lib", usr_lib))
+            .with_child(
+                "System",
+                FsNode::dir().with_child(
+                    "Library",
+                    FsNode::dir()
+                        .with_child("Fonts", FsNode::dir().with_child("Cache", system_fonts)),
+                ),
+            );
         log_dbg!("Initial filesystem layout: {:#?}", root);
 
         // Prepare the copy-on-write shadow directory for IPA bundle files.
@@ -1374,7 +1420,12 @@ impl Fs {
                 FileLocation::Path(path) => {
                     fs::metadata(path).map(|meta| meta.len()).map_err(|_| ())
                 }
-                FileLocation::ResourceFilePath(_) => Ok(0),
+                FileLocation::ResourceFilePath(name) => {
+                    // Apps that read a bundled resource (e.g. a system font)
+                    // often size their buffer from stat() first.
+                    let mut file = paths::ResourceFile::open(name).map_err(|_| ())?;
+                    file.get().seek(std::io::SeekFrom::End(0)).map_err(|_| ())
+                }
             },
             FsNode::Directory { writeable, .. } => {
                 if let Some(host_path) = writeable {

@@ -6,6 +6,7 @@
 //! `UITableView`, `UITableViewCell`.
 
 use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
+use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::frameworks::foundation::{NSInteger, NSUInteger};
 use crate::frameworks::uikit::ui_view;
 use crate::frameworks::uikit::ui_view::ui_scroll_view::UIScrollViewHostObject;
@@ -73,6 +74,10 @@ pub struct UITableViewHostObject {
     /// has no automatic layout pass, so we trigger that reload ourselves the
     /// first time the table has both a data source and a non-zero size.
     auto_reloaded: bool,
+    /// Whether the table has had its first `layoutSubviews`. UIKit's initial
+    /// load happens then, after the owning view controller's `-viewDidLoad`
+    /// has prepared the data, so the table is reloaded again at that point.
+    laid_out: bool,
 }
 impl Default for UITableViewHostObject {
     fn default() -> Self {
@@ -90,6 +95,7 @@ impl Default for UITableViewHostObject {
             table_header_view: nil,
             table_footer_view: nil,
             auto_reloaded: false,
+            laid_out: false,
         }
     }
 }
@@ -409,6 +415,38 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg_super![env; this initWithFrame:frame]
 }
 
+- (id)initWithCoder:(id)coder {
+    let this: id = msg_super![env; this initWithCoder:coder];
+    let row_height_key = get_static_str(env, "UIRowHeight");
+    let has_row_height: bool = msg![env; coder containsValueForKey:row_height_key];
+    if has_row_height {
+        let row_height: f32 = msg![env; coder decodeFloatForKey:row_height_key];
+        if row_height > 0.0 {
+            env.objc.borrow_mut::<UITableViewHostObject>(this).row_height = row_height;
+        }
+    }
+    let separator_style_key = get_static_str(env, "UISeparatorStyle");
+    let has_separator_style: bool = msg![env; coder containsValueForKey:separator_style_key];
+    if has_separator_style {
+        let separator_style: NSInteger = msg![env; coder decodeIntegerForKey:separator_style_key];
+        env.objc.borrow_mut::<UITableViewHostObject>(this).separator_style = separator_style;
+    }
+    this
+}
+
+- (())layoutSubviews {
+    () = msg_super![env; this layoutSubviews];
+    let (laid_out, data_source) = {
+        let host = env.objc.borrow::<UITableViewHostObject>(this);
+        (host.laid_out, host.data_source)
+    };
+    if !laid_out && data_source != nil {
+        env.objc.borrow_mut::<UITableViewHostObject>(this).laid_out = true;
+        env.objc.borrow_mut::<UITableViewHostObject>(this).auto_reloaded = true;
+        () = msg![env; this reloadData];
+    }
+}
+
 - (())dealloc {
     clear_cells(env, this, false);
     let header = env.objc.borrow::<UITableViewHostObject>(this).table_header_view;
@@ -494,6 +532,16 @@ pub const CLASSES: ClassExports = objc_classes! {
     let mut new_cells: Vec<id> = Vec::new();
     let mut new_paths: Vec<id> = Vec::new();
 
+    // Rows can have individual heights (-tableView:heightForRowAtIndexPath:).
+    let delegate = env.objc.borrow::<UITableViewHostObject>(this).table_delegate;
+    let delegate_has_row_heights = delegate != nil && {
+        let sel = env.objc.lookup_selector("tableView:heightForRowAtIndexPath:");
+        match sel {
+            Some(sel) => msg![env; delegate respondsToSelector:sel],
+            None => false,
+        }
+    };
+
     for section in 0..num_sections {
         let row_count: NSInteger = msg![env; data_source
             tableView:this
@@ -513,14 +561,19 @@ pub const CLASSES: ClassExports = objc_classes! {
             }
             retain(env, cell);
 
+            let this_row_height: f32 = if delegate_has_row_heights {
+                msg![env; delegate tableView:this heightForRowAtIndexPath:index_path]
+            } else {
+                row_height
+            };
             let frame = CGRect {
                 origin: CGPoint { x: 0.0, y },
-                size: CGSize { width, height: row_height },
+                size: CGSize { width, height: this_row_height },
             };
             () = msg![env; cell setFrame:frame];
             () = msg![env; this addSubview:cell];
 
-            y += row_height;
+            y += this_row_height;
             new_cells.push(cell);
             new_paths.push(index_path);
         }

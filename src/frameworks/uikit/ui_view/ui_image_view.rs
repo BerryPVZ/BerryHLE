@@ -59,6 +59,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     // Not sure if UIImageView does this unconditionally, or only for images
     // with alpha channels.
     () = msg![env; this setOpaque:false];
+    // UIImageView disables user interaction by default (unlike plain UIView).
+    // Apps routinely stack a decorative image view on top of the real tappable
+    // control (e.g. Doodle Jump's menu buttons, or an image inside a UIButton):
+    // if the image view swallowed touches, those controls would be dead.
+    () = msg![env; this setUserInteractionEnabled:false];
     this
 }
 
@@ -88,6 +93,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     () = msg![env; this setImage:image];
 
+    // UIImageView disables user interaction by default (unlike plain UIView).
+    () = msg![env; this setUserInteractionEnabled:false];
+
     this
 }
 
@@ -102,6 +110,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     // Not sure if UIImageView does this unconditionally, or only for images
     // with alpha channels.
     () = msg![env; this setOpaque:false];
+    // UIImageView disables user interaction by default (unlike plain UIView).
+    () = msg![env; this setUserInteractionEnabled:false];
     this
 }
 

@@ -4,7 +4,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn rerun_if_changed(path: &Path) {
     println!("cargo:rerun-if-changed={}", path.to_str().unwrap());
@@ -27,8 +27,24 @@ fn build_type_windows<'a>(os: &str, cmake_profile: &'a str) -> &'a str {
 fn main() {
     let package_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = package_root.join("../../..");
+    // The iOS build points this at a patched copy of the submodule (see
+    // platform/ios/scripts/build-rust.sh), so the submodule itself stays clean.
+    println!("cargo:rerun-if-env-changed=TOUCHHLE_DYNARMIC_DIR");
+    let dynarmic_dir = env::var_os("TOUCHHLE_DYNARMIC_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root.join("vendor/dynarmic"));
+    for path in [
+        "externals/oaknut/include/oaknut/code_block.hpp",
+        "src/dynarmic/backend/arm64/a32_address_space.cpp",
+        "src/dynarmic/backend/arm64/address_space.cpp",
+        "src/dynarmic/backend/block_range_information.cpp",
+        "src/dynarmic/backend/block_range_information.h",
+        "src/dynarmic/common/spin_lock_arm64.cpp",
+    ] {
+        rerun_if_changed(&dynarmic_dir.join(path));
+    }
 
-    let mut build = cmake::Config::new(workspace_root.join("vendor/dynarmic"));
+    let mut build = cmake::Config::new(&dynarmic_dir);
     let cmake_profile = build.get_profile().to_owned();
     build.define("DYNARMIC_FRONTENDS", "A32"); // We don't need 64-bit
     build.define("DYNARMIC_WARNINGS_AS_ERRORS", "OFF");

@@ -8,7 +8,7 @@ The repository does not distribute commercial apps or iOS firmware. Put an app b
 
 ## Platforms and features
 
-- Builds for Android, Windows, macOS, and Linux.
+- Builds for Android, iOS, Windows, macOS, and Linux. The iOS app comes from [Applesauce](https://github.com/johnny901901901/Applesauce); see [`platform/ios`](platform/ios/README.md).
 - Virtual iPhone and iPad device profiles.
 - Android touch input and fullscreen/orientation handling.
 - Ongoing GLES, EAGL, Core Animation, audio, and iOS framework compatibility work.
@@ -19,7 +19,7 @@ The repository does not distribute commercial apps or iOS firmware. Put an app b
 The titles below have been tested with HyperHLE-Fork and are known to run. Compatibility may still vary with the app version, virtual device profile, host GPU/driver, and settings; this list does not guarantee that every feature or a full playthrough works.
 
 - N.O.V.A. 3 (Playable)
-- Gangstar Vegas (Unplayable)
+- Gangstar Vegas (Unplayable on adreno)
 - Geometry Dash (2.11 and 1.0 + playable)
 - Terraria (1.0 + playable)
 - Modern Combat 3 (1.5.0 + playable)
@@ -44,7 +44,7 @@ Build and run a desktop version with Cargo:
 cargo run --release -- path/to/app.app
 ```
 
-For Android build steps, see the `android/` directory and the [CI workflow](https://github.com/KlugKlugTG/HyperHLE-Fork/actions/workflows/HyperHLE_release.yml). Command-line options are documented in [`OPTIONS_HELP.txt`](OPTIONS_HELP.txt); notable compatibility changes are tracked in [`CHANGELOG.md`](CHANGELOG.md).
+For iOS build steps and the unsigned IPAs, see [`platform/ios`](platform/ios/README.md). For Android build steps, see the `android/` directory and the [CI workflow](https://github.com/KlugKlugTG/HyperHLE-Fork/actions/workflows/HyperHLE_release.yml). Command-line options are documented in [`OPTIONS_HELP.txt`](OPTIONS_HELP.txt); notable compatibility changes are tracked in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Community
 

@@ -201,6 +201,13 @@ pub const CLASSES: ClassExports = objc_classes! {
         release(env, old_bundle);
     }
 
+    // View controllers inside a UITabBarController archive their tab item.
+    let tab_bar_item_key = get_static_str(env, "UITabBarItem");
+    let tab_bar_item: id = msg![env; coder decodeObjectForKey:tab_bar_item_key];
+    if tab_bar_item != nil {
+        () = msg![env; this setTabBarItem:tab_bar_item];
+    }
+
     this
 }
 
@@ -654,7 +661,47 @@ pub const CLASSES: ClassExports = objc_classes! {
             let delegate: id = msg![env; app delegate];
             log!("AgeGateView detected: completing age gate automatically on app delegate {:?}", delegate);
             if delegate != nil {
+                // The app hosts its age gate in a dedicated UIWindow which it
+                // makes key *before* presenting the gate. Because we complete
+                // the gate synchronously instead of running the real
+                // present/dismiss cycle, that helper window would otherwise
+                // stay key, visible and empty on top of the game window,
+                // swallowing every touch forever. Capture it first, run the
+                // completion callback, then hide it and hand key back to the
+                // presenter's (game) window so the UI underneath is reachable.
+                let gate_window: id = msg![env; app keyWindow];
+                let presenter_view: id = msg![env; this view];
+                let presenter_window: id = if presenter_view != nil {
+                    msg![env; presenter_view window]
+                } else {
+                    nil
+                };
                 let _: () = crate::objc::msg_send_no_type_checking(env, (delegate, callback));
+                if gate_window != nil && gate_window != presenter_window {
+                    () = msg![env; gate_window setHidden:true];
+                    let restore: id = if presenter_window != nil {
+                        presenter_window
+                    } else {
+                        // Fall back to the first other visible window.
+                        let windows: id = msg![env; app windows];
+                        let count: NSUInteger = msg![env; windows count];
+                        let mut found: id = nil;
+                        let mut idx: NSUInteger = 0;
+                        while idx < count {
+                            let candidate: id = msg![env; windows objectAtIndex:idx];
+                            let hidden: bool = msg![env; candidate isHidden];
+                            if !hidden && candidate != gate_window {
+                                found = candidate;
+                                break;
+                            }
+                            idx += 1;
+                        }
+                        found
+                    };
+                    if restore != nil {
+                        () = msg![env; restore makeKeyWindow];
+                    }
+                }
                 return;
             }
             log!("WARNING: UIApplication delegate is nil; cannot complete age gate");

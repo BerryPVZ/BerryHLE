@@ -1,7 +1,9 @@
 //! App picker GUI.
 
 use crate::bundle::Bundle;
-use crate::frameworks::core_graphics::cg_affine_transform::CGAffineTransform;
+use crate::frameworks::core_graphics::cg_affine_transform::{
+    CGAffineTransform, CGAffineTransformIdentity,
+};
 use crate::frameworks::core_graphics::cg_bitmap_context::{
     CGBitmapContextCreate, CGBitmapContextCreateImage,
 };
@@ -470,9 +472,13 @@ const CLASSES: ClassExports = objc_classes! {
 };
 
 fn show_app_picker_gui(
-    options: Options,
+    mut options: Options,
     apps: Result<Vec<AppInfo>, String>,
 ) -> Result<(PathBuf, Vec<String>), String> {
+    if std::env::consts::OS == "ios" && options.scale_hack.get() == 1 {
+        options.scale_hack = NonZeroU32::new(3).unwrap();
+    }
+
     let icon = {
         let bytes: &[u8] = match crate::branding() {
             "" => include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/icon.png")),
@@ -534,6 +540,7 @@ fn app_picker_inner(
     // Wallpaper
     let mut found_wallpaper = false;
     let mut have_wallpaper = false;
+    let mut wallpaper_view: Option<id> = None;
     for candidate in paths::WALLPAPER_FILES {
         let candidate = paths::user_data_base_path().join(candidate);
         if !candidate.exists() {
@@ -569,6 +576,7 @@ fn app_picker_inner(
         })];
         () = msg![env; wallpaper setAlpha:(0.5 as CGFloat)];
         () = msg![env; main_view addSubview:wallpaper];
+        wallpaper_view = Some(wallpaper);
         have_wallpaper = true;
         break;
     }
@@ -583,7 +591,7 @@ fn app_picker_inner(
     }
 
     // Build label
-    {
+    let version_label = {
         let label_frame = CGRect {
             origin: CGPoint {
                 x: 0.0,
@@ -614,7 +622,8 @@ fn app_picker_inner(
         let bg_color: id = msg_class![env; UIColor clearColor];
         () = msg![env; label setBackgroundColor:bg_color];
         () = msg![env; main_view addSubview:label];
-    }
+        label
+    };
 
     let brand_color: id = if crate::branding() == "UNOFFICIAL" {
         msg_class![env; UIColor redColor]
@@ -741,6 +750,19 @@ fn app_picker_inner(
     let mut pending_delete: Option<usize> = None;
 
     let main_run_loop: id = msg_class![env; NSRunLoop mainRunLoop];
+    if let Some(ref grid) = icon_grid_stuff {
+        play_home_screen_unlock_animation(
+            env,
+            main_run_loop,
+            delegate,
+            grid,
+            app_frame.size,
+            wallpaper_view,
+            title,
+            version_label,
+        );
+        PENDING_ARROW_KEY.store(0, Ordering::Relaxed);
+    }
     // If an app is picked, this loop returns. If the user quits touchHLE, the
     // process exits.
     let app_path = loop {
@@ -1646,6 +1668,19 @@ fn ease_in_out_cubic(t: f64) -> f64 {
     }
 }
 
+/// Duration of the iOS 4-style radial icon fly-in when the picker opens.
+const HOME_UNLOCK_DURATION: Duration = Duration::from_millis(600);
+/// Initial scale of each icon and label at the start of the unlock fly-in.
+const HOME_UNLOCK_START_SCALE: CGFloat = 1.65;
+/// Fraction of the unlock duration by which the outermost corner icons are
+/// staggered behind the innermost icons.
+const HOME_UNLOCK_MAX_STAGGER: f64 = 0.22;
+/// Base off-screen push distance as a fraction of the longer screen dimension,
+/// ensuring even the innermost cells start outside the screen bounds.
+const HOME_UNLOCK_BASE_PUSH_FACTOR: CGFloat = 0.55;
+/// Extra radial distance multiplier applied to each cell's offset from the
+/// grid center so outer rows/columns stay separated from inner ones in flight.
+const HOME_UNLOCK_RADIAL_MULT: CGFloat = 1.85;
 /// Duration of the page slide when pressing the arrow tiles.
 const PAGE_SLIDE_DURATION: Duration = Duration::from_millis(320);
 /// Duration of the "app icon zooms to the middle, screen fades to black"
@@ -1680,12 +1715,200 @@ fn animate_for(
         let t = (start.elapsed().as_secs_f64() / duration.as_secs_f64()).min(1.0);
         step(env, t);
         run_run_loop_single_iteration(env, run_loop);
-        env.objc
-            .borrow_mut::<AppPickerDelegateHostObject>(delegate)
-            .icon_tapped = nil;
+        let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
+        host_obj.icon_tapped = nil;
+        host_obj.icon_touch_down = nil;
         if t >= 1.0 {
             break;
         }
+    }
+}
+
+/// Precomputed trajectory of one icon-grid cell for the iOS 4-style home
+/// screen unlock animation.
+#[derive(Clone, Copy, Debug)]
+struct UnlockCellTarget {
+    /// Initial X displacement (off-screen) relative to the resting slot.
+    start_dx: CGFloat,
+    /// Initial Y displacement (off-screen) relative to the resting slot.
+    start_dy: CGFloat,
+    /// Resting vertical distance from the icon center to its label center,
+    /// so the label stays attached below the scaled icon during flight.
+    label_offset_y: CGFloat,
+    /// Normalized radial distance from the grid center (`0.0..=1.0`), used
+    /// to stagger outer icons slightly behind inner ones.
+    norm_dist: f64,
+}
+
+fn compute_unlock_cell_targets(
+    icon_centers: &[CGPoint],
+    label_offsets_y: &[CGFloat],
+    screen_size: CGSize,
+) -> Vec<UnlockCellTarget> {
+    if icon_centers.is_empty() {
+        return Vec::new();
+    }
+    let mut min_x = icon_centers[0].x;
+    let mut max_x = icon_centers[0].x;
+    let mut min_y = icon_centers[0].y;
+    let mut max_y = icon_centers[0].y;
+    for c in icon_centers {
+        min_x = min_x.min(c.x);
+        max_x = max_x.max(c.x);
+        min_y = min_y.min(c.y);
+        max_y = max_y.max(c.y);
+    }
+    let grid_center = CGPoint {
+        x: (min_x + max_x) / 2.0,
+        y: (min_y + max_y) / 2.0,
+    };
+
+    let mut max_dist: CGFloat = 0.0;
+    let mut raw: Vec<(CGFloat, CGFloat, CGFloat)> = Vec::with_capacity(icon_centers.len());
+    for c in icon_centers {
+        let vx = c.x - grid_center.x;
+        let vy = c.y - grid_center.y;
+        let dist = (vx * vx + vy * vy).sqrt();
+        max_dist = max_dist.max(dist);
+        raw.push((vx, vy, dist));
+    }
+
+    let base_push = screen_size.width.max(screen_size.height) * HOME_UNLOCK_BASE_PUSH_FACTOR;
+    raw.into_iter()
+        .zip(label_offsets_y.iter().copied())
+        .map(|((vx, vy, dist), label_offset_y)| {
+            let (ux, uy) = if dist > 1e-3 {
+                (vx / dist, vy / dist)
+            } else {
+                (0.0, -1.0)
+            };
+            let start_dx = ux * base_push + vx * HOME_UNLOCK_RADIAL_MULT;
+            let start_dy = uy * base_push + vy * HOME_UNLOCK_RADIAL_MULT;
+            let norm_dist = if max_dist > 1e-3 {
+                (dist / max_dist) as f64
+            } else {
+                0.0
+            };
+            UnlockCellTarget {
+                start_dx,
+                start_dy,
+                label_offset_y,
+                norm_dist,
+            }
+        })
+        .collect()
+}
+
+/// Returns `(dx, dy, label_dy, scale, alpha)` for `target` at global
+/// animation progress `t` (`0.0..=1.0`).
+fn unlock_cell_state_at(
+    target: &UnlockCellTarget,
+    t: f64,
+) -> (CGFloat, CGFloat, CGFloat, CGFloat, CGFloat) {
+    let t = t.clamp(0.0, 1.0);
+    let delay = target.norm_dist * HOME_UNLOCK_MAX_STAGGER;
+    let span = (1.0 - HOME_UNLOCK_MAX_STAGGER).max(1e-6);
+    let local_t = ((t - delay) / span).clamp(0.0, 1.0);
+    let p = ease_out_cubic(local_t) as CGFloat;
+    let rem = 1.0 - p;
+    let dx = target.start_dx * rem;
+    let dy = target.start_dy * rem;
+    let scale = lerp_f(HOME_UNLOCK_START_SCALE, 1.0, p);
+    let label_dy = dy + target.label_offset_y * (scale - 1.0);
+    let alpha = (local_t * 2.0).min(1.0) as CGFloat;
+    (dx, dy, label_dy, scale, alpha)
+}
+
+fn apply_unlock_step(
+    env: &mut Environment,
+    cells: &[(id, id)],
+    targets: &[UnlockCellTarget],
+    wallpaper: Option<id>,
+    title: id,
+    version_label: id,
+    t: f64,
+) {
+    let chrome_alpha = ease_out_cubic(t.clamp(0.0, 1.0)) as CGFloat;
+    if let Some(wallpaper) = wallpaper {
+        () = msg![env; wallpaper setAlpha:(0.5 * chrome_alpha)];
+    }
+    () = msg![env; title setAlpha:chrome_alpha];
+    () = msg![env; version_label setAlpha:chrome_alpha];
+
+    for (&(icon_button, label), target) in cells.iter().zip(targets.iter()) {
+        let (dx, dy, label_dy, scale, alpha) = unlock_cell_state_at(target, t);
+        let icon_transform = CGAffineTransform::make_scale(scale, scale)
+            .concat(CGAffineTransform::make_translation(dx, dy));
+        let label_transform = CGAffineTransform::make_scale(scale, scale)
+            .concat(CGAffineTransform::make_translation(dx, label_dy));
+        () = msg![env; icon_button setTransform:icon_transform];
+        () = msg![env; icon_button setAlpha:alpha];
+        () = msg![env; label setTransform:label_transform];
+        () = msg![env; label setAlpha:alpha];
+    }
+}
+
+/// Plays the iOS 4-style home screen unlock animation when the picker opens:
+/// app icons and their labels fly in radially from outside the screen into
+/// their grid slots, with inner icons leading and outer corners settling
+/// right after.
+#[allow(clippy::too_many_arguments)]
+fn play_home_screen_unlock_animation(
+    env: &mut Environment,
+    run_loop: id,
+    delegate: id,
+    grid: &IconGridStuff,
+    screen_size: CGSize,
+    wallpaper: Option<id>,
+    title: id,
+    version_label: id,
+) {
+    let cells = grid.containers[grid.visible].cells.clone();
+    let mut icon_centers = Vec::with_capacity(cells.len());
+    let mut label_offsets_y = Vec::with_capacity(cells.len());
+    for &(icon_button, label) in &cells {
+        let icon_frame: CGRect = msg![env; icon_button frame];
+        let label_frame: CGRect = msg![env; label frame];
+        let icon_center = CGPoint {
+            x: icon_frame.origin.x + icon_frame.size.width / 2.0,
+            y: icon_frame.origin.y + icon_frame.size.height / 2.0,
+        };
+        let label_center_y = label_frame.origin.y + label_frame.size.height / 2.0;
+        icon_centers.push(icon_center);
+        label_offsets_y.push(label_center_y - icon_center.y);
+    }
+    let targets = compute_unlock_cell_targets(&icon_centers, &label_offsets_y, screen_size);
+
+    // Render the initial off-screen state once before starting the timer so
+    // first-frame texture creation doesn't eat into the animation duration.
+    apply_unlock_step(env, &cells, &targets, wallpaper, title, version_label, 0.0);
+    run_run_loop_single_iteration(env, run_loop);
+    {
+        let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
+        host_obj.icon_tapped = nil;
+        host_obj.icon_touch_down = nil;
+    }
+
+    animate_for(
+        env,
+        run_loop,
+        delegate,
+        HOME_UNLOCK_DURATION,
+        |env, t| {
+            apply_unlock_step(env, &cells, &targets, wallpaper, title, version_label, t);
+        },
+    );
+
+    if let Some(wallpaper) = wallpaper {
+        () = msg![env; wallpaper setAlpha:(0.5 as CGFloat)];
+    }
+    () = msg![env; title setAlpha:(1.0 as CGFloat)];
+    () = msg![env; version_label setAlpha:(1.0 as CGFloat)];
+    for &(icon_button, label) in &cells {
+        () = msg![env; icon_button setTransform:CGAffineTransformIdentity];
+        () = msg![env; icon_button setAlpha:(1.0 as CGFloat)];
+        () = msg![env; label setTransform:CGAffineTransformIdentity];
+        () = msg![env; label setAlpha:(1.0 as CGFloat)];
     }
 }
 
@@ -3094,5 +3317,56 @@ mod quick_options_force_composition_tests {
             quick_options_force_composition_argument(false),
             "--no-force-composition"
         );
+    }
+}
+
+#[cfg(test)]
+mod unlock_animation_tests {
+    use super::*;
+
+    #[test]
+    fn ios4_unlock_flies_in_radially_from_off_screen_to_grid_slots() {
+        let screen = CGSize {
+            width: 320.0,
+            height: 460.0,
+        };
+        let mut centers = Vec::new();
+        let mut label_offsets = Vec::new();
+        for row in 0..4 {
+            for col in 0..3 {
+                centers.push(CGPoint {
+                    x: 69.0 + (col as CGFloat) * 91.0,
+                    y: 80.0 + (row as CGFloat) * 88.0,
+                });
+                label_offsets.push(44.0);
+            }
+        }
+        let targets = compute_unlock_cell_targets(&centers, &label_offsets, screen);
+        assert_eq!(targets.len(), 12);
+
+        // Every cell starts completely off-screen at t = 0.0 and lands at its
+        // resting slot with identity scale and full opacity at t = 1.0.
+        for (center, target) in centers.iter().zip(targets.iter()) {
+            let (dx0, dy0, _, scale0, alpha0) = unlock_cell_state_at(target, 0.0);
+            let start_x = center.x + dx0;
+            let start_y = center.y + dy0;
+            let off_screen = start_x < -ICON_SIZE.width / 2.0
+                || start_x > screen.width + ICON_SIZE.width / 2.0
+                || start_y < -ICON_SIZE.height / 2.0
+                || start_y > screen.height + ICON_SIZE.height / 2.0;
+            assert!(off_screen);
+            assert!((scale0 - HOME_UNLOCK_START_SCALE).abs() < 1e-4);
+            assert_eq!(alpha0, 0.0);
+
+            let (dx1, dy1, label_dy1, scale1, alpha1) = unlock_cell_state_at(target, 1.0);
+            assert!(dx1.abs() < 1e-4);
+            assert!(dy1.abs() < 1e-4);
+            assert!(label_dy1.abs() < 1e-4);
+            assert!((scale1 - 1.0).abs() < 1e-4);
+            assert!((alpha1 - 1.0).abs() < 1e-4);
+        }
+
+        // Corner cells are staggered behind inner cells.
+        assert!(targets[0].norm_dist > targets[4].norm_dist);
     }
 }
