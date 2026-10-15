@@ -21,6 +21,7 @@ import android.media.ImageReader;
 import android.media.MediaRecorder;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.Looper;
 import android.util.Log;
 
 import java.io.ByteArrayOutputStream;
@@ -29,6 +30,7 @@ import java.nio.ShortBuffer;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+
 
 /**
  * Real host camera & microphone access for the emulated iOS apps.
@@ -382,23 +384,90 @@ public class HostMedia {
         if (micRunning) {
             return true;
         }
+        // The AudioRecord constructor parcels an AttributionSource with
+        // android.os.Parcel native (@FastNative) writes. Doing that while the
+        // calling (SDL) thread is inside a nested native-to-Java transition
+        // trips CheckJNI's "invalid JNI transition frame reference" abort on
+        // Android 14+. Creating the AudioRecord on the Android main thread (a
+        // plain Java thread) keeps all JNI transitions well-formed.
+        final AtomicReference<AudioRecord> built =
+                new AtomicReference<AudioRecord>(null);
+        final CountDownLatch done = new CountDownLatch(1);
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            public void run() {
+                try {
+                    built.set(buildMicRecord());
+                } catch (Throwable t) {
+                    Log.e(TAG, "startMic failed", t);
+                } finally {
+                    done.countDown();
+                }
+            }
+        });
+        try {
+            // The guest blocks in AudioQueueStart anyway; a slow main thread
+            // (e.g. a permission dialog) must not wedge the emulator forever.
+            if (!done.await(15, TimeUnit.SECONDS)) {
+                Log.w(TAG, "startMic: timed out waiting for the main thread");
+                return false;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+        AudioRecord record = built.get();
+        if (record == null) {
+            return false;
+        }
+        micRecord = record;
+        micLatest = new short[0];
+        micRunning = true;
+        record.startRecording();
+        micThread = new Thread(new Runnable() {
+            public void run() {
+                short[] chunk = new short[MIC_CHUNK_FRAMES];
+                while (micRunning) {
+                    int n = 0;
+                    try {
+                        n = record.read(chunk, 0, chunk.length);
+                    } catch (Throwable t) {
+                        Log.e(TAG, "mic read failed", t);
+                        break;
+                    }
+                    if (n > 0) {
+                        short[] out = new short[n];
+                        System.arraycopy(chunk, 0, out, 0, n);
+                        micLatest = out;
+                    } else {
+                        micLatest = new short[0];
+                    }
+                }
+            }
+        }, "HyperHLE-Mic");
+        micThread.start();
+        return true;
+    }
+
+    /** Runs on the Android main thread; returns a started-ready AudioRecord. */
+    @SuppressLint("MissingPermission")
+    private static AudioRecord buildMicRecord() {
         android.app.Activity act = MainActivity.getActivity();
         if (act == null) {
             Log.w(TAG, "startMic: no Activity");
-            return false;
+            return null;
         }
         try {
             if (!act.getPackageManager().hasSystemFeature(
                     android.content.pm.PackageManager.FEATURE_MICROPHONE)) {
                 Log.w(TAG, "startMic: no FEATURE_MICROPHONE");
-                return false;
+                return null;
             }
             // Capture is actually starting now  -  this is where the
             // RECORD_AUDIO permission dialog belongs. Without it AudioRecord
             // never reaches STATE_INITIALIZED on Android 6+.
             if (!ensurePermissions(new String[] { Manifest.permission.RECORD_AUDIO })) {
                 Log.w(TAG, "startMic: RECORD_AUDIO permission denied");
-                return false;
+                return null;
             }
             int min =
                     AudioRecord.getMinBufferSize(MIC_SAMPLE_RATE,
@@ -406,7 +475,7 @@ public class HostMedia {
                             AudioFormat.ENCODING_PCM_16BIT);
             if (min <= 0) {
                 Log.w(TAG, "startMic: getMinBufferSize() = " + min);
-                return false;
+                return null;
             }
             int bufferSize = Math.max(min, MIC_CHUNK_FRAMES * 4);
             final AudioRecord record =
@@ -417,46 +486,12 @@ public class HostMedia {
                 Log.w(TAG, "startMic: AudioRecord state = " + record.getState()
                         + " (not STATE_INITIALIZED)");
                 record.release();
-                return false;
+                return null;
             }
-            micRecord = record;
-            micLatest = new short[0];
-            micRunning = true;
-            record.startRecording();
-            micThread = new Thread(new Runnable() {
-                public void run() {
-                    short[] chunk = new short[MIC_CHUNK_FRAMES];
-                    while (micRunning) {
-                        int n = 0;
-                        try {
-                            n = record.read(chunk, 0, chunk.length);
-                        } catch (Throwable t) {
-                            Log.e(TAG, "mic read failed", t);
-                            break;
-                        }
-                        if (n > 0) {
-                            short[] out = new short[n];
-                            System.arraycopy(chunk, 0, out, 0, n);
-                            micLatest = out;
-                        } else {
-                            micLatest = new short[0];
-                        }
-                    }
-                }
-            }, "HyperHLE-Mic");
-            micThread.start();
-            return true;
+            return record;
         } catch (Throwable t) {
             Log.e(TAG, "startMic failed", t);
-            micRunning = false;
-            if (micRecord != null) {
-                try {
-                    micRecord.release();
-                } catch (Throwable ignored) {
-                }
-                micRecord = null;
-            }
-            return false;
+            return null;
         }
     }
 
