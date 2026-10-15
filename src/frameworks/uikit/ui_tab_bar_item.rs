@@ -5,8 +5,11 @@
  */
 //! `UITabBarItem`.
 
+use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::frameworks::foundation::NSInteger;
-use crate::objc::{id, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr};
+use crate::objc::{
+    id, msg, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
+};
 
 // MARK: - UITabBarItem host object
 
@@ -47,8 +50,35 @@ pub const CLASSES: ClassExports = objc_classes! {
     this
 }
 
-- (id)initWithCoder:(id)_coder {
-    nil
+- (id)initWithCoder:(id)coder {
+    // Tab bar items archived in a nib (e.g. on the view controllers of a
+    // UITabBarController) carry their title, image and state here.
+    let title_key = get_static_str(env, "UITitle");
+    let title: id = msg![env; coder decodeObjectForKey:title_key];
+    let image_key = get_static_str(env, "UIImage");
+    let image: id = msg![env; coder decodeObjectForKey:image_key];
+    let selected_image_key = get_static_str(env, "UISelectedImage");
+    let selected_image: id = msg![env; coder decodeObjectForKey:selected_image_key];
+    let badge_key = get_static_str(env, "UIBadgeValue");
+    let badge_value: id = msg![env; coder decodeObjectForKey:badge_key];
+    let tag_key = get_static_str(env, "UITag");
+    let tag: NSInteger = msg![env; coder decodeIntegerForKey:tag_key];
+    let enabled_key = get_static_str(env, "UIEnabled");
+    let has_enabled: bool = msg![env; coder containsValueForKey:enabled_key];
+    let enabled: bool = !has_enabled || msg![env; coder decodeBoolForKey:enabled_key];
+
+    retain(env, title);
+    retain(env, image);
+    retain(env, selected_image);
+    retain(env, badge_value);
+    let host = env.objc.borrow_mut::<UITabBarItemHostObject>(this);
+    host.title = title;
+    host.image = image;
+    host.selected_image = selected_image;
+    host.badge_value = badge_value;
+    host.tag = tag;
+    host.enabled = enabled;
+    this
 }
 
 - (id)initWithTitle:(id)title image:(id)image tag:(NSInteger)tag {
