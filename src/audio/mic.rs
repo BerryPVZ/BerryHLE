@@ -24,7 +24,9 @@
 //! requested range that is no longer in the ring (on real hardware, late
 //! data is simply gone too).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(not(target_os = "android"))]
+use std::sync::atomic::AtomicU8;
 use std::sync::{Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -44,7 +46,6 @@ const RING_SECONDS: f64 = 2.0;
 const POLL_INTERVAL: Duration = Duration::from_millis(15);
 
 /// OpenAL capture device buffer size in samples (~100 ms).
-#[cfg(not(target_os = "android"))]
 const CAPTURE_BUFFER_SAMPLES: u32 = MIC_SAMPLE_RATE / 10;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
