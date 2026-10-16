@@ -312,6 +312,112 @@ impl ObjC {
             }
         }
     }
+    /// Like [Self::object_lookup_ivar] but also returns the ivar's `@encode`
+    /// type string (read from its `ivar_t` metadata), so KVC can box a scalar
+    /// or struct ivar correctly instead of reading its raw bits as an `id`.
+    pub fn object_lookup_ivar_encoding(
+        &self,
+        mem: &Mem,
+        obj: id,
+        name: &String,
+    ) -> Option<(MutPtr<GuestUSize>, Vec<u8>)> {
+        let mut class = ObjC::read_isa(obj, mem);
+        loop {
+            let &ClassHostObject {
+                superclass,
+                ref ivars,
+                ..
+            } = self.borrow(class);
+            if let Some(ivar) = ivars.get(name) {
+                let ivar_offset = mem.read(ivar.offset);
+                let address = obj.to_bits().checked_add(ivar_offset)?;
+                let ptr: MutPtr<GuestUSize> = MutVoidPtr::from_bits(address).cast();
+                let encoding = if ivar.metadata.is_null() {
+                    Vec::new()
+                } else {
+                    let ivar_t { type_, .. } = mem.read(ivar.metadata.cast());
+                    if type_.is_null() {
+                        Vec::new()
+                    } else {
+                        mem.cstr_at(type_).to_vec()
+                    }
+                };
+                return Some((ptr, encoding));
+            } else if superclass == nil {
+                return None;
+            } else {
+                class = superclass;
+            }
+        }
+    }
+
+    /// Like [Self::object_lookup_ivar] but returns the ivar's `@encode` type
+    /// string (from the binary's `ivar_t`), used by KVC to box a direct ivar
+    /// read of a scalar/struct into NSNumber/NSValue.
+    pub fn object_lookup_ivar_type(&self, mem: &Mem, obj: id, name: &String) -> Option<Vec<u8>> {
+        let mut class = ObjC::read_isa(obj, mem);
+        loop {
+            let &ClassHostObject {
+                superclass,
+                ref ivars,
+                ..
+            } = self.borrow(class);
+            if let Some(ivar) = ivars.get(name) {
+                if ivar.metadata.is_null() {
+                    return None;
+                }
+                let ivar_t { type_, .. } = mem.read(ivar.metadata.cast());
+                if type_.is_null() {
+                    return None;
+                }
+                return Some(mem.cstr_at(type_).to_vec());
+            } else if superclass == nil {
+                return None;
+            } else {
+                class = superclass;
+            }
+        }
+    }
+
+    /// Like [Self::object_lookup_ivar], but also returns the ivar's `@encode`
+    /// type string (read from its `ivar_t` metadata). Used by KVC to box
+    /// scalar/struct ivars read directly.
+    pub fn object_lookup_ivar_with_type(
+        &self,
+        mem: &Mem,
+        obj: id,
+        name: &String,
+    ) -> Option<(MutPtr<GuestUSize>, Vec<u8>)> {
+        let mut class = ObjC::read_isa(obj, mem);
+        loop {
+            let &ClassHostObject {
+                superclass,
+                ref ivars,
+                ..
+            } = self.borrow(class);
+            if let Some(ivar) = ivars.get(name) {
+                let ivar_offset = mem.read(ivar.offset);
+                let address = obj.to_bits().checked_add(ivar_offset)?;
+                let ptr: MutPtr<GuestUSize> = MutVoidPtr::from_bits(address).cast();
+                let encoding = if ivar.metadata.is_null() {
+                    Vec::new()
+                } else {
+                    let ivar_t_rec: ivar_t = mem.read(ivar.metadata.cast());
+                    let type_ptr = ivar_t_rec.type_;
+                    if type_ptr.is_null() {
+                        Vec::new()
+                    } else {
+                        mem.cstr_at(type_ptr).to_vec()
+                    }
+                };
+                return Some((ptr, encoding));
+            } else if superclass == nil {
+                return None;
+            } else {
+                class = superclass;
+            }
+        }
+    }
 
     pub fn debug_all_class_ivars_as_strings(&self, class: Class) -> Vec<String> {
         let mut class = class;
@@ -398,6 +504,42 @@ pub fn object_getIvar(env: &mut Environment, object: id, ivar: MutVoidPtr) -> id
     value
 }
 
+/// `void object_setIvar(id obj, Ivar ivar, id value)`
+///
+/// Classic/ARC runtime primitive that stores an object pointer directly into
+/// an instance variable (bypassing any synthesized setter). This is used by
+/// code that wires outlets or callback objects through runtime ivar metadata.
+///
+/// Like Apple's `object_setIvar`, this does not retain `value` or release the
+/// previous value; it just stores the raw pointer at the ivar's offset.
+pub fn object_setIvar(env: &mut Environment, object: id, ivar: MutVoidPtr, value: id) {
+    if object == nil || ivar.is_null() {
+        return;
+    }
+    let class = ObjC::read_isa(object, &env.mem);
+    let class_name = env.objc.get_class_name(class).to_string();
+    let Some(offset_pointer) = env
+        .objc
+        .class_lookup_ivar_offset_by_metadata(class, ivar.cast_const())
+    else {
+        trace_ivar_access(&format!(
+            "object_setIvar class={} object={:?} ivar={:?} value={:?} — unknown ivar, ignored",
+            class_name, object, ivar, value
+        ));
+        return;
+    };
+    if offset_pointer.is_null() {
+        return;
+    }
+    let offset: GuestUSize = env.mem.read(offset_pointer);
+    let field_address = object.to_bits().wrapping_add(offset);
+    let field_ptr: MutPtr<id> = Ptr::from_bits(field_address);
+    env.mem.write(field_ptr, value);
+    trace_ivar_access(&format!(
+        "object_setIvar class={} object={:?} ivar={:?} offset={} value={:?}",
+        class_name, object, ivar, offset, value
+    ));
+}
 /// Acquire the per-object recursive mutex used to protect `atomic`
 /// property accesses. Lazily creates the mutex on first use.
 ///

@@ -229,6 +229,21 @@ fn objc_msgSend_inner(
         selector.as_str(&env.mem),
         receiver
     );
+    if crate::env_flag_cached!("TOUCHHLE_TRACE_ENUM") && receiver != nil {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static ENUM_CALLS: AtomicU64 = AtomicU64::new(0);
+        if selector.as_str(&env.mem) == "countByEnumeratingWithState:objects:count:" {
+            let n = ENUM_CALLS.fetch_add(1, Ordering::Relaxed);
+            if n < 80 || n % 4096 == 0 {
+                let class = ObjC::read_isa(receiver, &env.mem);
+                let name = env.objc.get_class_name(class).to_owned();
+                log!(
+                    "TRACE_ENUM: countByEnumerating call #{} receiver={:?} class={}",
+                    n, receiver, name
+                );
+            }
+        }
+    }
     if crate::env_flag_cached!("TOUCHHLE_TRACE_MSGS") && receiver != nil {
         use std::sync::Mutex;
         static SEEN: Mutex<Option<std::collections::HashSet<(Class, SEL)>>> = Mutex::new(None);
@@ -1045,8 +1060,13 @@ Type mismatch when sending message {} to {:?}!
             env.cpu.regs_mut()[0..2].fill(0);
             return;
         } else {
+            let sel_name = selector.as_str(&env.mem).to_owned();
+            let class_name = env.objc.try_get_class_name(class).map(|s| s.to_owned());
+            let orig_name = env.objc.try_get_class_name(orig_class).map(|s| s.to_owned());
+            let type_name = host_object.type_name();
             log!(
-                "Item {class:?} in superclass chain of object {receiver:?}'s class {orig_class:?} has an unexpected host object type."
+                "Item {class:?} ({:?}) in superclass chain of object {receiver:?}'s class {orig_class:?} ({:?}) has an unexpected host object type ({}). Selector: \"{}\". Behaving as if message was sent to nil.",
+                class_name, orig_name, type_name, sel_name
             );
             env.cpu.regs_mut()[0..2].fill(0);
             return;
@@ -2438,6 +2458,45 @@ pub(super) fn objc_msgSendSuper2_stret(
         /* tolerate_type_mismatch: */ false,
         /* skip_initialize: */ false,
     )
+}
+
+/// `void objc_enumerationMutation(id)` is called by compiler-generated fast
+/// enumeration code when it detects that the collection was mutated while being
+/// enumerated. On Apple's runtime the default handler raises an
+/// `NSGenericException`, which aborts the enumeration. touchHLE previously had
+/// no implementation, so the symbol resolved to a silent stub and the guest's
+/// enumeration loop could spin forever when a buggy/edge-case path mutated the
+/// collection mid-enumeration (e.g. Drive Ahead's first-frame render path).
+///
+/// We log the offending collection (throttled) for diagnostics. Raising a real
+/// Objective-C exception from here would require unwinding guest frames, which
+/// touchHLE does not support, so we only warn.
+#[allow(non_snake_case)]
+pub(super) fn objc_enumerationMutation(env: &mut Environment, obj: id) {
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<std::collections::HashSet<Class>>> = Mutex::new(None);
+    let class = if obj != nil {
+        ObjC::read_isa(obj, &env.mem)
+    } else {
+        nil
+    };
+    let mut guard = SEEN.lock().unwrap();
+    let seen = guard.get_or_insert_with(Default::default);
+    if seen.insert(class) {
+        let name = env.objc.get_class_name(class).to_owned();
+        let count: crate::frameworks::foundation::NSUInteger = if obj != nil {
+            msg![env; obj count]
+        } else {
+            0
+        };
+        log!(
+            "objc_enumerationMutation: collection {:?} (class {}) mutated while \
+             being enumerated (count now {})",
+            obj,
+            name,
+            count,
+        );
+    }
 }
 
 /// Trait that assists with type-checking of [msg_send]'s arguments.

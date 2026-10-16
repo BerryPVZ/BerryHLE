@@ -427,6 +427,14 @@ fn substitute_classes(
         || name.starts_with("ALTargeting") // AppLovin targeting
         || name.starts_with("ALPrivacy")
         // AppLovin privacy settings
+        || name.starts_with("Everyplay")
+        // Everyplay gameplay video-recording SDK. Its capture proxy hooks the
+        // GL context and installs a CCGLView frame-completion handler that
+        // re-renders every frame through APPLE fence sync objects. Under
+        // touchHLE that handler spins forever inside -[CCGLView presentFrame],
+        // so the game never gets past its first frame. Recording is optional,
+        // so faking the whole Everyplay class namespace (messages behave as if
+        // sent to nil) disables capture and lets the game run.
     )
     // <-- ДОБАВЛЕНО ЗДЕСЬ
     {

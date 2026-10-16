@@ -648,8 +648,8 @@ pub fn clear_presented_pixels(env: &mut Environment, layer: id) {
     host_obj.gles_texture_is_up_to_date = false;
 }
 
-/// Records that `EAGLContext presentRenderbuffer:` drew the layer's latest
-/// frame straight to the window, so the compositor must not draw over it.
+/// Records that `EAGLContext presentRenderbuffer:` presented this layer's
+/// drawable directly to the window, bypassing `presented_pixels`.
 pub fn mark_presented_directly(env: &mut Environment, layer: id) {
     env.objc
         .borrow_mut::<CALayerHostObject>(layer)

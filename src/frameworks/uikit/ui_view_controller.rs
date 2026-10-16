@@ -201,6 +201,13 @@ pub const CLASSES: ClassExports = objc_classes! {
         release(env, old_bundle);
     }
 
+    // View controllers inside a UITabBarController archive their tab item.
+    let tab_bar_item_key = get_static_str(env, "UITabBarItem");
+    let tab_bar_item: id = msg![env; coder decodeObjectForKey:tab_bar_item_key];
+    if tab_bar_item != nil {
+        () = msg![env; this setTabBarItem:tab_bar_item];
+    }
+
     this
 }
 

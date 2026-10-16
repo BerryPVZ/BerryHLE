@@ -265,6 +265,140 @@ int test_Block_byref_lifetime(void) {
   return 0;
 }
 
+// GKLocalPlayer keeps the app's authentication handlers and calls them on a
+// later run-loop turn. Each handler below is a stack block (built by hand, as
+// above) that retains an object; the stack literal is cleared before the run
+// loop runs.
+@interface GKLocalPlayer : NSObject
++ (GKLocalPlayer *)localPlayer;
+- (void)authenticateWithCompletionHandler:(id)handler;
+- (void)setAuthenticateHandler:(id)handler;
+@end
+extern NSString *const GKPlayerAuthenticationDidChangeNotificationName;
+
+static int gk_calls, gk_ok, gk_gone, gk_clear_in_handler;
+
+@interface GKTestProbe : NSObject
+@end
+@implementation GKTestProbe
+- (void)dealloc {
+  gk_gone = 1;
+  [super dealloc];
+}
+@end
+
+@interface GKTestObserver : NSObject
+- (void)authChanged:(NSNotification *)notification;
+@end
+@implementation GKTestObserver
+- (void)authChanged:(NSNotification *)notification {
+  (void)notification;
+  [[GKLocalPlayer localPlayer] setAuthenticateHandler:nil];
+}
+@end
+
+struct GKTestHandler;
+struct GKTestHandlerDescriptor {
+  unsigned long reserved, size;
+  void (*copy)(struct GKTestHandler *, const struct GKTestHandler *);
+  void (*dispose)(const struct GKTestHandler *);
+};
+struct GKTestHandler {
+  void *isa;
+  unsigned int flags, reserved;
+  void *invoke;
+  const struct GKTestHandlerDescriptor *descriptor;
+  id captured;
+};
+static void gk_handler_copy(struct GKTestHandler *dst,
+                            const struct GKTestHandler *src) {
+  _Block_object_assign(&dst->captured, src->captured, 3);
+}
+static void gk_handler_dispose(const struct GKTestHandler *block) {
+  _Block_object_dispose(block->captured, 3);
+}
+static const struct GKTestHandlerDescriptor gk_handler_descriptor = {
+    0, sizeof(struct GKTestHandler), gk_handler_copy, gk_handler_dispose};
+// void (^)(NSError *error)
+static void gk_completion_invoke(struct GKTestHandler *block, id error) {
+  gk_calls++;
+  gk_ok = error != nil && !gk_gone && [block->captured retainCount] == 1;
+}
+// void (^)(UIViewController *viewController, NSError *error)
+static void gk_handler_invoke(struct GKTestHandler *block, id vc, id error) {
+  gk_calls++;
+  if (gk_clear_in_handler)
+    [[GKLocalPlayer localPlayer] setAuthenticateHandler:nil];
+  // The block and what it captured must live until it returns.
+  gk_ok = vc == nil && error != nil && !gk_gone &&
+          [block->captured retainCount] == 1;
+}
+
+enum { GK_COMPLETION, GK_HANDLER, GK_CLEAR_IN_HANDLER };
+static int gk_run(int kind) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  struct GKTestHandler stack = {
+      NULL,
+      1u << 25,
+      0,
+      kind == GK_COMPLETION ? (void *)gk_completion_invoke
+                            : (void *)gk_handler_invoke,
+      &gk_handler_descriptor,
+      nil};
+  gk_calls = gk_ok = gk_gone = 0;
+  gk_clear_in_handler = kind == GK_CLEAR_IN_HANDLER;
+  stack.captured = [[GKTestProbe alloc] init];
+  GKLocalPlayer *player = [GKLocalPlayer localPlayer];
+  if (kind == GK_COMPLETION)
+    [player authenticateWithCompletionHandler:(id)&stack];
+  else
+    [player setAuthenticateHandler:(id)&stack];
+  [stack.captured release];
+  int early = gk_calls; // GameKit returns before calling the handler
+  memset(&stack, 0, sizeof(stack));
+  for (int i = 0; i < 3 && !gk_calls; i++) {
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:0.05];
+    [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode beforeDate:deadline];
+  }
+  // Once GameKit drops the handler, the captured object goes too.
+  [player setAuthenticateHandler:nil];
+  [pool drain];
+  if (early != 0)
+    return -1;
+  if (gk_calls != 1)
+    return -2;
+  if (!gk_ok)
+    return -3;
+  if (!gk_gone)
+    return -4;
+  return 0;
+}
+
+int test_GKLocalPlayer_authenticateWithCompletionHandler(void) {
+  return gk_run(GK_COMPLETION);
+}
+
+int test_GKLocalPlayer_authenticateHandler(void) { return gk_run(GK_HANDLER); }
+
+int test_GKLocalPlayer_authenticateHandler_clearedByHandler(void) {
+  return gk_run(GK_CLEAR_IN_HANDLER);
+}
+
+// GameKit posts the auth change notification before calling the handler.
+// touchHLE still calls the handler it was delivering (not checked on iOS).
+int test_GKLocalPlayer_authenticateHandler_clearedByObserver(void) {
+  GKTestObserver *observer = [[GKTestObserver alloc] init];
+  [[NSNotificationCenter defaultCenter]
+      addObserver:observer
+         selector:@selector(authChanged:)
+             name:GKPlayerAuthenticationDidChangeNotificationName
+           object:nil];
+  int result = gk_run(GK_HANDLER);
+  [[NSNotificationCenter defaultCenter] removeObserver:observer];
+  [observer release];
+  return result;
+}
+
 // === Main code ===
 
 int test_CGGeometry() {
@@ -6384,6 +6518,10 @@ struct {
     FUNC_DEF(test_Initialize),
     FUNC_DEF(test_Block_lifetime),
     FUNC_DEF(test_Block_byref_lifetime),
+    FUNC_DEF(test_GKLocalPlayer_authenticateWithCompletionHandler),
+    FUNC_DEF(test_GKLocalPlayer_authenticateHandler),
+    FUNC_DEF(test_GKLocalPlayer_authenticateHandler_clearedByHandler),
+    FUNC_DEF(test_GKLocalPlayer_authenticateHandler_clearedByObserver),
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName),
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_withObject),
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_removeObserver),

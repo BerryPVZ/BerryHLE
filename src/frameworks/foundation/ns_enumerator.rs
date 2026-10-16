@@ -63,6 +63,15 @@ pub fn fast_enumeration_helper<F: FnMut(&mut Environment, u32) -> id>(
         state: start_index, ..
     } = env.mem.read(state);
 
+    if crate::env_flag_cached!("TOUCHHLE_TRACE_FASTENUM") && start_index >= 4096 && start_index.is_power_of_two() {
+        let class = crate::objc::ObjC::read_isa(this, &env.mem);
+        let name = env.objc.get_class_name(class).to_owned();
+        log!(
+            "FASTENUM runaway: class={} this={:?} start_index={} len={}",
+            name, this, start_index, len
+        );
+    }
+
     let mut batch_count = 0;
     while batch_count < len {
         let object = iter_fn(env, start_index + batch_count);

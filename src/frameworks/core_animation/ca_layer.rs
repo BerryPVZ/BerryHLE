@@ -82,9 +82,10 @@ pub(crate) struct CALayerHostObject {
     pub(super) contents: id,
     pub(super) drawable_properties: id,
     pub(super) presented_pixels: Option<(Vec<u8>, u32, u32)>,
-    /// Whether `presentRenderbuffer:` has drawn this layer's frames straight
-    /// to the window (the GPU-copy path, which leaves `presented_pixels`
-    /// empty).
+    /// Set once `presentRenderbuffer:` has drawn this layer's drawable
+    /// straight to the window (GPU present path). That path never fills
+    /// `presented_pixels`, but the compositor still needs to know the layer
+    /// is live so it doesn't composite over (and swap away) the game's frames.
     pub(super) presented_directly: bool,
     pub(super) cg_context: Option<CGContextRef>,
     pub(super) gles_texture: Option<crate::gles::gles11_raw::types::GLuint>,

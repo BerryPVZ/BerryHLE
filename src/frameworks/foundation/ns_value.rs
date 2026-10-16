@@ -223,8 +223,154 @@ fn decode_struct_value(
             encoding: enc.to_owned(),
             bytes,
         })
+    } else if let Some(size) = generic_struct_size(enc) {
+        // Generic fallback for any other struct/union/array type (e.g. a
+        // game's own `{_CCPositionType=CCC}`). Store the raw bytes so the
+        // value round-trips exactly through `-getValue:`, matching the real
+        // runtime instead of silently corrupting it to "pointer bits".
+        let bytes = env.mem.get_bytes_fallible(value, size as u32)?.to_vec();
+        Some(NSValueHostObject::RawStruct {
+            encoding: enc.to_owned(),
+            bytes,
+        })
     } else {
         None
+    }
+}
+
+/// Size (in bytes) of a struct/union/array Objective-C `@encode` string under
+/// the 32-bit armv7 iOS ABI, or `None` for scalar/unsupported encodings.
+///
+/// This backs the generic `NSValue` struct fallback: the real runtime copies
+/// `sizeof(T)` bytes for `+valueWithBytes:objCType:`, so games that box their
+/// own small structs (Drive Ahead's `{_CCPositionType=CCC}` /
+/// `{_CCSizeType=CC}`) get a byte-exact round-trip instead of corrupted
+/// "pointer bits" that later get dereferenced as objects/functions.
+fn generic_struct_size(enc: &str) -> Option<usize> {
+    let bytes = enc.as_bytes();
+    if !matches!(bytes.first(), Some(b'{') | Some(b'(') | Some(b'[')) {
+        return None;
+    }
+    let mut pos = 0usize;
+    let (_align, size) = objc_type_align_size(bytes, &mut pos)?;
+    if (1..=4096).contains(&size) {
+        Some(size)
+    } else {
+        None
+    }
+}
+
+/// Parse one Objective-C type encoding starting at `*pos`, returning its
+/// `(alignment, size)` under the 32-bit armv7 ABI and advancing `*pos` past
+/// it. Returns `None` on an encoding this parser does not understand.
+fn objc_type_align_size(bytes: &[u8], pos: &mut usize) -> Option<(usize, usize)> {
+    // Skip leading type qualifiers (const/in/out/inout/bycopy/byref/oneway).
+    while let Some(&c) = bytes.get(*pos) {
+        if matches!(c, b'r' | b'n' | b'N' | b'o' | b'O' | b'R' | b'V') {
+            *pos += 1;
+        } else {
+            break;
+        }
+    }
+    let c = *bytes.get(*pos)?;
+    *pos += 1;
+    let simple = |align: usize| Some((align, align));
+    match c {
+        b'c' | b'C' | b'B' => simple(1),
+        b's' | b'S' => simple(2),
+        b'i' | b'I' | b'l' | b'L' | b'f' => simple(4),
+        b'q' | b'Q' | b'd' => simple(8),
+        // All pointers are 4 bytes on armv7.
+        b'*' | b'#' | b':' => simple(4),
+        b'@' => {
+            // May be followed by a quoted class/protocol name: @"NSString".
+            if bytes.get(*pos) == Some(&b'"') {
+                *pos += 1;
+                while let Some(&q) = bytes.get(*pos) {
+                    *pos += 1;
+                    if q == b'"' {
+                        break;
+                    }
+                }
+            }
+            simple(4)
+        }
+        b'^' => {
+            // Pointer to some type: consume the pointee encoding, pointer is
+            // still 4 bytes.
+            let _ = objc_type_align_size(bytes, pos)?;
+            simple(4)
+        }
+        b'[' => {
+            // Array: [<count><element>] .
+            let mut count = 0usize;
+            while let Some(&d) = bytes.get(*pos) {
+                if d.is_ascii_digit() {
+                    count = count.checked_mul(10)?.checked_add((d - b'0') as usize)?;
+                    *pos += 1;
+                } else {
+                    break;
+                }
+            }
+            let (elem_align, elem_size) = objc_type_align_size(bytes, pos)?;
+            if bytes.get(*pos) == Some(&b']') {
+                *pos += 1;
+            }
+            Some((elem_align, elem_size.checked_mul(count)?))
+        }
+        b'{' | b'(' => {
+            let closer = if c == b'{' { b'}' } else { b')' };
+            // Skip the struct/union tag up to '=' (or the closer for an
+            // opaque forward-declared struct like `{Foo}`).
+            while let Some(&t) = bytes.get(*pos) {
+                if t == b'=' {
+                    *pos += 1;
+                    break;
+                }
+                if t == closer {
+                    // Opaque: unknown layout.
+                    return None;
+                }
+                *pos += 1;
+            }
+            let mut max_align = 1usize;
+            let mut total = 0usize;
+            let is_union = c == b'(';
+            while let Some(&t) = bytes.get(*pos) {
+                if t == closer {
+                    *pos += 1;
+                    break;
+                }
+                // Skip quoted field names: {CGPoint="x"f"y"f}.
+                if t == b'"' {
+                    *pos += 1;
+                    while let Some(&q) = bytes.get(*pos) {
+                        *pos += 1;
+                        if q == b'"' {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                let (f_align, f_size) = objc_type_align_size(bytes, pos)?;
+                max_align = max_align.max(f_align);
+                if is_union {
+                    total = total.max(f_size);
+                } else {
+                    // Align this field's offset up to its alignment.
+                    if f_align > 0 {
+                        total = total.div_ceil(f_align) * f_align;
+                    }
+                    total = total.checked_add(f_size)?;
+                }
+            }
+            // Pad the struct size up to its own alignment.
+            if max_align > 0 {
+                total = total.div_ceil(max_align) * max_align;
+            }
+            Some((max_align, total))
+        }
+        _ => None,
     }
 }
 

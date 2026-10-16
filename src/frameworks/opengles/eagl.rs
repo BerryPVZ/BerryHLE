@@ -1206,12 +1206,16 @@ pub const CLASSES: ClassExports = objc_classes! {
                     .drawable_framebuffer,
                 skip_rotation: use_ios_es2_direct_path,
             };
+            // Tell the Core Animation compositor this layer is live, so it
+            // takes its CAEAGLLayer fast path instead of compositing (and
+            // swapping) a frame with a black EAGL layer in between ours.
+            mark_presented_directly(env, drawable);
+            if fullscreen_layer != nil && fullscreen_layer != drawable {
+                mark_presented_directly(env, fullscreen_layer);
+            }
             unsafe {
                 present_renderbuffer(env, renderbuffer, drawable, options, this.to_bits() as usize);
             }
-            // Without this, the compositor would keep drawing the layer tree
-            // over the frames presented here.
-            mark_presented_directly(env, drawable);
         }
     } else {
         if fullscreen_layer != nil {

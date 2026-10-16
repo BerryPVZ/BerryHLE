@@ -26,7 +26,8 @@ use std::sync::Mutex;
 #[path = "ns_object_kvc.rs"]
 mod kvc_helpers;
 use self::kvc_helpers::{
-    kvc_setter_argument_encoding, send_numeric_kvc_setter, send_nsvalue_kvc_setter,
+    box_kvc_getter_result, box_kvc_ivar_value, kvc_setter_argument_encoding,
+    send_numeric_kvc_setter, send_nsvalue_kvc_setter,
 };
 
 // Хранилище для отмененных таймеров (target, имя селектора в виде строки)
@@ -368,20 +369,27 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.class_has_method(this, selector)
 }
 
-// ИЗМЕНЕНО: Ищем _objc_msgSend через create_proc_address (без логов)
-+ (u32)instanceMethodForSelector:(SEL)_selector {
-    let dyld = &mut env.dyld;
-    let mem = &mut env.mem;
-    let cpu = &mut env.cpu;
-    match dyld.create_proc_address(mem, cpu, "_objc_msgSend") {
-        Ok(guest_func) => guest_func.addr_with_thumb_bit(),
-        Err(_) => {
-            log!("Error: _objc_msgSend not found! Returning dummy IMP.");
-            let ptr: crate::mem::MutPtr<u16> = mem.alloc(2).cast();
-            mem.write(ptr, 0x4770);
-            ptr.to_bits() | 1
-        }
-    }
+// `+instanceMethodForSelector:` must resolve the selector to the same IMP
+// an instance would use — i.e. it has to agree with `-methodForSelector:`
+// for the same class+selector. Objective-Chipmunk's override detection
+// (`ChipmunkBody methodIsOverriden:`) compares
+// `[self methodForSelector:sel]` against
+// `[[self class] instanceMethodForSelector:sel]`; when the two disagree it
+// concludes the method is overridden. The old implementation ignored the
+// selector and always handed back the `_objc_msgSend` trampoline, so the
+// comparison never matched the real IMP returned by `-methodForSelector:`.
+// Every physics body then looked as if it overrode its velocity/position
+// integrator, and Chipmunk installed an ObjC-dispatch update callback that
+// was invoked with the C `cpBody*` calling convention, branching into
+// garbage (an `UndefinedInstruction` at the image base / heap) on the very
+// first physics step. Resolving the selector here — exactly like
+// `-methodForSelector:` — keeps the two in agreement. In a class method
+// `this` is the class itself, which is what `class_getMethodImplementation`
+// expects. Host-implemented methods still come back as the `_objc_msgSend`
+// trampoline via `class_getMethodImplementation`, preserving the previous
+// behaviour for them.
++ (u32)instanceMethodForSelector:(SEL)selector {
+    crate::objc::class_getMethodImplementation(env, this, selector).to_bits()
 }
 
 + (id)instanceMethodSignatureForSelector:(SEL)selector {
@@ -1094,18 +1102,27 @@ pub const CLASSES: ClassExports = objc_classes! {
     // 1. Поиск геттеров (get<Key>, <key>, is<Key>)
     if let Some(sel) = env.objc.lookup_selector(&key_str) {
         if env.objc.object_has_method(&env.mem, this, sel) {
+            if let Some(boxed) = box_kvc_getter_result(env, this, sel) {
+                return boxed;
+            }
             return msg_send(env, (this, sel));
         }
     }
     let is_sel_name = format!("is{camel_case_key_string}");
     if let Some(sel) = env.objc.lookup_selector(&is_sel_name) {
         if env.objc.object_has_method(&env.mem, this, sel) {
+            if let Some(boxed) = box_kvc_getter_result(env, this, sel) {
+                return boxed;
+            }
             return msg_send(env, (this, sel));
         }
     }
     let get_sel_name = format!("get{camel_case_key_string}");
     if let Some(sel) = env.objc.lookup_selector(&get_sel_name) {
         if env.objc.object_has_method(&env.mem, this, sel) {
+            if let Some(boxed) = box_kvc_getter_result(env, this, sel) {
+                return boxed;
+            }
             return msg_send(env, (this, sel));
         }
     }
@@ -1116,12 +1133,17 @@ pub const CLASSES: ClassExports = objc_classes! {
         if env.objc.class_has_method(class, access_sel) {
             let access_ivars: bool = msg_send(env, (class, access_sel));
             if access_ivars {
-                if let Some(ivar_ptr) = env.objc
-                    .object_lookup_ivar(&env.mem, this, &format!("_{key_str}"))
-                    .or_else(|| env.objc.object_lookup_ivar(&env.mem, this, &format!("_is{camel_case_key_string}")))
-                    .or_else(|| env.objc.object_lookup_ivar(&env.mem, this, &format!("{key_str}")))
-                    .or_else(|| env.objc.object_lookup_ivar(&env.mem, this, &format!("is{camel_case_key_string}")))
+                if let Some((ivar_ptr, encoding)) = env.objc
+                    .object_lookup_ivar_with_type(&env.mem, this, &format!("_{key_str}"))
+                    .or_else(|| env.objc.object_lookup_ivar_with_type(&env.mem, this, &format!("_is{camel_case_key_string}")))
+                    .or_else(|| env.objc.object_lookup_ivar_with_type(&env.mem, this, &format!("{key_str}")))
+                    .or_else(|| env.objc.object_lookup_ivar_with_type(&env.mem, this, &format!("is{camel_case_key_string}")))
                 {
+                    if !encoding.is_empty() {
+                        if let Some(boxed) = box_kvc_ivar_value(env, ivar_ptr, &encoding) {
+                            return boxed;
+                        }
+                    }
                     let val: id = env.mem.read(ivar_ptr.cast());
                     return val;
                 }
@@ -1438,6 +1460,48 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)superview {
     nil
+}
+
+@end
+
+// `_touchHLE_NSBlock` is the ObjC class used as the `isa` of guest block
+// objects (`__NSConcreteStackBlock` / `__NSConcreteGlobalBlock` /
+// `__NSConcreteMallocBlock`; see `dyld::do_non_lazy_linking`). Blocks are
+// allocated by guest code (block literals) and are NOT touchHLE host objects,
+// so they must NOT use the host-object refcount table. Instead their memory
+// management routes to the Blocks runtime in `libc::blocks`. Without this,
+// `[someBlock copy]` / `[someBlock retain]` (used pervasively by cocos2d v3's
+// scheduler and CCBReader to store callback blocks) would hit a dummy class
+// with no methods and return nil, leaving e.g. `CCTimer._block` nil and
+// crashing the scheduler when it later invokes the (nil/garbage) callback.
+@implementation _touchHLE_NSBlock: NSObject
+
+- (id)retain {
+    let blk = crate::mem::ConstVoidPtr::from_bits(this.to_bits());
+    let copied = crate::libc::blocks::_Block_copy(env, blk);
+    crate::mem::Ptr::from_bits(copied.to_bits())
+}
+
+- (id)copy {
+    msg![env; this copyWithZone:(MutVoidPtr::null())]
+}
+
+- (id)copyWithZone:(NSZonePtr)_zone {
+    let blk = crate::mem::ConstVoidPtr::from_bits(this.to_bits());
+    let copied = crate::libc::blocks::_Block_copy(env, blk);
+    crate::mem::Ptr::from_bits(copied.to_bits())
+}
+
+- (())release {
+    let blk = crate::mem::ConstVoidPtr::from_bits(this.to_bits());
+    crate::libc::blocks::_Block_release(env, blk);
+}
+
+- (id)autorelease {
+    // Blocks that outlive the current scope are retained via copy by their
+    // owner, so a no-op autorelease is safe here and avoids routing a
+    // non-host-object block through the autorelease pool's release path.
+    this
 }
 
 @end

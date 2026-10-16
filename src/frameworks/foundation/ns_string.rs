@@ -787,45 +787,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (NSRange)rangeOfString:(id)search_string options:(NSStringCompareOptions)options {
+    // The options are flags and are often combined (e.g.
+    // NSCaseInsensitiveSearch | NSLiteralSearch); the ranged variant handles
+    // them as such.
     let len: NSUInteger = msg![env; this length];
-    let len_search: NSUInteger = msg![env; search_string length];
-    if len_search == 0 { return NSRange { location: NSNotFound as NSUInteger, length: 0 }; }
-    match options {
-        NSLiteralSearch | 0 => {
-            for i in 0..len {
-                if is_match_at_position(env, this, search_string, i, len, len_search, |a, b| a == b) {
-                    return NSRange { location: i, length: len_search }
-                }
-            }
-        },
-        NSCaseInsensitiveSearch => {
-            let compare = |a, b| {
-                let (Some(a_c), Some(b_c)) = (char::from_u32(a as u32), char::from_u32(b as u32)) else { return false; };
-                a_c.to_lowercase().eq(b_c.to_lowercase())
-            };
-            for i in 0..len {
-                if is_match_at_position(env, this, search_string, i, len, len_search, compare) {
-                    return NSRange { location: i, length: len_search }
-                }
-            }
-        },
-        NSBackwardsSearch => {
-            for i in (0..len).rev() {
-                if is_match_at_position(env, this, search_string, i, len, len_search, |a, b| a == b) {
-                    return NSRange { location: i, length: len_search }
-                }
-            }
-        },
-        _ => {
-            println!("Warning: rangeOfString:options: unhandled options {}, falling back to literal search", options);
-            for i in 0..len {
-                if is_match_at_position(env, this, search_string, i, len, len_search, |a, b| a == b) {
-                    return NSRange { location: i, length: len_search }
-                }
-            }
-        }
-    }
-    NSRange { location: NSNotFound as NSUInteger, length: 0 }
+    let whole = NSRange { location: 0, length: len };
+    msg![env; this rangeOfString:search_string options:options range:whole]
 }
 
 - (NSRange)rangeOfString:(id)search_string options:(NSStringCompareOptions)options range:(NSRange)search_range {
@@ -956,69 +923,50 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     let mut a_iter = env.objc.borrow::<StringHostObject>(this).iter_code_units().peekable();
     let mut b_iter = env.objc.borrow::<StringHostObject>(other).iter_code_units().peekable();
-    let mask = if mask == 0 { NSLiteralSearch } else { mask };
-    match mask {
-        NSCaseInsensitiveSearch => {
-            loop {
-                let a_next = a_iter.next();
-                let b_next = b_iter.next();
-                let (Some(a_unit), Some(b_unit)) = (a_next, b_next) else { return from_rust_ordering(a_next.cmp(&b_next)); };
-                let (a_c, b_c) = match (char::from_u32(a_unit as u32), char::from_u32(b_unit as u32)) {
-                    (Some(a), Some(b)) => (a, b),
-                    _ => {
-                        // One of the code units is a UTF-16 surrogate half
-                        // (`char::from_u32` rejects U+D800..=U+DFFF). Fall
-                        // back to byte-order comparison on the raw u16s
-                        // rather than panicking the host.
-                        log!(
-                            "Warning: NSString compare: unpaired surrogate(s) at U+{:04X}/U+{:04X}; falling back to code-unit compare.",
-                            a_unit,
-                            b_unit
-                        );
-                        let ord = a_unit.cmp(&b_unit);
-                        if ord != std::cmp::Ordering::Equal { return from_rust_ordering(ord); }
-                        continue;
-                    }
-                };
-
-                let insensitive_order = a_c.to_lowercase().cmp(b_c.to_lowercase());
-                if insensitive_order != std::cmp::Ordering::Equal { return from_rust_ordering(insensitive_order); }
+    // The options are flags and are often combined, e.g.
+    // NSCaseInsensitiveSearch | NSLiteralSearch for dictionary lookups (word
+    // games). NSLiteralSearch only disables Unicode canonical equivalence,
+    // which this code-unit based comparison never applies anyway, and
+    // NSBackwardsSearch/NSAnchoredSearch don't affect a whole-string compare.
+    let case_insensitive = mask & NSCaseInsensitiveSearch != 0;
+    let numeric = mask & NSNumericSearch != 0;
+    if !case_insensitive && !numeric {
+        return from_rust_ordering(a_iter.cmp(b_iter));
+    }
+    loop {
+        let a_next = a_iter.next();
+        let b_next = b_iter.next();
+        let (Some(a_unit), Some(b_unit)) = (a_next, b_next) else { return from_rust_ordering(a_next.cmp(&b_next)); };
+        let (a_c, b_c) = match (char::from_u32(a_unit as u32), char::from_u32(b_unit as u32)) {
+            (Some(a), Some(b)) => (a, b),
+            _ => {
+                // One of the code units is a UTF-16 surrogate half
+                // (`char::from_u32` rejects U+D800..=U+DFFF). Fall back to
+                // byte-order comparison on the raw u16s rather than
+                // panicking the host.
+                log!(
+                    "Warning: NSString compare: unpaired surrogate(s) at U+{:04X}/U+{:04X}; falling back to code-unit compare.",
+                    a_unit,
+                    b_unit
+                );
+                let ord = a_unit.cmp(&b_unit);
+                if ord != std::cmp::Ordering::Equal { return from_rust_ordering(ord); }
+                continue;
             }
-        },
-        NSLiteralSearch => from_rust_ordering(a_iter.cmp(b_iter)),
-        NSNumericSearch => {
-            loop {
-                let a_next = a_iter.next();
-                let b_next = b_iter.next();
-                let (Some(a_unit), Some(b_unit)) = (a_next, b_next) else { return from_rust_ordering(a_next.cmp(&b_next)); };
-                let (a_c, b_c) = match (char::from_u32(a_unit as u32), char::from_u32(b_unit as u32)) {
-                    (Some(a), Some(b)) => (a, b),
-                    _ => {
-                        log!(
-                            "Warning: NSString compare (numeric): unpaired surrogate(s) at U+{:04X}/U+{:04X}; falling back to code-unit compare.",
-                            a_unit,
-                            b_unit
-                        );
-                        let ord = a_unit.cmp(&b_unit);
-                        if ord != std::cmp::Ordering::Equal { return from_rust_ordering(ord); }
-                        continue;
-                    }
-                };
-                if a_c.is_ascii_digit() && b_c.is_ascii_digit() {
-                    let a_int = ascii_number(&mut a_iter, a_c);
-                    let b_int = ascii_number(&mut b_iter, b_c);
+        };
 
-                    let numeric_order = a_int.cmp(&b_int);
-                    if numeric_order != std::cmp::Ordering::Equal { return from_rust_ordering(numeric_order); }
-                } else {
-                    let char_order = a_c.cmp(&b_c);
-                    if char_order != std::cmp::Ordering::Equal { return from_rust_ordering(char_order); }
-                }
-            }
-        },
-        _ => {
-            println!("Warning: compare:options: unhandled mask {}, falling back to literal search", mask);
-            from_rust_ordering(a_iter.cmp(b_iter))
+        if numeric && a_c.is_ascii_digit() && b_c.is_ascii_digit() {
+            let a_int = ascii_number(&mut a_iter, a_c);
+            let b_int = ascii_number(&mut b_iter, b_c);
+            let numeric_order = a_int.cmp(&b_int);
+            if numeric_order != std::cmp::Ordering::Equal { return from_rust_ordering(numeric_order); }
+        } else {
+            let char_order = if case_insensitive {
+                a_c.to_lowercase().cmp(b_c.to_lowercase())
+            } else {
+                a_c.cmp(&b_c)
+            };
+            if char_order != std::cmp::Ordering::Equal { return from_rust_ordering(char_order); }
         }
     }
 }
@@ -3142,17 +3090,9 @@ fn string_by_replacing_occurrences_inner(
         let res = msg![env; source copy];
         return autorelease(env, res);
     }
-    let case_insensitive = match options {
-        0 => false,
-        NSCaseInsensitiveSearch => true,
-        _ => {
-            println!(
-                "Warning: unhandled options {}, falling back to case-sensitive",
-                options
-            );
-            false
-        }
-    };
+    // NSLiteralSearch doesn't change a code-unit based search; other options
+    // (e.g. NSAnchoredSearch) are ignored.
+    let case_insensitive = options & NSCaseInsensitiveSearch != 0;
     let mut result: Utf16String = Vec::new();
     loop {
         if let Some(new_main_iter) = main_iter.strip_prefix(&target_iter, case_insensitive) {

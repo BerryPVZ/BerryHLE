@@ -7746,8 +7746,11 @@ const GL_SYNC_STATUS: GLenum = 0x9114;
 const GL_SYNC_FLAGS: GLenum = 0x9115;
 const GL_SYNC_FENCE: GLenum = 0x9116;
 const GL_SYNC_GPU_COMMANDS_COMPLETE: GLenum = 0x9117;
+const GL_UNSIGNALED: GLenum = 0x9118;
 const GL_SIGNALED: GLenum = 0x9119;
 const GL_ALREADY_SIGNALED: GLenum = 0x911A;
+const GL_TIMEOUT_EXPIRED: GLenum = 0x911B;
+const GL_CONDITION_SATISFIED: GLenum = 0x911C;
 const GL_WAIT_FAILED: GLenum = 0x911D;
 const GL_TIMEOUT_IGNORED: u64 = u64::MAX;
 
@@ -7757,8 +7760,18 @@ type GuestGLsync = GLuint;
 /// Book-keeping for one guest `GLsync`. See the comment above.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct GuestSyncObject {
-    /// Host `GLsync`, or `None` for an emulated (already signalled) fence.
+    /// Host `GLsync`, or `None` for an emulated fence.
     host: Option<usize>,
+    /// For emulated (`host == None`) fences: whether the fence should now be
+    /// reported as signalled. A freshly inserted emulated fence starts *not*
+    /// signalled and flips to signalled on the first zero-timeout poll (or
+    /// immediately on a blocking wait). This one-poll latency mimics real GPU
+    /// fences and is required by guests that poll a just-inserted fence to
+    /// throttle frames (e.g. cocos2d v3's `-[CCGLView presentFrame]`, which
+    /// expects the newest fence to read "not complete" so its completion loop
+    /// terminates). Guests that busy-wait for completion still make progress
+    /// because the second poll reports signalled.
+    emulated_ready: bool,
 }
 
 fn has_current_ctx(env: &mut Environment) -> bool {
@@ -7770,6 +7783,29 @@ fn has_current_ctx(env: &mut Environment) -> bool {
 
 fn lookup_sync(env: &Environment, sync: GuestGLsync) -> Option<GuestSyncObject> {
     env.framework_state.opengles.sync_objects.get(&sync).copied()
+}
+
+/// Observe an emulated (`host == None`) fence, returning whether it is now
+/// signalled. A freshly inserted emulated fence reads "not yet signalled" the
+/// first time it is observed and "signalled" on every observation after that
+/// (see [GuestSyncObject::emulated_ready]). `blocking` observations (a wait
+/// with a non-zero timeout) report the fence as signalled immediately, because
+/// the queued work was already flushed synchronously at creation time.
+fn observe_emulated_fence(env: &mut Environment, sync: GuestGLsync, blocking: bool) -> bool {
+    if let Some(object) = env.framework_state.opengles.sync_objects.get_mut(&sync) {
+        if object.emulated_ready {
+            return true;
+        }
+        if blocking {
+            object.emulated_ready = true;
+            return true;
+        }
+        // First non-blocking poll: latch the fence so the next poll succeeds,
+        // but report "not yet signalled" this time.
+        object.emulated_ready = true;
+        return false;
+    }
+    false
 }
 
 fn glFenceSync(env: &mut Environment, condition: GLenum, flags: GLbitfield) -> GuestGLsync {
@@ -7785,16 +7821,15 @@ fn glFenceSync(env: &mut Environment, condition: GLenum, flags: GLbitfield) -> G
     if !has_current_ctx(env) {
         return 0;
     }
+    // We emulate fences without real host sync objects: complete the queued
+    // host work synchronously here, then report the fence as signalled only
+    // after it has been observed once (see `emulated_ready`). The one-poll
+    // latency is what guests like cocos2d v3 rely on to throttle frames; a
+    // fence that reads "already signalled" on the very first poll makes
+    // `-[CCGLView presentFrame]`'s completion loop spin forever.
     let host = with_ctx_and_mem(env, |gles, _mem| unsafe {
-        if gles.supports_sync_objects() {
-            match gles.FenceSync(condition, flags) {
-                0 => None,
-                host => Some(Some(host)),
-            }
-        } else {
-            gles.Finish();
-            Some(None)
-        }
+        gles.Finish();
+        Some(None)
     });
     let Some(host) = host else {
         return 0;
@@ -7807,9 +7842,13 @@ fn glFenceSync(env: &mut Environment, condition: GLenum, flags: GLbitfield) -> G
             break candidate;
         }
     };
-    state
-        .sync_objects
-        .insert(handle, GuestSyncObject { host });
+    state.sync_objects.insert(
+        handle,
+        GuestSyncObject {
+            host,
+            emulated_ready: false,
+        },
+    );
     handle
 }
 
@@ -7861,7 +7900,17 @@ fn client_wait_sync_impl(
                 res
             }
         }
-        None => GL_ALREADY_SIGNALED,
+        None => {
+            // Emulated fence: report signalled only after it has been observed
+            // once (or immediately for a blocking wait). This one-poll latency
+            // keeps cocos2d v3's -[CCGLView presentFrame] completion loop from
+            // spinning forever on the just-inserted fence.
+            if observe_emulated_fence(env, sync, /* blocking: */ timeout != 0) {
+                GL_ALREADY_SIGNALED
+            } else {
+                GL_TIMEOUT_EXPIRED
+            }
+        }
     }
 }
 
@@ -7941,7 +7990,16 @@ fn glGetSynciv(
                 }
                 status
             }
-            None => GL_SIGNALED as GLint,
+            None => {
+                // Emulated fence: mirror the one-poll latency used by
+                // glClientWaitSync so a status poll of a just-inserted fence
+                // reads unsignalled once before flipping to signalled.
+                if observe_emulated_fence(env, sync, /* blocking: */ false) {
+                    GL_SIGNALED as GLint
+                } else {
+                    GL_UNSIGNALED as GLint
+                }
+            }
         },
         _ => {
             log!("Warning: glGetSynciv(): invalid pname {:#x}", pname);
