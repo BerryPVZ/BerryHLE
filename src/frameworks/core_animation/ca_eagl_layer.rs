@@ -644,7 +644,16 @@ pub fn get_pixels_vec_for_presenting(env: &mut Environment, layer: id) -> Vec<u8
 pub fn clear_presented_pixels(env: &mut Environment, layer: id) {
     let host_obj = env.objc.borrow_mut::<CALayerHostObject>(layer);
     host_obj.presented_pixels = None;
+    host_obj.presented_directly = false;
     host_obj.gles_texture_is_up_to_date = false;
+}
+
+/// Records that `EAGLContext presentRenderbuffer:` drew the layer's latest
+/// frame straight to the window, so the compositor must not draw over it.
+pub fn mark_presented_directly(env: &mut Environment, layer: id) {
+    env.objc
+        .borrow_mut::<CALayerHostObject>(layer)
+        .presented_directly = true;
 }
 
 /// Stores the new rendered frame in the layer and marks the GLES texture as

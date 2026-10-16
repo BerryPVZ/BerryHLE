@@ -95,12 +95,9 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
 
     let fullscreen_eagl_layer = find_fullscreen_eagl_layer(env);
     if fullscreen_eagl_layer != nil {
-        let has_presented_pixels = env
-            .objc
-            .borrow::<CALayerHostObject>(fullscreen_eagl_layer)
-            .presented_pixels
-            .is_some();
-        if has_presented_pixels
+        let host_obj = env.objc.borrow::<CALayerHostObject>(fullscreen_eagl_layer);
+        let has_presented = host_obj.presented_pixels.is_some() || host_obj.presented_directly;
+        if has_presented
             && !force
             && !crate::frameworks::media_player::has_active_video(env)
         {
@@ -115,8 +112,9 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
             // state the fast path would skip composition and leave the screen
             // blank, so fall through to the Core Animation compositor and draw
             // the UIKit view/layer tree instead. Once the app starts driving
-            // GL (presentRenderbuffer sets presented_pixels), the fast path
-            // takes over again.
+            // GL (presentRenderbuffer sets presented_pixels, or
+            // presented_directly on the GPU-copy path), the fast path takes
+            // over again.
             log_dbg!("Using CAEAGLLayer fast path, skipping composition");
             return None;
         }

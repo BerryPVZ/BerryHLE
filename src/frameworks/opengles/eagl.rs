@@ -8,7 +8,8 @@
 use super::software_vao::VertexArrayState;
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
 use crate::frameworks::core_animation::ca_eagl_layer::{
-    find_fullscreen_eagl_layer, get_pixels_vec_for_presenting, present_pixels,
+    find_fullscreen_eagl_layer, get_pixels_vec_for_presenting, mark_presented_directly,
+    present_pixels,
 };
 use crate::frameworks::core_graphics::{CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::get_static_str;
@@ -1208,6 +1209,9 @@ pub const CLASSES: ClassExports = objc_classes! {
             unsafe {
                 present_renderbuffer(env, renderbuffer, drawable, options, this.to_bits() as usize);
             }
+            // Without this, the compositor would keep drawing the layer tree
+            // over the frames presented here.
+            mark_presented_directly(env, drawable);
         }
     } else {
         if fullscreen_layer != nil {

@@ -82,6 +82,10 @@ pub(crate) struct CALayerHostObject {
     pub(super) contents: id,
     pub(super) drawable_properties: id,
     pub(super) presented_pixels: Option<(Vec<u8>, u32, u32)>,
+    /// Whether `presentRenderbuffer:` has drawn this layer's frames straight
+    /// to the window (the GPU-copy path, which leaves `presented_pixels`
+    /// empty).
+    pub(super) presented_directly: bool,
     pub(super) cg_context: Option<CGContextRef>,
     pub(super) gles_texture: Option<crate::gles::gles11_raw::types::GLuint>,
     pub(super) gles_texture_is_up_to_date: bool,
@@ -409,6 +413,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         contents: nil,
         drawable_properties: nil,
         presented_pixels: None,
+        presented_directly: false,
         cg_context: None,
         gles_texture: None,
         gles_texture_is_up_to_date: false,
