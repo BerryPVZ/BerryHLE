@@ -1020,6 +1020,21 @@ Type mismatch when sending message {} to {:?}!
             ) {
                 return;
             }
+            if let Some(result) =
+                fake_class_message_result(&class_name_for_log, is_metaclass, &sel_name)
+            {
+                log!(
+                    "Call to faked class \"{}\" ({:?}) {} method \"{}\". Returning {}.",
+                    class_name_for_log,
+                    class,
+                    if is_metaclass { "class" } else { "instance" },
+                    sel_name,
+                    result,
+                );
+                env.cpu.regs_mut()[0] = result;
+                env.cpu.regs_mut()[1] = 0;
+                return;
+            }
             log!(
                 "Call to faked class \"{}\" ({:?}) {} method \"{}\". Behaving as if message was sent to nil.",
                 class_name_for_log,
@@ -1056,6 +1071,22 @@ fn objc_ret_zero(env: &mut Environment) {
 fn objc_ret_u32(env: &mut Environment, value: u32) {
     env.cpu.regs_mut()[0] = value;
     env.cpu.regs_mut()[1] = 0;
+}
+
+/// Return value for a message to a faked third-party SDK class (see
+/// `substitute_classes`), when behaving as if it were sent to nil (returning
+/// 0) would put the app into a state the real SDK never leaves it in.
+fn fake_class_message_result(class_name: &str, is_metaclass: bool, selector: &str) -> Option<u32> {
+    match (class_name, is_metaclass, selector) {
+        // Act as if the player has already answered OpenFeint's opt-in
+        // prompt and declined (so `hasUserApprovedFeint` stays NO). "Not
+        // answered yet" makes games bring up their OpenFeint approval
+        // screen and wait for it to be dismissed, which never happens with
+        // OpenFeint faked: Atlantis Sky Patrol spins its run loop forever
+        // inside a frame, freezing on the splash screen.
+        ("OpenFeint", true, "hasUserSetFeintAccess") => Some(1),
+        _ => None,
+    }
 }
 
 fn objc_ret_f32(env: &mut Environment, value: f32) {
@@ -2769,4 +2800,31 @@ pub fn autorelease(env: &mut Environment, object: id) -> id {
         return nil;
     }
     msg![env; object autorelease]
+}
+
+#[cfg(test)]
+mod fake_class_tests {
+    use super::fake_class_message_result;
+
+    #[test]
+    fn openfeint_reports_that_the_player_declined_it() {
+        assert_eq!(
+            fake_class_message_result("OpenFeint", true, "hasUserSetFeintAccess"),
+            Some(1)
+        );
+        // Everything else, including whether OpenFeint was approved, still
+        // behaves as if sent to nil.
+        assert_eq!(
+            fake_class_message_result("OpenFeint", true, "hasUserApprovedFeint"),
+            None
+        );
+        assert_eq!(
+            fake_class_message_result("OpenFeint", false, "hasUserSetFeintAccess"),
+            None
+        );
+        assert_eq!(
+            fake_class_message_result("FlurryAPI", true, "hasUserSetFeintAccess"),
+            None
+        );
+    }
 }
