@@ -11,6 +11,7 @@
 
 mod eagl;
 mod gles_guest;
+mod software_vao;
 
 use touchHLE_gl_bindings::gles11::types::{GLenum, GLint, GLsizei, GLuint};
 

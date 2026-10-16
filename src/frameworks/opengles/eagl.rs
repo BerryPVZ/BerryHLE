@@ -5,6 +5,7 @@
  */
 //! EAGL.
 
+use super::software_vao::VertexArrayState;
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
 use crate::frameworks::core_animation::ca_eagl_layer::{
     find_fullscreen_eagl_layer, get_pixels_vec_for_presenting, present_pixels,
@@ -177,6 +178,13 @@ pub(super) struct GLShadowState {
     pub(super) software_vertex_arrays: HashSet<GLuint>,
     pub(super) software_vao_element_array_buffers: HashMap<GLuint, GLuint>,
     pub(super) next_software_vertex_array: GLuint,
+    /// Client active texture unit (`GL_CLIENT_ACTIVE_TEXTURE - GL_TEXTURE0`).
+    pub(super) client_active_texture: usize,
+    /// Client array state of the currently bound vertex array object. Only
+    /// meaningful with the software VAO fallback, see [super::software_vao].
+    pub(super) vertex_array_state: VertexArrayState,
+    /// Client array state of the other (software) vertex array objects.
+    pub(super) software_vao_states: HashMap<GLuint, VertexArrayState>,
 }
 impl Default for GLShadowState {
     fn default() -> Self {
@@ -194,6 +202,9 @@ impl Default for GLShadowState {
             software_vertex_arrays: HashSet::new(),
             software_vao_element_array_buffers: HashMap::new(),
             next_software_vertex_array: 1,
+            client_active_texture: 0,
+            vertex_array_state: VertexArrayState::default(),
+            software_vao_states: HashMap::new(),
         }
     }
 }
@@ -259,7 +270,28 @@ impl GLShadowState {
         self.software_vao_element_array_buffers
             .insert(self.current_vertex_array, buffer);
     }
-    pub(super) fn bind_software_vertex_array(&mut self, array: GLuint) -> GLuint {
+    /// Switch the software VAO binding to `array`. Returns the element array
+    /// buffer to bind and, if the binding changed, the client array state the
+    /// host context is in (the outgoing VAO's), which
+    /// [super::software_vao::apply_vertex_array_state] must turn into
+    /// [Self::vertex_array_state].
+    pub(super) fn bind_software_vertex_array(
+        &mut self,
+        array: GLuint,
+    ) -> (GLuint, Option<VertexArrayState>) {
+        if array == self.current_vertex_array {
+            return (self.bind_software_element_array_buffer(array), None);
+        }
+        let incoming = self.software_vao_states.remove(&array).unwrap_or_default();
+        let outgoing = std::mem::replace(&mut self.vertex_array_state, incoming);
+        self.software_vao_states
+            .insert(self.current_vertex_array, outgoing.clone());
+        (
+            self.bind_software_element_array_buffer(array),
+            Some(outgoing),
+        )
+    }
+    fn bind_software_element_array_buffer(&mut self, array: GLuint) -> GLuint {
         if let Some(binding) = self.element_array_buffer {
             self.software_vao_element_array_buffers
                 .insert(self.current_vertex_array, binding);
@@ -285,20 +317,24 @@ impl GLShadowState {
     pub(super) fn is_software_vertex_array(&self, array: GLuint) -> bool {
         array != 0 && self.software_vertex_arrays.contains(&array)
     }
-    pub(super) fn delete_software_vertex_array(&mut self, array: GLuint) -> Option<GLuint> {
+    pub(super) fn delete_software_vertex_array(
+        &mut self,
+        array: GLuint,
+    ) -> Option<(GLuint, Option<VertexArrayState>)> {
         if array == 0 || !self.software_vertex_arrays.remove(&array) {
             return None;
         }
         self.software_vao_element_array_buffers.remove(&array);
         if self.current_vertex_array == array {
-            self.current_vertex_array = 0;
-            let binding = *self
-                .software_vao_element_array_buffers
-                .entry(0)
-                .or_insert(0);
-            self.element_array_buffer = Some(binding);
-            Some(binding)
+            // Deleting the bound VAO reverts to the default one. Forget the
+            // deleted VAO's element array binding before switching so that
+            // it isn't saved under its name again.
+            self.element_array_buffer = None;
+            let (binding, outgoing) = self.bind_software_vertex_array(0);
+            self.software_vao_states.remove(&array);
+            Some((binding, outgoing))
         } else {
+            self.software_vao_states.remove(&array);
             None
         }
     }

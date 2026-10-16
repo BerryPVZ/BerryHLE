@@ -8,6 +8,7 @@
 
 use crate::dyld::{export_c_func, export_c_func_aliased, FunctionExports};
 use crate::frameworks::opengles::eagl::{EAGLContextHostObject, GLShadowState};
+use crate::frameworks::opengles::software_vao::{self, ArrayPointer, FixedArray};
 use crate::gles::{gles11_raw as gles11, GuestGlesCallGuard, GLES};
 use crate::mem::{ConstPtr, ConstVoidPtr, GuestISize, GuestUSize, Mem, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::nil;
@@ -374,15 +375,31 @@ fn glDisable(env: &mut Environment, cap: GLenum) {
     }
 }
 fn glClientActiveTexture(env: &mut Environment, texture: GLenum) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        let unit = texture.wrapping_sub(gles11::TEXTURE0) as usize;
+        if unit < software_vao::MAX_TEXTURE_UNITS {
+            shadow.client_active_texture = unit;
+        }
         gles.ClientActiveTexture(texture)
     })
 }
 fn glEnableClientState(env: &mut Environment, array: GLenum) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.EnableClientState(array) });
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        let unit = shadow.client_active_texture;
+        shadow
+            .vertex_array_state
+            .set_client_state(array, unit, true);
+        gles.EnableClientState(array)
+    });
 }
 fn glDisableClientState(env: &mut Environment, array: GLenum) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.DisableClientState(array) });
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        let unit = shadow.client_active_texture;
+        shadow
+            .vertex_array_state
+            .set_client_state(array, unit, false);
+        gles.DisableClientState(array)
+    });
 }
 
 fn glGetBooleanv(env: &mut Environment, pname: GLenum, params: MutPtr<GLboolean>) {
@@ -437,6 +454,13 @@ fn glGetIntegerv(env: &mut Environment, pname: GLenum, params: MutPtr<GLint>) {
         }
         0x8cdf | 0x8d57 => {
             env.mem.write(params, 1 as _);
+        }
+        // GL_VERTEX_ARRAY_BINDING_OES: the software VAO fallback has no host
+        // object to ask.
+        0x85B5 if with_ctx_mem_and_shadow(env, |gles, _mem, _shadow| !gles.supports_vao_oes()) => {
+            let binding =
+                with_ctx_mem_and_shadow(env, |_gles, _mem, shadow| shadow.current_vertex_array);
+            env.mem.write(params, binding as GLint);
         }
         _ => {
             if env
@@ -1241,6 +1265,38 @@ unsafe fn translate_pointer_or_offset_to_guest(
     }
 }
 
+/// Describe a `gl*Pointer` call for [GLShadowState::vertex_array_state], so
+/// the software vertex array object emulation can restore it later.
+fn array_pointer_record(
+    shadow: &GLShadowState,
+    size: GLint,
+    type_: GLenum,
+    normalized: GLboolean,
+    stride: GLsizei,
+    pointer: ConstVoidPtr,
+) -> ArrayPointer {
+    ArrayPointer {
+        set: true,
+        size,
+        type_,
+        normalized,
+        stride,
+        pointer: pointer.to_bits(),
+        buffer: shadow.array_buffer,
+    }
+}
+fn record_fixed_array_pointer(
+    shadow: &mut GLShadowState,
+    array: FixedArray,
+    size: GLint,
+    type_: GLenum,
+    stride: GLsizei,
+    pointer: ConstVoidPtr,
+) {
+    let record = array_pointer_record(shadow, size, type_, 0, stride, pointer);
+    shadow.vertex_array_state.set_fixed_pointer(array, record);
+}
+
 fn glColorPointer(
     env: &mut Environment,
     size: GLint,
@@ -1249,12 +1305,14 @@ fn glColorPointer(
     pointer: ConstVoidPtr,
 ) {
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        record_fixed_array_pointer(shadow, FixedArray::Color, size, type_, stride, pointer);
         let pointer = translate_pointer_or_offset_to_host(gles, mem, shadow, pointer, ARRAY_BUFFER);
         gles.ColorPointer(size, type_, stride, pointer)
     })
 }
 fn glNormalPointer(env: &mut Environment, type_: GLenum, stride: GLsizei, pointer: ConstVoidPtr) {
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        record_fixed_array_pointer(shadow, FixedArray::Normal, 3, type_, stride, pointer);
         let pointer = translate_pointer_or_offset_to_host(gles, mem, shadow, pointer, ARRAY_BUFFER);
         gles.NormalPointer(type_, stride, pointer)
     })
@@ -1267,6 +1325,11 @@ fn glTexCoordPointer(
     pointer: ConstVoidPtr,
 ) {
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let record = array_pointer_record(shadow, size, type_, 0, stride, pointer);
+        let unit = shadow.client_active_texture;
+        shadow
+            .vertex_array_state
+            .set_tex_coord_pointer(unit, record);
         let pointer = translate_pointer_or_offset_to_host(gles, mem, shadow, pointer, ARRAY_BUFFER);
         gles.TexCoordPointer(size, type_, stride, pointer)
     })
@@ -1279,6 +1342,7 @@ fn glVertexPointer(
     pointer: ConstVoidPtr,
 ) {
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        record_fixed_array_pointer(shadow, FixedArray::Vertex, size, type_, stride, pointer);
         let pointer = translate_pointer_or_offset_to_host(gles, mem, shadow, pointer, ARRAY_BUFFER);
         gles.VertexPointer(size, type_, stride, pointer)
     })
@@ -1294,6 +1358,7 @@ fn glPointSizePointerOES(
     pointer: ConstVoidPtr,
 ) {
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        record_fixed_array_pointer(shadow, FixedArray::PointSize, 1, type_, stride, pointer);
         let pointer = translate_pointer_or_offset_to_host(gles, mem, shadow, pointer, ARRAY_BUFFER);
         gles.PointSizePointerOES(type_, stride, pointer)
     })
@@ -1651,7 +1716,7 @@ fn glPopGroupMarkerEXT(_env: &mut Environment) {
 }
 
 fn glBindVertexArrayOES(env: &mut Environment, array: GLuint) {
-    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         if gles.supports_vao_oes() {
             shadow.current_vertex_array = array;
             shadow.invalidate_vao_state();
@@ -1661,10 +1726,30 @@ fn glBindVertexArrayOES(env: &mut Environment, array: GLuint) {
                 log_once!("Ignoring glBindVertexArrayOES for an ungenerated name on the software fallback");
                 return;
             }
-            let element_array_buffer = shadow.bind_software_vertex_array(array);
+            let (element_array_buffer, outgoing) = shadow.bind_software_vertex_array(array);
             gles.BindBuffer(ELEMENT_ARRAY_BUFFER, element_array_buffer);
+            if let Some(outgoing) = outgoing {
+                apply_software_vertex_array_state(gles, mem, shadow, &outgoing);
+            }
         }
     });
+}
+/// Bring the host's client array state from `outgoing` to the state of the
+/// newly bound software vertex array object.
+unsafe fn apply_software_vertex_array_state(
+    gles: &mut dyn GLES,
+    mem: &Mem,
+    shadow: &GLShadowState,
+    outgoing: &software_vao::VertexArrayState,
+) {
+    software_vao::apply_vertex_array_state(
+        gles,
+        mem,
+        outgoing,
+        &shadow.vertex_array_state,
+        shadow.array_buffer,
+        shadow.client_active_texture,
+    );
 }
 fn glDeleteVertexArraysOES(env: &mut Environment, n: GLsizei, arrays: ConstPtr<GLuint>) {
     if n <= 0 || arrays.is_null() {
@@ -1684,8 +1769,13 @@ fn glDeleteVertexArraysOES(env: &mut Environment, n: GLsizei, arrays: ConstPtr<G
         } else {
             for index in 0..count {
                 let array = mem.read(arrays + index);
-                if let Some(element_array_buffer) = shadow.delete_software_vertex_array(array) {
+                if let Some((element_array_buffer, outgoing)) =
+                    shadow.delete_software_vertex_array(array)
+                {
                     gles.BindBuffer(ELEMENT_ARRAY_BUFFER, element_array_buffer);
+                    if let Some(outgoing) = outgoing {
+                        apply_software_vertex_array_state(gles, mem, shadow, &outgoing);
+                    }
                 }
             }
         }
@@ -1735,6 +1825,14 @@ fn glMatrixIndexPointerOES(
     pointer: ConstVoidPtr,
 ) {
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        record_fixed_array_pointer(
+            shadow,
+            FixedArray::MatrixIndex,
+            size,
+            type_,
+            stride,
+            pointer,
+        );
         let pointer = translate_pointer_or_offset_to_host(gles, mem, shadow, pointer, ARRAY_BUFFER);
         gles.MatrixIndexPointerOES(size, type_, stride, pointer)
     })
@@ -1747,6 +1845,7 @@ fn glWeightPointerOES(
     pointer: ConstVoidPtr,
 ) {
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        record_fixed_array_pointer(shadow, FixedArray::Weight, size, type_, stride, pointer);
         let pointer = translate_pointer_or_offset_to_host(gles, mem, shadow, pointer, ARRAY_BUFFER);
         gles.WeightPointerOES(size, type_, stride, pointer)
     })
@@ -5784,11 +5883,17 @@ fn glShaderSource(
 fn glEnableVertexAttribArray(env: &mut Environment, index: GLuint) {
     with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
         shadow.generic_attribs_used = true;
+        shadow
+            .vertex_array_state
+            .set_generic_enabled(index as usize, true);
         gles.EnableVertexAttribArray(index)
     });
 }
 fn glDisableVertexAttribArray(env: &mut Environment, index: GLuint) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        shadow
+            .vertex_array_state
+            .set_generic_enabled(index as usize, false);
         gles.DisableVertexAttribArray(index)
     });
 }
@@ -5806,6 +5911,10 @@ fn glVertexAttribPointer(
     // as-is. Otherwise we need to translate the guest pointer to a host
     // pointer.
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let record = array_pointer_record(shadow, size, type_, normalized, stride, pointer);
+        shadow
+            .vertex_array_state
+            .set_generic_pointer(index as usize, record);
         let host_ptr = if !buffer_is_bound(gles, shadow, ARRAY_BUFFER) {
             if pointer.is_null() {
                 std::ptr::null()
