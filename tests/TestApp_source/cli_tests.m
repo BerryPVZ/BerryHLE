@@ -20,6 +20,7 @@
 #include <fenv.h>
 #include <fnmatch.h>
 #include <glob.h>
+#include <limits.h>
 #include <locale.h>
 #include <mach/kern_return.h>
 #include <mach/thread_info.h>
@@ -32,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <time.h>
@@ -1235,6 +1237,62 @@ int test_sscanf() {
     return -91;
   return 0;
 }
+
+// Like Apple's vfscanf, integers are read with strtoimax/strtoumax semantics
+// (64-bit, saturating on overflow) and then truncated to the argument size.
+// sscanf() reads integers like strtoimax()/strtoumax(): overflow saturates
+// and sets ERANGE, and the result is truncated to the size of the argument
+// without an error. Values are from macOS.
+#define SCAN_CHECK(str, fmt, var, expected, expected_errno, code)              \
+  do {                                                                         \
+    errno = 0;                                                                 \
+    if (sscanf(str, fmt, &var) != 1 || var != (expected) ||                    \
+        errno != (expected_errno))                                             \
+      return code;                                                             \
+  } while (0)
+int test_sscanf_integer_overflow() {
+  short hd = 0;
+  int d = 0;
+  unsigned int u = 0;
+  unsigned char hhu = 0;
+  long long lld = 0;
+  unsigned long long llu = 0;
+  SCAN_CHECK("4294967297", "%d", d, 1, 0, -1);
+  SCAN_CHECK("99999999999999999999", "%hd", hd, -1, ERANGE, -2);
+  SCAN_CHECK("-99999999999999999999", "%hd", hd, 0, ERANGE, -3);
+  SCAN_CHECK("99999999999999999999", "%u", u, 4294967295u, ERANGE, -4);
+  SCAN_CHECK("-99999999999999999999", "%u", u, 4294967295u, ERANGE, -5);
+  SCAN_CHECK("-1", "%hhu", hhu, 255, 0, -6);
+  SCAN_CHECK("-4294967297", "%u", u, 4294967295u, 0, -7);
+  SCAN_CHECK("9223372036854775808", "%lld", lld, LLONG_MAX, ERANGE, -8);
+  SCAN_CHECK("-9223372036854775808", "%lld", lld, LLONG_MIN, 0, -9);
+  SCAN_CHECK("-99999999999999999999", "%llu", llu, ULLONG_MAX, ERANGE, -10);
+  SCAN_CHECK("10000000000000000", "%llx", llu, ULLONG_MAX, ERANGE, -11);
+  SCAN_CHECK("1ffffffff", "%x", u, 0xffffffffu, 0, -12);
+  SCAN_CHECK("12345", "%3d", d, 123, 0, -13);
+  // A suppressed conversion consumes the number but does not set errno.
+  errno = 0;
+  d = 0;
+  if (sscanf("99999999999999999999 5", "%*d %d", &d) != 1 || d != 5 ||
+      errno != 0)
+    return -14;
+  // fscanf() keeps ERANGE while it reads further input.
+  FILE *file = tmpfile();
+  if (file == NULL)
+    return -15;
+  fputs("99999999999999999999 5", file);
+  rewind(file);
+  errno = 0;
+  hd = 0;
+  d = 0;
+  int matched = fscanf(file, "%hd %d", &hd, &d);
+  int scan_errno = errno;
+  fclose(file);
+  if (matched != 2 || hd != -1 || d != 5 || scan_errno != ERANGE)
+    return -16;
+  return 0;
+}
+#undef SCAN_CHECK
 
 int test_swscanf() {
   int a, b;
@@ -3526,6 +3584,263 @@ int test_flockfile_io_while_locked() {
 
   funlockfile(file);
   fclose(file);
+  return 0;
+}
+
+// Apple's stdio functions take the stream lock themselves, so a thread that
+// uses a stream locked by another thread waits until it is unlocked.
+struct lock_wait_args {
+  FILE *file;
+  void (*op)(FILE *);
+  pthread_mutex_t *mu;
+  pthread_cond_t *cv;
+  int *started;
+  int *done;
+};
+
+void *lock_wait_thread(void *arg) {
+  struct lock_wait_args *a = arg;
+  pthread_mutex_lock(a->mu);
+  *(a->started) = 1;
+  pthread_cond_signal(a->cv);
+  pthread_mutex_unlock(a->mu);
+
+  // This call must wait until the main thread releases the stream lock.
+  a->op(a->file);
+
+  pthread_mutex_lock(a->mu);
+  *(a->done) = 1;
+  pthread_cond_signal(a->cv);
+  pthread_mutex_unlock(a->mu);
+  return NULL;
+}
+
+// Locks `file`, runs `op` on another thread and checks that it finishes only
+// after the lock is released. If `side_effect` is not NULL, `op` must not
+// change it while the lock is held. If `while_locked` is not NULL, this
+// thread calls it while the other thread waits.
+int check_waits_for_other_thread_lock(FILE *file, void (*op)(FILE *),
+                                      int *side_effect,
+                                      void (*while_locked)(void)) {
+  pthread_mutex_t mu;
+  pthread_cond_t cv;
+  pthread_mutex_init(&mu, NULL);
+  pthread_cond_init(&cv, NULL);
+  int started = 0;
+  int done = 0;
+  struct lock_wait_args args = {file, op, &mu, &cv, &started, &done};
+  if (side_effect != NULL)
+    *side_effect = -1;
+
+  flockfile(file);
+  pthread_t p;
+  if (pthread_create(&p, NULL, lock_wait_thread, &args) != 0) {
+    funlockfile(file);
+    return -2;
+  }
+  pthread_mutex_lock(&mu);
+  while (!started)
+    pthread_cond_wait(&cv, &mu);
+  pthread_mutex_unlock(&mu);
+  // Give the other thread time to reach `op`. If `op` does not wait, it
+  // finishes during this sleep.
+  usleep(100000);
+  if (while_locked != NULL)
+    while_locked();
+  pthread_mutex_lock(&mu);
+  int done_before_unlock = done;
+  int side_effect_before_unlock = side_effect != NULL ? *side_effect : -1;
+  pthread_mutex_unlock(&mu);
+  funlockfile(file);
+
+  pthread_join(p, NULL);
+  pthread_cond_destroy(&cv);
+  pthread_mutex_destroy(&mu);
+  if (done_before_unlock != 0 || side_effect_before_unlock != -1)
+    return -3;
+  if (done != 1 || (side_effect != NULL && *side_effect != 0))
+    return -4;
+  return 0;
+}
+
+void read_one_byte(FILE *file) {
+  char c;
+  fread(&c, 1, 1, file);
+}
+
+int test_fread_waits_for_other_thread_lock() {
+  FILE *file = fopen("TestApp", "r");
+  if (file == NULL)
+    return -1;
+  int res = check_waits_for_other_thread_lock(file, read_one_byte, NULL, NULL);
+  // Nothing was read while the stream was locked, then one byte.
+  off_t pos = ftello(file);
+  fclose(file);
+  if (res != 0)
+    return res;
+  return pos == 1 ? 0 : -5;
+}
+
+// %n stores the number of characters printed so far: here 0. It must not be
+// stored before the lock is acquired.
+int printed_count;
+
+void printf_count(FILE *file) { printf("%n", &printed_count); }
+
+void *read_one_byte_thread(void *arg) {
+  read_one_byte(arg);
+  return NULL;
+}
+
+// fread() keeps the stream locked while it waits for input: here a UDP
+// socket put in place of the stream's file descriptor. Only sockets can make
+// a read wait in touchHLE, and they need --allow-network-access; without it
+// the test is skipped.
+int test_fread_holds_lock_while_waiting() {
+  FILE *file = tmpfile();
+  if (file == NULL)
+    return -1;
+  struct sockaddr_in addr = {0};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  socklen_t addr_len = sizeof(addr);
+  int receiver = socket(AF_INET, SOCK_DGRAM, 0);
+  if (receiver < 0 && errno == EPROTONOSUPPORT) {
+    fclose(file);
+    return 0;
+  }
+  int sender = socket(AF_INET, SOCK_DGRAM, 0);
+  if (receiver < 0 || sender < 0 ||
+      bind(receiver, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+      getsockname(receiver, (struct sockaddr *)&addr, &addr_len) != 0) {
+    fclose(file);
+    return -2;
+  }
+  int fd = fileno(file);
+  close(fd);
+  if (fcntl(receiver, F_DUPFD, fd) != fd) {
+    fclose(file);
+    return -3;
+  }
+  close(receiver);
+
+  pthread_t p;
+  if (pthread_create(&p, NULL, read_one_byte_thread, file) != 0) {
+    fclose(file);
+    return -4;
+  }
+  // Give the other thread time to start waiting in fread().
+  usleep(100000);
+  int trylock_result = ftrylockfile(file);
+  if (trylock_result == 0)
+    funlockfile(file);
+  sendto(sender, "x", 1, 0, (struct sockaddr *)&addr, sizeof(addr));
+  pthread_join(p, NULL);
+  close(sender);
+  fclose(file);
+  return trylock_result == -1 ? 0 : -5;
+}
+
+FILE *rewind_file;
+int error_while_locked;
+
+void do_rewind(FILE *file) { rewind(file); }
+
+void check_error_indicator(void) { error_while_locked = ferror(rewind_file); }
+
+// rewind() clears the error indicator only once it has the lock.
+int test_rewind_waits_for_other_thread_lock() {
+  rewind_file = fopen("TestApp", "r");
+  if (rewind_file == NULL)
+    return -1;
+  // Writing to a read-only stream sets the error indicator.
+  fputc('x', rewind_file);
+  if (!ferror(rewind_file)) {
+    fclose(rewind_file);
+    return -2;
+  }
+  error_while_locked = 0;
+  int res = check_waits_for_other_thread_lock(rewind_file, do_rewind, NULL,
+                                              check_error_indicator);
+  int error_after = ferror(rewind_file);
+  fclose(rewind_file);
+  if (res != 0)
+    return res;
+  if (!error_while_locked)
+    return -5;
+  return error_after == 0 ? 0 : -6;
+}
+
+int owner_printed_count;
+
+void printf_owner_count(void) { printf("%n", &owner_printed_count); }
+
+// printf() takes no FILE*, but still waits for a lock on stdout. stdout is
+// &__sF[1] on Apple, so a lock taken through either counts, and the thread
+// that holds it can still print. The SDK only declares __sF for old
+// deployment targets.
+extern FILE __sF[];
+int test_printf_waits_for_stdout_lock() {
+  FILE *objects[2] = {stdout, &__sF[1]};
+  for (int i = 0; i < 2; i++) {
+    owner_printed_count = -1;
+    int res = check_waits_for_other_thread_lock(
+        objects[i], printf_count, &printed_count, printf_owner_count);
+    if (res == 0 && owner_printed_count != 0)
+      res = -5;
+    if (res != 0)
+      return res - 10 * i;
+  }
+  return 0;
+}
+
+void fprintf_count(FILE *file) { fprintf(file, "%n", &printed_count); }
+
+int test_fprintf_waits_for_other_thread_lock() {
+  FILE *file = tmpfile();
+  if (file == NULL)
+    return -1;
+  int res =
+      check_waits_for_other_thread_lock(file, fprintf_count, &printed_count,
+                                        NULL);
+  fclose(file);
+  return res;
+}
+
+struct funlockfile_args {
+  FILE *file;
+  int trylock_result;
+};
+
+void *funlockfile_other_thread(void *arg) {
+  struct funlockfile_args *a = arg;
+  // Unlocking a stream this thread does not own does nothing.
+  funlockfile(a->file);
+  a->trylock_result = ftrylockfile(a->file);
+  if (a->trylock_result == 0)
+    funlockfile(a->file);
+  return NULL;
+}
+
+// funlockfile() from a thread that does not own the lock is ignored, and
+// ftrylockfile() on a stream locked by another thread returns -1.
+int test_funlockfile_from_other_thread_is_ignored() {
+  FILE *file = fopen("TestApp", "r");
+  if (file == NULL)
+    return -1;
+  flockfile(file);
+  struct funlockfile_args args = {file, 0};
+  pthread_t p;
+  if (pthread_create(&p, NULL, funlockfile_other_thread, &args) != 0) {
+    funlockfile(file);
+    fclose(file);
+    return -2;
+  }
+  pthread_join(p, NULL);
+  funlockfile(file);
+  fclose(file);
+  if (args.trylock_result != -1)
+    return -3;
   return 0;
 }
 
@@ -6431,6 +6746,7 @@ struct {
     FUNC_DEF(test_qsort),
     FUNC_DEF(test_vsnprintf),
     FUNC_DEF(test_sscanf),
+    FUNC_DEF(test_sscanf_integer_overflow),
     FUNC_DEF(test_swscanf),
     FUNC_DEF(test_realloc),
     FUNC_DEF(test_atof),
@@ -6467,6 +6783,12 @@ struct {
     FUNC_DEF(test_ftrylockfile_locked_by_other_thread),
     FUNC_DEF(test_flockfile_blocks_other_thread),
     FUNC_DEF(test_flockfile_io_while_locked),
+    FUNC_DEF(test_fread_waits_for_other_thread_lock),
+    FUNC_DEF(test_fread_holds_lock_while_waiting),
+    FUNC_DEF(test_rewind_waits_for_other_thread_lock),
+    FUNC_DEF(test_printf_waits_for_stdout_lock),
+    FUNC_DEF(test_fprintf_waits_for_other_thread_lock),
+    FUNC_DEF(test_funlockfile_from_other_thread_is_ignored),
     FUNC_DEF(test_open),
     FUNC_DEF(test_close),
     FUNC_DEF(test_cond_var),
