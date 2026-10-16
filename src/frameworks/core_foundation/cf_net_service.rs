@@ -352,11 +352,10 @@ impl MdnsSocket {
             // Without an explicit multicast interface, sends to the group
             // follow the default route (cellular on dual-network phones) and
             // LAN peers never see our announcements and queries.
-            #[cfg(target_os = "macos")]
-            let _ = socket.set_multicast_if_v4(&ip);
-            // Linux-family targets (including Android) do not expose the std
-            // helper; set IP_MULTICAST_IF through raw setsockopt instead.
-            #[cfg(any(target_os = "linux", target_os = "android"))]
+            // The std helper `set_multicast_if_v4` is unstable, so every
+            // Unix-family target gets IP_MULTICAST_IF through raw setsockopt
+            // instead (BSD accepts a plain `struct in_addr` there).
+            #[cfg(not(windows))]
             unsafe {
                 use std::os::fd::AsRawFd;
                 let arg = libc::in_addr {
