@@ -198,7 +198,7 @@ fn parse_name(msg: &[u8], pos: usize) -> Option<(String, usize)> {
         labels.push(String::from_utf8_lossy(&msg[start..stop]).into_owned());
         pos = stop;
     }
-    (Some((labels.join("."), end)))
+    Some((labels.join("."), end))
 }
 
 struct MdnsRecord<'a> {
@@ -251,6 +251,57 @@ fn parse_records(msg: &[u8]) -> Option<Vec<MdnsRecord<'_>>> {
 
 // MARK: - mDNS socket
 
+/// Binds a UDP socket to mDNS port 5353, preferring one that can coexist
+/// with the host OS's own mDNS responder (Android's mdnsd) and with our
+/// other mDNS sockets. On Unix this sets SO_REUSEADDR/SO_REUSEPORT, which
+/// makes multicast delivery reach every bound socket. If 5353 can't be
+/// bound at all, an ephemeral port is used (legacy unicast-response mode).
+fn bind_mdns_socket() -> Option<UdpSocket> {
+    #[cfg(not(windows))]
+    {
+        unsafe {
+            use std::os::fd::FromRawFd;
+            let fd = ::libc::socket(::libc::AF_INET, ::libc::SOCK_DGRAM, 0);
+            if fd < 0 {
+                return UdpSocket::bind(("0.0.0.0", MDNS_PORT))
+                    .ok()
+                    .or_else(|| UdpSocket::bind(("0.0.0.0", 0)).ok());
+            }
+            let one: ::libc::c_int = 1;
+            ::libc::setsockopt(
+                fd,
+                ::libc::SOL_SOCKET,
+                ::libc::SO_REUSEADDR,
+                &one as *const _ as *const ::libc::c_void,
+                std::mem::size_of::<::libc::c_int>() as ::libc::socklen_t,
+            );
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            ::libc::setsockopt(
+                fd,
+                ::libc::SOL_SOCKET,
+                ::libc::SO_REUSEPORT,
+                &one as *const _ as *const ::libc::c_void,
+                std::mem::size_of::<::libc::c_int>() as ::libc::socklen_t,
+            );
+            let mut addr: ::libc::sockaddr_in = std::mem::zeroed();
+            addr.sin_family = ::libc::AF_INET as u16;
+            addr.sin_port = MDNS_PORT.to_be();
+            let res = ::libc::bind(
+                fd,
+                &addr as *const _ as *const ::libc::sockaddr,
+                std::mem::size_of::<::libc::sockaddr_in>() as ::libc::socklen_t,
+            );
+            if res == 0 {
+                return Some(UdpSocket::from_raw_fd(fd));
+            }
+            ::libc::close(fd);
+        }
+    }
+    UdpSocket::bind(("0.0.0.0", MDNS_PORT))
+        .ok()
+        .or_else(|| UdpSocket::bind(("0.0.0.0", 0)).ok())
+}
+
 /// A multicast mDNS socket. Each browse/register gets its own socket because
 /// the emulator's guest sockets (libc::socket) and this one must not collide.
 struct MdnsSocket {
@@ -261,31 +312,61 @@ struct MdnsSocket {
 
 impl MdnsSocket {
     fn new() -> Option<MdnsSocket> {
-        let socket = UdpSocket::bind(("0.0.0.0", MDNS_PORT)).ok().or_else(|| {
-            // Port 5353 may already be taken by the host OS's own mDNS
-            // responder. Fall back to an ephemeral port: we can still send
-            // queries and receive unicast responses directed at our source
-            // port, which is how legacy (QU) mDNS queriers work.
-            UdpSocket::bind(("0.0.0.0", 0)).ok()
-        })?;
+        let socket = bind_mdns_socket()?;
         let _ = socket.set_read_timeout(Some(Duration::from_millis(50)));
         let _ = socket.set_multicast_loop_v4(true);
-        let _ = socket.join_multicast_v4(&MDNS_GROUP, &Ipv4Addr::UNSPECIFIED);
 
-        // Find a local IPv4 address by connecting a throwaway UDP socket to
-        // the multicast group (this does not send packets for UDP).
-        let local_addr = UdpSocket::bind(("0.0.0.0", 0))
-            .ok()
-            .and_then(|s| {
-                s.connect(SocketAddr::V4(SocketAddrV4::new(MDNS_GROUP, MDNS_PORT)))
-                    .ok()
-                    .map(|_| s)
-            })
-            .and_then(|s| s.local_addr().ok())
-            .and_then(|a| match a.ip() {
-                std::net::IpAddr::V4(v4) => Some(v4),
-                std::net::IpAddr::V6(_) => None,
-            });
+        let lans = crate::libc::ifaddrs::lan_interfaces();
+
+        // Join the mDNS group on the default interface (keeps the previous
+        // behaviour) and on every LAN interface: on phones with both Wi-Fi
+        // and mobile data, the default interface can be cellular, and peer
+        // announcements arriving on Wi-Fi would otherwise never reach us.
+        let _ = socket.join_multicast_v4(&MDNS_GROUP, &Ipv4Addr::UNSPECIFIED);
+        for iface in &lans {
+            let _ = socket.join_multicast_v4(&MDNS_GROUP, &iface.ip);
+        }
+
+        // Pick the address we advertise in A records and the interface
+        // multicast is sent from. The routing-table trick (connect to the
+        // group) follows the default route, which is cellular on
+        // dual-network phones, so prefer a real LAN interface instead.
+        let local_addr = lans.first().map(|iface| iface.ip).or_else(|| {
+            UdpSocket::bind(("0.0.0.0", 0))
+                .ok()
+                .and_then(|s| {
+                    s.connect(SocketAddr::V4(SocketAddrV4::new(MDNS_GROUP, MDNS_PORT)))
+                        .ok()
+                        .map(|_| s)
+                })
+                .and_then(|s| s.local_addr().ok())
+                .and_then(|a| match a.ip() {
+                    std::net::IpAddr::V4(v4) => Some(v4),
+                    std::net::IpAddr::V6(_) => None,
+                })
+        });
+        // Without an explicit multicast interface, sends to the group follow
+        // the default route (cellular on dual-network phones) and LAN peers
+        // never see our announcements and queries.
+        if let Some(ip) = local_addr {
+            // IP_MULTICAST_IF via raw setsockopt: the std helper is not
+            // available on every target we build for.
+            {
+                use std::os::fd::AsRawFd;
+                let arg = libc::in_addr {
+                    s_addr: u32::from(ip).to_be(),
+                };
+                let _ = unsafe {
+                    libc::setsockopt(
+                        socket.as_raw_fd(),
+                        libc::IPPROTO_IP,
+                        libc::IP_MULTICAST_IF,
+                        &arg as *const libc::in_addr as *const libc::c_void,
+                        std::mem::size_of::<libc::in_addr>() as libc::socklen_t,
+                    )
+                };
+            }
+        }
 
         Some(MdnsSocket { socket, local_addr })
     }
@@ -360,6 +441,7 @@ pub struct CFNetServiceHostObject {
 }
 impl HostObject for CFNetServiceHostObject {}
 
+#[derive(Clone)]
 struct RegisteredService {
     /// Full instance name, e.g. `Player1._realracing._tcp.local.`.
     full_name: String,
@@ -611,6 +693,57 @@ fn respond_to_query(socket: &MdnsSocket, packet: &[u8]) {
     }
     msg.extend_from_slice(&answers);
     socket.send(&msg);
+}
+
+// MARK: - persistent responder
+
+/// How often the responder thread re-announces registered services. Must be
+/// below the announcement TTL so peers never lose the record between bursts.
+const RESPONDER_ANNOUNCE_INTERVAL: Duration = Duration::from_millis(2500);
+/// TTL carried by re-announcements (4.5s, like a fresh registration).
+const RESPONDER_TTL: u32 = 4500;
+
+static RESPONDER_STARTED: std::sync::Once = std::sync::Once::new();
+
+/// Spawns (once per process) a host-side mDNS responder thread.
+///
+/// Registration used to announce the service twice and then drop the
+/// socket: the record's 4.5s TTL expired and the service vanished from
+/// peers' browsers after a few seconds, and queries arriving later went
+/// unanswered. The responder keeps every registered service alive on the
+/// LAN for as long as the process runs: it re-announces periodically (so
+/// peers on the same Wi-Fi keep seeing us) and answers queries from other
+/// devices at any time, not just during a short post-registration window.
+fn ensure_responder() {
+    RESPONDER_STARTED.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("mdns-responder".to_string())
+            .spawn(|| {
+                let Some(socket) = MdnsSocket::new() else {
+                    return;
+                };
+                let mut last_announce =
+                    Instant::now() - RESPONDER_ANNOUNCE_INTERVAL - Duration::from_secs(1);
+                loop {
+                    let regs: Vec<RegisteredService> =
+                        REGISTERED_SERVICES.lock().unwrap().clone();
+                    if !regs.is_empty()
+                        && last_announce.elapsed() >= RESPONDER_ANNOUNCE_INTERVAL
+                    {
+                        for reg in &regs {
+                            announce_service(&socket, reg, RESPONDER_TTL);
+                        }
+                        last_announce = Instant::now();
+                    }
+                    // Answer queries from peers (and our own browsing
+                    // sockets) while waiting for the next announcement.
+                    let deadline = Instant::now() + Duration::from_millis(500);
+                    socket.drain_until(deadline, |packet, _| {
+                        respond_to_query(&socket, packet)
+                    });
+                }
+            });
+    });
 }
 
 /// Creates a CFData (NSData) wrapping a Rust byte vector. The bytes are
@@ -953,6 +1086,8 @@ pub fn CFNetServiceRegisterWithOptions(
     // while we are still here.
     let deadline = Instant::now() + Duration::from_millis(300);
     socket.drain_until(deadline, |packet, _| respond_to_query(&socket, packet));
+
+    ensure_responder();
 
     REGISTERED_SERVICES.lock().unwrap().push(RegisteredService {
         full_name,
@@ -1381,8 +1516,18 @@ pub fn browse_services(
     let mut found: HashMap<String, DiscoveredService> = HashMap::new();
     let type_l = query_name.to_lowercase();
 
-    let deadline = Instant::now() + window;
+    // Split the window in halves and re-send the query at the midpoint:
+    // peer announcements repeat every few seconds, so a single 1.2 s
+    // window catches them only about half the time.
+    let start = Instant::now();
+    let midpoint = start + window / 2;
+    let deadline = start + window;
+    let mut resent = false;
     socket.drain_until(deadline, |packet, _| {
+        if !resent && Instant::now() >= midpoint {
+            resent = true;
+            socket.send(&msg);
+        }
         let Some(records) = parse_records(packet) else {
             return;
         };

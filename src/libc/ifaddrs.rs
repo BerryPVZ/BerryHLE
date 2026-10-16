@@ -120,15 +120,179 @@ unsafe fn host_interfaces() -> Option<Vec<(String, Option<u32>, Option<u32>, Opt
 /// Best-effort primary LAN IPv4 of the host, as a dotted-quad string.
 /// `None` when no non-loopback IPv4 interface exists. Used by `netdb`
 /// to map `.local` hostnames to the address peers can actually reach.
+/// LAN (Wi-Fi/Ethernet) interfaces are preferred over cellular ones,
+/// because `.local` peers are on the LAN, not on the mobile network.
 pub fn primary_lan_ipv4() -> Option<String> {
-    let list = unsafe { host_interfaces() }?;
-    list.into_iter()
-        .find(|(_, addr, _, _, flags)| addr.is_some() && *flags & IFF_LOOPBACK == 0)
-        .and_then(|(_, addr, _, _, _)| addr)
-        .map(|a| {
-            let b = a.to_be_bytes();
-            format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
+    lan_interfaces()
+        .first()
+        .map(|iface| iface.ip.to_string())
+        .or_else(|| {
+            let list = unsafe { host_interfaces() }?;
+            list.into_iter()
+                .find(|(_, addr, _, _, flags)| addr.is_some() && *flags & IFF_LOOPBACK == 0)
+                .and_then(|(_, addr, _, _, _)| addr)
+                .map(|a| {
+                    let b = a.to_be_bytes();
+                    format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
+                })
         })
+}
+
+// MARK: - Host LAN interfaces (host-side helpers)
+
+/// One real IPv4 interface of the host. Unlike the guest-facing mapping
+/// (en0/en1/…), this keeps the host's real interface name, which lets us
+/// tell Wi-Fi/Ethernet apart from cellular links.
+#[derive(Clone, Debug)]
+pub struct HostInterface {
+    /// Real host interface name, e.g. "wlan0", "rmnet_data0".
+    pub name: String,
+    /// Interface IPv4 address.
+    pub ip: std::net::Ipv4Addr,
+    /// Interface netmask.
+    pub netmask: std::net::Ipv4Addr,
+    /// Directed broadcast address, if known.
+    pub broadcast: Option<std::net::Ipv4Addr>,
+}
+
+/// Real IPv4 interfaces of the host (loopback included).
+pub fn real_ipv4_interfaces() -> Vec<HostInterface> {
+    #[cfg(not(windows))]
+    {
+        let mut ifap_host: *mut ::libc::ifaddrs = std::ptr::null_mut();
+        if unsafe { ::libc::getifaddrs(&mut ifap_host) } != 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut cursor = ifap_host;
+        while !cursor.is_null() {
+            let ia = unsafe { &*cursor };
+            let sa = ia.ifa_addr;
+            if !sa.is_null() && unsafe { (*sa).sa_family as i32 } == ::libc::AF_INET {
+                let sin = sa as *const ::libc::sockaddr_in;
+                let ip = std::net::Ipv4Addr::from(
+                    u32::from_be(unsafe { (*sin).sin_addr.s_addr }).to_be_bytes(),
+                );
+                let netmask = if !ia.ifa_netmask.is_null() {
+                    let nm = ia.ifa_netmask as *const ::libc::sockaddr_in;
+                    std::net::Ipv4Addr::from(
+                        u32::from_be(unsafe { (*nm).sin_addr.s_addr }).to_be_bytes(),
+                    )
+                } else {
+                    // Assume a /24 if the netmask is missing; typical for LANs.
+                    std::net::Ipv4Addr::new(255, 255, 255, 0)
+                };
+                let broadcast = {
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    let dst = ia.ifa_ifu;
+                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                    let dst = ia.ifa_dstaddr;
+                    if !dst.is_null()
+                        && unsafe { (*dst).sa_family as i32 } == ::libc::AF_INET
+                    {
+                        let bc = dst.cast::<::libc::sockaddr_in>();
+                        let addr = std::net::Ipv4Addr::from(
+                            u32::from_be(unsafe { (*bc).sin_addr.s_addr }).to_be_bytes(),
+                        );
+                        if !addr.is_broadcast() {
+                            Some(addr)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+                let name = if ia.ifa_name.is_null() {
+                    String::new()
+                } else {
+                    unsafe { std::ffi::CStr::from_ptr(ia.ifa_name) }
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                out.push(HostInterface {
+                    name,
+                    ip,
+                    netmask,
+                    broadcast,
+                });
+            }
+            cursor = unsafe { (*ia).ifa_next };
+        }
+        unsafe { ::libc::freeifaddrs(ifap_host) };
+        out
+    }
+    #[cfg(windows)]
+    {
+        // libc's ifaddrs API isn't available on Windows. Use the
+        // routing-table trick instead (no packets are sent for UDP).
+        use std::net::UdpSocket;
+        let mut out = Vec::new();
+        if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
+            if sock.connect("10.255.255.255:9").is_ok() {
+                if let Ok(local) = sock.local_addr() {
+                    if let std::net::IpAddr::V4(v4) = local.ip() {
+                        out.push(HostInterface {
+                            name: "en0".to_string(),
+                            ip: v4,
+                            netmask: std::net::Ipv4Addr::new(255, 255, 255, 0),
+                            broadcast: Some(std::net::Ipv4Addr::new(
+                                255, 255, 255, 255,
+                            )),
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+fn is_lan_interface_name(name: &str) -> bool {
+    // Wi-Fi/Ethernet/AP/bridge names used by Linux, Android and iOS hosts.
+    // Cellular links (rmnet*, clat*, ccmni*), USB and tunnels are excluded
+    // because LAN peers are never reachable through them.
+    let n = name.to_ascii_lowercase();
+    ["wlan", "wifi", "eth", "swlan", "sw", "ap", "ra", "br", "en"]
+        .iter()
+        .any(|p| n.starts_with(p))
+}
+
+/// IPv4 interfaces usable for LAN play, best (LAN-class) interfaces first.
+///
+/// On phones with both Wi-Fi and mobile data, multicast and broadcast sent
+/// without picking an interface egress the *default route* (cellular), so
+/// peers on the same Wi-Fi never receive them. Anything that needs to reach
+/// the LAN should send via these interfaces.
+pub fn lan_interfaces() -> Vec<HostInterface> {
+    let all: Vec<HostInterface> = real_ipv4_interfaces()
+        .into_iter()
+        .filter(|iface| !iface.ip.is_loopback() && !iface.ip.is_unspecified())
+        .collect();
+    let lan: Vec<HostInterface> = all
+        .iter()
+        .filter(|iface| is_lan_interface_name(&iface.name))
+        .cloned()
+        .collect();
+    if !lan.is_empty() {
+        return lan;
+    }
+    // No Wi-Fi-like name found (or unusual host): fall back to every
+    // non-loopback interface, excluding typical cellular/tunnel names.
+    let fallback: Vec<HostInterface> = all
+        .iter()
+        .filter(|iface| {
+            let n = iface.name.to_ascii_lowercase();
+            !["rmnet", "clat", "ccmni", "usb", "tun", "tap", "dummy", "virbr", "sit", "can"]
+                .iter()
+                .any(|p| n.starts_with(p))
+        })
+        .cloned()
+        .collect();
+    if !fallback.is_empty() {
+        return fallback;
+    }
+    all
 }
 
 // BSD interface flags (net/if.h) as seen by 32-bit iOS guests.
