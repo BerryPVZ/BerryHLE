@@ -7,15 +7,18 @@
 use crate::dyld::FunctionExports;
 use crate::environment::Environment;
 use crate::export_c_func;
-use crate::libc::errno::{set_errno, EINVAL, EIO};
+use crate::libc::errno::{set_errno, EINVAL, EIO, ENOMEM};
 use crate::libc::posix_io;
 use crate::libc::posix_io::{off_t, open_direct, FileDescriptor, SEEK_SET};
-use crate::mem::{ConstPtr, GuestUSize, MutVoidPtr, PAGE_SIZE_ALIGN_MASK};
+use crate::mem::{ConstPtr, GuestUSize, Mem, MutVoidPtr, PAGE_SIZE, PAGE_SIZE_ALIGN_MASK};
 use std::collections::HashMap;
 
 #[allow(dead_code)]
 const MAP_FILE: i32 = 0x0000;
+const MAP_FIXED: i32 = 0x0010;
 const MAP_ANON: i32 = 0x1000;
+
+const MAP_FAILED: MutVoidPtr = MutVoidPtr::from_bits(0xFFFFFFFF);
 
 #[derive(Default)]
 pub struct State {
@@ -45,6 +48,10 @@ fn mmap(
         fd,
         offset
     );
+
+    if (flags & MAP_FIXED) != 0 {
+        return mmap_fixed(env, addr, len, flags, fd, offset);
+    }
 
     // TODO: use vm_allocate() instead
     let ptr = env.mem.calloc(len);
@@ -94,7 +101,7 @@ fn mmap(
             );
             env.mem.free(ptr);
             set_errno(env, EIO);
-            return MutVoidPtr::from_bits(0xFFFFFFFF); // MAP_FAILED
+            return MAP_FAILED;
         }
 
         let read = posix_io::read(env, fd, ptr, len);
@@ -113,6 +120,101 @@ fn mmap(
     env.libc_state.mmap.allocations.insert(ptr, len);
 
     ptr
+}
+
+/// `mmap` with `MAP_FIXED`: the mapping must be placed at exactly `addr`,
+/// replacing whatever was mapped there before.
+///
+/// The Boehm GC used by Mono (and so by every Unity game) relies on this to
+/// release memory: `GC_unmap` maps fresh `PROT_NONE` pages over free heap
+/// blocks with `MAP_FIXED` and aborts with `mmap(...PROT_NONE...) failed` if
+/// the result isn't the address it asked for. `GC_remap` does the same with
+/// read/write pages in older versions. Guest memory has no page protections,
+/// so replacing a mapping just means giving it the contents of the new one:
+/// zeroes for an anonymous mapping, the file's data for a file mapping.
+fn mmap_fixed(
+    env: &mut Environment,
+    addr: MutVoidPtr,
+    len: GuestUSize,
+    flags: i32,
+    fd: FileDescriptor,
+    offset: off_t,
+) -> MutVoidPtr {
+    let (len, is_new_mapping) = match map_fixed_zeroed(
+        &mut env.mem,
+        &mut env.libc_state.mmap.allocations,
+        addr,
+        len,
+    ) {
+        Ok(result) => result,
+        Err(errno) => {
+            set_errno(env, errno);
+            return MAP_FAILED;
+        }
+    };
+
+    if (flags & MAP_ANON) == 0 {
+        let new_offset = posix_io::lseek(env, fd, offset, SEEK_SET);
+        if new_offset != offset {
+            log!(
+                "Warning: mmap MAP_FIXED: lseek to offset {} failed (returned {}); returning MAP_FAILED",
+                offset,
+                new_offset
+            );
+            if is_new_mapping {
+                env.libc_state.mmap.allocations.remove(&addr);
+                env.mem.free(addr);
+            }
+            set_errno(env, EIO);
+            return MAP_FAILED;
+        }
+        posix_io::read(env, fd, addr, len);
+    }
+
+    set_errno(env, 0);
+    addr
+}
+
+/// The memory side of [mmap_fixed]: make the `len` bytes at `addr` a fresh,
+/// zero-filled mapping. On success, returns the page-rounded length and
+/// whether the range was previously unused (and is now tracked in
+/// `allocations`), otherwise an errno value.
+fn map_fixed_zeroed(
+    mem: &mut Mem,
+    allocations: &mut HashMap<MutVoidPtr, GuestUSize>,
+    addr: MutVoidPtr,
+    len: GuestUSize,
+) -> Result<(GuestUSize, bool), i32> {
+    let base = addr.to_bits();
+    let len = len
+        .checked_next_multiple_of(PAGE_SIZE)
+        .filter(|&len| len != 0 && base.checked_add(len - 1).is_some())
+        .ok_or(EINVAL)?;
+    if base & PAGE_SIZE_ALIGN_MASK != 0 || base < mem.null_segment_size() {
+        return Err(EINVAL);
+    }
+    if mem.get_bytes_fallible_mut(addr.cast_const(), len).is_none() {
+        return Err(ENOMEM);
+    }
+
+    let is_new_mapping = mem.is_range_free(base, len);
+    if is_new_mapping {
+        // A brand-new mapping: claim the range so the allocator won't hand
+        // it out, and let munmap() release it again.
+        mem.reserve(base, len);
+        allocations.insert(addr, len);
+    } else {
+        // Replacing (part of) memory that is already in use, which is what
+        // the GC does to its own heap. The range keeps belonging to whatever
+        // allocation it is part of.
+        log_dbg!(
+            "mmap MAP_FIXED over in-use memory {:?} ({:#x} bytes)",
+            addr,
+            len
+        );
+    }
+    mem.bytes_at_mut(addr.cast(), len).fill(0);
+    Ok((len, is_new_mapping))
 }
 
 fn munmap(env: &mut Environment, addr: MutVoidPtr, len: GuestUSize) -> i32 {
@@ -320,3 +422,88 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(mlock(_, _)),
     export_c_func!(munlock(_, _)),
 ];
+
+#[cfg(test)]
+mod map_fixed_tests {
+    use super::*;
+    use crate::mem::Ptr;
+
+    fn new_test_mem() -> Mem {
+        let mut mem = Mem::new();
+        mem.set_null_segment_size(PAGE_SIZE);
+        mem
+    }
+
+    /// What Boehm GC's `GC_unmap` does: map `PROT_NONE` pages over part of
+    /// a heap block it got from an earlier `mmap`, and abort unless the
+    /// result is the address it asked for.
+    #[test]
+    fn replaces_pages_inside_an_existing_mapping_in_place() {
+        let mut mem = new_test_mem();
+        let mut allocations = HashMap::new();
+        let heap: MutVoidPtr = mem.alloc(PAGE_SIZE * 4);
+        allocations.insert(heap, PAGE_SIZE * 4);
+        mem.bytes_at_mut(heap.cast(), PAGE_SIZE * 4).fill(0xAB);
+
+        let middle: MutVoidPtr = Ptr::from_bits(heap.to_bits() + PAGE_SIZE);
+        assert_eq!(
+            map_fixed_zeroed(&mut mem, &mut allocations, middle, PAGE_SIZE * 2),
+            Ok((PAGE_SIZE * 2, false))
+        );
+
+        let bytes = mem.bytes_at(heap.cast(), PAGE_SIZE * 4);
+        let page = PAGE_SIZE as usize;
+        assert!(bytes[..page].iter().all(|&b| b == 0xAB));
+        assert!(bytes[page..page * 3].iter().all(|&b| b == 0));
+        assert!(bytes[page * 3..].iter().all(|&b| b == 0xAB));
+        // The heap block is still a single mapping that munmap() can free.
+        assert_eq!(allocations.len(), 1);
+        assert!(mem.is_known_allocation(heap.to_bits()));
+    }
+
+    #[test]
+    fn claims_unused_address_space() {
+        let mut mem = new_test_mem();
+        let mut allocations = HashMap::new();
+        let addr: MutVoidPtr = Ptr::from_bits(0x2000_0000);
+        assert!(mem.is_range_free(addr.to_bits(), PAGE_SIZE));
+
+        // Lengths are rounded up to whole pages.
+        assert_eq!(
+            map_fixed_zeroed(&mut mem, &mut allocations, addr, 100),
+            Ok((PAGE_SIZE, true))
+        );
+        assert!(!mem.is_range_free(addr.to_bits(), PAGE_SIZE));
+        assert_eq!(allocations.get(&addr), Some(&PAGE_SIZE));
+        assert!(mem.bytes_at(addr.cast(), PAGE_SIZE).iter().all(|&b| b == 0));
+
+        mem.free(addr);
+        assert!(mem.is_range_free(addr.to_bits(), PAGE_SIZE));
+    }
+
+    #[test]
+    fn rejects_bad_arguments() {
+        let mut mem = new_test_mem();
+        let mut allocations = HashMap::new();
+        let unaligned: MutVoidPtr = Ptr::from_bits(0x2000_0010);
+        assert_eq!(
+            map_fixed_zeroed(&mut mem, &mut allocations, unaligned, PAGE_SIZE),
+            Err(EINVAL)
+        );
+        let aligned: MutVoidPtr = Ptr::from_bits(0x2000_0000);
+        assert_eq!(
+            map_fixed_zeroed(&mut mem, &mut allocations, aligned, 0),
+            Err(EINVAL)
+        );
+        assert_eq!(
+            map_fixed_zeroed(&mut mem, &mut allocations, Ptr::null(), PAGE_SIZE),
+            Err(EINVAL)
+        );
+        let near_top: MutVoidPtr = Ptr::from_bits(0xFFFF_F000);
+        assert_eq!(
+            map_fixed_zeroed(&mut mem, &mut allocations, near_top, PAGE_SIZE * 2),
+            Err(EINVAL)
+        );
+        assert!(allocations.is_empty());
+    }
+}
