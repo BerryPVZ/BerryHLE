@@ -284,7 +284,7 @@ fn bind_mdns_socket() -> Option<UdpSocket> {
                 std::mem::size_of::<::libc::c_int>() as ::libc::socklen_t,
             );
             let mut addr: ::libc::sockaddr_in = std::mem::zeroed();
-            addr.sin_family = ::libc::AF_INET as u16;
+            addr.sin_family = ::libc::AF_INET as ::libc::sa_family_t;
             addr.sin_port = MDNS_PORT.to_be();
             let res = ::libc::bind(
                 fd,
@@ -349,22 +349,26 @@ impl MdnsSocket {
         // the default route (cellular on dual-network phones) and LAN peers
         // never see our announcements and queries.
         if let Some(ip) = local_addr {
-            // IP_MULTICAST_IF via raw setsockopt: the std helper is not
-            // available on every target we build for.
-            {
+            // Without an explicit multicast interface, sends to the group
+            // follow the default route (cellular on dual-network phones) and
+            // LAN peers never see our announcements and queries.
+            #[cfg(target_os = "macos")]
+            let _ = socket.set_multicast_if_v4(&ip);
+            // Linux-family targets (including Android) do not expose the std
+            // helper; set IP_MULTICAST_IF through raw setsockopt instead.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            unsafe {
                 use std::os::fd::AsRawFd;
                 let arg = libc::in_addr {
                     s_addr: u32::from(ip).to_be(),
                 };
-                let _ = unsafe {
-                    libc::setsockopt(
-                        socket.as_raw_fd(),
-                        libc::IPPROTO_IP,
-                        libc::IP_MULTICAST_IF,
-                        &arg as *const libc::in_addr as *const libc::c_void,
-                        std::mem::size_of::<libc::in_addr>() as libc::socklen_t,
-                    )
-                };
+                let _ = libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::IPPROTO_IP,
+                    libc::IP_MULTICAST_IF,
+                    &arg as *const libc::in_addr as *const libc::c_void,
+                    std::mem::size_of::<libc::in_addr>() as libc::socklen_t,
+                );
             }
         }
 
