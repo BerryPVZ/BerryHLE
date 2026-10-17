@@ -100,6 +100,10 @@ struct CTLineHostObject {
     text: id,
     font: id,
     attributes: id,
+    /// Buffers handed out by `CTRunGetGlyphsPtr` / `CTRunGetPositionsPtr`,
+    /// which must stay valid for as long as the run exists.
+    glyphs_ptr: MutPtr<CGGlyph>,
+    positions_ptr: MutPtr<CGPoint>,
 }
 impl HostObject for CTLineHostObject {}
 
@@ -146,13 +150,15 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @implementation _touchHLE_CTLine: NSObject
 - (())dealloc {
-    let (text, font, attributes) = {
+    let (text, font, attributes, glyphs_ptr, positions_ptr) = {
         let host = env.objc.borrow::<CTLineHostObject>(this);
-        (host.text, host.font, host.attributes)
+        (host.text, host.font, host.attributes, host.glyphs_ptr, host.positions_ptr)
     };
     release(env, text);
     release(env, font);
     release(env, attributes);
+    env.mem.free(glyphs_ptr.cast());
+    env.mem.free(positions_ptr.cast());
     env.objc.dealloc_object(this, &mut env.mem)
 }
 @end
@@ -207,6 +213,8 @@ fn alloc_line(env: &mut Environment, text: id, font: id, attributes: id) -> CTLi
             text,
             font,
             attributes,
+            glyphs_ptr: Ptr::null(),
+            positions_ptr: Ptr::null(),
         }),
         &mut env.mem,
     )
@@ -760,6 +768,69 @@ fn CTRunGetGlyphs(env: &mut Environment, run: CTRunRef, range: CFRange, buffer: 
     }
 }
 
+/// `const CGGlyph *CTRunGetGlyphsPtr(CTRunRef run)`
+///
+/// CoreText may return NULL here, telling the caller to copy the glyphs out
+/// with `CTRunGetGlyphs` instead, but apps often skip that fallback: Real
+/// Racing 3 only imports this function and read every glyph as 0 (.notdef),
+/// so its text came out as a row of boxes. Hand out a buffer that lives as
+/// long as the run, like CoreText's own storage.
+fn CTRunGetGlyphsPtr(env: &mut Environment, run: CTRunRef) -> ConstPtr<CGGlyph> {
+    if run.is_null() {
+        return Ptr::null();
+    }
+    let existing = env.objc.borrow::<CTLineHostObject>(run).glyphs_ptr;
+    if !existing.is_null() {
+        return existing.cast_const();
+    }
+    let count = CTRunGetGlyphCount(env, run).max(0) as u32;
+    if count == 0 {
+        return Ptr::null();
+    }
+    let buffer: MutPtr<CGGlyph> = env.mem.calloc(count * 2).cast();
+    CTRunGetGlyphs(
+        env,
+        run,
+        CFRange {
+            location: 0,
+            length: 0,
+        },
+        buffer,
+    );
+    env.objc.borrow_mut::<CTLineHostObject>(run).glyphs_ptr = buffer;
+    buffer.cast_const()
+}
+
+/// `const CGPoint *CTRunGetPositionsPtr(CTRunRef run)`
+///
+/// See [CTRunGetGlyphsPtr].
+fn CTRunGetPositionsPtr(env: &mut Environment, run: CTRunRef) -> ConstPtr<CGPoint> {
+    if run.is_null() {
+        return Ptr::null();
+    }
+    let existing = env.objc.borrow::<CTLineHostObject>(run).positions_ptr;
+    if !existing.is_null() {
+        return existing.cast_const();
+    }
+    let count = CTRunGetGlyphCount(env, run).max(0) as u32;
+    if count == 0 {
+        return Ptr::null();
+    }
+    let size = count * crate::mem::guest_size_of::<CGPoint>();
+    let buffer: MutPtr<CGPoint> = env.mem.calloc(size).cast();
+    CTRunGetPositions(
+        env,
+        run,
+        CFRange {
+            location: 0,
+            length: 0,
+        },
+        buffer,
+    );
+    env.objc.borrow_mut::<CTLineHostObject>(run).positions_ptr = buffer;
+    buffer.cast_const()
+}
+
 /// `void CTRunGetPositions(CTRunRef run, CFRange range, CGPoint buffer[])`
 fn CTRunGetPositions(env: &mut Environment, run: CTRunRef, range: CFRange, buffer: MutPtr<CGPoint>) {
     if run.is_null() || buffer.is_null() {
@@ -1288,6 +1359,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CTRunGetGlyphCount(_)),
     export_c_func!(CTRunGetAttributes(_)),
     export_c_func!(CTRunGetGlyphs(_, _, _)),
+    export_c_func!(CTRunGetGlyphsPtr(_)),
+    export_c_func!(CTRunGetPositionsPtr(_)),
     export_c_func!(CTRunGetPositions(_, _, _)),
     export_c_func!(CTParagraphStyleCreate(_, _)),
     export_c_func!(CTParagraphStyleCreateCopy(_)),
