@@ -106,10 +106,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)dataWithContentsOfURL:(id)url
                     options:(NSUInteger)options
                       error:(MutVoidPtr)error {
-    let _ = options;
-    let _ = error;
     let new: id = msg![env; this alloc];
-    let new: id = msg![env; new initWithContentsOfURL:url];
+    let new: id = msg![env; new initWithContentsOfURL:url options:options error:error];
     autorelease(env, new)
 }
 
@@ -163,18 +161,61 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)initWithContentsOfURL:(id)url {
-    if url == nil {
-        release(env, this);
-        return nil;
-    }
-    let path: id = msg![env; url path];
-    msg![env; this initWithContentsOfFile:path]
+    msg![env; this initWithContentsOfURL:url options:0u32 error:(MutVoidPtr::null())]
 }
 
 - (id)initWithContentsOfURL:(id)url
                     options:(NSUInteger)_options
-                      error:(MutVoidPtr)_error {
-    msg![env; this initWithContentsOfURL:url]
+                      error:(MutVoidPtr)error_ptr {
+    if !error_ptr.is_null() {
+        env.mem.write(error_ptr.cast(), nil);
+    }
+    if url == nil {
+        release(env, this);
+        return nil;
+    }
+
+    let is_file: bool = msg![env; url isFileURL];
+    if is_file {
+        let path: id = msg![env; url path];
+        return msg![env; this initWithContentsOfFile:path];
+    }
+
+    let result = crate::frameworks::foundation::url_loading::send(
+        crate::frameworks::foundation::url_loading::get_request_from_url(env, url),
+        env.options.network_access,
+    );
+    match result {
+        Ok(response) => {
+            if response.body.is_empty() {
+                return this;
+            }
+            let length: NSUInteger = response.body.len().try_into().unwrap_or(u32::MAX);
+            let bytes: MutPtr<u8> = env.mem.alloc(length).cast();
+            env.mem
+                .bytes_at_mut(bytes, length)
+                .copy_from_slice(&response.body);
+            let initialized: id = msg![env;
+                this initWithBytes:(bytes.cast_const().cast_void()) length:length];
+            env.mem.free(bytes.cast());
+            initialized
+        }
+        Err(network_error) => {
+            if !error_ptr.is_null() {
+                let error = crate::frameworks::foundation::url_loading::make_foundation_error(
+                    env,
+                    &network_error,
+                );
+                crate::frameworks::foundation::url_loading::write_error_out_parameter(
+                    env,
+                    error_ptr,
+                    error,
+                );
+            }
+            release(env, this);
+            nil
+        }
+    }
 }
 
 - (id)initWithContentsOfFile:(id)path {

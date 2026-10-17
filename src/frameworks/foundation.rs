@@ -90,6 +90,7 @@ pub mod ns_undo_manager;
 pub mod ns_net_service;
 pub mod ns_url;
 pub mod ns_user_defaults;
+pub mod url_loading;
 pub mod url_protocol;
 pub mod ns_url_connection;
 pub mod ns_url_request;

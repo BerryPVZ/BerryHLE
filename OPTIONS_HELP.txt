@@ -426,7 +426,9 @@ Other options:
         pipeline.
 
     --allow-network-access
-        Allow apps running in touchHLE to access the Internet and the local network.
+        Allow apps running in touchHLE to access the Internet and the local network,
+        including HTTP/HTTPS URL-loading APIs (NSURLConnection, NSURLSession, and NSData).
+        Disabled by default.
 
     --ignore-gl-errors
         Ignore host OpenGL errors as queried by glGetError function.
