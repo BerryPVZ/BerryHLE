@@ -1213,6 +1213,12 @@ impl Mem {
         String::from_iter(iter)
     }
 
+    /// Returns whether the `size` bytes at `base` are neither allocated nor
+    /// reserved, so [Self::reserve] can claim them.
+    pub fn is_range_free(&self, base: VAddr, size: GuestUSize) -> bool {
+        size != 0 && self.allocator.is_free(allocator::Chunk::new(base, size))
+    }
+
     /// Permanently mark a region of address space as being unusable to the
     /// memory allocator.
     ///

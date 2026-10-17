@@ -355,6 +355,14 @@ impl Allocator {
         self.used_chunks.insert(chunk);
     }
 
+    /// Returns whether all of `chunk` is free memory, i.e. it could be
+    /// passed to [Self::reserve].
+    pub fn is_free(&self, chunk: Chunk) -> bool {
+        self.unused_chunks
+            .iter()
+            .any(|unused_chunk| unused_chunk.trisect_by(chunk).is_some())
+    }
+
     pub fn alloc(&mut self, size: GuestUSize) -> VAddr {
         // ИСПРАВЛЕНИЕ: Выравнивание может привести к переполнению (overflow),
         // если игра запрашивает гигантский объем памяти (например, 0xffffffff).

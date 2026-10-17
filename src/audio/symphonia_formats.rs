@@ -30,13 +30,18 @@
 //!   `channels()` accessors), replacing 0.5's `SignalSpec`.
 
 use std::io::Cursor;
-use symphonia::core::codecs::audio::{AudioDecoderOptions, CODEC_ID_NULL_AUDIO};
+use symphonia::core::codecs::audio::well_known::CODEC_ID_MP3;
+use symphonia::core::codecs::audio::{
+    AudioCodecParameters, AudioDecoder, AudioDecoderOptions, CODEC_ID_NULL_AUDIO,
+};
 use symphonia::core::codecs::CodecParameters;
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
+use symphonia::core::packet::PacketRef;
+use symphonia::core::units::{Duration, Timestamp};
 
 /// PCM data decoded from a miscellaneous format file.
 pub struct SymphoniaDecodedToPcm {
@@ -191,4 +196,60 @@ pub fn decode_symphonia_to_pcm(file: Cursor<Vec<u8>>) -> Result<SymphoniaDecoded
         sample_rate,
         channels: channels.try_into().unwrap(),
     })
+}
+
+/// MP3 decoder fed one frame at a time, keeping its state between frames.
+///
+/// Layer III frames borrow bits from the frames before them (the "bit
+/// reservoir"), so a stream that arrives a frame or two at a time, like the
+/// packets an app enqueues on an `AudioQueue`, can't be decoded by starting
+/// afresh for each chunk.
+pub struct Mp3FrameDecoder {
+    decoder: Box<dyn AudioDecoder>,
+    packet_bytes: Vec<u8>,
+}
+
+impl Mp3FrameDecoder {
+    pub fn new() -> Option<Self> {
+        let mut params = AudioCodecParameters::new();
+        params.for_codec(CODEC_ID_MP3);
+        let decoder = symphonia::default::get_codecs()
+            .make_audio_decoder(&params, &AudioDecoderOptions::default())
+            .map_err(|e| log!("Symphonia failed to create MP3 decoder: {:?}", e))
+            .ok()?;
+        Some(Mp3FrameDecoder {
+            decoder,
+            packet_bytes: Vec::new(),
+        })
+    }
+
+    /// Decodes a single MPEG audio frame (header included) to 16-bit
+    /// little-endian interleaved PCM. Returns the PCM with its sample rate
+    /// and channel count, or [None] if the frame couldn't be decoded, which
+    /// is normal for the first frames after a discontinuity.
+    pub fn decode_frame(&mut self, frame: &[u8]) -> Option<(&[u8], u32, u32)> {
+        let packet = PacketRef::new(0, Timestamp::new(0), Duration::new(0), frame);
+        let decoder = &mut self.decoder;
+        let packet_bytes = &mut self.packet_bytes;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            decoder.decode_ref(&packet).map(|decoded| {
+                let spec = decoded.spec();
+                let spec_pair = (spec.rate(), spec.channels().count());
+                decoded.copy_bytes_to_vec_interleaved_as::<i16>(packet_bytes);
+                spec_pair
+            })
+        }));
+        match result {
+            Ok(Ok((rate, channels))) => Some((&self.packet_bytes, rate, channels as u32)),
+            Ok(Err(e)) => {
+                log_dbg!("MP3 frame could not be decoded: {:?}", e);
+                None
+            }
+            Err(_) => {
+                log!("Symphonia MP3 decoder panicked; resetting it");
+                self.decoder.reset();
+                None
+            }
+        }
+    }
 }

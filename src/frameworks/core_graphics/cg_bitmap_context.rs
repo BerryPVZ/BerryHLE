@@ -16,7 +16,8 @@ use super::cg_context::{CGContextHostObject, CGContextRef, CGContextSubclass};
 use super::cg_image::{
     self, kCGBitmapAlphaInfoMask, kCGBitmapByteOrderMask, kCGImageAlphaFirst, kCGImageAlphaLast,
     kCGImageAlphaNone, kCGImageAlphaNoneSkipFirst, kCGImageAlphaNoneSkipLast, kCGImageAlphaOnly,
-    kCGImageAlphaPremultipliedFirst, kCGImageAlphaPremultipliedLast, kCGImageByteOrder32Big,
+    kCGImageAlphaPremultipliedFirst, kCGImageAlphaPremultipliedLast, kCGImageByteOrder16Big,
+    kCGImageByteOrder16Little, kCGImageByteOrder32Big, kCGImageByteOrder32Little,
     kCGImageByteOrderDefault, CGBitmapInfo, CGImageAlphaInfo, CGImageRef,
 };
 use super::{CGFloat, CGPoint, CGRect};
@@ -36,6 +37,8 @@ pub(super) struct CGBitmapContextData {
     bytes_per_row: GuestUSize,
     color_space: &'static str,
     alpha_info: CGImageAlphaInfo,
+    /// `bitmap_info & kCGBitmapByteOrderMask`.
+    byte_order: CGBitmapInfo,
 }
 
 pub fn CGBitmapContextCreate(
@@ -91,6 +94,7 @@ pub fn CGBitmapContextCreate(
             bytes_per_row,
             color_space,
             alpha_info: bitmap_info & kCGBitmapAlphaInfoMask,
+            byte_order: bitmap_info & kCGBitmapByteOrderMask,
         }),
         transform: CGAffineTransformIdentity,
         text_transform: None,
@@ -203,7 +207,10 @@ pub fn CGBitmapContextCreateImage(env: &mut Environment, context: CGContextRef) 
 
 fn components_for_rgb(bitmap_info: CGBitmapInfo) -> Result<GuestUSize, ()> {
     let byte_order = bitmap_info & kCGBitmapByteOrderMask;
-    if byte_order != kCGImageByteOrderDefault && byte_order != kCGImageByteOrder32Big {
+    if !matches!(
+        byte_order,
+        kCGImageByteOrderDefault | kCGImageByteOrder32Big | kCGImageByteOrder32Little
+    ) {
         return Err(());
     }
 
@@ -226,7 +233,13 @@ fn components_for_rgb(bitmap_info: CGBitmapInfo) -> Result<GuestUSize, ()> {
 
 fn components_for_gray(bitmap_info: CGBitmapInfo) -> Result<GuestUSize, ()> {
     let byte_order = bitmap_info & kCGBitmapByteOrderMask;
-    if byte_order != kCGImageByteOrderDefault && byte_order != kCGImageByteOrder32Big {
+    if !matches!(
+        byte_order,
+        kCGImageByteOrderDefault
+            | kCGImageByteOrder32Big
+            | kCGImageByteOrder16Big
+            | kCGImageByteOrder16Little
+    ) {
         return Err(());
     }
 
@@ -307,6 +320,20 @@ fn blend_premultiplied(bg: (f32, f32, f32, f32), fg: (f32, f32, f32, f32)) -> (f
 // Теперь, если игра передает нестандартный формат, мы безопасно откатываемся на
 // RGBA
 fn pixel_offsets(data: &CGBitmapContextData) -> (usize, usize, usize, Option<usize>) {
+    let (r, g, b, a) = big_endian_pixel_offsets(data);
+    // The alpha info names the components in the order of a big-endian pixel
+    // word. A little-endian word stores them the other way round in memory:
+    // kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little (what
+    // iOS apps use as "32-bit host order") is BGRA, not ARGB.
+    let last = match (data.byte_order, bytes_per_pixel(data)) {
+        (kCGImageByteOrder32Little, 4) => 3,
+        (kCGImageByteOrder16Little, 2) => 1,
+        _ => return (r, g, b, a),
+    };
+    (last - r, last - g, last - b, a.map(|a| last - a))
+}
+
+fn big_endian_pixel_offsets(data: &CGBitmapContextData) -> (usize, usize, usize, Option<usize>) {
     if data.color_space == kCGColorSpaceGenericGray {
         match data.alpha_info {
             kCGImageAlphaNone => (0, 0, 0, None),
@@ -565,3 +592,97 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGBitmapContextGetHeight(_)),
     export_c_func!(CGBitmapContextGetBytesPerRow(_)),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context(color_space: &'static str, bitmap_info: CGBitmapInfo) -> CGBitmapContextData {
+        CGBitmapContextData {
+            width: 1,
+            height: 1,
+            bits_per_component: 8,
+            bytes_per_row: 4,
+            color_space,
+            alpha_info: bitmap_info & kCGBitmapAlphaInfoMask,
+            byte_order: bitmap_info & kCGBitmapByteOrderMask,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rgb_component_offsets_follow_the_byte_order() {
+        let rgb = kCGColorSpaceGenericRGB;
+        // ARGB and RGBA words, stored big-endian.
+        assert_eq!(
+            pixel_offsets(&context(rgb, kCGImageAlphaPremultipliedFirst)),
+            (1, 2, 3, Some(0))
+        );
+        assert_eq!(
+            pixel_offsets(&context(
+                rgb,
+                kCGImageAlphaPremultipliedLast | kCGImageByteOrder32Big
+            )),
+            (0, 1, 2, Some(3))
+        );
+        // The same words stored little-endian: BGRA and ABGR in memory.
+        assert_eq!(
+            pixel_offsets(&context(
+                rgb,
+                kCGImageAlphaPremultipliedFirst | kCGImageByteOrder32Little
+            )),
+            (2, 1, 0, Some(3))
+        );
+        assert_eq!(
+            pixel_offsets(&context(
+                rgb,
+                kCGImageAlphaPremultipliedLast | kCGImageByteOrder32Little
+            )),
+            (3, 2, 1, Some(0))
+        );
+        assert_eq!(
+            pixel_offsets(&context(
+                rgb,
+                kCGImageAlphaNoneSkipFirst | kCGImageByteOrder32Little
+            )),
+            (2, 1, 0, None)
+        );
+    }
+
+    #[test]
+    fn gray_alpha_component_offsets_follow_the_byte_order() {
+        let gray = kCGColorSpaceGenericGray;
+        assert_eq!(
+            pixel_offsets(&context(gray, kCGImageAlphaPremultipliedLast)),
+            (0, 0, 0, Some(1))
+        );
+        assert_eq!(
+            pixel_offsets(&context(
+                gray,
+                kCGImageAlphaPremultipliedLast | kCGImageByteOrder16Little
+            )),
+            (1, 1, 1, Some(0))
+        );
+        // A single component has no byte order to speak of.
+        assert_eq!(
+            pixel_offsets(&context(gray, kCGImageAlphaNone)),
+            (0, 0, 0, None)
+        );
+    }
+
+    #[test]
+    fn little_endian_layouts_have_the_right_pixel_size() {
+        let rgb = kCGColorSpaceGenericRGB;
+        let gray = kCGColorSpaceGenericGray;
+        let bgra = context(
+            rgb,
+            kCGImageAlphaPremultipliedFirst | kCGImageByteOrder32Little,
+        );
+        assert_eq!(bytes_per_pixel(&bgra), 4);
+        let alpha_gray = context(
+            gray,
+            kCGImageAlphaPremultipliedLast | kCGImageByteOrder16Little,
+        );
+        assert_eq!(bytes_per_pixel(&alpha_gray), 2);
+    }
+}

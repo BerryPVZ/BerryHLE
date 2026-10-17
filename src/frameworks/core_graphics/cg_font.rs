@@ -162,9 +162,23 @@ fn CGFontCreateWithDataProvider(env: &mut Environment, provider: CGDataProviderR
             Font::sans_regular()
         }
     };
+    cg_font_with_font(env, font)
+}
+
+/// Create a CGFont (+1) backed by `font`, like [CGFontCreateWithDataProvider].
+pub fn cg_font_with_font(env: &mut Environment, font: Font) -> CGFontRef {
     let host_obj = Box::new(CGFontHostObject { font });
     let class = env.objc.get_known_class("_touchHLE_CGFont", &mut env.mem);
     env.objc.alloc_object(class, host_obj, &mut env.mem)
+}
+
+/// The font backing a CGFont created from font data (see
+/// [is_data_provider_font]), or `None` for other CGFonts.
+pub fn data_provider_font(env: &mut Environment, font: CGFontRef) -> Option<Font> {
+    if !is_data_provider_font(env, font) {
+        return None;
+    }
+    Some(env.objc.borrow::<CGFontHostObject>(font).font.clone())
 }
 
 // =========================================================================

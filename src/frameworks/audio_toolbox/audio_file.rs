@@ -139,7 +139,30 @@ const kAudioFilePropertyMagicCookieData: AudioFilePropertyID = fourcc(b"mgic");
 const kAudioFilePropertyChannelLayout: AudioFilePropertyID = fourcc(b"cmap");
 const kAudioFilePropertyEstimatedDuration: AudioFilePropertyID = fourcc(b"edur");
 const kAudioFilePropertyPacketTableInfo: AudioFilePropertyID = fourcc(b"pnfo");
-const kAudioFilePropertyPacketToFrame: AudioFilePropertyID = fourcc(b"flst");
+const kAudioFilePropertyPacketToFrame: AudioFilePropertyID = fourcc(b"pkfr");
+const kAudioFilePropertyFormatList: AudioFilePropertyID = fourcc(b"flst");
+
+/// `AudioFormatListItem`, the element type of `kAudioFilePropertyFormatList`.
+/// 44 bytes on iOS ARM, where `double` only needs 4-byte alignment.
+#[derive(Copy, Clone)]
+#[repr(C, packed)]
+struct AudioFormatListItem {
+    asbd: AudioStreamBasicDescription,
+    channel_layout_tag: u32,
+}
+unsafe impl SafeRead for AudioFormatListItem {}
+
+/// The `AudioChannelLayoutTag` for a plain layout of `channels` channels.
+fn channel_layout_tag(channels: u32) -> u32 {
+    const kAudioChannelLayoutTag_Mono: u32 = (100 << 16) | 1;
+    const kAudioChannelLayoutTag_Stereo: u32 = (101 << 16) | 2;
+    const kAudioChannelLayoutTag_Unknown: u32 = 0xFFFF0000;
+    match channels {
+        1 => kAudioChannelLayoutTag_Mono,
+        2 => kAudioChannelLayoutTag_Stereo,
+        n => kAudioChannelLayoutTag_Unknown | n,
+    }
+}
 pub const kAudioFilePropertyFileFormat: AudioFilePropertyID = fourcc(b"ffmt");
 
 const MAX_PACKET_SIZE_UPPER_BOUND: u32 = 65536;
@@ -571,7 +594,17 @@ pub fn AudioFileOpenWithCallbacks(
         return final_status;
     }
 
-    let host_object = match audio::AudioFile::read_from_vec(data_vec) {
+    // MP3s are served as their compressed frames, like on a real device.
+    // Callers of this function bring their own data and usually their own
+    // decoding pipeline too: FMOD feeds the packets to an AudioQueue in
+    // offline-render mode, which can't work with PCM "packets" of one frame.
+    // See `AudioFile::read_mp3_packets_from_vec` for why this isn't done for
+    // every AudioFile.
+    let opened = match audio::AudioFile::read_mp3_packets_from_vec(data_vec.clone()) {
+        Some(file) => Ok(file),
+        None => audio::AudioFile::read_from_vec(data_vec),
+    };
+    let host_object = match opened {
         Ok(file) => AudioFileHostObject::Real(file),
         Err(e) => {
             log!(
@@ -826,11 +859,15 @@ pub fn AudioFileReadPackets(
         // (per Apple's Audio File Services documentation, descriptions are
         // required to make sense of VBR data).
         let aac_packet_infos = match host_object {
-            AudioFileHostObject::Real(ref audio_file) => audio_file.aac_packets().map(|aac| {
-                (0..packets_to_read)
-                    .map_while(|i| aac.packet_info(in_starting_packet as u64 + u64::from(i)))
-                    .collect::<Vec<(u64, u32)>>()
-            }),
+            AudioFileHostObject::Real(ref audio_file) => {
+                audio_file.compressed_packets().map(|packets| {
+                    (0..packets_to_read)
+                        .map_while(|i| {
+                            packets.packet_info(in_starting_packet as u64 + u64::from(i))
+                        })
+                        .collect::<Vec<(u64, u32)>>()
+                })
+            }
             _ => None,
         };
         let Some(packet_infos) = aac_packet_infos else {
@@ -1072,6 +1109,8 @@ pub(super) fn property_size(property_id: AudioFilePropertyID) -> GuestUSize {
         kAudioFilePropertyEstimatedDuration => guest_size_of::<f64>(),
         kAudioFilePropertyPacketTableInfo => guest_size_of::<AudioFilePacketTableInfo>(),
         kAudioFilePropertyPacketToFrame => guest_size_of::<f64>(),
+        // A single entry: the files we open have one data format.
+        kAudioFilePropertyFormatList => guest_size_of::<AudioFormatListItem>(),
         kAudioFilePropertyFileFormat => guest_size_of::<AudioFileTypeID>(),
         _ => 0,
     }
@@ -1147,6 +1186,36 @@ pub fn AudioFileGetProperty(
         return kAudioFileSuccess;
     }
 
+    if in_property_id == kAudioFilePropertyFormatList {
+        // The list of formats the file can be read as (several for HE-AAC);
+        // for our files that's just the data format. Games' audio loaders
+        // check it before reading anything: Real Racing 3 rejected every
+        // music file while this answered with 8 bytes, i.e. no formats, and
+        // kept reopening them.
+        let asbd_ptr: MutPtr<AudioStreamBasicDescription> = out_property_data.cast();
+        let size_ptr = env
+            .mem
+            .alloc_and_write(property_size(kAudioFilePropertyDataFormat));
+        let status = AudioFileGetProperty(
+            env,
+            in_audio_file,
+            kAudioFilePropertyDataFormat,
+            size_ptr,
+            asbd_ptr.cast(),
+        );
+        env.mem.free(size_ptr.cast());
+        if status != kAudioFileSuccess {
+            return status;
+        }
+        let asbd = env.mem.read(asbd_ptr);
+        let item = AudioFormatListItem {
+            asbd,
+            channel_layout_tag: channel_layout_tag(asbd.channels_per_frame),
+        };
+        env.mem.write(out_property_data.cast(), item);
+        return kAudioFileSuccess;
+    }
+
     let host_object = match State::get(&mut env.framework_state)
         .audio_files
         .get_mut(&in_audio_file)
@@ -1197,6 +1266,17 @@ pub fn AudioFileGetProperty(
                         audio::AudioFormat::Mpeg4Aac => AudioStreamBasicDescription {
                             sample_rate,
                             format_id: fourcc(b"aac "),
+                            format_flags: 0,
+                            bytes_per_packet,
+                            frames_per_packet,
+                            bytes_per_frame: 0,
+                            channels_per_frame,
+                            bits_per_channel,
+                            _reserved: 0,
+                        },
+                        audio::AudioFormat::MpegLayer3 => AudioStreamBasicDescription {
+                            sample_rate,
+                            format_id: fourcc(b".mp3"),
                             format_flags: 0,
                             bytes_per_packet,
                             frames_per_packet,
@@ -2055,5 +2135,29 @@ mod output_file_tests {
     #[test]
     fn wave_output_roundtrips_pcm() {
         assert_roundtrip(kAudioFileWaveType);
+    }
+}
+
+#[cfg(test)]
+mod format_list_tests {
+    use super::*;
+
+    #[test]
+    fn format_list_item_matches_the_ios_layout() {
+        // AudioStreamBasicDescription (40 bytes) + AudioChannelLayoutTag.
+        assert_eq!(guest_size_of::<AudioFormatListItem>(), 44);
+        assert_eq!(property_size(kAudioFilePropertyFormatList), 44);
+        // 'flst' used to be mistaken for kAudioFilePropertyPacketToFrame.
+        assert_ne!(
+            kAudioFilePropertyFormatList,
+            kAudioFilePropertyPacketToFrame
+        );
+    }
+
+    #[test]
+    fn channel_layout_tags() {
+        assert_eq!(channel_layout_tag(1), 0x0064_0001);
+        assert_eq!(channel_layout_tag(2), 0x0065_0002);
+        assert_eq!(channel_layout_tag(6), 0xFFFF_0006);
     }
 }

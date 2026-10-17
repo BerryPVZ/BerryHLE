@@ -35,6 +35,8 @@ pub enum AudioFormat {
     /// frames (each packet carries its own 7-byte ADTS header), which is what
     /// `audio_queue::decode_buffer` knows how to decode.
     Mpeg4Aac,
+    /// MPEG-1/2 Audio Layer III. Each packet is one frame, header included.
+    MpegLayer3,
 }
 
 #[derive(Debug)]
@@ -47,15 +49,17 @@ pub struct AudioDescription {
     pub bits_per_channel: u32,
 }
 
-pub struct AacPackets {
+#[derive(Clone)]
+pub struct CompressedPackets {
     pub sample_rate: f64,
     pub channels_per_frame: u32,
+    pub frames_per_packet: u32,
     pub packet_bytes: Vec<u8>,
     pub packet_offsets: Vec<usize>,
     pub magic_cookie: Vec<u8>,
 }
 
-impl AacPackets {
+impl CompressedPackets {
     pub fn packet_count(&self) -> u64 {
         self.packet_offsets.len().saturating_sub(1) as u64
     }
@@ -100,7 +104,10 @@ pub struct AudioFile {
 
 impl Clone for AudioFile {
     fn clone(&self) -> Self {
-        let inner = Self::parse_inner(self.raw_data.as_ref().clone()).unwrap();
+        let inner = match self.inner {
+            AudioFileInner::Mp3(ref mp3) => AudioFileInner::Mp3(mp3.clone()),
+            _ => Self::parse_inner(self.raw_data.as_ref().clone()).unwrap(),
+        };
         AudioFile {
             raw_data: self.raw_data.clone(),
             inner,
@@ -111,7 +118,9 @@ impl Clone for AudioFile {
 enum AudioFileInner {
     Wave(hound::WavReader<Cursor<Vec<u8>>>),
     Symphonia(symphonia_formats::SymphoniaDecodedToPcm),
-    Aac(AacPackets),
+    Aac(CompressedPackets),
+    /// Only produced by [AudioFile::read_mp3_packets_from_vec].
+    Mp3(CompressedPackets),
 }
 
 impl AudioFile {
@@ -156,6 +165,23 @@ impl AudioFile {
         Ok(AudioFile {
             raw_data: std::sync::Arc::new(bytes),
             inner,
+        })
+    }
+
+    /// Opens an MP3 file as its compressed frames, like the real Audio File
+    /// Services do, rather than decoding it to PCM up front. Returns [None]
+    /// if the data isn't an MPEG Layer III stream.
+    ///
+    /// This is opt-in because a lot of our audio code (ExtAudioFile wrapping
+    /// an AudioFileID, AudioConverter) can only consume PCM, while some
+    /// guests can only consume the compressed packets: FMOD's AudioQueue
+    /// codec sizes its buffers from the frames per packet and asks for zero
+    /// frames per render if it's handed 1-frame PCM packets.
+    pub fn read_mp3_packets_from_vec(bytes: Vec<u8>) -> Option<Self> {
+        let mp3 = parse_mp3_packets(&bytes)?;
+        Some(AudioFile {
+            raw_data: std::sync::Arc::new(bytes),
+            inner: AudioFileInner::Mp3(mp3),
         })
     }
 
@@ -332,17 +358,25 @@ impl AudioFile {
                 sample_rate: aac.sample_rate,
                 format: AudioFormat::Mpeg4Aac,
                 bytes_per_packet: 0,
-                frames_per_packet: 1024,
+                frames_per_packet: aac.frames_per_packet,
                 channels_per_frame: aac.channels_per_frame,
+                bits_per_channel: 0,
+            },
+            AudioFileInner::Mp3(ref mp3) => AudioDescription {
+                sample_rate: mp3.sample_rate,
+                format: AudioFormat::MpegLayer3,
+                bytes_per_packet: 0,
+                frames_per_packet: mp3.frames_per_packet,
+                channels_per_frame: mp3.channels_per_frame,
                 bits_per_channel: 0,
             },
         }
     }
 
-    /// The AAC packets of this file, if it is an AAC file.
-    pub fn aac_packets(&self) -> Option<&AacPackets> {
+    /// The packets of this file, if it is in a compressed format.
+    pub fn compressed_packets(&self) -> Option<&CompressedPackets> {
         match self.inner {
-            AudioFileInner::Aac(ref aac) => Some(aac),
+            AudioFileInner::Aac(ref packets) | AudioFileInner::Mp3(ref packets) => Some(packets),
             _ => None,
         }
     }
@@ -389,7 +423,9 @@ impl AudioFile {
                 ref bytes,
                 ..
             }) => bytes.len() as u64,
-            AudioFileInner::Aac(ref aac) => aac.byte_count(),
+            AudioFileInner::Aac(ref packets) | AudioFileInner::Mp3(ref packets) => {
+                packets.byte_count()
+            }
         }
     }
 
@@ -399,7 +435,9 @@ impl AudioFile {
             | AudioFileInner::Symphonia(symphonia_formats::SymphoniaDecodedToPcm { .. }) => {
                 self.byte_count() / u64::from(self.packet_size_fixed())
             }
-            AudioFileInner::Aac(ref aac) => aac.packet_count(),
+            AudioFileInner::Aac(ref packets) | AudioFileInner::Mp3(ref packets) => {
+                packets.packet_count()
+            }
         }
     }
 
@@ -413,7 +451,9 @@ impl AudioFile {
     pub fn packet_size_upper_bound(&self) -> u32 {
         match self.inner {
             // Variable packet size: report the largest actual packet.
-            AudioFileInner::Aac(ref aac) => aac.packet_size_upper_bound(),
+            AudioFileInner::Aac(ref packets) | AudioFileInner::Mp3(ref packets) => {
+                packets.packet_size_upper_bound()
+            }
             _ => self.packet_size_fixed(),
         }
     }
@@ -474,7 +514,9 @@ impl AudioFile {
                 buffer[..bytes_to_read].copy_from_slice(bytes);
                 Ok(bytes_to_read)
             }
-            AudioFileInner::Aac(ref aac) => aac.read_bytes(offset, buffer),
+            AudioFileInner::Aac(ref packets) | AudioFileInner::Mp3(ref packets) => {
+                packets.read_bytes(offset, buffer)
+            }
         }
     }
 }
@@ -505,7 +547,7 @@ fn adts_header(sample_rate_index: u8, channel_config: u8, payload_len: usize) ->
 /// Extracts the AAC packets of a CAF file, wrapping each one in an ADTS
 /// header so that the result can be decoded as a plain ADTS stream
 /// (which is what `audio_queue::decode_buffer` expects for AAC buffers).
-fn try_parse_caf_aac(bytes: &[u8]) -> Option<AacPackets> {
+fn try_parse_caf_aac(bytes: &[u8]) -> Option<CompressedPackets> {
     let format_id = caf_read_format_id(bytes)?;
     if &format_id != CAF_FORMAT_AAC_LC {
         return None;
@@ -554,9 +596,10 @@ fn try_parse_caf_aac(bytes: &[u8]) -> Option<AacPackets> {
     }
     packet_offsets.push(packet_bytes.len());
 
-    Some(AacPackets {
+    Some(CompressedPackets {
         sample_rate,
         channels_per_frame,
+        frames_per_packet: 1024,
         packet_bytes,
         packet_offsets,
         magic_cookie,
@@ -605,7 +648,98 @@ mod adts_detection_tests {
     }
 }
 
-fn parse_adts_aac(bytes: Vec<u8>) -> Result<AacPackets, ()> {
+#[cfg(test)]
+mod mp3_packet_tests {
+    use super::*;
+
+    #[test]
+    fn parses_layer_3_frame_headers() {
+        // MPEG-1, 64 kbit/s, 44.1 kHz, unpadded, mono: 144 * 64000 / 44100.
+        assert_eq!(
+            parse_mp3_frame_header(&[0xFF, 0xFB, 0x50, 0xC0]),
+            Some(Mp3FrameHeader {
+                frame_len: 208,
+                sample_rate: 44100,
+                channels: 1,
+                frames_per_packet: 1152,
+            })
+        );
+        // MPEG-2, 32 kbit/s, 22.05 kHz, padded, joint stereo.
+        assert_eq!(
+            parse_mp3_frame_header(&[0xFF, 0xF3, 0x42, 0x44]),
+            Some(Mp3FrameHeader {
+                frame_len: 72 * 32000 / 22050 + 1,
+                sample_rate: 22050,
+                channels: 2,
+                frames_per_packet: 576,
+            })
+        );
+        // ADTS AAC, free-format bitrate, reserved sample rate, truncated.
+        assert_eq!(parse_mp3_frame_header(&[0xFF, 0xF1, 0x50, 0x80]), None);
+        assert_eq!(parse_mp3_frame_header(&[0xFF, 0xFB, 0x00, 0xC0]), None);
+        assert_eq!(parse_mp3_frame_header(&[0xFF, 0xFB, 0x5C, 0xC0]), None);
+        assert_eq!(parse_mp3_frame_header(&[0xFF, 0xFB, 0x50]), None);
+    }
+
+    #[test]
+    fn opens_mp3_as_frames() {
+        let bytes = include_bytes!("../tests/fixtures/sine-440hz-mono.mp3").to_vec();
+        // The fixture starts with an ID3v2 tag and a LAME "Info" frame.
+        assert_eq!(&bytes[..3], b"ID3");
+        let mut file = AudioFile::read_mp3_packets_from_vec(bytes).unwrap();
+
+        let desc = file.audio_description();
+        assert!(matches!(desc.format, AudioFormat::MpegLayer3));
+        assert_eq!(desc.sample_rate, 44100.0);
+        assert_eq!(desc.channels_per_frame, 1);
+        assert_eq!(desc.frames_per_packet, 1152);
+        assert_eq!(desc.bytes_per_packet, 0);
+
+        // Half a second is about 19 frames, plus the encoder's delay.
+        let packet_count = file.packet_count();
+        assert!((19..=24).contains(&packet_count), "{}", packet_count);
+        let mut total = 0;
+        for i in 0..packet_count {
+            let (offset, size) = file.compressed_packets().unwrap().packet_info(i).unwrap();
+            let mut frame = vec![0; size as usize];
+            assert_eq!(file.read_bytes(offset, &mut frame), Ok(frame.len()));
+            let header = parse_mp3_frame_header(&frame).unwrap();
+            assert_eq!(header.frame_len, frame.len());
+            assert!(!frame.windows(4).any(|w| w == b"Info"));
+            total += u64::from(size);
+        }
+        assert_eq!(total, file.byte_count());
+        assert!(file.packet_size_upper_bound() >= 208);
+    }
+
+    #[test]
+    fn only_opens_mp3_as_frames() {
+        let mut adts = vec![0xFF, 0xF1, 0x50, 0x80, 0x02, 0x1F, 0xFC];
+        adts.resize(16, 0);
+        assert!(AudioFile::read_mp3_packets_from_vec(adts).is_none());
+        assert!(AudioFile::read_mp3_packets_from_vec(b"RIFF....WAVEfmt ".to_vec()).is_none());
+        // Other formats' data can contain things that look like frames.
+        let frame = |len| {
+            let mut frame = vec![0xFF, 0xFB, 0x50, 0xC0];
+            frame.resize(len, 0x55);
+            frame
+        };
+        let mut wave = b"RIFF....WAVEfmt ".to_vec();
+        wave.resize(8192, 0);
+        for _ in 0..3 {
+            wave.extend(frame(208));
+        }
+        assert!(AudioFile::read_mp3_packets_from_vec(wave).is_none());
+        let mut mp3 = vec![0; 100];
+        for _ in 0..3 {
+            mp3.extend(frame(208));
+        }
+        let mp3 = AudioFile::read_mp3_packets_from_vec(mp3).unwrap();
+        assert_eq!(mp3.packet_count(), 3);
+    }
+}
+
+fn parse_adts_aac(bytes: Vec<u8>) -> Result<CompressedPackets, ()> {
     const SAMPLE_RATES: [u32; 13] = [
         96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
     ];
@@ -653,9 +787,152 @@ fn parse_adts_aac(bytes: Vec<u8>) -> Result<AacPackets, ()> {
     }
     packet_offsets.push(packet_bytes.len());
 
-    Ok(AacPackets {
+    Ok(CompressedPackets {
         sample_rate,
         channels_per_frame,
+        frames_per_packet: 1024,
+        packet_bytes,
+        packet_offsets,
+        magic_cookie: Vec::new(),
+    })
+}
+
+/// The fields of an MPEG audio Layer III frame header that we need.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Mp3FrameHeader {
+    /// Length of the whole frame in bytes, header included.
+    pub frame_len: usize,
+    pub sample_rate: u32,
+    pub channels: u32,
+    /// 1152 for MPEG-1, 576 for MPEG-2 and MPEG-2.5.
+    pub frames_per_packet: u32,
+}
+
+/// Parses the MPEG-1/2/2.5 Layer III frame header at the start of `bytes`.
+/// See ISO/IEC 11172-3 section 2.4.2.3 (and 13818-3 for the lower rates).
+pub fn parse_mp3_frame_header(bytes: &[u8]) -> Option<Mp3FrameHeader> {
+    let &[b0, b1, b2, b3, ..] = bytes else {
+        return None;
+    };
+    // 11-bit sync word, then version (2 bits) and layer (2 bits).
+    if b0 != 0xFF || (b1 & 0xE0) != 0xE0 {
+        return None;
+    }
+    let version = (b1 >> 3) & 0x3; // 0: MPEG-2.5, 2: MPEG-2, 3: MPEG-1
+    let layer = (b1 >> 1) & 0x3; // 1: Layer III
+    if version == 1 || layer != 1 {
+        return None;
+    }
+    let bitrate_index = usize::from(b2 >> 4);
+    let sample_rate_index = usize::from((b2 >> 2) & 0x3);
+    // Free-format (0) frames have no length in the header.
+    if bitrate_index == 0 || bitrate_index == 15 || sample_rate_index == 3 {
+        return None;
+    }
+    const MPEG1_KBPS: [u32; 15] = [
+        0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+    ];
+    const MPEG2_KBPS: [u32; 15] = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+    let (bitrate, sample_rate, frames_per_packet) = match version {
+        3 => (
+            MPEG1_KBPS[bitrate_index],
+            [44100, 48000, 32000][sample_rate_index],
+            1152,
+        ),
+        2 => (
+            MPEG2_KBPS[bitrate_index],
+            [22050, 24000, 16000][sample_rate_index],
+            576,
+        ),
+        _ => (
+            MPEG2_KBPS[bitrate_index],
+            [11025, 12000, 8000][sample_rate_index],
+            576,
+        ),
+    };
+    let padding = u32::from((b2 >> 1) & 0x1);
+    let frame_len = (frames_per_packet / 8) * bitrate * 1000 / sample_rate + padding;
+    let channels = if (b3 >> 6) == 3 { 1 } else { 2 };
+    Some(Mp3FrameHeader {
+        frame_len: frame_len as usize,
+        sample_rate,
+        channels,
+        frames_per_packet,
+    })
+}
+
+/// Splits an MP3 file into its frames. Tags (ID3v2, ID3v1, APE) and junk
+/// between frames are skipped, as is a Xing/Info/VBRI header frame, which
+/// carries metadata rather than audio and isn't a packet in Core Audio
+/// either. Returns [None] for anything that isn't a Layer III stream.
+fn parse_mp3_packets(bytes: &[u8]) -> Option<CompressedPackets> {
+    let mut pos = 0;
+    // An ID3v2 tag: "ID3", version, flags, then a 28-bit "syncsafe" size
+    // that excludes the 10-byte header (and the footer, if flagged).
+    if bytes.len() >= 10 && &bytes[..3] == b"ID3" {
+        let size = bytes[6..10]
+            .iter()
+            .fold(0usize, |acc, &b| (acc << 7) | usize::from(b & 0x7F));
+        let footer = if bytes[5] & 0x10 != 0 { 10 } else { 0 };
+        pos = 10 + size + footer;
+    }
+    // MP3 files start with a frame (give or take a little padding), so only
+    // look for the first one near the start: further in, a sync word and
+    // a plausible header are bound to turn up in some other format's data.
+    let search_limit = pos + 4096;
+
+    let mut first: Option<Mp3FrameHeader> = None;
+    let mut packet_bytes = Vec::new();
+    let mut packet_offsets = vec![0];
+    while pos + 4 <= bytes.len() {
+        let header = parse_mp3_frame_header(&bytes[pos..]).filter(|header| {
+            pos + header.frame_len <= bytes.len()
+                && first.is_none_or(|first| {
+                    first.sample_rate == header.sample_rate
+                        && first.frames_per_packet == header.frames_per_packet
+                })
+        });
+        let Some(header) = header else {
+            if first.is_none() && pos >= search_limit {
+                return None;
+            }
+            pos += 1;
+            continue;
+        };
+        let frame = &bytes[pos..][..header.frame_len];
+        if first.is_none() {
+            // A false sync is likely in junk before the first frame, so make
+            // sure another frame follows it (unless it's the only one).
+            let next = &bytes[pos + header.frame_len..];
+            if !next.is_empty() && parse_mp3_frame_header(next).is_none() {
+                if pos >= search_limit {
+                    return None;
+                }
+                pos += 1;
+                continue;
+            }
+            first = Some(header);
+            if [b"Xing", b"Info", b"VBRI"]
+                .iter()
+                .any(|tag| frame[4..].windows(4).take(40).any(|w| w == *tag))
+            {
+                pos += header.frame_len;
+                continue;
+            }
+        }
+        packet_bytes.extend_from_slice(frame);
+        packet_offsets.push(packet_bytes.len());
+        pos += header.frame_len;
+    }
+
+    let first = first?;
+    if packet_offsets.len() < 2 {
+        return None;
+    }
+    Some(CompressedPackets {
+        sample_rate: f64::from(first.sample_rate),
+        channels_per_frame: first.channels,
+        frames_per_packet: first.frames_per_packet,
         packet_bytes,
         packet_offsets,
         magic_cookie: Vec::new(),
