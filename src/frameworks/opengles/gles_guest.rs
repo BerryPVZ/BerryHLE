@@ -2690,13 +2690,11 @@ fn glGenTextures(env: &mut Environment, n: GLsizei, textures: MutPtr<GLuint>) {
 fn glDeleteTextures(env: &mut Environment, n: GLsizei, textures: ConstPtr<GLuint>) {
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| {
         let n_usize: GuestUSize = n.try_into().unwrap();
-        let textures = mem.ptr_at(textures, n_usize);
-        let deleted = if n_usize == 0 {
-            Vec::new()
-        } else {
-            unsafe { from_raw_parts(textures, n_usize as usize) }.to_vec()
-        };
-        unsafe { gles.DeleteTextures(n, textures) };
+        // Copy the names out with unaligned reads: the guest array needn't be
+        // 4-byte aligned (Costume Quest passes one that isn't), and a slice
+        // over it would be undefined behaviour.
+        let deleted: Vec<GLuint> = (0..n_usize).map(|i| mem.read(textures + i)).collect();
+        unsafe { gles.DeleteTextures(n, deleted.as_ptr()) };
         for texture in deleted {
             shadow.forget_pvrtc_texture(texture);
         }
