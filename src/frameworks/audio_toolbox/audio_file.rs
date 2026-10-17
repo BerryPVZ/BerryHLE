@@ -87,6 +87,36 @@ struct AudioFilePacketTableInfo {
 }
 unsafe impl SafeRead for AudioFilePacketTableInfo {}
 
+/// `AudioFramePacketTranslation`, the in/out value of
+/// `kAudioFilePropertyFrameToPacket`. 20 bytes on iOS ARM, where `SInt64`
+/// only needs 4-byte alignment.
+#[derive(Copy, Clone)]
+#[repr(C, packed)]
+struct AudioFramePacketTranslation {
+    frame: i64,
+    packet: i64,
+    frame_offset_in_packet: u32,
+}
+unsafe impl SafeRead for AudioFramePacketTranslation {}
+
+/// Answers `kAudioFilePropertyFrameToPacket`: the caller fills in `frame`,
+/// we fill in the packet containing it and the frame's offset in that packet.
+/// FMOD's AudioQueue codec asks for this when it seeks, including to the
+/// start before first playing a stream, and gives up on the file if it fails:
+/// Where's My Water had no music or comic voice-overs.
+fn write_frame_to_packet(
+    env: &mut Environment,
+    io_data: MutPtr<AudioFramePacketTranslation>,
+    frames_per_packet: u32,
+) {
+    let mut translation = env.mem.read(io_data);
+    let frame = translation.frame.max(0);
+    let frames_per_packet = i64::from(frames_per_packet.max(1));
+    translation.packet = frame / frames_per_packet;
+    translation.frame_offset_in_packet = (frame % frames_per_packet) as u32;
+    env.mem.write(io_data, translation);
+}
+
 // --- Официальные коды ошибок Audio File Services ---
 const kAudioFileSuccess: OSStatus = 0;
 const kAudioFileUnspecifiedError: OSStatus = fourcc(b"wht?") as _;
@@ -140,6 +170,7 @@ const kAudioFilePropertyChannelLayout: AudioFilePropertyID = fourcc(b"cmap");
 const kAudioFilePropertyEstimatedDuration: AudioFilePropertyID = fourcc(b"edur");
 const kAudioFilePropertyPacketTableInfo: AudioFilePropertyID = fourcc(b"pnfo");
 const kAudioFilePropertyPacketToFrame: AudioFilePropertyID = fourcc(b"pkfr");
+const kAudioFilePropertyFrameToPacket: AudioFilePropertyID = fourcc(b"frpk");
 const kAudioFilePropertyFormatList: AudioFilePropertyID = fourcc(b"flst");
 
 /// `AudioFormatListItem`, the element type of `kAudioFilePropertyFormatList`.
@@ -794,7 +825,10 @@ fn AudioFileReadPacketData(
     io_num_packets: MutPtr<u32>,
     out_buffer: MutVoidPtr,
 ) -> OSStatus {
-    AudioFileReadPackets(
+    // Unlike AudioFileReadPackets, ioNumBytes is also an input here: the size
+    // of outBuffer.
+    let byte_capacity = (!out_num_bytes.is_null()).then(|| env.mem.read(out_num_bytes));
+    read_packets(
         env,
         in_audio_file,
         in_use_cache,
@@ -803,10 +837,37 @@ fn AudioFileReadPacketData(
         in_starting_packet,
         io_num_packets,
         out_buffer,
+        byte_capacity,
     )
 }
 
 pub fn AudioFileReadPackets(
+    env: &mut Environment,
+    in_audio_file: AudioFileID,
+    in_use_cache: bool,
+    out_num_bytes: MutPtr<u32>,
+    out_packet_descriptions: MutVoidPtr,
+    in_starting_packet: i64,
+    io_num_packets: MutPtr<u32>,
+    out_buffer: MutVoidPtr,
+) -> OSStatus {
+    read_packets(
+        env,
+        in_audio_file,
+        in_use_cache,
+        out_num_bytes,
+        out_packet_descriptions,
+        in_starting_packet,
+        io_num_packets,
+        out_buffer,
+        None,
+    )
+}
+
+/// Shared implementation of AudioFileReadPackets and AudioFileReadPacketData.
+/// `byte_capacity` is the size of `out_buffer` when the caller told us it.
+#[allow(clippy::too_many_arguments)]
+fn read_packets(
     env: &mut Environment,
     in_audio_file: AudioFileID,
     _in_use_cache: bool,
@@ -815,6 +876,7 @@ pub fn AudioFileReadPackets(
     in_starting_packet: i64,
     io_num_packets: MutPtr<u32>,
     out_buffer: MutVoidPtr,
+    byte_capacity: Option<u32>,
 ) -> OSStatus {
     return_if_null!(in_audio_file);
     if io_num_packets.is_null() {
@@ -870,7 +932,7 @@ pub fn AudioFileReadPackets(
             }
             _ => None,
         };
-        let Some(packet_infos) = aac_packet_infos else {
+        let Some(mut packet_infos) = aac_packet_infos else {
             // VBR format we don't have packet data for.
             env.mem.write(io_num_packets, 0);
             if !out_num_bytes.is_null() {
@@ -879,6 +941,18 @@ pub fn AudioFileReadPackets(
             return kAudioFileSuccess;
         };
 
+        // Only whole packets that fit in the caller's buffer.
+        if let Some(capacity) = byte_capacity {
+            let mut fitting_bytes: u32 = 0;
+            let fitting = packet_infos
+                .iter()
+                .take_while(|&&(_, size)| {
+                    fitting_bytes = fitting_bytes.saturating_add(size);
+                    fitting_bytes <= capacity
+                })
+                .count();
+            packet_infos.truncate(fitting);
+        }
         let total_bytes: u32 = packet_infos.iter().map(|&(_, size)| size).sum();
         let mut written: usize = 0;
         let mut packets_read: u32 = 0;
@@ -920,7 +994,12 @@ pub fn AudioFileReadPackets(
             env.mem
                 .write(out_num_bytes, written.try_into().unwrap_or(0));
         }
-        return if packets_read < packets_to_read {
+        // Running out of packets part-way is not an error: like Apple's
+        // implementation, report what was read and only return eofErr once
+        // there is nothing left. FMOD loads short MP3s in one read that asks
+        // for more packets than the file has, and gave up on them (Where's My
+        // Water's comic voice-overs) when that read failed.
+        return if packets_read == 0 {
             eofErr
         } else {
             kAudioFileSuccess
@@ -1109,6 +1188,7 @@ pub(super) fn property_size(property_id: AudioFilePropertyID) -> GuestUSize {
         kAudioFilePropertyEstimatedDuration => guest_size_of::<f64>(),
         kAudioFilePropertyPacketTableInfo => guest_size_of::<AudioFilePacketTableInfo>(),
         kAudioFilePropertyPacketToFrame => guest_size_of::<f64>(),
+        kAudioFilePropertyFrameToPacket => guest_size_of::<AudioFramePacketTranslation>(),
         // A single entry: the files we open have one data format.
         kAudioFilePropertyFormatList => guest_size_of::<AudioFormatListItem>(),
         kAudioFilePropertyFileFormat => guest_size_of::<AudioFileTypeID>(),
@@ -1348,6 +1428,12 @@ pub fn AudioFileGetProperty(
                     env.mem
                         .write(out_property_data.cast(), frames_per_packet as f64);
                 }
+                kAudioFilePropertyFrameToPacket => {
+                    let AudioDescription {
+                        frames_per_packet, ..
+                    } = audio_file.audio_description();
+                    write_frame_to_packet(env, out_property_data.cast(), frames_per_packet);
+                }
                 kAudioFilePropertyFileFormat => {
                     let bundle_id = env.bundle.bundle_identifier();
                     if bundle_id.starts_with("com.ea.mirrorsedge.bv")
@@ -1397,6 +1483,10 @@ pub fn AudioFileGetProperty(
                 kAudioFilePropertyPacketToFrame => env
                     .mem
                     .write(out_property_data.cast(), format.frames_per_packet as f64),
+                kAudioFilePropertyFrameToPacket => {
+                    let frames_per_packet = format.frames_per_packet;
+                    write_frame_to_packet(env, out_property_data.cast(), frames_per_packet);
+                }
                 kAudioFilePropertyFileFormat => {
                     env.mem.write(out_property_data.cast(), kAudioFileCAFType)
                 }
@@ -1448,6 +1538,10 @@ pub fn AudioFileGetProperty(
                 kAudioFilePropertyPacketToFrame => env
                     .mem
                     .write(out_property_data.cast(), format.frames_per_packet as f64),
+                kAudioFilePropertyFrameToPacket => {
+                    let frames_per_packet = format.frames_per_packet;
+                    write_frame_to_packet(env, out_property_data.cast(), frames_per_packet);
+                }
                 kAudioFilePropertyFileFormat => env.mem.write(out_property_data.cast(), *file_type),
                 _ => return kAudioFileUnsupportedPropertyError,
             }
