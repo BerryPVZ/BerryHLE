@@ -72,9 +72,12 @@ impl SCNetworkReachabilityContext {
 }
 
 fn read_context(
-    mem: &Mem, ptr: ConstPtr<SCNetworkReachabilityContext>,
+    mem: &Mem,
+    ptr: ConstPtr<SCNetworkReachabilityContext>,
 ) -> Result<Option<SCNetworkReachabilityContext>, &'static str> {
-    if ptr.is_null() { return Ok(None); }
+    if ptr.is_null() {
+        return Ok(None);
+    }
     let size = guest_size_of::<SCNetworkReachabilityContext>();
     let end = ptr.to_bits() as u64 + size as u64;
     // get_bytes_fallible can return a SHORT synthetic null-page slice.
@@ -85,7 +88,9 @@ fn read_context(
         return Err("unreadable context");
     }
     let context: SCNetworkReachabilityContext = mem.read(ptr);
-    if context.version != 0 { return Err("unsupported context version"); }
+    if context.version != 0 {
+        return Err("unsupported context version");
+    }
     Ok(Some(context))
 }
 
@@ -117,12 +122,18 @@ impl HostObject for SCNetworkReachabilityHostObject {}
 impl SCNetworkReachabilityHostObject {
     /// Defer release if a callback replaces/unregisters its own context.
     fn replace_callback(
-        &mut self, callout: Option<GuestFunction>, context: Option<SCNetworkReachabilityContext>,
+        &mut self,
+        callout: Option<GuestFunction>,
+        context: Option<SCNetworkReachabilityContext>,
     ) -> Option<SCNetworkReachabilityContext> {
         self.callout = callout;
         let old = std::mem::replace(&mut self.context, context);
-        if self.active_callbacks == 0 { return old; }
-        if let Some(old) = old { self.retired_contexts.push(old); }
+        if self.active_callbacks == 0 {
+            return old;
+        }
+        if let Some(old) = old {
+            self.retired_contexts.push(old);
+        }
         None
     }
 
@@ -137,7 +148,8 @@ impl SCNetworkReachabilityHostObject {
 }
 
 fn is_reachability(env: &Environment, target: SCNetworkReachabilityRef) -> bool {
-    env.objc.get_host_object(target)
+    env.objc
+        .get_host_object(target)
         .is_some_and(|host| host.as_any().is::<SCNetworkReachabilityHostObject>())
 }
 
@@ -221,8 +233,14 @@ fn SCNetworkReachabilityGetFlags(
     _target: SCNetworkReachabilityRef,
     flags: MutPtr<SCNetworkReachabilityFlags>,
 ) -> bool {
-    // Принудительно говорим игре, что сеть доступна (Reachable)
-    env.mem.write(flags, kSCNetworkReachabilityFlagsReachable);
+    let flags_value = if env.options.network_access {
+        kSCNetworkReachabilityFlagsReachable
+    } else {
+        0
+    };
+    if !flags.is_null() {
+        env.mem.write(flags, flags_value);
+    }
     true
 }
 
@@ -232,7 +250,9 @@ fn SCNetworkReachabilitySetCallback(
     callout: GuestFunction,
     context: ConstPtr<SCNetworkReachabilityContext>,
 ) -> bool {
-    if !is_reachability(env, target) { return false; }
+    if !is_reachability(env, target) {
+        return false;
+    }
     let callout = (callout.addr_with_thumb_bit() != 0).then_some(callout);
     let mut context = if callout.is_none() {
         // NULL callout unregisters the callback; do not retain a new context.
@@ -241,7 +261,10 @@ fn SCNetworkReachabilitySetCallback(
         match read_context(&env.mem, context) {
             Ok(context) => context,
             Err(reason) => {
-                log!("SCNetworkReachabilitySetCallback: {}; keeping previous callback", reason);
+                log!(
+                    "SCNetworkReachabilitySetCallback: {}; keeping previous callback",
+                    reason
+                );
                 return false;
             }
         }
@@ -250,7 +273,9 @@ fn SCNetworkReachabilitySetCallback(
     // and never hold a host-object borrow across guest execution.
     CFRetain(env, target);
     retain_context(env, &mut context);
-    let old = env.objc.borrow_mut::<SCNetworkReachabilityHostObject>(target)
+    let old = env
+        .objc
+        .borrow_mut::<SCNetworkReachabilityHostObject>(target)
         .replace_callback(callout, context);
     release_context(env, old);
     CFRelease(env, target);
@@ -263,23 +288,40 @@ fn SCNetworkReachabilityScheduleWithRunLoop(
     _run_loop: CFTypeRef,
     _run_loop_mode: CFTypeRef,
 ) -> bool {
-    if !is_reachability(env, target) { return false; }
+    if !is_reachability(env, target) {
+        return false;
+    }
     // Keep the existing immediate-notification stub for now. A real run-loop
     // source/network-change implementation is separate from this ABI fix.
     CFRetain(env, target);
     let (callback, info) = {
-        let host = env.objc.borrow_mut::<SCNetworkReachabilityHostObject>(target);
-        if host.callout.is_some() { host.active_callbacks += 1; }
-        (host.callout, host.context.map_or(MutVoidPtr::null(), |c| c.info))
+        let host = env
+            .objc
+            .borrow_mut::<SCNetworkReachabilityHostObject>(target);
+        if host.callout.is_some() {
+            host.active_callbacks += 1;
+        }
+        (
+            host.callout,
+            host.context.map_or(MutVoidPtr::null(), |c| c.info),
+        )
     };
     if let Some(callback) = callback {
-        let flags = kSCNetworkReachabilityFlagsReachable
-            | kSCNetworkReachabilityFlagsIsDirect
-            | kSCNetworkReachabilityFlagsIsWWAN;
+        let flags = if env.options.network_access {
+            kSCNetworkReachabilityFlagsReachable
+                | kSCNetworkReachabilityFlagsIsDirect
+                | kSCNetworkReachabilityFlagsIsWWAN
+        } else {
+            0
+        };
         let _: () = callback.call_from_host(env, (target, flags, info));
-        let retired = env.objc.borrow_mut::<SCNetworkReachabilityHostObject>(target)
+        let retired = env
+            .objc
+            .borrow_mut::<SCNetworkReachabilityHostObject>(target)
             .finish_callback();
-        for context in retired { release_context(env, Some(context)); }
+        for context in retired {
+            release_context(env, Some(context));
+        }
     }
     CFRelease(env, target);
     true

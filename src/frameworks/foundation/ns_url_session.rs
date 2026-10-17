@@ -5,13 +5,10 @@
  */
 
 //! `NSURLSession`, `NSURLSessionConfiguration` and `NSURLSessionTask`
-//! (iOS 7+ networking).
-//!
-//! This is a stub implementation that does not perform real networking, in
-//! keeping with the existing `NSURLConnection` stub (see `ns_url_connection`).
-//! touchHLE has no live network stack, so requests are completed with the
-//! standard `NSURLErrorNotConnectedToInternet` (-1009) error in the
-//! `NSURLErrorDomain`, exactly as Apple documents for the offline case.
+//! (iOS 7+ networking). HTTP/HTTPS requests use the host transport when
+//! `--allow-network-access` is enabled. Workers operate on copied Rust request
+//! data and results are delivered on the guest run loop, never from a host
+//! worker thread.
 //!
 //! The shape of the API faithfully follows Apple's reference:
 //! - `+[NSURLSessionConfiguration defaultSessionConfiguration]` /
@@ -25,29 +22,19 @@
 //! - `NSURLSessionTask`: `resume`, `suspend`, `cancel`, and the read-only
 //!   `state`, `taskIdentifier`, `originalRequest`, `currentRequest`, `error`.
 //!
-//! Behaviour on `resume`:
-//! - If the task was created with a completion handler, it is invoked with
-//!   `(nil data, nil response, error)` — matching Apple's contract for
-//!   failures.
-//! - Otherwise the session delegate is notified via
-//!   `URLSession:task:didCompleteWithError:` (if implemented), matching
-//!   Apple's documented delegate flow.
-//!
-//! Returning an error (rather than fake success) is deliberate and matches
-//! the `NSURLConnection` stub's rationale: faking `200 OK` with empty data
-//! crashes apps that parse protocol-specific fields from the body.
-
+//! HTTP status codes (including 4xx/5xx) are returned as normal responses;
+//! only transport failures are reported through NSError. Background sessions
+//! are executed in-process and do not survive emulator shutdown.
 use super::NSUInteger;
 use crate::abi::{CallFromHost, GuestFunction};
+use crate::frameworks::foundation::url_loading;
 use crate::mem::{ConstVoidPtr, Ptr};
 use crate::objc::{
     autorelease, id, msg, msg_class, msg_super, nil, objc_classes, release, retain, ClassExports,
     HostObject,
 };
-
-// NSError domain / code used when reporting "no network in emulator".
-const NS_URL_ERROR_DOMAIN: &str = "NSURLErrorDomain";
-const NS_URL_ERROR_NOT_CONNECTED_TO_INTERNET: i32 = -1009;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::TryRecvError;
 
 // NSURLSessionTaskState values (Apple's enum).
 const NS_URL_SESSION_TASK_STATE_RUNNING: i64 = 0;
@@ -62,10 +49,11 @@ const BLOCK_INVOKE_WORD_OFFSET: u32 = 3;
 
 #[derive(Default)]
 pub struct State {
-    /// Monotonic counter used to hand out unique task identifiers, mirroring a
-    /// real `NSURLSession`. A process-global counter is a faithful-enough
-    /// approximation that keeps identifiers unique.
+    /// Monotonic counter used to hand out unique task identifiers within this
+    /// emulated process.
     next_task_identifier: u64,
+    /// Strongly held process-wide `+[NSURLSession sharedSession]` instance.
+    shared_session: id,
 }
 impl State {
     fn get(env: &mut crate::Environment) -> &mut State {
@@ -102,51 +90,25 @@ impl HostObject for NSURLSessionHostObject {}
 
 #[derive(Default)]
 struct NSURLSessionTaskHostObject {
-    /// The owning session (not retained — the session owns its tasks; this
-    /// mirrors real NSURLSession ownership and avoids a retain cycle).
+    /// Retained until completion/deallocation so delegate callbacks remain valid.
     session: id,
     /// `NSURLRequest *` — retained.
     original_request: id,
-    /// The `void (^)(NSData *, NSURLResponse *, NSError *)` completion-handler
-    /// block, `-copy`'d to the heap (so it survives until `resume`), or nil.
+    /// `NSData *` supplied to an upload-task factory, if any.
+    upload_body: id,
+    /// The copied completion-handler block, or nil.
     completion_handler: id,
     state: i64,
     task_identifier: u64,
-    /// Set once the task completes, so the `error` getter can report it.
+    is_download: bool,
+    /// Stored `NSURLResponse *` and `NSError *` for the task accessors.
+    response: id,
     error: id,
+    bytes_received: i64,
+    bytes_sent: i64,
+    receiver: Option<url_loading::HttpReceiver>,
 }
 impl HostObject for NSURLSessionTaskHostObject {}
-
-// ---------------------------------------------------------------------------
-// Helper — build an autoreleased NSError for "not connected to internet".
-// ---------------------------------------------------------------------------
-fn make_network_error(env: &mut crate::Environment) -> id {
-    use crate::frameworks::foundation::ns_string::{from_rust_string, get_static_str};
-
-    let domain = from_rust_string(env, NS_URL_ERROR_DOMAIN.to_string());
-    autorelease(env, domain);
-
-    let desc_key = get_static_str(env, "NSLocalizedDescription");
-    let desc_val = from_rust_string(
-        env,
-        "The Internet connection appears to be offline. \
-         (touchHLE: networking not supported)"
-            .to_string(),
-    );
-    autorelease(env, desc_val);
-
-    let user_info: id = msg_class![env; NSMutableDictionary new];
-    autorelease(env, user_info);
-    () = msg![env; user_info setObject:desc_val forKey:desc_key];
-
-    let error: id = msg_class![env; NSError alloc];
-    let error: id = msg![env;
-        error initWithDomain:domain
-                        code:NS_URL_ERROR_NOT_CONNECTED_TO_INTERNET
-                    userInfo:user_info];
-    autorelease(env, error);
-    error
-}
 
 /// Invoke a `void (^)(NSData *, NSURLResponse *, NSError *)` completion block.
 /// Returns silently if `block` is nil or its invoke pointer is zero.
@@ -179,57 +141,33 @@ fn invoke_completion_handler(
     );
 }
 
-/// Deliver completion to a task. Marks the task completed, stores the error,
-/// then either invokes its completion handler with `(nil, nil, error)` or
-/// notifies the session delegate via `URLSession:task:didCompleteWithError:`.
-fn deliver_task_failure(env: &mut crate::Environment, task: id) {
-    // Build and retain the error we will store on the task for `-error`.
-    let stored_error = make_network_error(env);
-    retain(env, stored_error);
-
-    let (handler, session, previous_error) = {
-        let host = env.objc.borrow_mut::<NSURLSessionTaskHostObject>(task);
-        host.state = NS_URL_SESSION_TASK_STATE_COMPLETED;
-        let previous_error = host.error;
-        host.error = stored_error;
-        (host.completion_handler, host.session, previous_error)
-    };
-
-    // Release any error from a previous completion now that the borrow ended.
-    if previous_error != nil {
-        release(env, previous_error);
-    }
-
-    if handler != nil {
-        let err = make_network_error(env);
-        invoke_completion_handler(env, handler, nil, nil, err);
-        return;
-    }
-
-    // No completion handler: notify the session delegate if present.
-    let delegate: id = if session != nil {
-        env.objc.borrow::<NSURLSessionHostObject>(session).delegate
-    } else {
-        nil
-    };
-    if delegate != nil {
-        let err = make_network_error(env);
-        () = msg![env; delegate URLSession:session task:task didCompleteWithError:err];
-    }
+#[derive(Clone, Copy)]
+enum TaskKind {
+    Data,
+    Download,
+    Upload,
 }
 
-/// Shared task-creation logic. Allocates an `NSURLSessionDataTask`, wires it to
-/// its session and request, `-copy`s the completion-handler block to the heap
-/// (so it survives until `resume`), and assigns a unique identifier.
-fn make_task(env: &mut crate::Environment, session: id, request: id, handler: id) -> id {
-    let task: id = msg_class![env; NSURLSessionDataTask alloc];
+/// Shared task-creation logic. The session and request are retained so an
+/// in-flight task never outlives objects it needs for callback delivery.
+fn make_task(
+    env: &mut crate::Environment,
+    session: id,
+    request: id,
+    handler: id,
+    kind: TaskKind,
+    upload_body: id,
+) -> id {
+    let task: id = match kind {
+        TaskKind::Data => msg_class![env; NSURLSessionDataTask alloc],
+        TaskKind::Download => msg_class![env; NSURLSessionDownloadTask alloc],
+        TaskKind::Upload => msg_class![env; NSURLSessionUploadTask alloc],
+    };
     let task: id = msg![env; task init];
 
+    retain(env, session);
     retain(env, request);
-
-    // Apple's contract: blocks captured by the framework must be copied to the
-    // heap. `-copy` on a stack block produces a heap block; on a heap block
-    // it's a retain.
+    retain(env, upload_body);
     let copied_handler: id = if handler == nil {
         nil
     } else {
@@ -247,13 +185,198 @@ fn make_task(env: &mut crate::Environment, session: id, request: id, handler: id
         let host = env.objc.borrow_mut::<NSURLSessionTaskHostObject>(task);
         host.session = session;
         host.original_request = request;
+        host.upload_body = upload_body;
         host.completion_handler = copied_handler;
         host.state = NS_URL_SESSION_TASK_STATE_SUSPENDED;
         host.task_identifier = identifier;
+        host.is_download = matches!(kind, TaskKind::Download);
+        host.response = nil;
         host.error = nil;
+        host.bytes_received = 0;
+        host.bytes_sent = 0;
+        host.receiver = None;
     }
 
     autorelease(env, task)
+}
+
+fn schedule_task_poll(env: &mut crate::Environment, task: id, delay: f64) {
+    let selector = env
+        .objc
+        .register_host_selector("_touchHLE_pollNetwork".to_string(), &mut env.mem);
+    () = msg![env; task performSelector:selector withObject:nil afterDelay:delay];
+}
+
+fn save_download_to_temporary_file(
+    env: &mut crate::Environment,
+    task_identifier: u64,
+    bytes: &[u8],
+) -> Result<id, url_loading::HttpError> {
+    use crate::frameworks::foundation::ns_string::from_rust_string;
+    static NEXT_DOWNLOAD_FILE: AtomicU64 = AtomicU64::new(0);
+
+    let unique = NEXT_DOWNLOAD_FILE.fetch_add(1, Ordering::Relaxed);
+    let path = env.fs.home_directory().join(format!(
+        "tmp/touchHLE_download_{}_{}_{}.tmp",
+        std::process::id(),
+        task_identifier,
+        unique
+    ));
+    env.fs
+        .write(&path, bytes)
+        .map_err(|_| url_loading::HttpError {
+            code: -3000,
+            description: "Could not write the downloaded file into the app's temporary directory."
+                .to_string(),
+        })?;
+    let path_string = from_rust_string(env, path.as_str().to_string());
+    autorelease(env, path_string);
+    let location: id = msg_class![env; NSURL fileURLWithPath:path_string];
+    Ok(location)
+}
+
+fn finish_task(env: &mut crate::Environment, task: id, result: url_loading::HttpResult) {
+    let (is_download, identifier, current_state) = {
+        let host = env.objc.borrow::<NSURLSessionTaskHostObject>(task);
+        (host.is_download, host.task_identifier, host.state)
+    };
+    if current_state == NS_URL_SESSION_TASK_STATE_COMPLETED {
+        return;
+    }
+
+    let (result, download_location) = match result {
+        Ok(response) if is_download => {
+            match save_download_to_temporary_file(env, identifier, &response.body) {
+                Ok(location) => (Ok(response), location),
+                Err(error) => (Err(error), nil),
+            }
+        }
+        other => (other, nil),
+    };
+
+    let (response_object, first_result, error_object, received) = match result {
+        Ok(response) => {
+            let (response_object, first_result) = if is_download {
+                (
+                    url_loading::make_foundation_http_response(env, &response),
+                    download_location,
+                )
+            } else {
+                url_loading::make_foundation_response(env, &response)
+            };
+            (
+                response_object,
+                first_result,
+                nil,
+                response.body.len().min(i64::MAX as usize) as i64,
+            )
+        }
+        Err(error) => (nil, nil, url_loading::make_foundation_error(env, &error), 0),
+    };
+
+    retain(env, response_object);
+    retain(env, error_object);
+    let (session, handler, previous_response, previous_error) = {
+        let host = env.objc.borrow_mut::<NSURLSessionTaskHostObject>(task);
+        host.state = NS_URL_SESSION_TASK_STATE_COMPLETED;
+        host.receiver = None;
+        host.bytes_received = received;
+        let previous_response = std::mem::replace(&mut host.response, response_object);
+        let previous_error = std::mem::replace(&mut host.error, error_object);
+        (
+            host.session,
+            host.completion_handler,
+            previous_response,
+            previous_error,
+        )
+    };
+    release(env, previous_response);
+    release(env, previous_error);
+
+    if handler != nil {
+        invoke_completion_handler(env, handler, first_result, response_object, error_object);
+        return;
+    }
+    let delegate: id = if session != nil {
+        env.objc.borrow::<NSURLSessionHostObject>(session).delegate
+    } else {
+        nil
+    };
+    if delegate == nil {
+        return;
+    }
+    if error_object == nil {
+        if is_download {
+            () = msg![env; delegate URLSession:session downloadTask:task didFinishDownloadingToURL:first_result];
+        } else {
+            () = msg![env; delegate URLSession:session dataTask:task didReceiveData:first_result];
+        }
+    }
+    () = msg![env; delegate URLSession:session task:task didCompleteWithError:error_object];
+}
+
+fn start_task_network(env: &mut crate::Environment, task: id) {
+    let (session, request, upload_body, existing_receiver) = {
+        let host = env.objc.borrow::<NSURLSessionTaskHostObject>(task);
+        (
+            host.session,
+            host.original_request,
+            host.upload_body,
+            host.receiver.is_some(),
+        )
+    };
+    if existing_receiver {
+        schedule_task_poll(env, task, 0.05);
+        return;
+    }
+
+    let (additional_headers, timeout) = if session != nil {
+        let configuration: id = msg![env; session configuration];
+        if configuration != nil {
+            (
+                msg![env; configuration HTTPAdditionalHeaders],
+                Some(msg![env; configuration timeoutIntervalForRequest]),
+            )
+        } else {
+            (nil, None)
+        }
+    } else {
+        (nil, None)
+    };
+    let mut request_data =
+        url_loading::request_from_objc(env, request, additional_headers, timeout);
+    if upload_body != nil {
+        request_data = match request_data {
+            Ok(mut request_data) => {
+                let length: NSUInteger = msg![env; upload_body length];
+                if length > 64 * 1024 * 1024 {
+                    Err(url_loading::HttpError {
+                        code: -1103,
+                        description: "The upload body exceeds touchHLE's 64 MiB safety limit."
+                            .to_string(),
+                    })
+                } else if length == 0 {
+                    request_data.body.clear();
+                    Ok(request_data)
+                } else {
+                    let bytes: crate::mem::ConstVoidPtr = msg![env; upload_body bytes];
+                    request_data.body = env.mem.bytes_at(bytes.cast(), length).to_vec();
+                    Ok(request_data)
+                }
+            }
+            Err(error) => Err(error),
+        };
+    }
+    let bytes_sent = request_data.as_ref().map_or(0, |request| {
+        request.body.len().min(i64::MAX as usize) as i64
+    });
+    let receiver = url_loading::send_async(request_data, env.options.network_access);
+    {
+        let host = env.objc.borrow_mut::<NSURLSessionTaskHostObject>(task);
+        host.bytes_sent = bytes_sent;
+        host.receiver = Some(receiver);
+    }
+    schedule_task_poll(env, task, 0.05);
 }
 
 pub const CLASSES: ClassExports = objc_classes! {
@@ -425,8 +548,15 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (id)sharedSession {
+    let cached = State::get(env).shared_session;
+    if cached != nil {
+        return cached;
+    }
     let config: id = msg_class![env; NSURLSessionConfiguration defaultSessionConfiguration];
-    msg![env; this sessionWithConfiguration:config]
+    let session: id = msg![env; this sessionWithConfiguration:config];
+    retain(env, session);
+    State::get(env).shared_session = session;
+    session
 }
 
 + (id)sessionWithConfiguration:(id)configuration {
@@ -464,42 +594,66 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - Task creation
 
 - (id)dataTaskWithRequest:(id)request {
-    make_task(env, this, request, nil)
+    make_task(env, this, request, nil, TaskKind::Data, nil)
 }
 
 - (id)dataTaskWithRequest:(id)request
         completionHandler:(id)handler {
-    make_task(env, this, request, handler)
+    make_task(env, this, request, handler, TaskKind::Data, nil)
 }
 
 - (id)dataTaskWithURL:(id)url {
     let request: id = msg_class![env; NSURLRequest requestWithURL:url];
-    make_task(env, this, request, nil)
+    make_task(env, this, request, nil, TaskKind::Data, nil)
 }
 
 - (id)dataTaskWithURL:(id)url
     completionHandler:(id)handler {
     let request: id = msg_class![env; NSURLRequest requestWithURL:url];
-    make_task(env, this, request, handler)
+    make_task(env, this, request, handler, TaskKind::Data, nil)
 }
 
-// downloadTask*/uploadTask* share the same offline behaviour; we vend the
-// same task object type so apps get a graceful failure either way.
 - (id)downloadTaskWithRequest:(id)request {
-    make_task(env, this, request, nil)
+    make_task(env, this, request, nil, TaskKind::Download, nil)
 }
 - (id)downloadTaskWithRequest:(id)request
             completionHandler:(id)handler {
-    make_task(env, this, request, handler)
+    make_task(env, this, request, handler, TaskKind::Download, nil)
 }
 - (id)downloadTaskWithURL:(id)url {
     let request: id = msg_class![env; NSURLRequest requestWithURL:url];
-    make_task(env, this, request, nil)
+    make_task(env, this, request, nil, TaskKind::Download, nil)
 }
 - (id)downloadTaskWithURL:(id)url
         completionHandler:(id)handler {
     let request: id = msg_class![env; NSURLRequest requestWithURL:url];
-    make_task(env, this, request, handler)
+    make_task(env, this, request, handler, TaskKind::Download, nil)
+}
+
+- (id)uploadTaskWithRequest:(id)request fromData:(id)data {
+    make_task(env, this, request, nil, TaskKind::Upload, data)
+}
+- (id)uploadTaskWithRequest:(id)request
+                   fromData:(id)data
+          completionHandler:(id)handler {
+    make_task(env, this, request, handler, TaskKind::Upload, data)
+}
+- (id)uploadTaskWithRequest:(id)request fromFile:(id)file_url {
+    let data: id = msg_class![env; NSData dataWithContentsOfURL:file_url];
+    make_task(env, this, request, nil, TaskKind::Upload, data)
+}
+- (id)uploadTaskWithRequest:(id)request
+                   fromFile:(id)file_url
+          completionHandler:(id)handler {
+    let data: id = msg_class![env; NSData dataWithContentsOfURL:file_url];
+    make_task(env, this, request, handler, TaskKind::Upload, data)
+}
+- (id)uploadTaskWithStreamedRequest:(id)request {
+    make_task(env, this, request, nil, TaskKind::Upload, nil)
+}
+- (id)uploadTaskWithStreamedRequest:(id)request
+                  completionHandler:(id)handler {
+    make_task(env, this, request, handler, TaskKind::Upload, nil)
 }
 
 // MARK: - Lifecycle
@@ -543,23 +697,17 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())resume {
-    let state = env
-        .objc
-        .borrow::<NSURLSessionTaskHostObject>(this)
-        .state;
+    let state = env.objc.borrow::<NSURLSessionTaskHostObject>(this).state;
     if state == NS_URL_SESSION_TASK_STATE_COMPLETED
         || state == NS_URL_SESSION_TASK_STATE_CANCELING
+        || state == NS_URL_SESSION_TASK_STATE_RUNNING
     {
         return;
     }
     env.objc
         .borrow_mut::<NSURLSessionTaskHostObject>(this)
         .state = NS_URL_SESSION_TASK_STATE_RUNNING;
-    log!(
-        "NSURLSessionTask resume: delivering NSURLErrorNotConnectedToInternet \
-         (touchHLE has no network)"
-    );
-    deliver_task_failure(env, this);
+    start_task_network(env, this);
 }
 
 - (())suspend {
@@ -570,9 +718,61 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())cancel {
-    let host = env.objc.borrow_mut::<NSURLSessionTaskHostObject>(this);
-    if host.state != NS_URL_SESSION_TASK_STATE_COMPLETED {
+    let receiver = {
+        let host = env.objc.borrow_mut::<NSURLSessionTaskHostObject>(this);
+        if host.state == NS_URL_SESSION_TASK_STATE_COMPLETED
+            || host.state == NS_URL_SESSION_TASK_STATE_CANCELING
+        {
+            return;
+        }
         host.state = NS_URL_SESSION_TASK_STATE_CANCELING;
+        host.receiver.take()
+    };
+    drop(receiver);
+    let selector = env
+        .objc
+        .register_host_selector("_touchHLE_completeCancellation".to_string(), &mut env.mem);
+    () = msg![env; this performSelector:selector withObject:nil afterDelay:0.0_f64];
+}
+
+- (())_touchHLE_completeCancellation {
+    if env.objc.borrow::<NSURLSessionTaskHostObject>(this).state
+        != NS_URL_SESSION_TASK_STATE_CANCELING
+    {
+        return;
+    }
+    finish_task(
+        env,
+        this,
+        Err(url_loading::HttpError {
+            code: -999,
+            description: "The request was cancelled.".to_string(),
+        }),
+    );
+}
+
+- (())_touchHLE_pollNetwork {
+    let poll = {
+        let host = env.objc.borrow::<NSURLSessionTaskHostObject>(this);
+        if host.state != NS_URL_SESSION_TASK_STATE_RUNNING {
+            return;
+        }
+        let Some(receiver) = host.receiver.as_ref() else {
+            return;
+        };
+        receiver.try_recv()
+    };
+    match poll {
+        Ok(result) => finish_task(env, this, result),
+        Err(TryRecvError::Empty) => schedule_task_poll(env, this, 0.05),
+        Err(TryRecvError::Disconnected) => finish_task(
+            env,
+            this,
+            Err(url_loading::HttpError {
+                code: -1005,
+                description: "The HTTP worker stopped before returning a result.".to_string(),
+            }),
+        ),
     }
 }
 
@@ -581,37 +781,56 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (u64)taskIdentifier {
-    env.objc
-        .borrow::<NSURLSessionTaskHostObject>(this)
-        .task_identifier
+    env.objc.borrow::<NSURLSessionTaskHostObject>(this).task_identifier
 }
 
 - (id)originalRequest {
-    env.objc
-        .borrow::<NSURLSessionTaskHostObject>(this)
-        .original_request
+    env.objc.borrow::<NSURLSessionTaskHostObject>(this).original_request
 }
 - (id)currentRequest {
-    env.objc
-        .borrow::<NSURLSessionTaskHostObject>(this)
-        .original_request
+    env.objc.borrow::<NSURLSessionTaskHostObject>(this).original_request
 }
 - (id)response {
-    nil
+    env.objc.borrow::<NSURLSessionTaskHostObject>(this).response
 }
 - (id)error {
     env.objc.borrow::<NSURLSessionTaskHostObject>(this).error
 }
+- (i64)countOfBytesReceived {
+    env.objc.borrow::<NSURLSessionTaskHostObject>(this).bytes_received
+}
+- (i64)countOfBytesExpectedToReceive {
+    let response = env.objc.borrow::<NSURLSessionTaskHostObject>(this).response;
+    if response == nil {
+        -1
+    } else {
+        msg![env; response expectedContentLength]
+    }
+}
+- (i64)countOfBytesSent {
+    env.objc.borrow::<NSURLSessionTaskHostObject>(this).bytes_sent
+}
+- (i64)countOfBytesExpectedToSend {
+    env.objc.borrow::<NSURLSessionTaskHostObject>(this).bytes_sent
+}
 
 - (())dealloc {
-    let &NSURLSessionTaskHostObject {
-        original_request,
-        completion_handler,
-        error,
-        ..
-    } = env.objc.borrow::<NSURLSessionTaskHostObject>(this);
+    let (session, original_request, upload_body, completion_handler, response, error) = {
+        let host = env.objc.borrow::<NSURLSessionTaskHostObject>(this);
+        (
+            host.session,
+            host.original_request,
+            host.upload_body,
+            host.completion_handler,
+            host.response,
+            host.error,
+        )
+    };
+    release(env, session);
     release(env, original_request);
+    release(env, upload_body);
     release(env, completion_handler);
+    release(env, response);
     release(env, error);
     env.objc.dealloc_object(this, &mut env.mem);
 }

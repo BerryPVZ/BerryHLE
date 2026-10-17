@@ -10,7 +10,7 @@
 //! <https://developer.apple.com/documentation/foundation/nsurlresponse>
 //! <https://developer.apple.com/documentation/foundation/nshttpurlresponse>
 
-use crate::frameworks::foundation::ns_string::from_rust_string;
+use crate::frameworks::foundation::ns_string::{from_rust_string, to_rust_string};
 use crate::frameworks::foundation::NSInteger;
 use crate::objc::{
     id, msg, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
@@ -177,6 +177,30 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)allHeaderFields {
     env.objc.borrow::<NSHTTPURLResponseHostObject>(this).all_header_fields
+}
+
+- (id)valueForHTTPHeaderField:(id)field {
+    if field == nil {
+        return nil;
+    }
+    let headers = env
+        .objc
+        .borrow::<NSHTTPURLResponseHostObject>(this)
+        .all_header_fields;
+    if headers == nil {
+        return nil;
+    }
+    let field_name = to_rust_string(env, field).into_owned();
+    let keys: id = msg![env; headers allKeys];
+    let count: crate::frameworks::foundation::NSUInteger = msg![env; keys count];
+    for index in 0..count {
+        let key: id = msg![env; keys objectAtIndex:index];
+        let key_name = to_rust_string(env, key);
+        if key_name.eq_ignore_ascii_case(&field_name) {
+            return msg![env; headers objectForKey:key];
+        }
+    }
+    nil
 }
 
 - (id)URL {
