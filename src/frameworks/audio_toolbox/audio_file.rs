@@ -594,7 +594,17 @@ pub fn AudioFileOpenWithCallbacks(
         return final_status;
     }
 
-    let host_object = match audio::AudioFile::read_from_vec(data_vec) {
+    // MP3s are served as their compressed frames, like on a real device.
+    // Callers of this function bring their own data and usually their own
+    // decoding pipeline too: FMOD feeds the packets to an AudioQueue in
+    // offline-render mode, which can't work with PCM "packets" of one frame.
+    // See `AudioFile::read_mp3_packets_from_vec` for why this isn't done for
+    // every AudioFile.
+    let opened = match audio::AudioFile::read_mp3_packets_from_vec(data_vec.clone()) {
+        Some(file) => Ok(file),
+        None => audio::AudioFile::read_from_vec(data_vec),
+    };
+    let host_object = match opened {
         Ok(file) => AudioFileHostObject::Real(file),
         Err(e) => {
             log!(
@@ -849,11 +859,15 @@ pub fn AudioFileReadPackets(
         // (per Apple's Audio File Services documentation, descriptions are
         // required to make sense of VBR data).
         let aac_packet_infos = match host_object {
-            AudioFileHostObject::Real(ref audio_file) => audio_file.aac_packets().map(|aac| {
-                (0..packets_to_read)
-                    .map_while(|i| aac.packet_info(in_starting_packet as u64 + u64::from(i)))
-                    .collect::<Vec<(u64, u32)>>()
-            }),
+            AudioFileHostObject::Real(ref audio_file) => {
+                audio_file.compressed_packets().map(|packets| {
+                    (0..packets_to_read)
+                        .map_while(|i| {
+                            packets.packet_info(in_starting_packet as u64 + u64::from(i))
+                        })
+                        .collect::<Vec<(u64, u32)>>()
+                })
+            }
             _ => None,
         };
         let Some(packet_infos) = aac_packet_infos else {
@@ -1252,6 +1266,17 @@ pub fn AudioFileGetProperty(
                         audio::AudioFormat::Mpeg4Aac => AudioStreamBasicDescription {
                             sample_rate,
                             format_id: fourcc(b"aac "),
+                            format_flags: 0,
+                            bytes_per_packet,
+                            frames_per_packet,
+                            bytes_per_frame: 0,
+                            channels_per_frame,
+                            bits_per_channel,
+                            _reserved: 0,
+                        },
+                        audio::AudioFormat::MpegLayer3 => AudioStreamBasicDescription {
+                            sample_rate,
+                            format_id: fourcc(b".mp3"),
                             format_flags: 0,
                             bytes_per_packet,
                             frames_per_packet,

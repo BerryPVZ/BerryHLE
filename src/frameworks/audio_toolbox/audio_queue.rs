@@ -17,6 +17,8 @@ use crate::frameworks::audio_toolbox::audio_converter::{
 };
 use crate::frameworks::audio_toolbox::audio_unit::alloc_render_timestamp;
 use crate::audio::openal as al;
+use crate::audio::parse_mp3_frame_header;
+use crate::audio::symphonia_formats::Mp3FrameDecoder;
 use crate::audio::openal::al_types::*;
 use crate::audio::openal::{OpenAL, OpenALManager};
 use crate::dyld::{export_c_func, FunctionExports};
@@ -127,6 +129,9 @@ struct AudioQueueHostObject {
     /// handed out yet, interleaved 16-bit samples at `offline_pcm_channels`.
     offline_pcm: VecDeque<i16>,
     offline_pcm_channels: u32,
+    /// For MP3 queues: the decoder, which has to carry over from one buffer
+    /// to the next. Created on first use.
+    mp3_decoder: Option<Mp3FrameDecoder>,
 }
 
 /// Track whether the audio queue is meant to be running, in order to handle
@@ -338,6 +343,7 @@ pub fn AudioQueueNewOutput(
         offline_render_format: None,
         offline_pcm: VecDeque::new(),
         offline_pcm_channels: 0,
+        mp3_decoder: None,
     };
 
     let aq_ref = env.mem.alloc_and_write(OpaqueAudioQueue { _filler: 0 });
@@ -1198,7 +1204,8 @@ fn AudioQueueOfflineRender(
             .cloned()
             .unwrap_or_default();
         let buffer = env.mem.read(buffer_ref);
-        let (al_format, sample_rate, pcm) = decode_buffer(
+        let (al_format, sample_rate, pcm) = decode_queue_buffer(
+            &mut host_object.mp3_decoder,
             &env.mem,
             &in_format,
             buffer.audio_data.cast(),
@@ -1504,6 +1511,70 @@ fn wrap_raw_aac_as_adts(
         out.extend_from_slice(&data[off..off + len]);
     }
     out
+}
+
+/// [decode_buffer] for a buffer enqueued on an audio queue. MP3 is decoded
+/// with the queue's own decoder, since a frame can depend on the ones in
+/// earlier buffers and a buffer may hold as little as one frame (FMOD).
+fn decode_queue_buffer(
+    mp3_decoder: &mut Option<Mp3FrameDecoder>,
+    mem: &Mem,
+    format: &AudioStreamBasicDescription,
+    audio_data: MutPtr<u8>,
+    audio_data_byte_size: GuestUSize,
+    packet_descs: &[(u32, u32)],
+) -> (ALenum, ALsizei, Vec<u8>) {
+    if format.format_id != kAudioFormatMPEGLayer3 {
+        return decode_buffer(mem, format, audio_data, audio_data_byte_size, packet_descs);
+    }
+    if mp3_decoder.is_none() {
+        *mp3_decoder = Mp3FrameDecoder::new();
+    }
+    let Some(decoder) = mp3_decoder else {
+        return decode_buffer(mem, format, audio_data, audio_data_byte_size, packet_descs);
+    };
+
+    let data = mem.bytes_at(audio_data, audio_data_byte_size);
+    let mut frames: Vec<&[u8]> = packet_descs
+        .iter()
+        .filter_map(|&(start, size)| data.get(start as usize..)?.get(..size as usize))
+        .collect();
+    if frames.is_empty() {
+        // MP3 is self-framing, so packet descriptions are optional.
+        let mut pos = 0;
+        while pos + 4 <= data.len() {
+            match parse_mp3_frame_header(&data[pos..]) {
+                Some(header) if pos + header.frame_len <= data.len() => {
+                    frames.push(&data[pos..][..header.frame_len]);
+                    pos += header.frame_len;
+                }
+                _ => pos += 1,
+            }
+        }
+    }
+
+    let mut pcm = Vec::new();
+    let mut spec: Option<(u32, u32)> = None;
+    for frame in frames {
+        let Some((frame_pcm, rate, channels)) = decoder.decode_frame(frame) else {
+            continue;
+        };
+        // An OpenAL buffer has one format, so a buffer that changes channel
+        // count mid-way (very unusual) keeps the first one.
+        if *spec.get_or_insert((rate, channels)) == (rate, channels) {
+            pcm.extend_from_slice(frame_pcm);
+        }
+    }
+    let (rate, channels) = spec.unwrap_or((
+        format.sample_rate as u32,
+        format.channels_per_frame,
+    ));
+    let al_format = if channels == 2 {
+        al::AL_FORMAT_STEREO16
+    } else {
+        al::AL_FORMAT_MONO16
+    };
+    (al_format, rate as ALsizei, pcm)
 }
 
 pub fn decode_buffer(
@@ -1997,7 +2068,8 @@ fn prime_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
             .cloned()
             .unwrap_or_default();
 
-        let (al_format, al_frequency, data) = decode_buffer(
+        let (al_format, al_frequency, data) = decode_queue_buffer(
+            &mut host_object.mp3_decoder,
             &env.mem,
             &host_object.format,
             next_buffer.audio_data.cast(),
@@ -2803,6 +2875,8 @@ fn AudioQueueReset(env: &mut Environment, in_aq: AudioQueueRef) -> OSStatus {
 
     host_object.buffer_queue.clear();
     host_object.offline_pcm.clear();
+    // Whatever's enqueued next needn't follow on from what came before.
+    host_object.mp3_decoder = None;
 
     if host_object.is_input {
         // Drop pending data: delivery resumes from the current capture
@@ -2992,6 +3066,7 @@ pub fn AudioQueueNewInput(
         offline_render_format: None,
         offline_pcm: VecDeque::new(),
         offline_pcm_channels: 0,
+        mp3_decoder: None,
     };
 
     let aq_ref = env.mem.alloc_and_write(OpaqueAudioQueue { _filler: 0 });
@@ -3185,6 +3260,74 @@ mod offline_render_tests {
             bits_per_channel: bits,
             _reserved: 0,
         }
+    }
+
+    #[test]
+    fn decodes_mp3_a_frame_at_a_time() {
+        // FMOD enqueues one MP3 frame per buffer. Most frames use bits from
+        // the frames before them, so this only works if the queue's decoder
+        // carries over from buffer to buffer.
+        let bytes = include_bytes!("../../../tests/fixtures/sine-440hz-mono.mp3").to_vec();
+        let file = crate::audio::AudioFile::read_mp3_packets_from_vec(bytes).unwrap();
+        let packets = file.compressed_packets().unwrap();
+        let format = AudioStreamBasicDescription {
+            sample_rate: 44100.0,
+            format_id: kAudioFormatMPEGLayer3,
+            format_flags: 0,
+            bytes_per_packet: 0,
+            frames_per_packet: 1152,
+            bytes_per_frame: 0,
+            channels_per_frame: 1,
+            bits_per_channel: 0,
+            _reserved: 0,
+        };
+
+        let mut mem = Mem::new();
+        let data: MutPtr<u8> = mem.alloc(packets.byte_count() as GuestUSize).cast();
+        mem.bytes_at_mut(data, packets.byte_count() as GuestUSize)
+            .copy_from_slice(&packets.packet_bytes);
+
+        let mut decoder = None;
+        let mut frame_by_frame = Vec::new();
+        for i in 0..packets.packet_count() {
+            let (offset, size) = packets.packet_info(i).unwrap();
+            let (al_format, rate, pcm) = decode_queue_buffer(
+                &mut decoder,
+                &mem,
+                &format,
+                data + offset as GuestUSize,
+                size,
+                &[],
+            );
+            assert_eq!((al_format, rate), (al::AL_FORMAT_MONO16, 44100));
+            frame_by_frame.extend_from_slice(&pcm);
+        }
+        let frame_count = packets.packet_count() as usize * 1152;
+        assert_eq!(frame_by_frame.len(), frame_count * 2);
+
+        let mut decoder = None;
+        let (_, _, all_at_once) = decode_queue_buffer(
+            &mut decoder,
+            &mem,
+            &format,
+            data,
+            packets.byte_count() as GuestUSize,
+            &[],
+        );
+        assert_eq!(frame_by_frame, all_at_once);
+
+        // It should be the 440 Hz tone: count the zero crossings in the
+        // middle of it, away from the encoder's delay and padding.
+        let samples: Vec<i16> = frame_by_frame
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        let middle = &samples[4410..4410 + 11025];
+        let crossings = middle
+            .windows(2)
+            .filter(|w| (w[0] < 0) != (w[1] < 0))
+            .count();
+        assert!((215..=225).contains(&crossings), "{}", crossings);
     }
 
     #[test]
