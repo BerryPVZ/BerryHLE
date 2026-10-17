@@ -317,7 +317,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         host.started = false;
     }
     if start_immediately {
-        msg![env; this start];
+        () = msg![env; this start];
     }
     this
 }
