@@ -123,6 +123,10 @@ struct AudioQueueHostObject {
     /// in offline-rendering mode and the caller is expected to drive playback
     /// via `AudioQueueOfflineRender`.
     offline_render_format: Option<AudioStreamBasicDescription>,
+    /// Offline mode: decoded audio that `AudioQueueOfflineRender` hasn't
+    /// handed out yet, interleaved 16-bit samples at `offline_pcm_channels`.
+    offline_pcm: VecDeque<i16>,
+    offline_pcm_channels: u32,
 }
 
 /// Track whether the audio queue is meant to be running, in order to handle
@@ -239,6 +243,9 @@ const kAudioQueueErr_InvalidProperty: OSStatus = -66684;
 /// `kAudioQueueErr_QueueNotStopped` from Apple's `AudioQueue.h`. Returned by
 /// `AudioQueueSetOfflineRenderFormat` when the queue is currently running.
 const kAudioQueueErr_QueueNotStopped: OSStatus = -66677;
+/// `kAudioQueueErr_InvalidOfflineMode`: `AudioQueueOfflineRender` on a queue
+/// that isn't in offline mode.
+const kAudioQueueErr_InvalidOfflineMode: OSStatus = -66626;
 /// Floor for `AudioQueueLevelMeterState` values (Apple clamps meters at
 /// -160 dB).
 const MIN_LEVEL_METER_DB: f32 = -160.0;
@@ -329,6 +336,8 @@ pub fn AudioQueueNewOutput(
         input_host_cursor: 0.0,
         hardware_codec_policy: codec_policy::DEFAULT,
         offline_render_format: None,
+        offline_pcm: VecDeque::new(),
+        offline_pcm_channels: 0,
     };
 
     let aq_ref = env.mem.alloc_and_write(OpaqueAudioQueue { _filler: 0 });
@@ -1126,6 +1135,191 @@ fn AudioQueueSetOfflineRenderFormat(
     0 // success
 }
 
+/// `OSStatus AudioQueueOfflineRender(AudioQueueRef inAQ,
+///     const AudioTimeStamp *inTimestamp, AudioQueueBufferRef ioBuffer,
+///     UInt32 inNumberFrames)`
+///
+/// Renders up to `inNumberFrames` frames of the queue's audio into `ioBuffer`
+/// in the offline render format, without playing it. Apps use this to decode
+/// compressed audio: FMOD's iOS MP3 codec (and so Real Racing 3's music)
+/// feeds MP3 packets in and pulls PCM out. Enqueued buffers are decoded as
+/// needed, and each one is handed back to the output callback once used up
+/// so that the app can refill it. Fewer frames are rendered once the app
+/// stops supplying data.
+fn AudioQueueOfflineRender(
+    env: &mut Environment,
+    in_aq: AudioQueueRef,
+    _in_timestamp: ConstVoidPtr,
+    io_buffer: AudioQueueBufferRef,
+    in_number_frames: u32,
+) -> OSStatus {
+    return_if_null!(in_aq);
+    let Some(host_object) = State::get(&mut env.framework_state)
+        .audio_queues
+        .get(&in_aq)
+    else {
+        return kAudioQueueErr_InvalidProperty;
+    };
+    let Some(out_format) = host_object.offline_render_format else {
+        return kAudioQueueErr_InvalidOfflineMode;
+    };
+    let (in_format, callback_proc, callback_user_data) = (
+        host_object.format,
+        host_object.callback_proc,
+        host_object.callback_user_data,
+    );
+    if io_buffer.is_null() {
+        return kAudioQueueErr_InvalidBuffer;
+    }
+
+    let bytes_per_frame = out_format.bytes_per_frame.max(1);
+    let capacity = env.mem.read(io_buffer).audio_data_bytes_capacity;
+    let frames = in_number_frames.min(capacity / bytes_per_frame) as usize;
+
+    // Decode enqueued buffers until enough audio is available.
+    loop {
+        let Some(host_object) = State::get(&mut env.framework_state)
+            .audio_queues
+            .get_mut(&in_aq)
+        else {
+            // The output callback disposed of the queue.
+            return 0;
+        };
+        let channels = host_object.offline_pcm_channels.max(1) as usize;
+        if host_object.offline_pcm.len() >= frames * channels {
+            break;
+        }
+        let Some(buffer_ref) = host_object.buffer_queue.pop_front() else {
+            break;
+        };
+        let packet_descs = host_object
+            .buffer_packet_descs
+            .get(&buffer_ref)
+            .cloned()
+            .unwrap_or_default();
+        let buffer = env.mem.read(buffer_ref);
+        let (al_format, sample_rate, pcm) = decode_buffer(
+            &env.mem,
+            &in_format,
+            buffer.audio_data.cast(),
+            buffer.audio_data_byte_size,
+            &packet_descs,
+        );
+        let decoded_channels = if al_format == al::AL_FORMAT_STEREO16 {
+            2
+        } else {
+            1
+        };
+        if sample_rate as f64 != out_format.sample_rate {
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                log!(
+                    "AudioQueueOfflineRender: decoded audio is {} Hz but the offline \
+                     render format is {} Hz; not resampling.",
+                    sample_rate,
+                    { out_format.sample_rate }
+                )
+            });
+        }
+        let host_object = State::get(&mut env.framework_state)
+            .audio_queues
+            .get_mut(&in_aq)
+            .unwrap();
+        if host_object.offline_pcm.is_empty() {
+            host_object.offline_pcm_channels = decoded_channels;
+        }
+        let samples = pcm
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]));
+        if decoded_channels == host_object.offline_pcm_channels {
+            host_object.offline_pcm.extend(samples);
+        } else {
+            let samples: Vec<i16> = samples.collect();
+            let mut converted = Vec::new();
+            remix_i16(
+                &samples,
+                decoded_channels,
+                host_object.offline_pcm_channels,
+                &mut converted,
+            );
+            host_object.offline_pcm.extend(converted);
+        }
+        let () = callback_proc.call_from_host(env, (callback_user_data, in_aq, buffer_ref));
+    }
+
+    let Some(host_object) = State::get(&mut env.framework_state)
+        .audio_queues
+        .get_mut(&in_aq)
+    else {
+        return 0;
+    };
+    let channels = host_object.offline_pcm_channels.max(1);
+    let available = host_object.offline_pcm.len() / channels as usize;
+    let rendered = frames.min(available);
+    let samples: Vec<i16> = host_object
+        .offline_pcm
+        .drain(..rendered * channels as usize)
+        .collect();
+    let mut bytes = Vec::with_capacity(rendered * bytes_per_frame as usize);
+    write_offline_pcm(&samples, channels, &out_format, &mut bytes);
+
+    let mut buffer = env.mem.read(io_buffer);
+    let byte_count = bytes.len() as GuestUSize;
+    if byte_count > 0 {
+        env.mem
+            .bytes_at_mut(buffer.audio_data.cast(), byte_count)
+            .copy_from_slice(&bytes);
+    }
+    buffer.audio_data_byte_size = byte_count;
+    env.mem.write(io_buffer, buffer);
+    0 // success
+}
+
+/// Convert interleaved samples from `from` channels to `to` channels (mono
+/// to stereo duplicates, stereo to mono averages, otherwise channels are
+/// dropped or zero-filled), appending to `out`.
+fn remix_i16(samples: &[i16], from: u32, to: u32, out: &mut Vec<i16>) {
+    let (from, to) = (from.max(1) as usize, to.max(1) as usize);
+    for frame in samples.chunks_exact(from) {
+        if from == 2 && to == 1 {
+            out.push(((frame[0] as i32 + frame[1] as i32) / 2) as i16);
+        } else if from == 1 {
+            out.extend(std::iter::repeat(frame[0]).take(to));
+        } else {
+            out.extend((0..to).map(|c| frame.get(c).copied().unwrap_or(0)));
+        }
+    }
+}
+
+/// Write interleaved 16-bit samples with `channels` channels in `format`
+/// (linear PCM, 16 or 32-bit integer or 32-bit float), appending to `out`.
+fn write_offline_pcm(
+    samples: &[i16],
+    channels: u32,
+    format: &AudioStreamBasicDescription,
+    out: &mut Vec<u8>,
+) {
+    let mut remixed = Vec::new();
+    let samples = if channels == format.channels_per_frame {
+        samples
+    } else {
+        remix_i16(samples, channels, format.channels_per_frame, &mut remixed);
+        &remixed
+    };
+    let is_float = (format.format_flags & kAudioFormatFlagIsFloat) != 0;
+    let big_endian = (format.format_flags & kAudioFormatFlagIsBigEndian) != 0;
+    for &sample in samples {
+        match (format.bits_per_channel, is_float, big_endian) {
+            (32, true, false) => out.extend((sample as f32 / 32768.0).to_le_bytes()),
+            (32, true, true) => out.extend((sample as f32 / 32768.0).to_be_bytes()),
+            (32, false, false) => out.extend(((sample as i32) << 16).to_le_bytes()),
+            (32, false, true) => out.extend(((sample as i32) << 16).to_be_bytes()),
+            (_, _, true) => out.extend(sample.to_be_bytes()),
+            _ => out.extend(sample.to_le_bytes()),
+        }
+    }
+}
+
 pub fn log_if_broken_audio_format(format: &AudioStreamBasicDescription) {
     // Compressed formats (MPEG Layer III, AAC) intentionally use
     // zero for `bytes_per_packet`, `bytes_per_frame` and
@@ -1660,7 +1854,9 @@ fn prime_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
     // Input queues have no OpenAL source; they are driven by the host
     // microphone (see handle_input_audio_queue). Don't waste a source on
     // them — some games create many queues, and the source pool is finite.
-    if host_object.is_input {
+    // Offline queues don't play either: AudioQueueOfflineRender pulls their
+    // buffers.
+    if host_object.is_input || host_object.offline_render_format.is_some() {
         return;
     }
 
@@ -2396,6 +2592,19 @@ pub fn AudioQueueStart(
         return result;
     }
 
+    // Offline queues render on demand (AudioQueueOfflineRender) instead of
+    // to the output hardware.
+    if let Some(host_object) = State::get(&mut env.framework_state)
+        .audio_queues
+        .get_mut(&in_aq)
+    {
+        if host_object.offline_render_format.is_some() {
+            host_object.is_running = AudioQueueIsRunning::Running;
+            notify_aq_is_running(env, in_aq);
+            return 0;
+        }
+    }
+
     prime_audio_queue(env, in_aq);
 
     let (state, context) =
@@ -2593,6 +2802,7 @@ fn AudioQueueReset(env: &mut Environment, in_aq: AudioQueueRef) -> OSStatus {
     }
 
     host_object.buffer_queue.clear();
+    host_object.offline_pcm.clear();
 
     if host_object.is_input {
         // Drop pending data: delivery resumes from the current capture
@@ -2780,6 +2990,8 @@ pub fn AudioQueueNewInput(
         input_host_cursor: 0.0,
         hardware_codec_policy: codec_policy::DEFAULT,
         offline_render_format: None,
+        offline_pcm: VecDeque::new(),
+        offline_pcm_channels: 0,
     };
 
     let aq_ref = env.mem.alloc_and_write(OpaqueAudioQueue { _filler: 0 });
@@ -2808,6 +3020,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(AudioQueueGetProperty(_, _, _, _)),
     export_c_func!(AudioQueueSetProperty(_, _, _, _)),
     export_c_func!(AudioQueueSetOfflineRenderFormat(_, _, _)),
+    export_c_func!(AudioQueueOfflineRender(_, _, _, _)),
     export_c_func!(AudioQueuePrime(_, _, _)),
     export_c_func!(AudioQueueStart(_, _)),
     export_c_func!(AudioQueuePause(_)),
@@ -2953,5 +3166,55 @@ mod tests {
             _packet_descriptions: Ptr::null(),
             _packet_description_count: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod offline_render_tests {
+    use super::*;
+
+    fn pcm_format(channels: u32, bits: u32, flags: u32) -> AudioStreamBasicDescription {
+        AudioStreamBasicDescription {
+            sample_rate: 44100.0,
+            format_id: kAudioFormatLinearPCM,
+            format_flags: flags,
+            bytes_per_packet: channels * bits / 8,
+            frames_per_packet: 1,
+            bytes_per_frame: channels * bits / 8,
+            channels_per_frame: channels,
+            bits_per_channel: bits,
+            _reserved: 0,
+        }
+    }
+
+    #[test]
+    fn remixes_channels() {
+        let mut out = Vec::new();
+        remix_i16(&[100, 300, -50, 50], 2, 1, &mut out);
+        assert_eq!(out, [200, 0]);
+        out.clear();
+        remix_i16(&[7, -7], 1, 2, &mut out);
+        assert_eq!(out, [7, 7, -7, -7]);
+    }
+
+    #[test]
+    fn writes_requested_sample_formats() {
+        let mut out = Vec::new();
+        write_offline_pcm(&[1, -2], 2, &pcm_format(2, 16, 0), &mut out);
+        assert_eq!(out, [1, 0, 0xfe, 0xff]);
+
+        out.clear();
+        write_offline_pcm(
+            &[16384],
+            1,
+            &pcm_format(1, 32, kAudioFormatFlagIsFloat),
+            &mut out,
+        );
+        assert_eq!(out, 0.5f32.to_le_bytes());
+
+        // Mono source, stereo destination.
+        out.clear();
+        write_offline_pcm(&[3], 1, &pcm_format(2, 16, 0), &mut out);
+        assert_eq!(out, [3, 0, 3, 0]);
     }
 }
