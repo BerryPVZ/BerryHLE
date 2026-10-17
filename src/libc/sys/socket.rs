@@ -192,6 +192,10 @@ struct SocketHostObject {
     udp_socket: Option<UdpSocket>,
     /// Domain of the socket
     domain: i32,
+    /// Address recorded by `bind()` while network access is disabled. Such a
+    /// socket never gets a host socket: it can be bound and listened on, but
+    /// no connection ever arrives (see [socket]).
+    offline_address: Option<SocketAddr>,
 }
 
 #[derive(Default)]
@@ -210,16 +214,12 @@ impl State {
 fn socket(env: &mut Environment, domain: i32, type_: i32, protocol: i32) -> FileDescriptor {
     // errno is set on every failure path below.
     set_errno(env, 0);
-    if !env.options.network_access {
-        log_dbg!(
-            "Network access is disabled, socket({}, {}, {}) => -1",
-            domain,
-            type_,
-            protocol
-        );
-        set_errno(env, EPROTONOSUPPORT);
-        return -1;
-    }
+    // Creating a socket works even when network access is disabled, as it
+    // does on a real device without connectivity: the socket only becomes
+    // a host socket in bind(), connect() or sendto(), and those refuse to
+    // touch the host network in that case. Failing here instead broke apps
+    // whose audio engine opens a listening socket while initializing (e.g.
+    // FMOD's profiler in Where's My Water), which then gave up on sound.
 
     if domain != AF_INET && domain != AF_INET6 {
         set_errno(env, EAFNOSUPPORT);
@@ -254,6 +254,7 @@ fn socket(env: &mut Environment, domain: i32, type_: i32, protocol: i32) -> File
         tcp_stream: None,
         udp_socket: None,
         domain,
+        offline_address: None,
     };
     State::get_mut(env).sockets.insert(fd, host_object);
 
@@ -673,6 +674,20 @@ fn bind(
         type_str,
         socket_address
     );
+    if !env.options.network_access {
+        let sock = State::get_mut(env).sockets.get_mut(&socket).unwrap();
+        if sock.offline_address.is_some() {
+            // already bound
+            set_errno(env, EINVAL);
+            return -1;
+        }
+        log_dbg!(
+            "bind({}): network access is disabled, not binding on host",
+            socket
+        );
+        sock.offline_address = Some(socket_address);
+        return 0;
+    }
     match type_ {
         SOCK_STREAM => {
             if State::get(env)
@@ -848,6 +863,15 @@ fn connect(
         address_len,
         socket_address
     );
+    if !env.options.network_access {
+        log!(
+            "connect({}, {:?}): network access is disabled, returning ENETUNREACH",
+            socket,
+            socket_address
+        );
+        set_errno(env, ENETUNREACH);
+        return -1;
+    }
 
     if State::get(env)
         .sockets
@@ -1084,7 +1108,12 @@ fn select(
                                 }
                             }
                         }
-                        let stream = socket_host_object.tcp_stream.as_ref().unwrap();
+                        let Some(stream) = socket_host_object.tcp_stream.as_ref() else {
+                            // Neither listening on nor connected to the host
+                            // network (e.g. bound while network access is
+                            // disabled), so it never becomes readable.
+                            return false;
+                        };
                         // Peek just one byte to check if we have some data
                         let mut buf = [0; 1];
                         match stream.peek(&mut buf) {
@@ -1377,6 +1406,7 @@ fn accept(
             tcp_stream: Some(stream),
             udp_socket: None,
             domain,
+            offline_address: None,
         };
         State::get_mut(env).sockets.insert(new_fd, host_object);
         if !address.is_null() {
@@ -1387,7 +1417,19 @@ fn accept(
 
     // re-borrow
     let socket_host_object = State::get(env).sockets.get(&socket).unwrap();
-    let listener = socket_host_object.tcp_listener.as_ref().unwrap();
+    let Some(listener) = socket_host_object.tcp_listener.as_ref() else {
+        if socket_host_object.offline_address.is_some() {
+            // Listening without network access: no client can connect.
+            set_errno(env, EAGAIN);
+        } else {
+            log!(
+                "accept: socket {} is not listening, returning EINVAL",
+                socket
+            );
+            set_errno(env, EINVAL);
+        }
+        return -1;
+    };
     match listener.accept() {
         Ok((stream, addr)) => {
             log!("accept: New client: {}", addr);
@@ -1409,6 +1451,7 @@ fn accept(
                 tcp_stream: Some(stream),
                 udp_socket: None,
                 domain,
+                offline_address: None,
             };
             State::get_mut(env).sockets.insert(new_fd, host_object);
             if !address.is_null() {
@@ -1799,6 +1842,15 @@ fn sendto(
         socket_address,
         dest_address_len
     );
+    if !env.options.network_access {
+        log!(
+            "sendto({}, {:?}): network access is disabled, returning ENETUNREACH",
+            socket,
+            socket_address
+        );
+        set_errno(env, ENETUNREACH);
+        return -1;
+    }
     let num_bytes_written = match type_ {
         SOCK_DGRAM => {
             if State::get(env)
@@ -1979,6 +2031,8 @@ fn getsockname(
                         return -1;
                     }
                 }
+            } else if let Some(addr) = sock.offline_address {
+                addr
             } else {
                 set_errno(env, EINVAL);
                 return -1;
@@ -1994,6 +2048,8 @@ fn getsockname(
                         return -1;
                     }
                 }
+            } else if let Some(addr) = sock.offline_address {
+                addr
             } else {
                 set_errno(env, EINVAL);
                 return -1;
@@ -2269,6 +2325,7 @@ pub fn duplicate_socket(env: &mut Environment, old_fd: i32, new_fd: i32) -> bool
             .map(|udp| try_clone_host_socket("udp_socket", udp.try_clone()))
             .flatten(),
         domain: socket.domain,
+        offline_address: socket.offline_address,
     };
     State::get_mut(env).sockets.insert(new_fd, duplicated);
     log_dbg!("duplicate_socket({}, {})", old_fd, new_fd);

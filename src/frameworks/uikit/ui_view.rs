@@ -295,7 +295,6 @@ fn touchhle_cocos_should_force_landscape_view(env: &mut Environment, view: id) -
     if crate::env_flag_cached!("TOUCHHLE_COCOS_FORCE_LANDSCAPE_VIEW")
         || crate::env_flag_cached!("TOUCHHLE_UNITY_FORCE_LANDSCAPE_VIEW")
         || crate::env_flag_cached!("TOUCHHLE_ENGINE_FORCE_LANDSCAPE_VIEW")
-        || env.bundle.bundle_identifier() == "com.disney.SwampyGame"
         || crate::env_flag_cached!("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS")
     {
         return true;

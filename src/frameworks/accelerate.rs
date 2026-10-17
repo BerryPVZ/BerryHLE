@@ -662,6 +662,54 @@ fn vDSP_vsub(
     }
 }
 
+/// `vDSP_vdiv` — vector divide (single-precision).
+/// **Important**: the divisor comes first: C[i] = A[i] / B[i], where B is the
+/// first argument and A the second.
+/// Reference: https://developer.apple.com/documentation/accelerate/1450752-vdsp_vdiv
+fn vDSP_vdiv(
+    env: &mut Environment,
+    input_b: ConstPtr<f32>,
+    stride_b: vDSP_Length,
+    input_a: ConstPtr<f32>,
+    stride_a: vDSP_Length,
+    output: MutPtr<f32>,
+    stride_c: vDSP_Length,
+    n: vDSP_Length,
+) {
+    let sa = stride_a.max(1) as GuestUSize;
+    let sb = stride_b.max(1) as GuestUSize;
+    let sc = stride_c.max(1) as GuestUSize;
+    for i in 0..(n as GuestUSize) {
+        let a: f32 = env.mem.read((input_a + i * sa).cast());
+        let b: f32 = env.mem.read((input_b + i * sb).cast());
+        env.mem.write((output + i * sc).cast(), a / b);
+    }
+}
+
+/// `vDSP_vdist` — element-wise distance (single-precision).
+/// C[i] = sqrt(A[i]^2 + B[i]^2)
+/// Reference: https://developer.apple.com/documentation/accelerate/1450283-vdsp_vdist
+fn vDSP_vdist(
+    env: &mut Environment,
+    input_a: ConstPtr<f32>,
+    stride_a: vDSP_Length,
+    input_b: ConstPtr<f32>,
+    stride_b: vDSP_Length,
+    output: MutPtr<f32>,
+    stride_c: vDSP_Length,
+    n: vDSP_Length,
+) {
+    let sa = stride_a.max(1) as GuestUSize;
+    let sb = stride_b.max(1) as GuestUSize;
+    let sc = stride_c.max(1) as GuestUSize;
+    for i in 0..(n as GuestUSize) {
+        let a: f32 = env.mem.read((input_a + i * sa).cast());
+        let b: f32 = env.mem.read((input_b + i * sb).cast());
+        env.mem
+            .write((output + i * sc).cast(), (a * a + b * b).sqrt());
+    }
+}
+
 /// `vDSP_vmax` — element-wise maximum of two vectors (single-precision).
 /// C[i] = max(A[i], B[i])
 /// Reference: https://developer.apple.com/documentation/accelerate/1450032-vdsp_vmax
@@ -724,6 +772,24 @@ fn vDSP_sve(
     for i in 0..(n as GuestUSize) {
         let val: f32 = env.mem.read((input + i * s).cast());
         sum += val;
+    }
+    env.mem.write(output, sum);
+}
+
+/// `vDSP_svesq` — sum of squares of vector elements (single-precision).
+/// Reference: https://developer.apple.com/documentation/accelerate/1450462-vdsp_svesq
+fn vDSP_svesq(
+    env: &mut Environment,
+    input: ConstPtr<f32>,
+    stride: vDSP_Length,
+    output: MutPtr<f32>,
+    n: vDSP_Length,
+) {
+    let s = stride.max(1) as GuestUSize;
+    let mut sum: f32 = 0.0;
+    for i in 0..(n as GuestUSize) {
+        let val: f32 = env.mem.read((input + i * s).cast());
+        sum += val * val;
     }
     env.mem.write(output, sum);
 }
@@ -1055,9 +1121,12 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(vDSP_dotpr(_, _, _, _, _, _)),
     export_c_func!(vDSP_vsdiv(_, _, _, _, _, _)),
     export_c_func!(vDSP_vsub(_, _, _, _, _, _, _)),
+    export_c_func!(vDSP_vdiv(_, _, _, _, _, _, _)),
+    export_c_func!(vDSP_vdist(_, _, _, _, _, _, _)),
     export_c_func!(vDSP_vmax(_, _, _, _, _, _, _)),
     export_c_func!(vDSP_vmin(_, _, _, _, _, _, _)),
     export_c_func!(vDSP_sve(_, _, _, _)),
+    export_c_func!(vDSP_svesq(_, _, _, _)),
     export_c_func!(vDSP_normalize(_, _, _, _, _, _, _)),
     export_c_func!(vDSP_vabs(_, _, _, _, _)),
     export_c_func!(vDSP_vneg(_, _, _, _, _)),

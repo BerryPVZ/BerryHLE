@@ -2086,6 +2086,16 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
         stream_format.channels_per_frame * bytes_per_sample
     };
     let buffer_size = frames * bytes_per_frame;
+    // Resident Evil 4 asks for non-interleaved 16-bit stereo, but its render
+    // callback ignores that and writes whole interleaved frames (4 bytes each)
+    // into every buffer (then copies buffer 0 into the others). With planes of
+    // exactly `buffer_size` bytes it overran the heap on every render and
+    // corrupted unrelated game objects, freezing the title screen. Back each
+    // plane with room for full frames, and fill the extra space with a canary
+    // so we can tell afterwards how the data was written.
+    let interleaved_size = frames * stream_format.channels_per_frame * bytes_per_sample;
+    let plane_alloc_size = buffer_size.max(interleaved_size);
+    const PLANE_SLACK_CANARY: u8 = 0xA5;
 
     // PERF OPTIMIZATION (audio): top the queue up to AUDIO_RENDER_TARGET_DEPTH
     // in a single run-loop tick instead of exactly one buffer per tick. After
@@ -2112,8 +2122,10 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
             MutVoidPtr,
             Option<MutVoidPtr>,
         ) = if planar_stereo_buffers {
-            let buf1 = env.mem.alloc(buffer_size);
-            let buf2 = env.mem.alloc(buffer_size);
+            let buf1 = env.mem.alloc(plane_alloc_size);
+            let buf2 = env.mem.alloc(plane_alloc_size);
+            env.mem.bytes_at_mut(buf1.cast(), plane_alloc_size)[buffer_size as usize..]
+                .fill(PLANE_SLACK_CANARY);
             let abl = env.mem.alloc_and_write(AudioBufferList::<2> {
                 number_buffers: 2,
                 buffers: [
@@ -2197,7 +2209,26 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
         );
         sample_time += frames as f64;
 
-        let (al_fmt, decoded_sample_rate, processed) = if planar_stereo_buffers {
+        let wrote_interleaved_frames = planar_stereo_buffers
+            && env.mem.bytes_at(buffer1_data.cast(), plane_alloc_size)[buffer_size as usize..]
+                .iter()
+                .any(|&byte| byte != PLANE_SLACK_CANARY);
+        if wrote_interleaved_frames {
+            log_once!(
+                "AudioUnit: render callback wrote interleaved frames into a \
+                 non-interleaved buffer; playing the first buffer as interleaved"
+            );
+        }
+        let (al_fmt, decoded_sample_rate, processed) = if wrote_interleaved_frames {
+            let interleaved_format = interleaved_format_for_planar_pcm(stream_format);
+            decode_buffer(
+                &env.mem,
+                &interleaved_format,
+                buffer1_data.cast(),
+                interleaved_size,
+                &[],
+            )
+        } else if planar_stereo_buffers {
             match buffer2_data {
                 Some(buffer2_data) => {
                     let planes = [

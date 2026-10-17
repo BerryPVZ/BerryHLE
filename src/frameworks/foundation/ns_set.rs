@@ -68,10 +68,18 @@ pub const CLASSES: ClassExports = objc_classes! {
     autorelease(env, new)
 }
 
-+ (id)setWithSet:(id)object {
-    // assert!(object != nil);
++ (id)setWithSet:(id)other { // NSSet*
+    // The new set holds the *members* of `other`, not `other` itself.
+    // Kick The Buddy: Second Kick filters each touch event with
+    // `[[NSMutableSet setWithSet:touches] intersectSet:...]`, which always came
+    // out empty when this was built with -initWithObject:, so no touch ever
+    // reached the game.
     let new: id = msg![env; this alloc];
-    let new: id = msg![env; new initWithObject:object];
+    let new: id = if other == nil {
+        msg![env; new init]
+    } else {
+        msg![env; new initWithSet:other]
+    };
     autorelease(env, new)
 }
 

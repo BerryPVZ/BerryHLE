@@ -17,8 +17,16 @@ use crate::mem::SafeRead;
 use crate::objc::{id, msg, msg_class, nil};
 use crate::Environment;
 
+/// The `FromStr` impls below implement `CGPointFromString` and friends, which
+/// ignore whitespace: `"{{0,0},{64,32}}"` (the usual form in sprite sheet
+/// plists) and `"{ 1, 2 }"` parse just like `NSStringFromCGRect`'s
+/// `"{{0, 0}, {64, 32}}"`.
+fn strip_whitespace(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
 fn parse_tuple(s: &str) -> Result<(f32, f32), ()> {
-    let (a, b) = s.split_once(", ").ok_or(())?;
+    let (a, b) = s.split_once(',').ok_or(())?;
     Ok((a.parse().map_err(|_| ())?, b.parse().map_err(|_| ())?))
 }
 
@@ -50,6 +58,7 @@ impl GuestArg for CGPoint {
 impl std::str::FromStr for CGPoint {
     type Err = ();
     fn from_str(s: &str) -> Result<CGPoint, ()> {
+        let s = strip_whitespace(s);
         let s = s.strip_prefix('{').ok_or(())?.strip_suffix('}').ok_or(())?;
         let (x, y) = parse_tuple(s)?;
         Ok(CGPoint { x, y })
@@ -127,6 +136,7 @@ impl GuestArg for CGSize {
 impl std::str::FromStr for CGSize {
     type Err = ();
     fn from_str(s: &str) -> Result<CGSize, ()> {
+        let s = strip_whitespace(s);
         let s = s.strip_prefix('{').ok_or(())?.strip_suffix('}').ok_or(())?;
         let (w, h) = parse_tuple(s)?;
         Ok(CGSize {
@@ -210,12 +220,13 @@ impl GuestArg for CGRect {
 impl std::str::FromStr for CGRect {
     type Err = ();
     fn from_str(s: &str) -> Result<CGRect, ()> {
+        let s = strip_whitespace(s);
         let s = s
             .strip_prefix("{{")
             .ok_or(())?
             .strip_suffix("}}")
             .ok_or(())?;
-        let (a, b) = s.split_once("}, {").ok_or(())?;
+        let (a, b) = s.split_once("},{").ok_or(())?;
         let (x, y) = parse_tuple(a)?;
         let (width, height) = parse_tuple(b)?;
         Ok(CGRect {
@@ -883,3 +894,38 @@ pub const CONSTANTS: ConstantExports = &[
         HostConstant::Custom(|env| env.mem.alloc_and_write(CGRectInfinite).cast().cast_const()),
     ),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::{CGPoint, CGRect, CGSize};
+
+    #[test]
+    fn geometry_from_string_ignores_whitespace() {
+        let rect = CGRect {
+            origin: CGPoint { x: 2.0, y: -4.5 },
+            size: CGSize {
+                width: 64.0,
+                height: 32.0,
+            },
+        };
+        assert_eq!("{{2, -4.5}, {64, 32}}".parse(), Ok(rect));
+        assert_eq!("{{2,-4.5},{64,32}}".parse(), Ok(rect));
+        assert_eq!(" { {2 ,-4.5} , {64, 32 } } ".parse(), Ok(rect));
+        assert_eq!(rect.to_string().parse(), Ok(rect));
+
+        let point = CGPoint { x: 1.0, y: 2.0 };
+        assert_eq!("{1,2}".parse(), Ok(point));
+        assert_eq!("{ 1,2 }".parse(), Ok(point));
+        assert_eq!("{1, 2}".parse(), Ok(point));
+        assert_eq!(
+            "{3,4}".parse(),
+            Ok(CGSize {
+                width: 3.0,
+                height: 4.0
+            })
+        );
+
+        assert_eq!("{1;2}".parse::<CGPoint>(), Err(()));
+        assert_eq!("{{1,2},{3}}".parse::<CGRect>(), Err(()));
+    }
+}

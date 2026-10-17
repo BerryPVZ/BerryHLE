@@ -671,8 +671,10 @@ impl Environment {
         let is_geometry_dash = bundle
             .bundle_identifier()
             .starts_with("com.robtop.geometryjump");
+        let is_wheres_my_water = bundle.bundle_identifier() == "com.disney.SwampyGame";
         // We always reset this flag depending on which game is launched.
-        mem.zero_memory_on_free = !is_spore && !is_critter_crunch && !is_geometry_dash;
+        mem.zero_memory_on_free =
+            !is_spore && !is_critter_crunch && !is_geometry_dash && !is_wheres_my_water;
         if is_spore {
             log!("Applying game-specific hack for Spore Origins: zeroing memory on alloc instead of free.");
         }
@@ -693,6 +695,15 @@ impl Environment {
             // chunk is reused, so zero on alloc instead, as for Spore Origins
             // and Critter Crunch above.
             log!("Applying game-specific hack for Geometry Dash: zeroing memory on alloc instead of free.");
+        }
+        if is_wheres_my_water {
+            // When a finger is lifted, Where's My Water's
+            // Widget_FingerCatcher::lostFingerHandled() walks a std::list
+            // through a node that has already been freed. With freed memory
+            // scrubbed, the node's `next` pointer reads as NULL and the walk
+            // loops forever on the null page, freezing the game on the first
+            // dig. Real malloc leaves the stale link in place.
+            log!("Applying game-specific hack for Where's My Water: zeroing memory on alloc instead of free.");
         }
         let executable = mach_o::MachO::load_from_bytes(
             &executable_bytes,
