@@ -476,6 +476,17 @@ pub const CLASSES: ClassExports = objc_classes! {
 
             let view_frame: CGRect = msg![env; view frame];
             log_dbg!("New view frame after re-applying old view frame: {view_frame:?}");
+
+            // The rotation swapped the view's bounds to landscape. UIKit lays
+            // the root view controller's view out again when it rotates, and
+            // apps depend on it: SDL 2's GL view recreates its renderbuffer
+            // from the new layer bounds in -layoutSubviews, and its view
+            // controller reports the new size to the game in
+            // -viewDidLayoutSubviews. Without this, Costume Quest kept a
+            // portrait renderbuffer and squeezed its landscape scene into it.
+            () = msg![env; vc viewWillLayoutSubviews];
+            () = msg![env; view layoutSubviews];
+            () = msg![env; vc viewDidLayoutSubviews];
         }
     }
 }
