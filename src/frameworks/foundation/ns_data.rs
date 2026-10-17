@@ -191,7 +191,7 @@ pub const CLASSES: ClassExports = objc_classes! {
                 return this;
             }
             let length: NSUInteger = response.body.len().try_into().unwrap_or(u32::MAX);
-            let bytes: MutPtr<u8> = env.mem.alloc(length);
+            let bytes: MutPtr<u8> = env.mem.alloc(length).cast();
             env.mem
                 .bytes_at_mut(bytes, length)
                 .copy_from_slice(&response.body);

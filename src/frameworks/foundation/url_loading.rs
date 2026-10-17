@@ -112,7 +112,7 @@ fn read_stream_body(env: &mut Environment, stream: id) -> Result<Vec<u8>, HttpEr
     let mut body = Vec::new();
     () = msg![env; stream open];
     loop {
-        let buffer: MutPtr<u8> = env.mem.alloc(CHUNK_SIZE);
+        let buffer: MutPtr<u8> = env.mem.alloc(CHUNK_SIZE).cast();
         let read: NSInteger = msg![env; stream read:buffer maxLength:CHUNK_SIZE];
         if read <= 0 {
             env.mem.free(buffer.cast());
@@ -491,7 +491,7 @@ pub fn make_foundation_response(env: &mut Environment, response: &HttpResponse) 
         msg_class![env; NSData data]
     } else {
         let length: NSUInteger = response.body.len().try_into().unwrap_or(u32::MAX);
-        let bytes: MutPtr<u8> = env.mem.alloc(length);
+        let bytes: MutPtr<u8> = env.mem.alloc(length).cast();
         env.mem
             .bytes_at_mut(bytes, length)
             .copy_from_slice(&response.body);
