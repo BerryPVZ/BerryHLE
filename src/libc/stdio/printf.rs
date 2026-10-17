@@ -881,7 +881,7 @@ fn f_format(
     if left_justified {
         format!("{float:<pad_width$.precision$}")
     } else if pad_char == '0' {
-        format!("{float:0>pad_width$.precision$}")
+        format!("{float:0pad_width$.precision$}")
     } else {
         // Space-padded right-justification: sign, then digits padded
         // with spaces to fill the total width.

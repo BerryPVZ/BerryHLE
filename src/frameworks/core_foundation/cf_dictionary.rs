@@ -20,7 +20,8 @@ use crate::dyld::{
 use crate::frameworks::core_foundation::cf_string::CFStringRef;
 use crate::frameworks::core_foundation::cf_type::{CFEqual, CFHash};
 use crate::frameworks::foundation::ns_dictionary::{
-    CFDictionaryKeyCallBacks, CFDictionaryValueCallBacks,
+    cf_dictionary_contains_value, cf_dictionary_lookup, CFDictionaryKeyCallBacks,
+    CFDictionaryValueCallBacks,
 };
 use crate::frameworks::foundation::NSUInteger;
 use crate::mem::{ConstPtr, ConstVoidPtr, Mem, MutVoidPtr};
@@ -111,14 +112,14 @@ fn CFDictionaryAddValue(
     value: ConstVoidPtr,
 ) {
     let key_id: id = key.cast().cast_mut();
-    let res: id = msg![env; dict objectForKey:key_id];
+    let exists = cf_dictionary_lookup(env, dict, key_id).is_some();
     log_dbg!(
         "CFDictionaryAddValue k {:?} v {:?}; exists={}",
         key,
         value,
-        res != nil
+        exists
     );
-    if res == nil {
+    if !exists {
         let value_id: id = value.cast().cast_mut();
         msg![env; dict setObject:value_id forKey:key_id]
     }
@@ -144,8 +145,7 @@ fn CFDictionaryReplaceValue(
 ) {
     // Only replaces if the key already exists.
     let key_id: id = key.cast().cast_mut();
-    let existing: id = msg![env; dict objectForKey:key_id];
-    if existing != nil {
+    if cf_dictionary_lookup(env, dict, key_id).is_some() {
         let value_id: id = value.cast().cast_mut();
         msg![env; dict setObject:value_id forKey:key_id]
     }
@@ -177,7 +177,7 @@ fn CFDictionaryGetValue(
     key: ConstVoidPtr,
 ) -> ConstVoidPtr {
     let key_id: id = key.cast().cast_mut();
-    let res: id = msg![env; dict objectForKey:key_id];
+    let res = cf_dictionary_lookup(env, dict, key_id).unwrap_or(nil);
     res.cast().cast_const()
 }
 
@@ -188,8 +188,7 @@ fn CFDictionaryGetValueIfPresent(
     value: MutVoidPtr, // void** — out param
 ) -> bool {
     let key_id: id = key.cast().cast_mut();
-    let res: id = msg![env; dict objectForKey:key_id];
-    if res != nil {
+    if let Some(res) = cf_dictionary_lookup(env, dict, key_id) {
         if !value.is_null() {
             env.mem
                 .write(value.cast::<ConstVoidPtr>(), res.cast().cast_const());
@@ -206,8 +205,7 @@ fn CFDictionaryContainsKey(
     key: ConstVoidPtr,
 ) -> bool {
     let key_id: id = key.cast().cast_mut();
-    let res: id = msg![env; dict objectForKey:key_id];
-    res != nil
+    cf_dictionary_lookup(env, dict, key_id).is_some()
 }
 
 fn CFDictionaryContainsValue(
@@ -216,16 +214,7 @@ fn CFDictionaryContainsValue(
     value: ConstVoidPtr,
 ) -> bool {
     let value_id: id = value.cast().cast_mut();
-    let values_arr: id = msg![env; dict allValues];
-    let count: NSUInteger = msg![env; values_arr count];
-    for i in 0..count {
-        let v: id = msg![env; values_arr objectAtIndex:i];
-        let eq: bool = msg![env; v isEqual:value_id];
-        if eq {
-            return true;
-        }
-    }
-    false
+    cf_dictionary_contains_value(env, dict, value_id)
 }
 
 pub(crate) fn CFDictionaryGetCount(env: &mut Environment, dict: CFDictionaryRef) -> CFIndex {

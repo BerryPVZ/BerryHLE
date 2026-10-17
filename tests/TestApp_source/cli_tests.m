@@ -3966,6 +3966,93 @@ int test_CFMutableDictionary_NullCallbacks() {
   return 0;
 }
 
+static CFDictionaryRef nullvalue_dict;
+
+// Also checks that the dictionary is intact while the callback runs.
+static Boolean nullvalue_equal_strings(const void *a, const void *b) {
+  return CFDictionaryGetCount(nullvalue_dict) == 1 && strcmp(a, b) == 0;
+}
+
+static CFHashCode nullvalue_hash(const void *value) { return 0; }
+
+int test_CFMutableDictionary_NullValue() {
+  CFMutableDictionaryRef dict = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
+  const char *key = "Key";
+  const char *otherKey = "OtherKey";
+  char value[] = "Value";
+  char sameText[] = "Value";
+  const void *out = value;
+
+  // A stored NULL is still an entry.
+  CFDictionarySetValue(dict, key, NULL);
+  if (CFDictionaryGetCount(dict) != 1 || !CFDictionaryContainsKey(dict, key) ||
+      CFDictionaryContainsKey(dict, otherKey)) {
+    CFRelease(dict);
+    return -1;
+  }
+  if (!CFDictionaryGetValueIfPresent(dict, key, &out) || out != NULL) {
+    CFRelease(dict);
+    return -2;
+  }
+  out = value;
+  if (CFDictionaryGetValueIfPresent(dict, otherKey, &out) || out != value) {
+    CFRelease(dict);
+    return -3;
+  }
+  if (!CFDictionaryContainsValue(dict, NULL)) {
+    CFRelease(dict);
+    return -4;
+  }
+  // AddValue keeps an existing NULL, ReplaceValue replaces it.
+  CFDictionaryAddValue(dict, key, value);
+  if (CFDictionaryGetValue(dict, key) != NULL) {
+    CFRelease(dict);
+    return -5;
+  }
+  CFDictionaryReplaceValue(dict, key, value);
+  if (CFDictionaryGetValue(dict, key) != value ||
+      CFDictionaryContainsValue(dict, NULL)) {
+    CFRelease(dict);
+    return -6;
+  }
+  // Without an equal callback, values are compared by pointer.
+  if (!CFDictionaryContainsValue(dict, value) ||
+      CFDictionaryContainsValue(dict, sameText)) {
+    CFRelease(dict);
+    return -7;
+  }
+  CFRelease(dict);
+
+  // With one, the callback decides.
+  CFDictionaryValueCallBacks valueCallbacks = {0, NULL, NULL, NULL,
+                                               nullvalue_equal_strings};
+  dict = CFDictionaryCreateMutable(NULL, 0, NULL, &valueCallbacks);
+  nullvalue_dict = dict;
+  CFDictionarySetValue(dict, key, value);
+  if (!CFDictionaryContainsValue(dict, sameText) ||
+      CFDictionaryContainsValue(dict, "Other")) {
+    CFRelease(dict);
+    return -8;
+  }
+  CFRelease(dict);
+
+  // The same for keys. The hash callback is constant, so lookups call equal.
+  CFDictionaryKeyCallBacks keyCallbacks = {0, NULL, NULL, NULL,
+                                           nullvalue_equal_strings,
+                                           nullvalue_hash};
+  dict = CFDictionaryCreateMutable(NULL, 0, &keyCallbacks, NULL);
+  nullvalue_dict = dict;
+  char keyCopy[] = "Key";
+  CFDictionarySetValue(dict, key, value);
+  if (CFDictionaryGetValue(dict, keyCopy) != value ||
+      !CFDictionaryContainsKey(dict, keyCopy)) {
+    CFRelease(dict);
+    return -9;
+  }
+  CFRelease(dict);
+  return 0;
+}
+
 // Counters for checking key/value callbacks
 static int keyRetainCount = 0;
 static int keyReleaseCount = 0;
@@ -5179,13 +5266,15 @@ static int compare_precision_examples(void) {
 }
 
 static int compare_special_float_values(void) {
-  /* Positive vs negative zero */
+  /* Positive vs negative zero: CFNumberCompare compares the signs first
+     (copysign), so -0.0 < +0.0 on the checked armv7 iOS versions
+     5.1.1, 6.1.3 and 10.3.3. Modern arm64 tagged numbers can compare equal. */
   {
     double pz = 0.0;
     double nz = -0.0;
     CFNumberRef nP = MAKE_NUM(pz, kCFNumberFloat64Type);
     CFNumberRef nN = MAKE_NUM(nz, kCFNumberFloat64Type);
-    TEST_CMP(nP, nN, kCFCompareEqualTo, "+0.0 == -0.0", -24);
+    TEST_CMP(nP, nN, kCFCompareGreaterThan, "+0.0 > -0.0", -24);
   }
 
   /* Infinities */
@@ -6801,6 +6890,7 @@ struct {
     FUNC_DEF(test_pthread_mutex_normal),
     FUNC_DEF(test_pthread_mutex_recursive_trylock),
     FUNC_DEF(test_CFMutableDictionary_NullCallbacks),
+    FUNC_DEF(test_CFMutableDictionary_NullValue),
     FUNC_DEF(test_CFMutableDictionary_CustomCallbacks_PrimitiveTypes),
     FUNC_DEF(test_CFMutableDictionary_CustomCallbacks_CFTypes),
     FUNC_DEF(test_lrint),
