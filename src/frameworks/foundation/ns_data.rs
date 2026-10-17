@@ -161,7 +161,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)initWithContentsOfURL:(id)url {
-    msg![env; this initWithContentsOfURL:url options:0u32 error:MutVoidPtr::null()]
+    msg![env; this initWithContentsOfURL:url options:0u32 error:(MutVoidPtr::null())]
 }
 
 - (id)initWithContentsOfURL:(id)url

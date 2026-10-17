@@ -477,7 +477,7 @@ pub fn make_foundation_http_response(env: &mut Environment, response: &HttpRespo
     let http_response: id = msg_class![env; NSHTTPURLResponse alloc];
     let http_response: id = msg![env;
         http_response initWithURL:url
-                       statusCode:response.status_code
+                       statusCode:(response.status_code)
                       HTTPVersion:version
                      headerFields:headers];
     autorelease(env, http_response)
@@ -518,7 +518,7 @@ pub fn make_foundation_error(env: &mut Environment, error: &HttpError) -> id {
     let ns_error: id = msg_class![env; NSError alloc];
     let ns_error: id = msg![env;
         ns_error initWithDomain:domain
-                           code:error.code
+                           code:(error.code)
                        userInfo:user_info];
     autorelease(env, ns_error)
 }
