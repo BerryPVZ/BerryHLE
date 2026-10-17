@@ -71,6 +71,10 @@ enum FontKind {
 struct UIFontHostObject {
     size: CGFloat,
     kind: FontKind,
+    /// A font the app supplied itself (e.g. via `CTFontCreateWithGraphicsFont`
+    /// on a `CGFont` loaded from its bundle). Used instead of `kind`'s
+    /// built-in font for drawing and metrics.
+    custom: Option<Font>,
 }
 impl HostObject for UIFontHostObject {}
 
@@ -99,6 +103,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let host_object = UIFontHostObject {
         size: 17.0,
         kind: FontKind::SansRegular,
+        custom: None,
     };
     env.objc.alloc_object(this, Box::new(host_object), &mut env.mem)
 }
@@ -123,6 +128,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let host_object = UIFontHostObject {
         size,
         kind: FontKind::SansRegular,
+        custom: None,
     };
     let new = env.objc.alloc_object(this, Box::new(host_object), &mut env.mem);
     autorelease(env, new)
@@ -137,6 +143,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let host_object = UIFontHostObject {
         size,
         kind: FontKind::SansBold,
+        custom: None,
     };
     let new = env.objc.alloc_object(this, Box::new(host_object), &mut env.mem);
     autorelease(env, new)
@@ -224,6 +231,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let host_object = UIFontHostObject {
         size,
         kind: FontKind::SansItalic,
+        custom: None,
     };
     let new = env.objc.alloc_object(this, Box::new(host_object), &mut env.mem);
     autorelease(env, new)
@@ -234,6 +242,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         let host_object = UIFontHostObject {
             kind: FontKind::SansRegular,
             size: fontSize,
+            custom: None,
         };
         let new = env.objc.alloc_object(this, Box::new(host_object), &mut env.mem);
         return autorelease(env, new);
@@ -244,6 +253,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             FontKind::SansRegular
         }),
         size: fontSize,
+        custom: None,
     };
     let new = env.objc.alloc_object(this, Box::new(host_object), &mut env.mem);
     autorelease(env, new)
@@ -282,21 +292,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 // than measured values.
 
 - (CGFloat)capHeight {
-    let (size, kind) = {
-        let host_object = env.objc.borrow::<UIFontHostObject>(this);
-        (host_object.size, host_object.kind)
-    };
-    let font = env.framework_state.uikit.ui_font.get_font_by_kind(kind);
+    let (font, size) = host_font(env, this);
     // Cap height is typically ~73% of the ascent for Helvetica-family fonts.
     (font.ascent(size) * 0.73).round()
 }
 
 - (CGFloat)xHeight {
-    let (size, kind) = {
-        let host_object = env.objc.borrow::<UIFontHostObject>(this);
-        (host_object.size, host_object.kind)
-    };
-    let font = env.framework_state.uikit.ui_font.get_font_by_kind(kind);
+    let (font, size) = host_font(env, this);
     // X-height is typically ~54% of the ascent for Helvetica-family fonts.
     (font.ascent(size) * 0.54).round()
 }
@@ -375,20 +377,17 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (CGFloat)ascender {
-    let host_object = env.objc.borrow::<UIFontHostObject>(this);
-    let font = env.framework_state.uikit.ui_font.get_font_by_kind(host_object.kind);
-    font.ascent(host_object.size)
+    let (font, size) = host_font(env, this);
+    font.ascent(size)
 }
 
 - (CGFloat)descender {
-    let host_object = env.objc.borrow::<UIFontHostObject>(this);
-    let font = env.framework_state.uikit.ui_font.get_font_by_kind(host_object.kind);
-    font.descent(host_object.size)
+    let (font, size) = host_font(env, this);
+    font.descent(size)
 }
 
 - (CGFloat)leading {
-    let host_object = env.objc.borrow::<UIFontHostObject>(this);
-    let font = env.framework_state.uikit.ui_font.get_font_by_kind(host_object.kind);
+    let (font, size) = host_font(env, this);
     // This _mostly_ lines up with what is reported on actual devices. It
     // seems there's variance between what apple and rusttype report for
     // leading/descent values, which is probably to be expected.
@@ -396,7 +395,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // As for what the 1.575 is doing here, I don't know. It's probably not
     // the right value, it's just (close) to a linear regression of size/leading
     // for Liberation Sans, and it mostly makes it work.
-    (font.ascent(host_object.size) - font.descent(host_object.size) + font.line_gap(host_object.size) + 1.575).round()
+    (font.ascent(size) - font.descent(size) + font.line_gap(size) + 1.575).round()
 }
 
 - (CGFloat)lineHeight {
@@ -407,8 +406,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)fontWithSize:(CGFloat)size {
-    let kind = env.objc.borrow::<UIFontHostObject>(this).kind;
-    let host_object = UIFontHostObject { size, kind };
+    let (kind, custom) = {
+        let host_object = env.objc.borrow::<UIFontHostObject>(this);
+        (host_object.kind, host_object.custom.clone())
+    };
+    let host_object = UIFontHostObject { size, kind, custom };
     let class_ptr = env.objc.get_known_class("UIFont", &mut env.mem);
     let new_font = env.objc.alloc_object(class_ptr, Box::new(host_object), &mut env.mem);
     autorelease(env, new_font)
@@ -442,28 +444,53 @@ pub fn is_uifont(env: &mut Environment, obj: crate::objc::id) -> bool {
     obj_class == class || env.objc.class_is_subclass_of(obj_class, class)
 }
 
-/// Returns the [Font] backing a UIFont object by re-loading it from its kind.
+/// The font a UIFont draws with and its point size: the app's own font if it
+/// has one, otherwise the built-in font of its kind.
+fn host_font(env: &mut Environment, this: id) -> (Font, CGFloat) {
+    let host_object = env.objc.borrow::<UIFontHostObject>(this);
+    let font = match &host_object.custom {
+        Some(font) => font.clone(),
+        None => env
+            .framework_state
+            .uikit
+            .ui_font
+            .get_font_by_kind(host_object.kind)
+            .clone(),
+    };
+    (font, host_object.size)
+}
+
+/// Returns the [Font] backing a UIFont object.
 /// Returns `None` if `obj` is not a UIFont.
 pub fn font_from_uifont(env: &mut Environment, obj: crate::objc::id) -> Option<Font> {
     if !is_uifont(env, obj) {
         return None;
     }
-    let kind = env.objc.borrow::<UIFontHostObject>(obj).kind;
-    // Re-construct the Font from its kind (Font doesn't implement Clone).
-    Some(match kind {
-        FontKind::MonoRegular => Font::mono_regular(),
-        FontKind::MonoBold => Font::mono_bold(),
-        FontKind::MonoBoldItalic => Font::mono_bold_italic(),
-        FontKind::MonoItalic => Font::mono_italic(),
-        FontKind::SansRegular => Font::sans_regular(),
-        FontKind::SansBold => Font::sans_bold(),
-        FontKind::SansBoldItalic => Font::sans_bold_italic(),
-        FontKind::SansItalic => Font::sans_italic(),
-        FontKind::SerifRegular => Font::serif_regular(),
-        FontKind::SerifBold => Font::serif_bold(),
-        FontKind::SerifBoldItalic => Font::serif_bold_italic(),
-        FontKind::SerifItalic => Font::serif_italic(),
-    })
+    Some(host_font(env, obj).0)
+}
+
+/// The app-supplied font backing a UIFont, if it has one (see
+/// [new_uifont_with_custom_font]).
+pub fn custom_font_of_uifont(env: &mut Environment, obj: crate::objc::id) -> Option<Font> {
+    if !is_uifont(env, obj) {
+        return None;
+    }
+    env.objc.borrow::<UIFontHostObject>(obj).custom.clone()
+}
+
+/// Create an (autoreleased) UIFont that draws with `font`, a font the app
+/// supplied itself rather than one of touchHLE's built-in fonts.
+pub fn new_uifont_with_custom_font(env: &mut Environment, font: Font, size: CGFloat) -> id {
+    let host_object = UIFontHostObject {
+        size,
+        kind: FontKind::SansRegular,
+        custom: Some(font),
+    };
+    let class = env.objc.get_known_class("UIFont", &mut env.mem);
+    let new = env
+        .objc
+        .alloc_object(class, Box::new(host_object), &mut env.mem);
+    autorelease(env, new)
 }
 
 fn convert_line_break_mode(ui_mode: UILineBreakMode) -> WrapMode {

@@ -45,11 +45,16 @@ use crate::frameworks::core_graphics::cg_bitmap_context::{
 use crate::frameworks::core_graphics::cg_context::{
     CGContextConcatCTM, CGContextGetCTM, CGContextRestoreGState, CGContextSaveGState,
 };
-use crate::frameworks::core_graphics::cg_font::{CGFontCreateWithFontName, CGFontRef, CGGlyph};
+use crate::frameworks::core_graphics::cg_font::{
+    cg_font_with_font, data_provider_font, CGFontCreateWithFontName, CGFontRef, CGGlyph,
+};
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::{get_static_str, to_rust_string};
 use crate::frameworks::foundation::{unichar, NSRange, NSUInteger};
-use crate::frameworks::uikit::ui_font::{draw_font_glyph, font_from_uifont, is_uifont};
+use crate::frameworks::uikit::ui_font::{
+    custom_font_of_uifont, draw_font_glyph, font_from_uifont, is_uifont,
+    new_uifont_with_custom_font,
+};
 use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr, Ptr};
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
@@ -1007,6 +1012,9 @@ fn CTFontCopyGraphicsFont(
         return Ptr::null();
     }
     let ui_font = env.objc.borrow::<CTFontHostObject>(font).font;
+    if let Some(custom) = custom_font_of_uifont(env, ui_font) {
+        return cg_font_with_font(env, custom);
+    }
     // Derive a font name from the UIFont and build a CGFont from it. This
     // matches what CoreText does (a CTFont and its CGFont share a typeface).
     let name: id = if ui_font != nil {
@@ -1266,13 +1274,18 @@ fn CTFontCreateWithGraphicsFont(
     _matrix: ConstVoidPtr, // const CGAffineTransform*
     _attributes: id,       // CTFontDescriptorRef
 ) -> CTFontRef {
-    // A CGFont is toll-free convertible to a UIFont in our model only via the
-    // font name; CGFont host objects don't carry a UIFont. Fall back to a
-    // system font at the requested size so callers get a usable CTFont with
-    // real metrics rather than NULL.
-    let _ = graphics_font;
     let font_size = if size > 0.0 { size } else { 12.0 };
-    let ui_font: id = msg_class![env; UIFont systemFontOfSize:font_size];
+    // Keep the typeface the CGFont was made from. Apps load their own font
+    // files this way (Real Racing 3 draws all its text and its icon glyphs
+    // with bundled fonts); substituting the system font turned icons into
+    // plain letters. A CGFont made from a font name is a UIFont here.
+    let ui_font: id = if let Some(font) = data_provider_font(env, graphics_font) {
+        new_uifont_with_custom_font(env, font, font_size)
+    } else if is_uifont(env, graphics_font) {
+        msg![env; graphics_font fontWithSize:font_size]
+    } else {
+        msg_class![env; UIFont systemFontOfSize:font_size]
+    };
     retain(env, ui_font);
     alloc_font(env, ui_font)
 }

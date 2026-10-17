@@ -21,6 +21,8 @@ use std::io::Read;
 
 mod arabic;
 
+/// Cloning is cheap: the parsed font and its file data are shared.
+#[derive(Clone)]
 pub struct Font {
     /// `None` only for the phantom-default `Font` returned via
     /// [`Default`] when the objc runtime needs a placeholder for a
@@ -29,7 +31,7 @@ pub struct Font {
     /// this to `Some(...)`.
     font: Option<rusttype::Font<'static>>,
     /// Raw font file bytes — needed for TrueType table access (CGFontCopyTableForTag).
-    raw_data: Option<Vec<u8>>,
+    raw_data: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 impl Default for Font {
@@ -164,7 +166,7 @@ impl Font {
 
     /// Returns raw bytes of the font data (for table access).
     pub fn raw_data(&self) -> Option<&[u8]> {
-        self.raw_data.as_deref()
+        self.raw_data.as_deref().map(Vec::as_slice)
     }
 
     /// Parse and return the raw data for a specific TrueType/OpenType table
@@ -214,7 +216,7 @@ impl Font {
 
         Font {
             font: Some(font),
-            raw_data: Some(raw_copy),
+            raw_data: Some(std::sync::Arc::new(raw_copy)),
         }
     }
 
@@ -231,7 +233,7 @@ impl Font {
 
         Some(Font {
             font: Some(font),
-            raw_data: Some(raw_copy),
+            raw_data: Some(std::sync::Arc::new(raw_copy)),
         })
     }
 
