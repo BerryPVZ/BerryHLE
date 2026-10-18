@@ -2382,53 +2382,48 @@ pub fn objc_retainBlock(env: &mut crate::Environment, block: id) -> id {
 }
 
 /// `IMP imp_implementationWithBlock(id block)` — returns an IMP that invokes
-/// `block` when called. Per the Objective-C runtime documentation, the block
-/// must be "copied and stored" by the runtime and, when the returned IMP is
-/// called as `(self, _cmd, ...)`, the block's invoke function is entered as
-/// `invoke(block, self, _cmd, ...)` — the block literal itself is passed as
-/// the first argument, shifting the implicit method arguments one register
-/// up (Apple block ABI: on entry to the invoke function, r0 = the block).
-///
-/// We implement it with a small A32 trampoline in guest memory:
+/// `block` when called. Per the Objective-C runtime documentation the block
+/// is copied by the runtime (callers routinely pass stack blocks, e.g.
+/// Crittercism's NSURLConnection hooks), and its signature is
+/// `^(id self, method_args...)`: there is no `_cmd` argument. Like Apple's
+/// `objc-blocktramps-arm.s`, the returned IMP therefore just overwrites
+/// `_cmd` with `self` and `self` with the block, then tail-calls the
+/// block's invoke function, leaving all other arguments (and callee-saved
+/// registers) untouched:
 ///
 /// ```text
-/// push {r0-r3}          ; stash self, _cmd and the first two register args
-/// ldr  r0, [pc, #8]     ; r0 = block literal
-/// ldr  r12, [pc, #8]    ; r12 = block->invoke
-/// pop  {r1-r4}          ; shift args up one register, restore sp
-/// bx   r12              ; tail-call invoke(block, self, _cmd, ...)
+/// mov r1, r0            ; _cmd = self
+/// ldr r0, [pc, #0]      ; self = block literal
+/// ldr pc, [r0, #12]     ; tail-call block->invoke (interworking)
 /// <block literal>       ; literal pool
-/// <invoke>
 /// ```
 ///
-/// The block pointer is read from the block literal (offset 12 in the
-/// 32-bit Apple block layout: `isa`, `flags`, `reserved`, `invoke`).
-/// Stack-passed arguments are unaffected: the push/pop pair restores the
-/// stack pointer before the branch. IMPs that return structs via the sret
-/// convention are not handled (the sret pointer would need the same one-
-/// slot shift as `self`); no guest call site in practice combines
-/// `imp_implementationWithBlock` with a struct-returning signature.
+/// Blocks flagged `BLOCK_USE_STRET` get the same sequence shifted by one
+/// register, as their first argument is the struct-return pointer.
 pub fn imp_implementationWithBlock(
     env: &mut crate::Environment,
     block: id,
 ) -> crate::mem::ConstVoidPtr {
+    const BLOCK_USE_STRET: u32 = 1 << 29;
+
     if block.to_bits() == 0 {
         // `imp_implementationWithBlock(NULL)` is documented to crash the
         // process; returning NULL is the closest non-fatal behaviour.
         return crate::mem::ConstVoidPtr::from_bits(0);
     }
-    let block_bits = block.to_bits();
-    let base: crate::mem::MutPtr<u32> = crate::mem::Ptr::from_bits(block_bits);
-    // Block literal layout (32-bit): isa @0, flags @4, reserved @8, invoke @12.
-    let invoke_bits: u32 = env.mem.read(base + 3);
-    let tramp: crate::mem::MutPtr<u32> = env.mem.alloc(32).cast();
-    env.mem.write(tramp + 0, 0xe92d_000f); // push {r0-r3}
-    env.mem.write(tramp + 1, 0xe59f_0008); // ldr  r0, [pc, #8]
-    env.mem.write(tramp + 2, 0xe59f_c008); // ldr  r12, [pc, #8]
-    env.mem.write(tramp + 3, 0xe8bd_001e); // pop  {r1-r4}
-    env.mem.write(tramp + 4, 0xe12f_ff1c); // bx   r12
-    env.mem.write(tramp + 5, block_bits); // literal: block literal
-    env.mem.write(tramp + 6, invoke_bits); // literal: invoke
+    let block = crate::libc::blocks::_Block_copy(env, block.cast().cast_const());
+    let flags: u32 = env.mem.read(block.cast::<u32>() + 1);
+    let tramp: crate::mem::MutPtr<u32> = env.mem.alloc(16).cast();
+    if flags & BLOCK_USE_STRET != 0 {
+        env.mem.write(tramp + 0, 0xe1a0_2001); // mov r2, r1
+        env.mem.write(tramp + 1, 0xe59f_1000); // ldr r1, [pc, #0]
+        env.mem.write(tramp + 2, 0xe591_f00c); // ldr pc, [r1, #12]
+    } else {
+        env.mem.write(tramp + 0, 0xe1a0_1000); // mov r1, r0
+        env.mem.write(tramp + 1, 0xe59f_0000); // ldr r0, [pc, #0]
+        env.mem.write(tramp + 2, 0xe590_f00c); // ldr pc, [r0, #12]
+    }
+    env.mem.write(tramp + 3, block.to_bits()); // literal: block literal
     tramp.cast().cast_const()
 }
 
@@ -2623,6 +2618,96 @@ pub fn protocol_conformsToProtocol(_env: &mut crate::Environment, proto: id, oth
         return false;
     }
     proto == other
+}
+
+/// `struct objc_method_description`, as returned by
+/// [protocol_getMethodDescription].
+#[allow(non_camel_case_types)]
+#[derive(Debug)]
+#[repr(C, packed)]
+pub struct objc_method_description {
+    name: SEL,
+    types: ConstPtr<u8>,
+}
+unsafe impl crate::mem::SafeRead for objc_method_description {}
+crate::abi::impl_GuestRet_for_large_struct!(objc_method_description);
+
+/// `struct objc_method_description protocol_getMethodDescription(Protocol *p,
+/// SEL aSel, BOOL isRequiredMethod, BOOL isInstanceMethod)`.
+///
+/// Protocol pointers the guest has are the `protocol_t` structures in its own
+/// binary (touchHLE doesn't fix them up), so this walks their method lists,
+/// and those of the protocols they adopt. Returns `{NULL, NULL}` if the
+/// method isn't found. Crittercism uses this to find out which
+/// `NSURLConnection` delegate methods to hook; the struct is returned via a
+/// hidden pointer, so this mustn't be left to a return-0 stub.
+pub fn protocol_getMethodDescription(
+    env: &mut crate::Environment,
+    proto: id,
+    sel: SEL,
+    is_required: bool,
+    is_instance: bool,
+) -> objc_method_description {
+    let types = find_protocol_method_types(&env.mem, proto, sel, is_required, is_instance, 0);
+    if types.is_null() {
+        return objc_method_description {
+            name: SEL::null(),
+            types: Ptr::null(),
+        };
+    }
+    objc_method_description { name: sel, types }
+}
+
+fn find_protocol_method_types(
+    mem: &Mem,
+    proto: id,
+    sel: SEL,
+    is_required: bool,
+    is_instance: bool,
+    depth: u32,
+) -> ConstPtr<u8> {
+    // Layout of the 32-bit `protocol_t`, in words: isa, name, protocols,
+    // instanceMethods, classMethods, optionalInstanceMethods,
+    // optionalClassMethods, ...
+    if proto.is_null() || sel.is_null() || depth > 16 {
+        return Ptr::null();
+    }
+    let words: ConstPtr<u32> = Ptr::from_bits(proto.to_bits());
+    let list_index = match (is_required, is_instance) {
+        (true, true) => 3,
+        (true, false) => 4,
+        (false, true) => 5,
+        (false, false) => 6,
+    };
+    let list: ConstPtr<u32> = Ptr::from_bits(mem.read(words + list_index));
+    if !list.is_null() {
+        // `method_list_t`: entsize (low bits are flags), count, then entries
+        // of name, types, imp.
+        let entsize = (mem.read(list) & !3).max(8);
+        let count: u32 = mem.read(list + 1);
+        let sel_name = sel.as_str(mem).as_bytes();
+        for i in 0..count.min(4096) {
+            let entry: ConstPtr<ConstPtr<u8>> = Ptr::from_bits(list.to_bits() + 8 + i * entsize);
+            let name = mem.read(entry);
+            if !name.is_null() && mem.cstr_eq(name, sel_name) {
+                return mem.read(entry + 1);
+            }
+        }
+    }
+    // `protocol_list_t`: count, then that many protocol pointers.
+    let adopted: ConstPtr<u32> = Ptr::from_bits(mem.read(words + 2));
+    if !adopted.is_null() {
+        let count: u32 = mem.read(adopted);
+        for i in 0..count.min(256) {
+            let other: id = Ptr::from_bits(mem.read(adopted + 1 + i));
+            let types =
+                find_protocol_method_types(mem, other, sel, is_required, is_instance, depth + 1);
+            if !types.is_null() {
+                return types;
+            }
+        }
+    }
+    Ptr::null()
 }
 
 /// `int objc_getClassList(Class *buffer, int bufferLen)` per Apple's

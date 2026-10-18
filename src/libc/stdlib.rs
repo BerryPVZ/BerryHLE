@@ -34,6 +34,8 @@ pub struct State {
     /// `0x1234ABCD330E` until `srand48`/`seed48` are called.
     drand48: Drand48State,
     pub atexit_handlers: Vec<GuestFunction>,
+    /// Buffer returned by the last `ecvt`/`fcvt` call.
+    cvt_buffer: Option<MutPtr<u8>>,
 }
 
 /// State for the POSIX `drand48`/`lrand48`/`mrand48` family. Mirrors what real
@@ -1488,79 +1490,149 @@ fn read_cstr_safe(env: &mut Environment, ptr: ConstPtr<u8>) -> String {
         .unwrap_or_else(|_| "(invalid utf-8)".to_string())
 }
 
-#[allow(non_snake_case)]
-fn _fcvt(
+/// Digits of `value`'s magnitude like `__dtoa()` returns them, without
+/// trailing zeros (but "0" for zero), together with the position of the
+/// decimal point relative to them. `fixed` selects `ndigit` digits after the
+/// decimal point (dtoa mode 3) instead of `ndigit` significant digits (mode
+/// 2). Callers handle infinities and NaNs.
+fn dtoa_digits(value: f64, ndigit: i32, fixed: bool) -> (Vec<u8>, i32) {
+    const MAX_DIGITS: usize = 80;
+    let value = value.abs();
+    if value == 0.0 {
+        return (b"0".to_vec(), 1);
+    }
+    let (mut digits, decpt) = if fixed {
+        let formatted = format!("{:.*}", ndigit.clamp(0, MAX_DIGITS as i32) as usize, value);
+        let (int_part, frac_part) = formatted.split_once('.').unwrap_or((&formatted, ""));
+        let all = format!("{int_part}{frac_part}").into_bytes();
+        let zeros = all.iter().take_while(|&&c| c == b'0').count();
+        (all[zeros..].to_vec(), int_part.len() as i32 - zeros as i32)
+    } else {
+        let precision = (ndigit.clamp(1, MAX_DIGITS as i32) - 1) as usize;
+        let formatted = format!("{:.*e}", precision, value);
+        let (mantissa, exponent) = formatted.split_once('e').unwrap();
+        let digits = mantissa.bytes().filter(|&c| c != b'.').collect();
+        (digits, exponent.parse::<i32>().unwrap() + 1)
+    };
+    while digits.last() == Some(&b'0') {
+        digits.pop();
+    }
+    (digits, decpt)
+}
+
+/// Shared implementation of `ecvt` and `fcvt`, like FreeBSD's `__cvt`, which
+/// Apple's libc uses: the digits are padded with zeros to `ndigit`
+/// significant digits (`ecvt`) or `ndigit` digits after the decimal point
+/// (`fcvt`), and are returned in a buffer that the next call reuses.
+fn cvt(
     env: &mut Environment,
     value: f64,
-    ndigits: i32,
+    ndigit: i32,
     decpt: MutPtr<i32>,
     sign: MutPtr<i32>,
+    fixed: bool,
 ) -> MutPtr<u8> {
-    set_errno(env, 0);
-    let is_negative = value.is_sign_negative() && value != 0.0;
-    let val_abs = value.abs();
-    // Format the number with the requested fractional digits
-    let ndigits_usize = ndigits.max(0) as usize;
-    let formatted = format!("{:.*}", ndigits_usize, val_abs);
-
-    let mut digits = String::with_capacity(formatted.len());
-    let mut decimal_pos = formatted.len() as i32;
-    let mut dot_found = false;
-
-    // Extract decimal position and remove the dot from the string
-    for (i, c) in formatted.chars().enumerate() {
-        if c == '.' {
-            decimal_pos = i as i32;
-            dot_found = true;
-        } else {
-            digits.push(c);
+    let ndigit = ndigit.max(0);
+    let (digits, point, negative) = if value.is_nan() || value.is_infinite() {
+        let digits = if value.is_nan() { "nan" } else { "inf" };
+        (digits.as_bytes().to_vec(), 0, value.is_sign_negative())
+    } else if value == 0.0 {
+        let len = ndigit.max(1) as usize;
+        (vec![b'0'; len], if fixed { 0 } else { 1 }, false)
+    } else {
+        let (mut digits, point) = dtoa_digits(value, ndigit, fixed);
+        let len = if fixed { ndigit + point } else { ndigit };
+        while (digits.len() as i32) < len {
+            digits.push(b'0');
         }
-    }
-
-    if !dot_found {
-        decimal_pos = digits.len() as i32;
-    }
-
-    // Remove leading zero for numbers < 1 to match C behavior
-    if digits.starts_with('0') && decimal_pos == 1 && digits.len() > 1 {
-        digits.remove(0);
-        decimal_pos -= 1;
-    }
-
+        (digits, point, value < 0.0)
+    };
     if !decpt.is_null() {
-        env.mem.write(decpt, decimal_pos);
+        env.mem.write(decpt, point);
     }
     if !sign.is_null() {
-        env.mem.write(sign, if is_negative { 1 } else { 0 });
+        env.mem.write(sign, negative as i32);
     }
 
-    // Allocate in guest memory and CAST to a u8 pointer
-    let buf_len = (digits.len() + 1) as GuestUSize;
-    let buf: MutPtr<u8> = env.mem.alloc(buf_len).cast();
-
-    env.mem
-        .bytes_at_mut(buf, digits.len() as GuestUSize)
-        .copy_from_slice(digits.as_bytes());
-    env.mem.write(buf + digits.len() as GuestUSize, b'\0');
+    if let Some(old) = env.libc_state.stdlib.cvt_buffer.take() {
+        env.mem.free(old.cast());
+    }
+    let buf = env.mem.alloc_and_write_cstr(&digits);
+    env.libc_state.stdlib.cvt_buffer = Some(buf);
     buf
 }
 
-#[allow(non_snake_case)]
-fn _gcvt(env: &mut Environment, value: f64, ndigit: i32, buf: MutPtr<u8>) -> MutPtr<u8> {
-    set_errno(env, 0);
-    let ndigit = ndigit.max(0) as usize;
-    // В Rust нет точного аналога "g", поэтому мы используем стандартный трейт
-    // Display
-    // с указанием точности (количества знаков после запятой).
-    let s = format!("{:.*}", ndigit, value);
+fn ecvt(
+    env: &mut Environment,
+    value: f64,
+    ndigit: i32,
+    decpt: MutPtr<i32>,
+    sign: MutPtr<i32>,
+) -> MutPtr<u8> {
+    cvt(env, value, ndigit, decpt, sign, false)
+}
 
-    let bytes = s.as_bytes();
-    let len = bytes.len() as GuestUSize;
-    if !buf.is_null() {
-        env.mem.bytes_at_mut(buf, len).copy_from_slice(bytes);
-        env.mem.write(buf + len, b'\0');
+fn fcvt(
+    env: &mut Environment,
+    value: f64,
+    ndigit: i32,
+    decpt: MutPtr<i32>,
+    sign: MutPtr<i32>,
+) -> MutPtr<u8> {
+    cvt(env, value, ndigit, decpt, sign, true)
+}
+
+/// `gcvt()`, following FreeBSD's implementation: `ndigit` significant
+/// digits without trailing zeros, in exponential form when the decimal point
+/// would be outside them.
+fn gcvt(env: &mut Environment, value: f64, ndigit: i32, buf: MutPtr<u8>) -> MutPtr<u8> {
+    if buf.is_null() {
+        return buf;
     }
-
+    let mut out = Vec::new();
+    if ndigit <= 0 {
+        // Nothing to write but the terminator.
+    } else if value.is_nan() || value.is_infinite() {
+        let text = format!(
+            "{}{}",
+            if value.is_sign_negative() { "-" } else { "" },
+            if value.is_nan() { "nan" } else { "inf" }
+        );
+        out.extend(text.bytes().take(ndigit as usize));
+    } else {
+        let (digits, decpt) = dtoa_digits(value, ndigit, false);
+        if value < 0.0 {
+            out.push(b'-');
+        }
+        if decpt < 0 || decpt > ndigit {
+            out.push(digits[0]);
+            out.push(b'.');
+            if digits.len() > 1 {
+                out.extend_from_slice(&digits[1..]);
+            } else {
+                out.push(b'0');
+            }
+            let exponent = decpt - 1;
+            let sign = if exponent < 0 { '-' } else { '+' };
+            out.extend(format!("e{}{}", sign, exponent.abs()).bytes());
+        } else {
+            let decpt = decpt as usize;
+            for i in 0..decpt {
+                out.push(*digits.get(i).unwrap_or(&b'0'));
+            }
+            if digits.len() > decpt {
+                if decpt == 0 {
+                    out.push(b'0');
+                }
+                out.push(b'.');
+                out.extend_from_slice(&digits[decpt..]);
+            }
+        }
+    }
+    env.mem
+        .bytes_at_mut(buf, out.len() as GuestUSize)
+        .copy_from_slice(&out);
+    env.mem.write(buf + out.len() as GuestUSize, b'\0');
     buf
 }
 
@@ -1981,8 +2053,9 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(__assert_rtn(_, _, _, _)),
     export_c_func!(__assert(_, _, _)),
     export_c_func!(__assert_fail(_, _, _, _)),
-    export_c_func!(_fcvt(_, _, _, _)),
-    export_c_func!(_gcvt(_, _, _)),
+    export_c_func!(ecvt(_, _, _, _)),
+    export_c_func!(fcvt(_, _, _, _)),
+    export_c_func!(gcvt(_, _, _)),
     export_c_func!(system(_)),
     export_c_func!(dladdr(_, _)),
     export_c_func!(kqueue()),

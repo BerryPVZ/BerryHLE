@@ -352,6 +352,12 @@ com.wb.GreenLantern: --landscape-left --prefer-gles2-context
 # asset XML root reads as null and the game renders empty.
 com.disney.SwampyGame: --device-family=iphone-3gs --xml-dom-mirror
 
+# Regular Show: Best Park in the Universe: reads globals.xml by walking xmlNode
+# struct fields directly, so it needs the libxml2 guest DOM mirror. Without it
+# the "fps" setting reads as 0, the frame interval becomes infinite and the
+# game never gets past the splash screen.
+com.turner.bestparkintheuniverse: --xml-dom-mirror
+
 # LEGO Ninjago: The Final Battle
 # Uses OpenAL streaming audio; keep its fixed-function landscape profile and
 # force the compatibility texture filter on strict mobile GLES drivers.

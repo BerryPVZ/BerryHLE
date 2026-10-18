@@ -52,7 +52,8 @@ pub use classes::{
     objc_registerClassPair, objc_release, objc_retain, objc_retainAutorelease,
     objc_retainAutoreleaseReturnValue, objc_retainAutoreleasedReturnValue, objc_retainBlock,
     objc_storeStrong, objc_unsafeClaimAutoreleasedReturnValue, object_getClass,
-    object_getClassName, object_getIndexedIvars, protocol_conformsToProtocol, protocol_getName,
+    object_getClassName, object_getIndexedIvars, protocol_conformsToProtocol,
+    protocol_getMethodDescription, protocol_getName,
     swift_getInitializedObjCClass, Class, ClassExports, ClassTemplate,
 };
 pub use messages::{
@@ -464,6 +465,7 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(class_setSuperclass(_, _)),
     export_c_func!(objc_getProtocol(_)),
     export_c_func!(protocol_getName(_)),
+    export_c_func!(protocol_getMethodDescription(_, _, _, _)),
     export_c_func!(objc_getClassList(_, _)),
     export_c_func!(protocol_conformsToProtocol(_, _)),
     export_c_func!(objc_copyClassNamesForImage(_, _)),
