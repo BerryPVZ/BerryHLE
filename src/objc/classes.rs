@@ -58,6 +58,8 @@ pub(super) struct ClassHostObject {
     /// `property_t` entry (as read from the binary's property list).
     /// This is what `class_getProperty` queries.
     pub(super) properties: HashMap<String, ConstVoidPtr>,
+    /// Protocols directly adopted by the class or one of its categories.
+    pub(super) protocols: Vec<id>,
     /// Offset into the allocated memory for the object where the ivars of
     /// instances of this class or metaclass (respectively: normal objects or
     /// classes) should live. This is always >= the value in the superclass.
@@ -115,7 +117,7 @@ struct class_rw_t {
     _reserved: u32,
     name: ConstPtr<u8>,
     base_methods: ConstPtr<method_list_t>,
-    _base_protocols: ConstVoidPtr, // protocol list (TODO)
+    base_protocols: ConstVoidPtr,
     ivars: ConstPtr<ivar_list_t>,
     _weak_ivar_layout: u32,
     _base_properties: ConstVoidPtr, // property list (TODO)
@@ -131,10 +133,22 @@ struct category_t {
     class: Class,
     instance_methods: ConstPtr<method_list_t>,
     class_methods: ConstPtr<method_list_t>,
-    _protocols: ConstVoidPtr,     // protocol list (TODO)
+    protocols: ConstVoidPtr,
     _property_list: ConstVoidPtr, // property list (TODO)
 }
 unsafe impl SafeRead for category_t {}
+
+fn protocol_list_entries(mem: &Mem, protocol_list: ConstVoidPtr) -> Vec<id> {
+    if protocol_list.is_null() {
+        return Vec::new();
+    }
+    let list: ConstPtr<u32> = protocol_list.cast();
+    let count = mem.read(list).min(256);
+    (0..count)
+        .map(|index| Ptr::from_bits(mem.read(list + 1 + index)))
+        .filter(|protocol: &id| !protocol.is_null())
+        .collect()
+}
 
 /// A template for a class defined with [objc_classes].
 ///
@@ -320,6 +334,7 @@ impl ClassHostObject {
             ivars: HashMap::default(),
             scalar_ivars: Default::default(),
             properties: HashMap::default(),
+            protocols: Vec::new(),
         }
     }
 
@@ -332,6 +347,7 @@ impl ClassHostObject {
             instance_size,
             name,
             base_methods,
+            base_protocols,
             ivars,
             _base_properties,
             ..
@@ -369,6 +385,7 @@ impl ClassHostObject {
             ivars: HashMap::new(),
             scalar_ivars: Default::default(),
             properties: HashMap::new(),
+            protocols: protocol_list_entries(mem, base_protocols),
         };
         if !base_methods.is_null() {
             host_object.add_methods_from_bin(base_methods, mem, objc);
@@ -913,7 +930,12 @@ impl ObjC {
             if crate::env_flag_cached!("TOUCHHLE_TRACE_IVARS") {
                 let (class_name, superclass, instance_start, instance_size) = {
                     let host = self.borrow::<ClassHostObject>(next);
-                    (host.name.clone(), host.superclass, host.instance_start, host.instance_size)
+                    (
+                        host.name.clone(),
+                        host.superclass,
+                        host.instance_start,
+                        host.instance_size,
+                    )
                 };
                 if class_name.starts_with("CC") {
                     let superclass_size = if superclass == nil {
@@ -965,7 +987,9 @@ impl ObjC {
                         if !ivar.offset.is_null() {
                             let old_offset = mem.read(ivar.offset);
                             if let Some(adjusted_offset) = old_offset.checked_add(diff) {
-                                if crate::env_flag_cached!("TOUCHHLE_TRACE_IVARS") && name.starts_with("CC") {
+                                if crate::env_flag_cached!("TOUCHHLE_TRACE_IVARS")
+                                    && name.starts_with("CC")
+                                {
                                     log!(
                                         "IVAR-OFFSET class={} slot={:?} old={} diff={} new={}",
                                         name,
@@ -1136,6 +1160,7 @@ impl ObjC {
                 }
             };
             let class = data.class;
+            let category_protocol_list = data.protocols;
             // In a truncated binary the category entry itself can live in
             // zero-filled memory (nil/garbage class pointer), or it can target
             // a class that was skipped as garbage in register_bin_classes.
@@ -1145,6 +1170,18 @@ impl ObjC {
                     "Warning: register_bin_categories: skipping category #{i} — its class ({class:?}) is nil or was not registered (truncated binary)"
                 );
                 continue;
+            }
+            let category_protocols = protocol_list_entries(mem, category_protocol_list);
+            let is_class_host_object = self
+                .get_host_object(class)
+                .is_some_and(|host| host.as_any().is::<ClassHostObject>());
+            if is_class_host_object {
+                let class_host_object = self.borrow_mut::<ClassHostObject>(class);
+                for protocol in category_protocols {
+                    if !class_host_object.protocols.contains(&protocol) {
+                        class_host_object.protocols.push(protocol);
+                    }
+                }
             }
             let metaclass = Self::read_isa(class, mem);
             for (class, methods) in [
@@ -1175,6 +1212,7 @@ impl ObjC {
                         ivars: Default::default(),
                         scalar_ivars: Default::default(),
                         properties: Default::default(),
+                        protocols: Default::default(),
                     },
                 );
                 log_dbg!(
@@ -1567,9 +1605,7 @@ fn imp_to_callable_guest_ptr(
             let mem = &mut env.mem;
             let cpu = &mut env.cpu;
             dyld.create_proc_address(mem, cpu, message_send_symbol)
-                .map(|guest_function| {
-                    ConstVoidPtr::from_bits(guest_function.addr_with_thumb_bit())
-                })
+                .map(|guest_function| ConstVoidPtr::from_bits(guest_function.addr_with_thumb_bit()))
                 .unwrap_or_else(|_| ConstVoidPtr::null())
         }
     }
@@ -2257,7 +2293,12 @@ pub fn objc_storeStrong(env: &mut crate::Environment, location: crate::mem::MutP
     if crate::env_flag_cached!("TOUCHHLE_TRACE_IVARS")
         && TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 256
     {
-        log!("ARC-STORE location={:?} prev={:?} new={:?}", location, prev, obj);
+        log!(
+            "ARC-STORE location={:?} prev={:?} new={:?}",
+            location,
+            prev,
+            obj
+        );
     }
     if prev == obj {
         return;
@@ -2592,19 +2633,25 @@ pub fn class_setSuperclass(env: &mut crate::Environment, cls: Class, new_super: 
     old
 }
 
-/// `Protocol *objc_getProtocol(const char *name)` — touchHLE doesn't
-/// model protocols separately; return nil so any defensive
-/// `if (proto)` check skips the protocol-specific path.
+/// `Protocol *objc_getProtocol(const char *name)` — the runtime does not
+/// maintain a global registry for protocol definitions that are not adopted
+/// by a loaded class, so name-based lookup is unavailable.
 pub fn objc_getProtocol(_env: &mut crate::Environment, _name: ConstPtr<u8>) -> id {
     nil
 }
 
-/// `const char *protocol_getName(Protocol *p)` — paired with
-/// `objc_getProtocol`. Returns NULL since we never hand out a real
-/// Protocol pointer to the guest.
-pub fn protocol_getName(_env: &mut crate::Environment, _p: id) -> ConstPtr<u8> {
-    use crate::mem::Ptr;
-    Ptr::null()
+/// Reads the `name` field from an app's 32-bit `protocol_t` metadata.
+fn protocol_get_name(mem: &Mem, protocol: id) -> ConstPtr<u8> {
+    if protocol.is_null() {
+        return Ptr::null();
+    }
+    let words: ConstPtr<u32> = Ptr::from_bits(protocol.to_bits());
+    Ptr::from_bits(mem.read(words + 1))
+}
+
+/// `const char *protocol_getName(Protocol *p)`.
+pub fn protocol_getName(env: &mut crate::Environment, protocol: id) -> ConstPtr<u8> {
+    protocol_get_name(&env.mem, protocol)
 }
 
 /// `BOOL protocol_conformsToProtocol(Protocol *proto, Protocol *other)`
@@ -2613,11 +2660,66 @@ pub fn protocol_getName(_env: &mut crate::Environment, _p: id) -> ConstPtr<u8> {
 ///
 /// > Returns a Boolean value that indicates whether one protocol
 /// > conforms to another.
-pub fn protocol_conformsToProtocol(_env: &mut crate::Environment, proto: id, other: id) -> bool {
-    if proto.is_null() || other.is_null() {
+pub fn protocol_conformsToProtocol(env: &mut crate::Environment, proto: id, other: id) -> bool {
+    protocol_conforms_to_protocol(&env.mem, proto, other, 0, &mut Vec::new())
+}
+
+fn protocol_conforms_to_protocol(
+    mem: &Mem,
+    proto: id,
+    other: id,
+    depth: u32,
+    visited: &mut Vec<id>,
+) -> bool {
+    if proto.is_null() || other.is_null() || depth > 16 {
         return false;
     }
-    proto == other
+    if proto == other {
+        return true;
+    }
+    if visited.contains(&proto) {
+        return false;
+    }
+    visited.push(proto);
+    let words: ConstPtr<u32> = Ptr::from_bits(proto.to_bits());
+    let adopted_list: ConstVoidPtr = Ptr::from_bits(mem.read(words + 2));
+    let conforms = protocol_list_entries(mem, adopted_list)
+        .into_iter()
+        .any(|adopted| protocol_conforms_to_protocol(mem, adopted, other, depth + 1, visited));
+    visited.pop();
+    conforms
+}
+
+fn class_conforms_to_protocol(objc: &ObjC, mem: &Mem, cls: Class, protocol: id) -> bool {
+    if cls.is_null() || protocol.is_null() {
+        return false;
+    }
+    let mut current = cls;
+    let mut visited = Vec::new();
+    while !current.is_null() && !visited.contains(&current) {
+        visited.push(current);
+        let Some(host_object) = objc.get_host_object(current) else {
+            return false;
+        };
+        let Some(class_object) = host_object.as_any().downcast_ref::<ClassHostObject>() else {
+            return false;
+        };
+        let superclass = class_object.superclass;
+        let protocols = class_object.protocols.clone();
+        if protocols.into_iter().any(|adopted| {
+            protocol_conforms_to_protocol(mem, adopted, protocol, 0, &mut Vec::new())
+        }) {
+            return true;
+        }
+        current = superclass;
+    }
+    false
+}
+
+/// `BOOL class_conformsToProtocol(Class cls, Protocol *protocol)`.
+/// Checks protocols adopted by the class, its categories, and its superclasses.
+pub fn class_conformsToProtocol(env: &mut crate::Environment, cls: Class, protocol: id) -> bool {
+    class_conforms_to_protocol(&env.objc, &env.mem, cls, protocol)
 }
 
 /// `struct objc_method_description`, as returned by
@@ -2738,6 +2840,43 @@ pub fn objc_getClassList(
         offset += 1;
     }
     i32::try_from(total).unwrap_or(i32::MAX)
+}
+
+fn copy_class_list_to_guest(
+    mem: &mut Mem,
+    classes: &[Class],
+    out_count: crate::mem::MutPtr<u32>,
+) -> crate::mem::MutPtr<Class> {
+    if !out_count.is_null() {
+        mem.write(out_count, 0);
+    }
+    let Ok(count) = u32::try_from(classes.len()) else {
+        return Ptr::null();
+    };
+    if count == 0 {
+        return Ptr::null();
+    }
+    let Some(size) = count.checked_mul(guest_size_of::<Class>()) else {
+        return Ptr::null();
+    };
+    let buffer: crate::mem::MutPtr<Class> = mem.alloc(size).cast();
+    for (index, class) in classes.iter().enumerate() {
+        mem.write(buffer + index as u32, *class);
+    }
+    if !out_count.is_null() {
+        mem.write(out_count, count);
+    }
+    buffer
+}
+
+/// `Class *objc_copyClassList(unsigned int *outCount)`.
+/// Returns a malloc-allocated array containing every currently registered class.
+pub fn objc_copyClassList(
+    env: &mut crate::Environment,
+    out_count: crate::mem::MutPtr<u32>,
+) -> crate::mem::MutPtr<Class> {
+    let classes: Vec<Class> = env.objc.classes.values().copied().collect();
+    copy_class_list_to_guest(&mut env.mem, &classes, out_count)
 }
 
 /// `const char **objc_copyClassNamesForImage(const char *image,
@@ -2979,19 +3118,43 @@ pub fn class_copyIvarList(
     Ptr::null()
 }
 
-/// `Protocol * __unsafe_unretained *class_copyProtocolList(Class cls, unsigned int *outCount)` —
-/// same shape. We don't model adopted protocols, so return NULL with
-/// `*outCount = 0`, which is also the spec-compliant answer for a class
-/// adopting no protocols.
+/// `Protocol * __unsafe_unretained *class_copyProtocolList(Class cls, unsigned int *outCount)`.
+/// Returns only protocols adopted by `cls` and its categories, not inherited protocols.
 pub fn class_copyProtocolList(
     env: &mut crate::Environment,
-    _cls: Class,
+    cls: Class,
     out_count: crate::mem::MutPtr<u32>,
 ) -> crate::mem::MutPtr<ConstVoidPtr> {
     if !out_count.is_null() {
         env.mem.write(out_count, 0);
     }
-    Ptr::null()
+    if cls.is_null() {
+        return Ptr::null();
+    }
+    let protocols = env
+        .objc
+        .get_host_object(cls)
+        .and_then(|host| host.as_any().downcast_ref::<ClassHostObject>())
+        .map(|class| class.protocols.clone())
+        .unwrap_or_default();
+    let Ok(count) = u32::try_from(protocols.len()) else {
+        return Ptr::null();
+    };
+    if count == 0 {
+        return Ptr::null();
+    }
+    let Some(size) = count.checked_mul(guest_size_of::<ConstVoidPtr>()) else {
+        return Ptr::null();
+    };
+    let buffer: crate::mem::MutPtr<ConstVoidPtr> = env.mem.alloc(size).cast();
+    for (index, protocol) in protocols.iter().enumerate() {
+        env.mem
+            .write(buffer + index as u32, protocol.cast_const().cast());
+    }
+    if !out_count.is_null() {
+        env.mem.write(out_count, count);
+    }
+    buffer
 }
 
 /// `objc_property_t class_getProperty(Class cls, const char *name)` —
@@ -3130,5 +3293,97 @@ mod class_registration_tests {
         objc.reconcile_bin_class_ivars(&mut mem);
         assert_eq!(objc.borrow::<ClassHostObject>(child).instance_size, 20);
         assert_eq!(mem.read(offset), 20);
+    }
+
+    fn synthetic_protocol(mem: &mut Mem, adopted: &[id]) -> id {
+        let protocol: crate::mem::MutPtr<u32> = mem.alloc(12).cast();
+        let adopted_list: ConstVoidPtr = if adopted.is_empty() {
+            Ptr::null()
+        } else {
+            let size = (adopted.len() as u32 + 1) * guest_size_of::<u32>();
+            let list: crate::mem::MutPtr<u32> = mem.alloc(size).cast();
+            mem.write(list, adopted.len() as u32);
+            for (index, adopted_protocol) in adopted.iter().enumerate() {
+                mem.write(list + 1 + index as u32, adopted_protocol.to_bits());
+            }
+            Ptr::from_bits(list.to_bits())
+        };
+        mem.write(protocol + 2, adopted_list.to_bits());
+        protocol.cast()
+    }
+
+    #[test]
+    fn protocol_get_name_reads_guest_metadata() {
+        let mut mem = Mem::new();
+        mem.set_null_segment_size(0x1000);
+        let name = mem.alloc_and_write_cstr(b"FixtureProtocol");
+        let protocol: crate::mem::MutPtr<u32> = mem.alloc(3 * guest_size_of::<u32>()).cast();
+        mem.write(protocol + 1, name.to_bits());
+
+        assert_eq!(protocol_get_name(&mem, protocol.cast()), name.cast_const());
+        assert!(protocol_get_name(&mem, nil).is_null());
+    }
+
+    #[test]
+    fn class_conformance_includes_protocol_adoption_and_superclasses() {
+        let (mut objc, mut mem) = runtime();
+        let base_protocol = synthetic_protocol(&mut mem, &[]);
+        let derived_protocol = synthetic_protocol(&mut mem, &[base_protocol]);
+        let unrelated_protocol = synthetic_protocol(&mut mem, &[]);
+        let superclass = objc.alloc_static_object(
+            nil,
+            Box::new(ClassHostObject {
+                name: "ProtocolSuperclass".to_string(),
+                protocols: vec![derived_protocol],
+                ..Default::default()
+            }),
+            &mut mem,
+        );
+        let subclass = objc.alloc_static_object(
+            nil,
+            Box::new(ClassHostObject {
+                name: "ProtocolSubclass".to_string(),
+                superclass,
+                ..Default::default()
+            }),
+            &mut mem,
+        );
+
+        assert!(protocol_conforms_to_protocol(
+            &mem,
+            derived_protocol,
+            base_protocol,
+            0,
+            &mut Vec::new(),
+        ));
+        assert!(class_conforms_to_protocol(
+            &objc,
+            &mem,
+            subclass,
+            base_protocol,
+        ));
+        assert!(!class_conforms_to_protocol(
+            &objc,
+            &mem,
+            subclass,
+            unrelated_protocol,
+        ));
+        assert!(!class_conforms_to_protocol(&objc, &mem, nil, base_protocol));
+    }
+
+    #[test]
+    fn copied_class_list_is_allocated_and_reports_its_count() {
+        let mut mem = Mem::new();
+        mem.set_null_segment_size(0x1000);
+        let classes: [Class; 2] = [Ptr::from_bits(0x2000), Ptr::from_bits(0x2004)];
+        let out_count: crate::mem::MutPtr<u32> = mem.alloc(guest_size_of::<u32>()).cast();
+
+        let buffer = copy_class_list_to_guest(&mut mem, &classes, out_count);
+
+        assert_eq!(mem.read(out_count), classes.len() as u32);
+        assert_eq!(mem.read(buffer), classes[0]);
+        assert_eq!(mem.read(buffer + 1), classes[1]);
+        assert!(copy_class_list_to_guest(&mut mem, &[], out_count).is_null());
+        assert_eq!(mem.read(out_count), 0);
     }
 }
