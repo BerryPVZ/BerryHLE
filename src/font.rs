@@ -135,6 +135,58 @@ impl Font {
         g.h_metrics().advance_width.round() as i32
     }
 
+    pub(crate) fn glyph_advance_at_size(&self, glyph_id: GlyphId, font_size: f32) -> f32 {
+        self.rt()
+            .glyph(glyph_id)
+            .scaled(scale(font_size))
+            .h_metrics()
+            .advance_width
+    }
+
+    pub(crate) fn glyph_positions_at_size(&self, font_size: f32, glyphs: &[GlyphId]) -> Vec<f32> {
+        let font_scale = scale(font_size);
+        let mut previous: Option<GlyphId> = None;
+        let mut x = 0.0;
+        glyphs
+            .iter()
+            .map(|glyph_id| {
+                if let Some(previous) = previous {
+                    x += self.rt().pair_kerning(font_scale, previous, *glyph_id);
+                }
+                let position = x;
+                x += self
+                    .rt()
+                    .glyph(*glyph_id)
+                    .scaled(font_scale)
+                    .h_metrics()
+                    .advance_width;
+                previous = Some(*glyph_id);
+                position
+            })
+            .collect()
+    }
+
+    pub(crate) fn glyph_bbox_at_size(
+        &self,
+        glyph_id: GlyphId,
+        font_size: f32,
+    ) -> (f32, f32, f32, f32) {
+        let glyph = self
+            .rt()
+            .glyph(glyph_id)
+            .scaled(scale(font_size))
+            .positioned(Point { x: 0.0, y: 0.0 });
+        match glyph.pixel_bounding_box() {
+            Some(bb) => (
+                bb.min.x as f32,
+                bb.min.y as f32,
+                (bb.max.x - bb.min.x) as f32,
+                (bb.max.y - bb.min.y) as f32,
+            ),
+            None => (0.0, 0.0, 0.0, 0.0),
+        }
+    }
+
     /// Returns the left side bearing (in design units) for a glyph.
     pub fn glyph_left_side_bearing(&self, glyph_id: GlyphId) -> i32 {
         let upm = self.units_per_em() as f32;
@@ -1284,6 +1336,34 @@ fn glyph_id_from_post_table(post_data: &[u8], name: &str, _glyph_count: u32) -> 
             None
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn core_text_glyph_positions_match_raster_scale_and_kerning() {
+        let font = Font::sans_regular();
+        let font_size = 20.0;
+        let glyphs = [
+            font.glyph_id_for_char('A' as u16),
+            font.glyph_id_for_char('V' as u16),
+        ];
+        let font_scale = scale(font_size);
+        let first_advance = font
+            .rt()
+            .glyph(glyphs[0])
+            .scaled(font_scale)
+            .h_metrics()
+            .advance_width;
+        let kerning = font.rt().pair_kerning(font_scale, glyphs[0], glyphs[1]);
+        let positions = font.glyph_positions_at_size(font_size, &glyphs);
+
+        assert_eq!(positions[0], 0.0);
+        assert!(kerning < 0.0);
+        assert!((positions[1] - (first_advance + kerning)).abs() < 0.001);
     }
 }
 

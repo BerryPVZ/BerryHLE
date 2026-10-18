@@ -854,17 +854,21 @@ fn CTRunGetPositions(env: &mut Environment, run: CTRunRef, range: CFRange, buffe
     };
     let font = font_from_uifont(env, ui_font).unwrap_or_else(Font::sans_regular);
     let size: CGFloat = msg![env; ui_font pointSize];
-    let units_per_em = font.units_per_em() as CGFloat;
-    let scale = if units_per_em > 0.0 { size / units_per_em } else { 0.0 };
-    let mut x = 0.0;
-    for text_index in 0..end {
-        let character: unichar = msg![env; text characterAtIndex:(text_index as NSUInteger)];
-        let glyph = glyph_for_code_unit(&font, character);
-        let advance = font.glyph_advance(GlyphId(glyph)) as CGFloat * scale;
-        if text_index >= start {
-            env.mem.write(buffer + (text_index - start), CGPoint { x, y: 0.0 });
-        }
-        x += advance;
+    let glyphs: Vec<GlyphId> = (0..end)
+        .map(|text_index| {
+            let character: unichar = msg![env; text characterAtIndex:(text_index as NSUInteger)];
+            GlyphId(glyph_for_code_unit(&font, character))
+        })
+        .collect();
+    let positions = font.glyph_positions_at_size(size, &glyphs);
+    for text_index in start..end {
+        env.mem.write(
+            buffer + (text_index - start),
+            CGPoint {
+                x: positions[text_index as usize],
+                y: 0.0,
+            },
+        );
     }
 }
 
@@ -891,15 +895,11 @@ fn CTFontGetAdvancesForGlyphs(
     }
     let ui_font = env.objc.borrow::<CTFontHostObject>(font).font;
     let font_obj = font_from_uifont(env, ui_font).unwrap_or_else(Font::sans_regular);
-    let upm = font_obj.units_per_em() as f64;
-    let size = CTFontGetSize(env, font) as f64;
-    // Design units -> points at the font's current size.
-    let scale = if upm > 0.0 { size / upm } else { 0.0 };
+    let size = CTFontGetSize(env, font);
     let mut total = 0.0f64;
     for i in 0..count as u32 {
         let glyph_id: CGGlyph = env.mem.read(glyphs + i);
-        let advance_design = font_obj.glyph_advance(GlyphId(glyph_id as u16)) as f64;
-        let advance_pt = advance_design * scale;
+        let advance_pt = font_obj.glyph_advance_at_size(GlyphId(glyph_id), size) as f64;
         if !advances.is_null() {
             env.mem.write(advances + i, CGSize { width: advance_pt as CGFloat, height: 0.0 });
         }
@@ -927,16 +927,14 @@ fn CTFontGetBoundingRectsForGlyphs(
     }
     let ui_font = env.objc.borrow::<CTFontHostObject>(font).font;
     let font_obj = font_from_uifont(env, ui_font).unwrap_or_else(Font::sans_regular);
-    let units_per_em = font_obj.units_per_em() as CGFloat;
     let size = CTFontGetSize(env, font);
-    let scale = if units_per_em > 0.0 { size / units_per_em } else { 0.0 };
     let mut union: Option<CGRect> = None;
     for index in 0..count as u32 {
         let glyph = env.mem.read(glyphs + index);
-        let (x, y, width, height) = font_obj.glyph_bbox(GlyphId(glyph));
+        let (x, y, width, height) = font_obj.glyph_bbox_at_size(GlyphId(glyph), size);
         let rect = CGRect {
-            origin: CGPoint { x: x * scale, y: y * scale },
-            size: CGSize { width: width * scale, height: height * scale },
+            origin: CGPoint { x, y },
+            size: CGSize { width, height },
         };
         if !bounding_rects.is_null() {
             env.mem.write(bounding_rects + index, rect);
