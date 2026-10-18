@@ -672,9 +672,13 @@ impl Environment {
             .bundle_identifier()
             .starts_with("com.robtop.geometryjump");
         let is_wheres_my_water = bundle.bundle_identifier() == "com.disney.SwampyGame";
+        let is_gravity_guy = bundle.bundle_identifier() == "com.miniclip.gravityguy";
         // We always reset this flag depending on which game is launched.
-        mem.zero_memory_on_free =
-            !is_spore && !is_critter_crunch && !is_geometry_dash && !is_wheres_my_water;
+        mem.zero_memory_on_free = !is_spore
+            && !is_critter_crunch
+            && !is_geometry_dash
+            && !is_wheres_my_water
+            && !is_gravity_guy;
         if is_spore {
             log!("Applying game-specific hack for Spore Origins: zeroing memory on alloc instead of free.");
         }
@@ -704,6 +708,15 @@ impl Environment {
             // loops forever on the null page, freezing the game on the first
             // dig. Real malloc leaves the stale link in place.
             log!("Applying game-specific hack for Where's My Water: zeroing memory on alloc instead of free.");
+        }
+        if is_gravity_guy {
+            // Gravity Guy reads memory it has already freed while the first
+            // level starts. With freed memory scrubbed, the camera usually
+            // races tens of thousands of points ahead within a few frames, so
+            // the player is never on screen and the tutorial never appears.
+            // Real malloc leaves the freed bytes in place. (This makes a good
+            // start much more likely but not certain yet.)
+            log!("Applying game-specific hack for Gravity Guy: zeroing memory on alloc instead of free.");
         }
         let executable = mach_o::MachO::load_from_bytes(
             &executable_bytes,
@@ -3793,7 +3806,7 @@ impl Environment {
                         next_awakening = Some(next_awakening.map_or(host_due, |d| d.min(host_due)));
                     }
                     ThreadBlock::Mutex(mutex_id) => {
-                        if !self.mutex_state.mutex_is_locked(mutex_id) {
+                        if self.mutex_state.mutex_can_be_locked_by(mutex_id, thread_id) {
                             log_dbg!("Thread {} was unblocked due to mutex #{} unlocking, relocking mutex.", thread_id, mutex_id);
                             self.threads[thread_id].blocked_by = ThreadBlock::NotBlocked;
                             self.relock_unblocked_mutex_for_thread(thread_id, mutex_id);
@@ -3847,7 +3860,7 @@ impl Environment {
                             .waking
                             .front()
                             .is_some_and(|waking_thread| *waking_thread == thread_id)
-                            && !self.mutex_state.mutex_is_locked(mutex)
+                            && self.mutex_state.mutex_can_be_locked_by(mutex, thread_id)
                         {
                             log_dbg!("Thread {} is unblocking on cond var {:?}.", thread_id, cond);
                             host_cond.waking.pop_front();
@@ -3881,7 +3894,7 @@ impl Environment {
                                 // ожидание
                                 // мьютекса (как в настоящем
                                 // pthread_cond_timedwait).
-                                if self.mutex_state.mutex_is_locked(mutex) {
+                                if !self.mutex_state.mutex_can_be_locked_by(mutex, thread_id) {
                                     log_dbg!(
                                         "Thread {} timed out on cond var {:?} but mutex is locked, blocking on mutex.",
                                         thread_id,

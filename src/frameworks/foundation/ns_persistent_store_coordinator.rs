@@ -63,6 +63,8 @@ struct NSManagedObjectContextHostObject {
 }
 impl HostObject for NSManagedObjectContextHostObject {}
 
+/// For failure paths only: on success, Cocoa leaves `*error` alone and
+/// callers may pass an uninitialized pointer.
 fn clear_error_out_parameter(env: &mut crate::Environment, error: MutPtr<id>) {
     if !error.is_null() {
         env.mem.write(error, nil);
@@ -424,7 +426,6 @@ pub const CLASSES: ClassExports = objc_classes! {
                               URL:(id)url            // NSURL*
                           options:(id)options        // NSDictionary*
                             error:(MutPtr<id>)_error {
-    clear_error_out_parameter(env, _error);       // NSError**
     let type_str = if store_type != nil {
         ns_string::to_rust_string(env, store_type).into_owned()
     } else {
@@ -454,7 +455,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (bool)removePersistentStore:(id)store  // NSPersistentStore*
                         error:(MutPtr<id>)_error {
-    clear_error_out_parameter(env, _error); // NSError**
     let stores = env.objc.borrow::<NSPersistentStoreCoordinatorHostObject>(this).persistent_stores;
     () = msg![env; stores removeObject:store];
     true
@@ -740,7 +740,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (bool)save:(MutPtr<id>)_error {
-    clear_error_out_parameter(env, _error); // NSError**
     log!("NSManagedObjectContext save: stubbed -> true");
     true
 }
@@ -763,7 +762,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)executeFetchRequest:(id)_request // NSFetchRequest*
                     error:(MutPtr<id>)_error {
-    clear_error_out_parameter(env, _error); // NSError**
     log!("NSManagedObjectContext executeFetchRequest:error: stubbed -> empty array");
     let arr: id = msg_class![env; NSArray new];
     autorelease(env, arr)
@@ -771,7 +769,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (NSUInteger)countForFetchRequest:(id)_request // NSFetchRequest*
                               error:(MutPtr<id>)_error {
-    clear_error_out_parameter(env, _error); // NSError**
     0
 }
 

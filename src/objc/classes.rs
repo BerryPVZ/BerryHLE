@@ -60,6 +60,9 @@ pub(super) struct ClassHostObject {
     pub(super) properties: HashMap<String, ConstVoidPtr>,
     /// Protocols directly adopted by the class or one of its categories.
     pub(super) protocols: Vec<id>,
+    /// Whether this class comes from the app binary, so that `protocols` is
+    /// complete. touchHLE doesn't model which protocols host classes adopt.
+    pub(super) is_from_bin: bool,
     /// Offset into the allocated memory for the object where the ivars of
     /// instances of this class or metaclass (respectively: normal objects or
     /// classes) should live. This is always >= the value in the superclass.
@@ -335,6 +338,7 @@ impl ClassHostObject {
             scalar_ivars: Default::default(),
             properties: HashMap::default(),
             protocols: Vec::new(),
+            is_from_bin: false,
         }
     }
 
@@ -386,6 +390,7 @@ impl ClassHostObject {
             scalar_ivars: Default::default(),
             properties: HashMap::new(),
             protocols: protocol_list_entries(mem, base_protocols),
+            is_from_bin: true,
         };
         if !base_methods.is_null() {
             host_object.add_methods_from_bin(base_methods, mem, objc);
@@ -1213,6 +1218,7 @@ impl ObjC {
                         scalar_ivars: Default::default(),
                         properties: Default::default(),
                         protocols: Default::default(),
+                        is_from_bin: Default::default(),
                     },
                 );
                 log_dbg!(
@@ -1303,6 +1309,61 @@ impl ObjC {
             );
             "<unknown>"
         })
+    }
+
+    /// Whether instances of `class` conform to `protocol`, a `protocol_t` from
+    /// the app binary (touchHLE doesn't fix up protocol references, so that's
+    /// what `@protocol()` gives). Protocols are compared by name. Returns
+    /// `None` if this can't be known because the class inherits from a host
+    /// class other than `NSObject`.
+    pub fn class_conforms_to_bin_protocol(
+        &self,
+        mem: &Mem,
+        class: Class,
+        protocol: id,
+    ) -> Option<bool> {
+        if protocol == nil {
+            return Some(false);
+        }
+        let name_ptr = protocol_get_name(mem, protocol);
+        if name_ptr.is_null() {
+            return None;
+        }
+        let name = mem.cstr_at(name_ptr);
+        if name == b"NSObject" {
+            return Some(true);
+        }
+        let mut class = class;
+        while class != nil {
+            let ClassHostObject {
+                name: class_name,
+                protocols,
+                is_from_bin,
+                superclass,
+                ..
+            } = self.get_host_object(class)?.as_any().downcast_ref()?;
+            if protocols
+                .iter()
+                .any(|&adopted| protocol_adopts_protocol_named(mem, adopted, name, 0))
+            {
+                return Some(true);
+            }
+            if !is_from_bin {
+                return if class_name == "NSObject" {
+                    Some(false)
+                } else {
+                    None
+                };
+            }
+            class = *superclass;
+        }
+        Some(false)
+    }
+
+    pub fn class_is_metaclass(&self, class: Class) -> bool {
+        self.get_host_object(class)
+            .and_then(|host_object| host_object.as_any().downcast_ref::<ClassHostObject>())
+            .is_some_and(|class| class.is_metaclass)
     }
 
     pub fn get_superclass(&self, class: Class) -> Class {
@@ -2758,6 +2819,23 @@ pub fn protocol_getMethodDescription(
         };
     }
     objc_method_description { name: sel, types }
+}
+
+/// Whether `protocol` is named `name` or adopts a protocol named `name`.
+fn protocol_adopts_protocol_named(mem: &Mem, protocol: id, name: &[u8], depth: u32) -> bool {
+    if protocol.is_null() || depth > 16 {
+        return false;
+    }
+    let name_ptr = protocol_get_name(mem, protocol);
+    if !name_ptr.is_null() && mem.cstr_at(name_ptr) == name {
+        return true;
+    }
+    // Layout of the 32-bit `protocol_t`, in words: isa, name, protocols, ...
+    let words: ConstPtr<u32> = Ptr::from_bits(protocol.to_bits());
+    let adopted_list: ConstVoidPtr = Ptr::from_bits(mem.read(words + 2));
+    protocol_list_entries(mem, adopted_list)
+        .into_iter()
+        .any(|adopted| protocol_adopts_protocol_named(mem, adopted, name, depth + 1))
 }
 
 fn find_protocol_method_types(

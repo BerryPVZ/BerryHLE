@@ -126,6 +126,17 @@ impl MutexState {
             }
         })
     }
+
+    /// Whether `thread` can take `mutex_id` without blocking: it is unlocked,
+    /// or it is a recursive mutex `thread` already holds. The latter happens
+    /// when a thread waits on a condition variable while holding a recursive
+    /// mutex more than once: the wait unlocks it only once, so the thread
+    /// still holds it when it wakes, and must not then wait for itself to
+    /// release it (Gangstar: Miami Vindication's loader threads).
+    pub fn mutex_can_be_locked_by(&self, mutex_id: MutexId, thread: ThreadId) -> bool {
+        !self.mutex_is_locked(mutex_id)
+            || (self.mutex_is_recursive(mutex_id) && self.mutex_is_locked_by(mutex_id, thread))
+    }
 }
 
 impl Environment {
@@ -143,8 +154,17 @@ impl Environment {
                 .waiting_count
         );
         let mutex: &mut _ = self.mutex_state.mutexes.get_mut(&mutex_id).unwrap();
-        assert!(mutex.locked.is_none());
-        mutex.locked = Some((thread_id, NonZeroU32::new(1).unwrap()));
+        mutex.locked = match mutex.locked {
+            None => Some((thread_id, NonZeroU32::new(1).unwrap())),
+            // See `mutex_can_be_locked_by`.
+            Some((locking_thread, lock_count))
+                if locking_thread == thread_id
+                    && mutex.type_ == MutexType::PTHREAD_MUTEX_RECURSIVE =>
+            {
+                Some((locking_thread, lock_count.checked_add(1).unwrap()))
+            }
+            Some(_) => panic!("Mutex #{mutex_id} is locked by another thread"),
+        };
         if self
             .mutex_state
             .mutexes

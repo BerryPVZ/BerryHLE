@@ -436,10 +436,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     false
 }
 
-- (bool)preflightAndReturnError:(MutPtr<id>)error {
-    if !error.is_null() {
-        env.mem.write(error, nil);
-    }
+- (bool)preflightAndReturnError:(MutPtr<id>)_error {
     true
 }
 
@@ -449,11 +446,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 // "On output, if the bundle was not loaded successfully, this contains
 // an error object describing why; otherwise, it contains no value."
 // touchHLE always treats the bundle as loaded (see -load above), so the
-// error out-parameter is explicitly set to nil.
-- (bool)loadAndReturnError:(MutPtr<id>)error {
-    if !error.is_null() {
-        env.mem.write(error, nil);
-    }
+// error out-parameter is left alone: callers may pass an uninitialized
+// pointer.
+- (bool)loadAndReturnError:(MutPtr<id>)_error {
     true
 }
 

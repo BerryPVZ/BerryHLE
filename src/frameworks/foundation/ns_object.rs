@@ -230,6 +230,26 @@ fn perform_selector_on_thread(
     }
 }
 
+/// Builds the `NSMethodSignature` for instances of `class` responding to
+/// `selector`. Methods from the app binary (or added with `class_addMethod`)
+/// carry a type encoding, which gives the real return and argument types: an
+/// `NSInvocation` needs them for `-getReturnValue:` and for float arguments.
+/// Host-implemented methods have none, so for those every argument is assumed
+/// to be an object and the return type to be void.
+fn method_signature_for(env: &mut Environment, class: Class, selector: SEL) -> id {
+    let method = crate::objc::class_getInstanceMethod(env, class, selector);
+    let types = crate::objc::method_getTypeEncoding(env, method);
+    if !types.is_null() {
+        return msg_class![env; NSMethodSignature signatureWithObjCTypes:(types.cast_mut())];
+    }
+    let sig: id = msg_class![env; NSMethodSignature signatureWithObjCTypes:(MutVoidPtr::null())];
+    let sel_str = selector.as_str(&env.mem);
+    let explicit_args = sel_str.chars().filter(|&c| c == ':').count() as NSUInteger;
+    let total_args = explicit_args + 2;
+    () = msg![env; sig _touchHLE_setNumberOfArguments:total_args];
+    sig
+}
+
 fn object_class_hierarchy(env: &Environment, object: id) -> Vec<Class> {
     let mut class = ObjC::read_isa(object, &env.mem);
     let mut hierarchy = Vec::new();
@@ -393,12 +413,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (id)instanceMethodSignatureForSelector:(SEL)selector {
-    let sig: id = msg_class![env; NSMethodSignature signatureWithObjCTypes:(MutVoidPtr::null())];
-    let sel_str = selector.as_str(&env.mem);
-    let explicit_args = sel_str.chars().filter(|&c| c == ':').count() as NSUInteger;
-    let total_args = explicit_args + 2;
-    () = msg![env; sig _touchHLE_setNumberOfArguments:total_args];
-    sig
+    method_signature_for(env, this, selector)
 }
 
 + (bool)accessInstanceVariablesDirectly {
@@ -740,8 +755,15 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.object_has_method(&env.mem, this, selector)
 }
 
-- (bool)conformsToProtocol:(id)_protocol {
-    true
+- (bool)conformsToProtocol:(id)protocol {
+    // Sent to a class object, this asks about the class itself.
+    let isa = ObjC::read_isa(this, &env.mem);
+    let class = if env.objc.class_is_metaclass(isa) { this } else { isa };
+    // Which protocols host classes adopt isn't modelled, so keep answering YES
+    // for those rather than break apps that check for e.g. NSCoding.
+    env.objc
+        .class_conforms_to_bin_protocol(&env.mem, class, protocol)
+        .unwrap_or(true)
 }
 
 - (u32)methodForSelector:(SEL)selector {
@@ -762,12 +784,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)methodSignatureForSelector:(SEL)selector {
-    let sig: id = msg_class![env; NSMethodSignature signatureWithObjCTypes:(MutVoidPtr::null())];
-    let sel_str = selector.as_str(&env.mem);
-    let explicit_args = sel_str.chars().filter(|&c| c == ':').count() as NSUInteger;
-    let total_args = explicit_args + 2;
-    () = msg![env; sig _touchHLE_setNumberOfArguments:total_args];
-    sig
+    // For a class object this is its metaclass, so class methods are found.
+    let class = ObjC::read_isa(this, &env.mem);
+    method_signature_for(env, class, selector)
 }
 
 // MARK: - Telemetry no-ops

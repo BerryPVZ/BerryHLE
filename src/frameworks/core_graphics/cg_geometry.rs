@@ -316,7 +316,12 @@ fn CGRectIsInfinite(_env: &mut Environment, rect: CGRect) -> bool {
         || rect.size.height.is_infinite()
 }
 
-fn CGRectContainsPoint(_env: &mut Environment, rect: CGRect, point: CGPoint) -> bool {
+// Like the other CGRect predicates, this works on the standardized rectangle,
+// so a negative width or height extends the rectangle the other way from its
+// origin. Gravity Guy's full-screen "touch to continue" menu item has a
+// negative height.
+fn CGRectContainsPoint(env: &mut Environment, rect: CGRect, point: CGPoint) -> bool {
+    let rect = CGRectStandardize(env, rect);
     rect.origin.x <= point.x
         && rect.origin.x + rect.size.width > point.x
         && rect.origin.y <= point.y
@@ -520,14 +525,18 @@ fn CGAffineTransformMakeWithDictionaryRepresentation(
     true
 }
 
-fn CGRectContainsRect(_env: &mut Environment, outer: CGRect, inner: CGRect) -> bool {
+fn CGRectContainsRect(env: &mut Environment, outer: CGRect, inner: CGRect) -> bool {
+    let outer = CGRectStandardize(env, outer);
+    let inner = CGRectStandardize(env, inner);
     outer.origin.x <= inner.origin.x
         && outer.origin.y <= inner.origin.y
         && outer.origin.x + outer.size.width >= inner.origin.x + inner.size.width
         && outer.origin.y + outer.size.height >= inner.origin.y + inner.size.height
 }
 
-fn CGRectIntersectsRect(_env: &mut Environment, rect1: CGRect, rect2: CGRect) -> bool {
+fn CGRectIntersectsRect(env: &mut Environment, rect1: CGRect, rect2: CGRect) -> bool {
+    let rect1 = CGRectStandardize(env, rect1);
+    let rect2 = CGRectStandardize(env, rect2);
     rect1.origin.x.max(rect2.origin.x)
         < (rect1.origin.x + rect1.size.width).min(rect2.origin.x + rect2.size.width)
         && rect1.origin.y.max(rect2.origin.y)
