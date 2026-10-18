@@ -79,6 +79,7 @@ const UI_USER_INTERFACE_IDIOM_PHONE: NSInteger = 0;
 const UI_USER_INTERFACE_IDIOM_PAD: NSInteger = 1;
 const UI_USER_INTERFACE_SIZE_CLASS_COMPACT: NSInteger = 1;
 const UI_USER_INTERFACE_SIZE_CLASS_REGULAR: NSInteger = 2;
+const UI_FORCE_TOUCH_CAPABILITY_UNAVAILABLE: NSInteger = 1;
 
 #[derive(Default)]
 struct UITraitCollectionHostObject {
@@ -410,6 +411,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (CGFloat)displayScale {
     env.objc.borrow::<UITraitCollectionHostObject>(this).display_scale
+}
+
+- (NSInteger)forceTouchCapability {
+    UI_FORCE_TOUCH_CAPABILITY_UNAVAILABLE
 }
 
 - (NSInteger)layoutDirection { 0 }
