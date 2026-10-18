@@ -35,6 +35,7 @@ The titles below have been tested with HyperHLE-Fork and are known to run. Compa
 - Oceanhorn (Ingame)
 - Asphalt 8 (Playable)
 - GTA 3 (Unplayable)
+- Granny (Ingame)
 - And more more games
 
 ## Build and documentation
