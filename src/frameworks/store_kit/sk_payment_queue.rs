@@ -58,8 +58,8 @@ impl State {
 
 #[derive(Default)]
 struct SKPaymentQueueHostObject {
-    /// SKPaymentTransactionObserver — weak reference
-    observer: id,
+    /// Registered observers, retained until explicitly removed.
+    observers: Vec<id>,
     /// Transactions delivered but not yet finished. Each is retained.
     pending: Vec<id>,
 }
@@ -196,6 +196,7 @@ struct SKPaymentTransactionHostObject {
     transaction_identifier: id,
     payment: id,
     original_transaction: id,
+    transaction_date: id,
 }
 impl HostObject for SKPaymentTransactionHostObject {}
 
@@ -210,6 +211,8 @@ fn make_transaction(
     original_transaction: id,
 ) -> id {
     let transaction: id = msg_class![env; SKPaymentTransaction alloc];
+    let transaction_date: id = msg_class![env; NSDate date];
+    retain(env, transaction_date);
     {
         let host = env
             .objc
@@ -218,6 +221,7 @@ fn make_transaction(
         host.transaction_identifier = transaction_identifier;
         host.payment = payment;
         host.original_transaction = original_transaction;
+        host.transaction_date = transaction_date;
     }
     retain(env, transaction_identifier);
     if payment != nil {
@@ -229,17 +233,21 @@ fn make_transaction(
     transaction
 }
 
-/// Deliver `transactions` to the queue's observer via
-/// `paymentQueue:updatedTransactions:`.
-fn deliver_transactions(env: &mut Environment, queue: id, transactions: &[id]) {
-    let observer = env.objc.borrow::<SKPaymentQueueHostObject>(queue).observer;
-    if observer == nil || transactions.is_empty() {
-        return;
+/// Snapshot and retain observers across callbacks, which may remove observers.
+fn observer_snapshot(env: &mut Environment, queue: id) -> Vec<id> {
+    let observers = env
+        .objc
+        .borrow::<SKPaymentQueueHostObject>(queue)
+        .observers
+        .clone();
+    for &observer in &observers {
+        retain(env, observer);
+        autorelease(env, observer);
     }
-    let array: id = msg_class![env; NSMutableArray array];
-    for &transaction in transactions {
-        () = msg![env; array addObject:transaction];
-    }
+    observers
+}
+
+fn deliver_to_observer(env: &mut Environment, queue: id, observer: id, array: id) {
     let sel = env.objc.register_host_selector(
         "paymentQueue:updatedTransactions:".to_string(),
         &mut env.mem,
@@ -247,10 +255,39 @@ fn deliver_transactions(env: &mut Environment, queue: id, transactions: &[id]) {
     let responds: bool = msg![env; observer respondsToSelector:sel];
     if responds {
         () = msg![env; observer paymentQueue:queue updatedTransactions:array];
-    } else {
-        log!(
-            "Warning: SKPaymentTransactionObserver does not respond to paymentQueue:updatedTransactions:; transaction result dropped."
+    }
+}
+
+/// Build the array before guest callbacks can finish and release transactions.
+fn transaction_array(env: &mut Environment, transactions: &[id]) -> id {
+    let array: id = msg_class![env; NSMutableArray array];
+    for &transaction in transactions {
+        () = msg![env; array addObject:transaction];
+    }
+    array
+}
+
+/// Deliver a transaction batch to every registered observer.
+fn deliver_transactions(env: &mut Environment, queue: id, transactions: &[id]) {
+    if transactions.is_empty() {
+        return;
+    }
+    let array = transaction_array(env, transactions);
+    for observer in observer_snapshot(env, queue) {
+        deliver_to_observer(env, queue, observer, array);
+    }
+}
+
+fn deliver_restore_finished(env: &mut Environment, queue: id) {
+    for observer in observer_snapshot(env, queue) {
+        let sel = env.objc.register_host_selector(
+            "paymentQueueRestoreCompletedTransactionsFinished:".to_string(),
+            &mut env.mem,
         );
+        let responds: bool = msg![env; observer respondsToSelector:sel];
+        if responds {
+            () = msg![env; observer paymentQueueRestoreCompletedTransactionsFinished:queue];
+        }
     }
 }
 
@@ -281,6 +318,7 @@ fn payment_for_identifier(env: &mut Environment, identifier: &str) -> id {
 
 // MARK: - SKPayment
 
+#[derive(Clone)]
 struct SKPaymentHostObject {
     product_identifier: id,
     application_username: id,
@@ -301,6 +339,24 @@ impl Default for SKPaymentHostObject {
 }
 impl HostObject for SKPaymentHostObject {}
 
+/// Copy payment fields without sharing mutable payment storage.
+fn copy_payment(env: &mut Environment, payment: id, mutable: bool) -> id {
+    let mut fields = env.objc.borrow::<SKPaymentHostObject>(payment).clone();
+    let identifier = fields.product_identifier;
+    let username = fields.application_username;
+    let data = fields.request_data;
+    fields.product_identifier = msg![env; identifier copy];
+    fields.application_username = msg![env; username copy];
+    fields.request_data = msg![env; data copy];
+    let copy: id = if mutable {
+        msg_class![env; SKMutablePayment alloc]
+    } else {
+        msg_class![env; SKPayment alloc]
+    };
+    *env.objc.borrow_mut::<SKPaymentHostObject>(copy) = fields;
+    copy
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -309,7 +365,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 + (id)allocWithZone:(NSZonePtr)_zone {
     let host_object = Box::new(SKPaymentQueueHostObject {
-        observer: nil,
+        observers: Vec::new(),
         pending: Vec::new(),
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
@@ -341,11 +397,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())dealloc {
-    let (observer, pending) = {
+    let (observers, pending) = {
         let host = env.objc.borrow::<SKPaymentQueueHostObject>(this);
-        (host.observer, host.pending.clone())
+        (host.observers.clone(), host.pending.clone())
     };
-    release(env, observer);
+    for observer in observers {
+        release(env, observer);
+    }
     for transaction in pending {
         release(env, transaction);
     }
@@ -355,15 +413,31 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - Observers
 
 - (())addTransactionObserver:(id)observer {
-    // Убрали .unwrap()
-    let host_obj = env.objc.borrow_mut::<SKPaymentQueueHostObject>(this);
-    host_obj.observer = observer;
+    if observer == nil {
+        return;
+    }
+    let host = env.objc.borrow_mut::<SKPaymentQueueHostObject>(this);
+    if host.observers.contains(&observer) {
+        return;
+    }
+    host.observers.push(observer);
+    let pending = host.pending.clone();
+    retain(env, observer);
+    // Replay unfinished purchases only to the newly registered observer.
+    if emulation_enabled() && !pending.is_empty() {
+        retain(env, observer);
+        autorelease(env, observer);
+        let array = transaction_array(env, &pending);
+        deliver_to_observer(env, this, observer, array);
+    }
 }
 
-- (())removeTransactionObserver:(id)_observer {
-    // Убрали .unwrap()
-    let host_obj = env.objc.borrow_mut::<SKPaymentQueueHostObject>(this);
-    host_obj.observer = nil;
+- (())removeTransactionObserver:(id)observer {
+    let host = env.objc.borrow_mut::<SKPaymentQueueHostObject>(this);
+    if let Some(index) = host.observers.iter().position(|&item| item == observer) {
+        host.observers.remove(index);
+        release(env, observer);
+    }
 }
 
 // MARK: - Payment requests
@@ -384,17 +458,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         // the observer with an EMPTY transaction array. No transaction
         // object is created, so nothing in the game can see a success.
         log!("SKPaymentQueue addPayment: stubbed — failing transaction immediately");
-        let observer = env.objc.borrow::<SKPaymentQueueHostObject>(this).observer;
-        if observer == nil {
-            return;
-        }
-        let transactions: id = msg_class![env; NSArray new];
-        let sel = env
-            .objc
-            .register_host_selector("paymentQueue:updatedTransactions:".to_string(), &mut env.mem);
-        let responds: bool = msg![env; observer respondsToSelector:sel];
-        if responds {
-            () = msg![env; observer paymentQueue:this updatedTransactions:transactions];
+        let transactions = transaction_array(env, &[]);
+        for observer in observer_snapshot(env, this) {
+            deliver_to_observer(env, this, observer, transactions);
         }
         return;
     }
@@ -402,6 +468,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     let (transaction_identifier_string, transaction_identifier) =
         next_transaction_identifier(env, "iap");
     remember_purchase(env, &identifier, &transaction_identifier_string);
+    // StoreKit snapshots mutable payments when they enter the queue.
+    let payment: id = msg![env; payment copy];
     let transaction = make_transaction(
         env,
         SK_PAYMENT_TRANSACTION_STATE_PURCHASED,
@@ -409,6 +477,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         transaction_identifier,
         nil,
     );
+    release(env, payment);
     release(env, transaction_identifier);
     // The pending queue owns one reference; the pool guards the delivery call.
     retain(env, transaction);
@@ -427,16 +496,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())restoreCompletedTransactions {
-    // Убрали .unwrap()
     if !emulation_enabled() {
-        let host_obj = env.objc.borrow::<SKPaymentQueueHostObject>(this);
-        let observer = host_obj.observer;
-
-        if observer != nil {
-            // Вызываем метод делегата, сообщая, что "восстановление" успешно
-            // завершено
-            let _: () = msg![env; observer paymentQueueRestoreCompletedTransactionsFinished:this];
-        }
+        deliver_restore_finished(env, this);
         return;
     }
     ensure_purchase_history_loaded(env);
@@ -478,19 +539,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         restored.len()
     );
     deliver_transactions(env, this, &restored);
-    let host_obj = env.objc.borrow::<SKPaymentQueueHostObject>(this);
-    let observer = host_obj.observer;
-    if observer != nil {
-        let sel = env.objc.register_host_selector(
-            "paymentQueueRestoreCompletedTransactionsFinished:".to_string(),
-            &mut env.mem,
-        );
-        let responds: bool = msg![env; observer respondsToSelector:sel];
-        if responds {
-            let _: () =
-                msg![env; observer paymentQueueRestoreCompletedTransactionsFinished:this];
-        }
-    }
+    deliver_restore_finished(env, this);
 }
 
 - (())restoreCompletedTransactionsWithApplicationUsername:(id)_username {
@@ -585,6 +634,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     this
 }
 
+- (id)copyWithZone:(NSZonePtr)_zone {
+    copy_payment(env, this, false)
+}
+
+- (id)mutableCopyWithZone:(NSZonePtr)_zone {
+    copy_payment(env, this, true)
+}
+
 - (id)productIdentifier {
     let identifier = env
         .objc
@@ -645,6 +702,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 @implementation SKMutablePayment: SKPayment
+
+- (())setProductIdentifier:(id)identifier {
+    let previous = env.objc.borrow::<SKPaymentHostObject>(this).product_identifier;
+    // NSString is immutable, but callers may supply an NSMutableString.
+    let identifier: id = msg![env; identifier copy];
+    env.objc.borrow_mut::<SKPaymentHostObject>(this).product_identifier = identifier;
+    release(env, previous);
+}
 
 - (())setQuantity:(NSInteger)quantity {
     env.objc
@@ -773,21 +838,28 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)transactionDate {
-    msg_class![env; NSDate date]
+    let date = env.objc.borrow::<SKPaymentTransactionHostObject>(this).transaction_date;
+    if date != nil {
+        retain(env, date);
+        autorelease(env, date);
+    }
+    date
 }
 
 - (())dealloc {
-    let (transaction_identifier, payment, original_transaction) = {
+    let (transaction_identifier, payment, original_transaction, transaction_date) = {
         let host = env.objc.borrow::<SKPaymentTransactionHostObject>(this);
         (
             host.transaction_identifier,
             host.payment,
             host.original_transaction,
+            host.transaction_date,
         )
     };
     release(env, transaction_identifier);
     release(env, payment);
     release(env, original_transaction);
+    release(env, transaction_date);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 
@@ -838,6 +910,22 @@ mod tests {
             "tx.duplicate"
         ));
         assert_eq!(history.len(), 2);
+    }
+
+    #[test]
+    fn payment_snapshot_preserves_quantity_and_sandbox_flags() {
+        let mut payment = super::SKPaymentHostObject {
+            quantity: 5,
+            simulates_ask_to_buy_in_sandbox: true,
+            ..Default::default()
+        };
+        let snapshot = payment.clone();
+        payment.quantity = 2;
+        payment.simulates_ask_to_buy_in_sandbox = false;
+
+        assert_eq!(snapshot.quantity, 5);
+        assert!(snapshot.simulates_ask_to_buy_in_sandbox);
+        assert_eq!(payment.quantity, 2);
     }
 
     #[test]

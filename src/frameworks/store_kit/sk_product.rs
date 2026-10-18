@@ -127,6 +127,8 @@ fn deliver_products_response(env: &mut Environment, this: id) {
     if delegate == nil {
         return;
     }
+    retain(env, delegate);
+    autorelease(env, delegate);
     let sel = env.objc.register_host_selector(
         "productsRequest:didReceiveResponse:".to_string(),
         &mut env.mem,
@@ -371,7 +373,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())_touchHLE_iapProductsTimer:(id)_timer {
     stop_response_timer(env, this);
-    deliver_products_response(env, this);
+    // The overlay may have disabled emulation while this timer was pending.
+    if emulation_enabled() {
+        deliver_products_response(env, this);
+    }
 }
 
 - (())dealloc {

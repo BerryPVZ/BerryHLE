@@ -87,3 +87,36 @@ fn retain_return_value_is_used_and_null_function_pointers_are_not_called() {
     empty.retain_with(|_, _| panic!("must not branch to NULL"));
     empty.release_with(|_, _| panic!("must not branch to NULL"));
 }
+
+#[test]
+fn local_iap_emulation_reports_reachable_without_real_network_access() {
+    assert_eq!(reachability_flags(false, false), 0);
+    assert_eq!(
+        reachability_flags(false, true),
+        kSCNetworkReachabilityFlagsReachable
+    );
+}
+
+#[test]
+fn real_network_access_does_not_depend_on_iap_emulation() {
+    assert_eq!(
+        reachability_flags(true, false),
+        kSCNetworkReachabilityFlagsReachable
+    );
+    assert_eq!(reachability_flags(true, true), reachability_flags(true, false));
+}
+
+#[test]
+fn reachable_route_is_wifi_without_connection_or_intervention_requirements() {
+    for (network, iap) in [(true, false), (false, true), (true, true)] {
+        let flags = reachability_flags(network, iap);
+        assert_ne!(flags & kSCNetworkReachabilityFlagsReachable, 0);
+        assert_eq!(
+            flags & (kSCNetworkReachabilityFlagsConnectionRequired
+                | kSCNetworkReachabilityFlagsInterventionRequired
+                | kSCNetworkReachabilityFlagsIsWWAN
+                | kSCNetworkReachabilityFlagsIsDirect),
+            0
+        );
+    }
+}
