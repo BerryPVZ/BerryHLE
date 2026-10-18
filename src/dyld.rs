@@ -1141,6 +1141,7 @@ impl Dyld {
                 || name == "__dispatch_source_type_timer"
                 || name == "__dispatch_source_type_data_add"
                 || name == "__dispatch_source_type_data_or"
+                || name == "__dispatch_source_type_data_replace"
                 || name == "__dispatch_source_type_signal"
                 || name == "__dispatch_source_type_proc"
                 || name == "__dispatch_source_type_vnode"
@@ -1156,15 +1157,10 @@ impl Dyld {
                 || name == "__dispatch_main_q"
                 || name == "__dispatch_queue_main"
             {
-                // GCD dispatch_source_type_t / queue-attribute / data-marker
-                // pointers are opaque "type tag" identifiers; touchHLE's
-                // libdispatch implementation never inspects their contents,
-                // only their identity. A small non-NULL allocation satisfies
-                // that contract and prevents NULL-page reads when an app
-                // passes one to dispatch_source_create / dispatch_queue_create
-                // / dispatch_data_create.
+                // Dispatch source types carry small internal tags; other
+                // libdispatch constants remain opaque non-NULL markers.
                 let p: MutPtr<u32> = mem.alloc(4).cast();
-                mem.write(p, 0);
+                mem.write(p, crate::libc::dispatch_source::source_type_tag(name));
                 p.cast().cast_const()
             } else if name == "_in6addr_any" || name == "_in6addr_loopback" {
                 // `struct in6_addr` is 16 bytes. `in6addr_any` is all zeros
@@ -1456,6 +1452,7 @@ impl Dyld {
                 || symbol == "__dispatch_source_type_timer"
                 || symbol == "__dispatch_source_type_data_add"
                 || symbol == "__dispatch_source_type_data_or"
+                || symbol == "__dispatch_source_type_data_replace"
                 || symbol == "__dispatch_source_type_signal"
                 || symbol == "__dispatch_source_type_proc"
                 || symbol == "__dispatch_source_type_vnode"
@@ -1473,10 +1470,10 @@ impl Dyld {
             {
                 // See the matching branch in the external-relocation loop.
                 let p: MutPtr<u32> = mem.alloc(4).cast();
-                mem.write(p, 0);
+                mem.write(p, crate::libc::dispatch_source::source_type_tag(symbol));
                 mem.write(ptr_ptr, p.cast().cast_const());
                 log_dbg!(
-                    "Stubbed libdispatch identity tag {} -> {:#x}",
+                    "libdispatch identity tag {} -> {:#x}",
                     symbol,
                     p.to_bits()
                 );

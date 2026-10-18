@@ -17,11 +17,14 @@
 //! already a member has no effect.
 
 use super::ns_enumerator::{fast_enumeration_helper, NSFastEnumerationState};
-use super::{ns_array, ns_string, NSNotFound, NSUInteger};
+use super::{
+    _nib_archive_decoder, ns_array, ns_keyed_archiver, ns_keyed_unarchiver, ns_string, NSNotFound,
+    NSUInteger,
+};
 use crate::mem::{ConstPtr, MutPtr};
 use crate::objc::{
-    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
-    NSZonePtr,
+    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, Class, ClassExports,
+    HostObject, NSZonePtr,
 };
 use crate::Environment;
 
@@ -166,6 +169,47 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     env.objc.borrow_mut::<OrderedSetHostObject>(new).array = array;
     new
+}
+
+// NSCoding implementation shared by immutable and mutable ordered sets.
+- (id)initWithCoder:(id)coder {
+    let class: Class = msg![env; coder class];
+    let keyed_unarchiver_class: Class = msg_class![env; NSKeyedUnarchiver class];
+    let nib_archive_class: Class = msg_class![env; _touchHLE_NIBArchiveDecoder class];
+    let objects = if env.objc.class_is_subclass_of(class, keyed_unarchiver_class) {
+        ns_keyed_unarchiver::decode_current_array(env, coder)
+    } else if env.objc.class_is_subclass_of(class, nib_archive_class) {
+        _nib_archive_decoder::decode_current_array(env, coder)
+    } else {
+        log!(
+            "Warning: -[_touchHLE_NSOrderedSet initWithCoder:] unsupported coder class {:?}; returning empty ordered set.",
+            class
+        );
+        Vec::new()
+    };
+    let previous = std::mem::take(&mut env.objc.borrow_mut::<OrderedSetHostObject>(this).array);
+    for object in previous {
+        release(env, object);
+    }
+    for object in objects {
+        append_unique(env, this, object);
+        release(env, object);
+    }
+    this
+}
+
+- (())encodeWithCoder:(id)coder {
+    let class: Class = msg![env; coder class];
+    let keyed_archiver_class: Class = msg_class![env; NSKeyedArchiver class];
+    if env.objc.class_is_subclass_of(class, keyed_archiver_class) {
+        let objects = env.objc.borrow::<OrderedSetHostObject>(this).array.clone();
+        ns_keyed_archiver::encode_objects_as_uid_array(env, coder, "NS.objects", &objects);
+    } else {
+        log!(
+            "Warning: -[_touchHLE_NSOrderedSet encodeWithCoder:] unsupported coder class {:?}",
+            class
+        );
+    }
 }
 
 @end

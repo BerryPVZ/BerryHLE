@@ -22,6 +22,7 @@ pub mod ctype;
 pub mod cxxabi;
 pub mod dirent;
 pub mod dispatch;
+pub mod dispatch_source;
 pub mod dlfcn;
 pub mod dns_sd;
 pub mod errno;

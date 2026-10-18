@@ -5,6 +5,8 @@
  */
 //! `UIApplication` and `UIApplicationMain`.
 
+use crate::abi::{CallFromHost, GuestFunction};
+
 use super::ui_device::*;
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
 use crate::frameworks::core_graphics::CGRect;
@@ -17,6 +19,7 @@ use crate::objc::{
 };
 use crate::window::DeviceOrientation;
 use crate::Environment;
+use std::collections::HashMap;
 
 #[derive(Default)]
 pub struct State {
@@ -40,6 +43,62 @@ struct UIApplicationHostObject {
     application_icon_badge_number: NSInteger,
     remote_notifications_registered: bool,
     user_notification_settings: id,
+    background_tasks: HashMap<NSUInteger, BackgroundTask>,
+    next_background_task_id: NSUInteger,
+}
+
+struct BackgroundTask {
+    name: id,
+    expiration_handler: id,
+    expiration_running: bool,
+}
+
+fn release_background_task(env: &mut Environment, task: BackgroundTask) {
+    release(env, task.name);
+    crate::libc::blocks::_Block_release(env, task.expiration_handler.cast_void().cast_const());
+}
+
+fn invoke_void_block(env: &mut Environment, block: id) {
+    if block == nil {
+        return;
+    }
+    let invoke_address: u32 = env.mem.read(block.cast::<u32>() + 3u32);
+    if invoke_address != 0 {
+        let invoke = GuestFunction::from_addr_with_thumb_bit(invoke_address);
+        let _: () = invoke.call_from_host(env, (block,));
+    }
+}
+
+fn expire_background_tasks(env: &mut Environment, application: id) {
+    let identifiers: Vec<NSUInteger> = env
+        .objc
+        .borrow::<UIApplicationHostObject>(application)
+        .background_tasks
+        .keys()
+        .copied()
+        .collect();
+    for identifier in identifiers {
+        let handler = {
+            let host = &mut *env.objc.borrow_mut::<UIApplicationHostObject>(application);
+            let Some(task) = host.background_tasks.get_mut(&identifier) else {
+                continue;
+            };
+            if task.expiration_running {
+                continue;
+            }
+            task.expiration_running = true;
+            task.expiration_handler
+        };
+        invoke_void_block(env, handler);
+        let task = env
+            .objc
+            .borrow_mut::<UIApplicationHostObject>(application)
+            .background_tasks
+            .remove(&identifier);
+        if let Some(task) = task {
+            release_background_task(env, task);
+        }
+    }
 }
 impl HostObject for UIApplicationHostObject {}
 
@@ -84,6 +143,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         application_icon_badge_number: 0,
         remote_notifications_registered: false,
         user_notification_settings: nil,
+        background_tasks: HashMap::new(),
+        next_background_task_id: 1,
     });
     env.objc.alloc_static_object(this, host_object, &mut env.mem)
 }
@@ -414,16 +475,71 @@ pub const CLASSES: ClassExports = objc_classes! {
     false
 }
 
-- (NSUInteger)beginBackgroundTaskWithExpirationHandler:(id)_handler {
-    log_dbg!("UIApplication beginBackgroundTaskWithExpirationHandler");
-    // Per Apple docs, this returns a UIBackgroundTaskIdentifier (NSUInteger).
-    // A non-zero value indicates a valid task. touchHLE does not implement
-    // background execution, so we return a fixed sentinel identifier.
-    1
+- (NSUInteger)beginBackgroundTaskWithExpirationHandler:(id)handler {
+    msg![env; this beginBackgroundTaskWithName:nil expirationHandler:handler]
 }
 
-- (())endBackgroundTask:(NSUInteger)_task {
-    log_dbg!("UIApplication endBackgroundTask: {}", _task);
+- (NSUInteger)beginBackgroundTaskWithName:(id)name expirationHandler:(id)handler {
+    let name: id = if name == nil {
+        nil
+    } else {
+        msg![env; name copy]
+    };
+    let handler: id = if handler == nil {
+        nil
+    } else {
+        crate::libc::blocks::_Block_copy(env, handler.cast_void().cast_const()).cast()
+    };
+    let task_identifier = {
+        let host = env.objc.borrow_mut::<UIApplicationHostObject>(this);
+        let mut identifier = host.next_background_task_id;
+        while identifier == 0
+            || identifier == NSUInteger::MAX
+            || host.background_tasks.contains_key(&identifier)
+        {
+            identifier = identifier.wrapping_add(1);
+        }
+        host.next_background_task_id = identifier.wrapping_add(1);
+        host.background_tasks.insert(
+            identifier,
+            BackgroundTask {
+                name,
+                expiration_handler: handler,
+                expiration_running: false,
+            },
+        );
+        identifier
+    };
+    log_dbg!(
+        "UIApplication began background task {:?} with identifier {}",
+        name,
+        task_identifier
+    );
+    task_identifier
+}
+
+- (())endBackgroundTask:(NSUInteger)task_identifier {
+    if task_identifier == NSUInteger::MAX {
+        return;
+    }
+    let task = {
+        let host = env.objc.borrow_mut::<UIApplicationHostObject>(this);
+        if let Some(task) = host.background_tasks.get(&task_identifier) {
+            if task.expiration_running {
+                return;
+            }
+        }
+        host.background_tasks.remove(&task_identifier)
+    };
+    if let Some(task) = task {
+        release(env, task.name);
+        crate::libc::blocks::_Block_release(env, task.expiration_handler.cast_void().cast_const());
+    } else {
+        log_dbg!(
+            "UIApplication ended unknown background task {}",
+            task_identifier
+        );
+    }
 }
 
 - (NSUInteger)backgroundTimeRemaining {
@@ -1010,6 +1126,7 @@ pub(super) fn handle_did_enter_background(env: &mut Environment) {
     }
     let notif_name = get_static_str(env, UIApplicationDidEnterBackgroundNotification);
     () = msg![env; center postNotificationName:notif_name object:ui_application userInfo:nil];
+    expire_background_tasks(env, ui_application);
     let _: () = msg![env; pool drain];
 }
 

@@ -50,6 +50,7 @@ pub mod ui_layout_placeholders;
 pub mod ui_local_notification;
 pub mod ui_navigation_bar;
 pub mod ui_nib;
+pub mod ui_page_view_controller;
 pub mod ui_pasteboard;
 pub mod ui_pinch_gesture_recognizer;
 pub mod ui_popover_controller;
@@ -61,8 +62,8 @@ pub mod ui_search_bar;
 pub mod ui_split_view_controller;
 pub mod ui_storyboard;
 pub mod ui_tab_bar_controller;
-pub mod ui_text_input;
 pub mod ui_tab_bar_item;
+pub mod ui_text_input;
 pub mod ui_touch;
 pub mod ui_view;
 pub mod ui_view_controller;
@@ -279,6 +280,14 @@ pub const CONSTANTS: &[(&str, HostConstant)] = &[
     (
         "_UIScreenDidConnectNotification",
         HostConstant::NSString("UIScreenDidConnectNotification"),
+    ),
+    (
+        "_UIPageViewControllerOptionSpineLocationKey",
+        HostConstant::NSString("UIPageViewControllerOptionSpineLocationKey"),
+    ),
+    (
+        "_UIPageViewControllerOptionInterPageSpacingKey",
+        HostConstant::NSString("UIPageViewControllerOptionInterPageSpacingKey"),
     ),
     // -----------------------------------------------------------------
     // UIPasteboard well-known pasteboard names.
@@ -981,6 +990,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ui_view::ui_web_view::CLASSES,
         ui_view::ui_window::CLASSES,
         ui_view_controller::CLASSES,
+        ui_page_view_controller::CLASSES,
         ui_view_controller::ui_navigation_controller::CLASSES,
     ],
     constant_exports: &[

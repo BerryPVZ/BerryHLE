@@ -65,6 +65,7 @@ pub(crate) struct UIViewControllerHostObject {
     modal_transition_style: UIModalTransitionStyle,
     modal_presentation_style: UIModalPresentationStyle,
     editing: bool,
+    is_being_presented: bool,
     /// When non-empty, the path (relative to the bundle resource path)
     /// at which the storyboardc directory lives. Storyboard-instantiated
     /// view controllers store the path so `-loadView` knows to load the
@@ -436,6 +437,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (bool)isEditing {
     env.objc.borrow::<UIViewControllerHostObject>(this).editing
 }
+- (bool)isBeingPresented {
+    env.objc.borrow::<UIViewControllerHostObject>(this).is_being_presented
+}
+
 - (())setWantsFullScreenLayout:(bool)_wants {
     // Apple docs: When set to YES, the view controller's view extends
     // underneath the status bar and navigation bar. On real iOS this
@@ -745,6 +750,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         return;
     }
 
+    env.objc
+        .borrow_mut::<UIViewControllerHostObject>(modal_vc)
+        .is_being_presented = true;
     () = msg![env; modal_vc viewWillAppear:animated];
     // UIWindow's -addSubview: applies the auto-rotation transform when the
     // view has an associated UIViewController and posts the appropriate
@@ -752,6 +760,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     // directly instead of adding the view to the presenter's view.
     () = msg![env; window addSubview:modal_view];
     () = msg![env; modal_vc viewDidAppear:animated];
+    env.objc
+        .borrow_mut::<UIViewControllerHostObject>(modal_vc)
+        .is_being_presented = false;
+
 
     // The modal hierarchy is now fully attached to a window. Any UIWebView
     // load deferred because the view had no on-screen extent yet (e.g.

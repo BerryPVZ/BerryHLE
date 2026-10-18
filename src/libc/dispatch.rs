@@ -23,6 +23,15 @@ use crate::objc::{id, msg, msg_class, objc_classes, Class, ClassExports};
 use crate::Environment;
 use std::collections::HashMap;
 
+use super::dispatch_source::{
+    self, dispatch_resume, dispatch_source_cancel, dispatch_source_create,
+    dispatch_source_get_data, dispatch_source_get_handle, dispatch_source_get_mask,
+    dispatch_source_merge_data, dispatch_source_set_cancel_handler,
+    dispatch_source_set_cancel_handler_f, dispatch_source_set_event_handler,
+    dispatch_source_set_event_handler_f, dispatch_source_set_timer, dispatch_source_testcancel,
+    dispatch_suspend,
+};
+
 // MARK: - Types
 
 /// `dispatch_once_t` is a `long` (i32 on 32-bit) used as a flag.
@@ -65,11 +74,11 @@ const DISPATCH_QUEUE_CONCURRENT: i32 = 1;
 
 /// `dispatch_time_t` constants.
 const DISPATCH_TIME_NOW: u64 = 0;
-const DISPATCH_TIME_FOREVER: u64 = u64::MAX;
+pub(super) const DISPATCH_TIME_FOREVER: u64 = u64::MAX;
 
 /// Sentinel pointer values we hand out as "queue" handles.
 /// We use small odd numbers so they're never confused with real allocations.
-const MAIN_QUEUE_PTR: u32 = 0x0000_0001;
+pub(super) const MAIN_QUEUE_PTR: u32 = 0x0000_0001;
 const GLOBAL_QUEUE_PTR: u32 = 0x0000_0003;
 
 // MARK: - Notification name constants
@@ -117,10 +126,14 @@ pub struct State {
     /// Stack of queue handles currently executing a block, so that
     /// `dispatch_get_specific` can resolve against the running queue. The
     /// main queue is assumed when the stack is empty.
-    current_queue_stack: Vec<u32>,
+    pub(super) current_queue_stack: Vec<u32>,
+    /// Active dispatch sources keyed by their opaque guest handles.
+    pub(super) sources: HashMap<u32, dispatch_source::DispatchSource>,
+    /// Next aligned opaque source handle.
+    pub(super) next_source_handle: u32,
 }
 
-fn get_state(env: &mut Environment) -> &mut State {
+pub(super) fn get_state(env: &mut Environment) -> &mut State {
     &mut env.libc_state.dispatch
 }
 
@@ -269,14 +282,14 @@ fn dispatch_queue_release(_env: &mut Environment, _queue: dispatch_queue_t) {
     // no-op
 }
 
-fn dispatch_retain(_env: &mut Environment, _obj: MutVoidPtr) {
-    // no-op for all dispatch objects
+fn dispatch_retain(env: &mut Environment, obj: MutVoidPtr) {
+    dispatch_source::retain_source(env, obj);
 }
 
 fn dispatch_release(env: &mut Environment, obj: MutVoidPtr) {
-    // Dispatch semaphores own a host semaphore and guest allocation; free them
-    // so a guest that churns through semaphores does not leak.
-    release_if_semaphore(env, obj);
+    if !release_if_semaphore(env, obj) {
+        dispatch_source::release_source(env, obj);
+    }
 }
 
 // MARK: - Dispatch async / sync
@@ -366,7 +379,7 @@ fn dispatch_apply_f(
 /// (because `DISPATCH_TIME_NOW` is 0), so a `when` produced by them is simply
 /// "nanoseconds from now". We clamp to a sane range: never negative, and at
 /// most 60s so a bogus/absolute value can't wedge a timer decades out.
-fn dispatch_after_delay_secs(when: u64) -> f64 {
+pub(super) fn dispatch_after_delay_secs(when: u64) -> f64 {
     if when == DISPATCH_TIME_FOREVER {
         return 60.0;
     }
@@ -486,6 +499,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     if work != GuestFunction::null_ptr() {
         let _: () = work.call_from_host(env, (context,));
     }
+}
+
++ (())_touchHLE_dispatchSourceTimerFired:(id)timer {
+    super::dispatch_source::source_timer_fired(env, timer);
+}
+
++ (())_touchHLE_dispatchSourceEventFired:(id)timer {
+    super::dispatch_source::source_event_fired(env, timer);
 }
 
 @end
@@ -679,79 +700,7 @@ fn release_if_semaphore(env: &mut Environment, obj: MutVoidPtr) -> bool {
     true
 }
 
-// MARK: - dispatch_source (stub)
-
-fn dispatch_source_create(
-    _env: &mut Environment,
-    _type_: ConstVoidPtr,
-    _handle: usize,
-    _mask: usize,
-    _queue: dispatch_queue_t,
-) -> dispatch_source_t {
-    log!("dispatch_source_create: stubbed");
-    MutVoidPtr::from_bits(0x0400_0001)
-}
-
-fn dispatch_source_set_event_handler(
-    _env: &mut Environment,
-    _source: dispatch_source_t,
-    _handler: dispatch_block_t,
-) {
-    log_dbg!("dispatch_source_set_event_handler: stubbed");
-}
-
-fn dispatch_source_set_event_handler_f(
-    _env: &mut Environment,
-    _source: dispatch_source_t,
-    _handler: GuestFunction,
-) {
-}
-
-fn dispatch_source_set_cancel_handler(
-    _env: &mut Environment,
-    _source: dispatch_source_t,
-    _handler: dispatch_block_t,
-) {
-}
-
-fn dispatch_source_set_cancel_handler_f(
-    _env: &mut Environment,
-    _source: dispatch_source_t,
-    _handler: GuestFunction,
-) {
-}
-
-fn dispatch_source_cancel(_env: &mut Environment, _source: dispatch_source_t) {}
-
-fn dispatch_source_testcancel(_env: &mut Environment, _source: dispatch_source_t) -> i32 {
-    0
-}
-
-fn dispatch_source_get_handle(_env: &mut Environment, _source: dispatch_source_t) -> usize {
-    0
-}
-
-fn dispatch_source_get_mask(_env: &mut Environment, _source: dispatch_source_t) -> usize {
-    0
-}
-
-fn dispatch_source_get_data(_env: &mut Environment, _source: dispatch_source_t) -> usize {
-    0
-}
-
-fn dispatch_source_merge_data(_env: &mut Environment, _source: dispatch_source_t, _value: usize) {}
-
-fn dispatch_source_set_timer(
-    _env: &mut Environment,
-    _source: dispatch_source_t,
-    _start: u64,
-    _interval: u64,
-    _leeway: u64,
-) {
-}
-
-fn dispatch_resume(_env: &mut Environment, _object: MutVoidPtr) {}
-fn dispatch_suspend(_env: &mut Environment, _object: MutVoidPtr) {}
+// MARK: - dispatch_source
 
 // MARK: - dispatch_barrier
 
@@ -783,10 +732,12 @@ fn dispatch_barrier_sync_f(
 
 // MARK: - dispatch_set_context / dispatch_get_context
 
-fn dispatch_set_context(_env: &mut Environment, _object: MutVoidPtr, _context: MutVoidPtr) {}
+fn dispatch_set_context(env: &mut Environment, object: MutVoidPtr, context: MutVoidPtr) {
+    dispatch_source::set_context(env, object, context);
+}
 
-fn dispatch_get_context(_env: &mut Environment, _object: MutVoidPtr) -> MutVoidPtr {
-    MutVoidPtr::null()
+fn dispatch_get_context(env: &mut Environment, object: MutVoidPtr) -> MutVoidPtr {
+    dispatch_source::get_context(env, object).unwrap_or_else(MutVoidPtr::null)
 }
 
 /// `void dispatch_queue_set_specific(dispatch_queue_t queue, const void *key,
@@ -890,7 +841,7 @@ fn dispatch_debug(_env: &mut Environment, _object: MutVoidPtr, _message: ConstVo
 /// On ARM32 a block is a struct whose second word is the invoke function
 //pointer.
 /// Layout: [isa, flags, reserved, invoke, descriptor, captures...]
-fn call_void_block(env: &mut Environment, block: dispatch_block_t) {
+pub(super) fn call_void_block(env: &mut Environment, block: dispatch_block_t) {
     let invoke_ptr = env.mem.read(block.cast::<u32>() + 3u32);
     if invoke_ptr == 0 {
         return;
