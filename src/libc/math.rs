@@ -7,7 +7,9 @@
 //! `math.h`
 
 use crate::abi::{impl_GuestRet_for_large_struct, GuestArg};
-use crate::dyld::{export_c_func, export_c_func_aliased, ConstantExports, FunctionExports, HostConstant};
+use crate::dyld::{
+    export_c_func, export_c_func_aliased, ConstantExports, FunctionExports, HostConstant,
+};
 use crate::libc::errno::set_errno;
 use crate::mem::{ConstPtr, MutPtr, SafeRead};
 use crate::Environment;
@@ -65,11 +67,15 @@ const FE_TONEAREST: FERoundingDirection = 0x000000;
 const FE_TOWARDZERO: FERoundingDirection = 0xc00000;
 const FE_UPWARD: FERoundingDirection = 0x400000;
 const FE_DOWNWARD: FERoundingDirection = 0x800000;
+const FPSCR_ROUNDING_MODE_MASK: u32 = 0x00c0_0000;
 
 #[derive(Default)]
 pub struct State {
-    rounding_direction: FERoundingDirection,
     timer_manager_instance: u32,
+}
+
+fn current_rounding_direction(env: &Environment) -> FERoundingDirection {
+    (env.cpu.fpscr() & FPSCR_ROUNDING_MODE_MASK) as FERoundingDirection
 }
 
 // The sections in this file are organized to match the C standard.
@@ -1025,7 +1031,7 @@ fn modff(env: &mut Environment, val: f32, iptr: MutPtr<f32>) -> f32 {
 }
 fn rint(env: &mut Environment, arg: f64) -> f64 {
     set_errno(env, 0);
-    let res = match env.libc_state.math.rounding_direction {
+    let res = match current_rounding_direction(env) {
         FE_TONEAREST => {
             // As tested on both macOS and iOS Simulator, by default it
             // rounds to the nearest integer with ties on even
@@ -1054,7 +1060,7 @@ fn rint(env: &mut Environment, arg: f64) -> f64 {
 fn lrint(env: &mut Environment, arg: f64) -> i32 {
     set_errno(env, 0);
     let clamped = arg.clamp(i32::MIN as f64, i32::MAX as f64);
-    match env.libc_state.math.rounding_direction {
+    match current_rounding_direction(env) {
         FE_TONEAREST => {
             // As tested on both macOS and iOS Simulator, by default it
             // rounds to the nearest integer with ties on even
@@ -1081,7 +1087,7 @@ fn lrintf(env: &mut Environment, arg: f32) -> i32 {
 // llrint rounds to an integer with the current rounding mode and returns
 // it as a long long; saturate on overflow instead of panicking the host.
 fn llrint_impl(env: &Environment, arg: f64) -> i64 {
-    let rounded = match env.libc_state.math.rounding_direction {
+    let rounded = match current_rounding_direction(env) {
         FE_TONEAREST => arg.round_ties_even(),
         FE_TOWARDZERO => arg.trunc(),
         FE_UPWARD => arg.ceil(),
@@ -1106,25 +1112,41 @@ fn llrintf(env: &mut Environment, arg: f32) -> i64 {
 
 // Rounding direction
 fn fegetround(env: &mut Environment) -> i32 {
-    env.libc_state.math.rounding_direction
+    current_rounding_direction(env)
 }
 fn fesetround(env: &mut Environment, round: i32) -> i32 {
-    // Per the C standard (7.6.3.2 fesetround), the argument must be one of
-    // the implementation's supported rounding-direction macros; the four
-    // IEEE 754 modes below are all supported by our rint()/nearbyint().
     if round == FE_TONEAREST || round == FE_TOWARDZERO || round == FE_UPWARD || round == FE_DOWNWARD
     {
-        env.libc_state.math.rounding_direction = round;
-        0 // Success
+        let fpscr = env.cpu.fpscr();
+        env.cpu
+            .set_fpscr((fpscr & !FPSCR_ROUNDING_MODE_MASK) | round as u32);
+        0
     } else {
-        // An invalid mode argument is not a fatal error for the guest;
-        // reject it and leave the current rounding direction unchanged.
         log!(
             "Warning: fesetround({:#x}): invalid rounding direction; ignoring.",
             round
         );
-        1 // Non-zero: failure
+        1
     }
+}
+
+fn fegetenv(env: &mut Environment, envp: MutPtr<u32>) -> i32 {
+    if envp.is_null() {
+        set_errno(env, crate::libc::errno::EINVAL);
+        return -1;
+    }
+    env.mem.write(envp, env.cpu.fpscr());
+    env.mem.write(envp + 1, 0);
+    0
+}
+
+fn fesetenv(env: &mut Environment, envp: ConstPtr<u32>) -> i32 {
+    if envp.is_null() {
+        set_errno(env, crate::libc::errno::EINVAL);
+        return -1;
+    }
+    env.cpu.set_fpscr(env.mem.read(envp));
+    0
 }
 
 // Remainder functions
@@ -1318,7 +1340,7 @@ fn llround_impl(arg: f64) -> i64 {
 
 fn rintf(env: &mut Environment, arg: f32) -> f32 {
     set_errno(env, 0);
-    let res = match env.libc_state.math.rounding_direction {
+    let res = match current_rounding_direction(env) {
         FE_TONEAREST => arg.round_ties_even(),
         FE_TOWARDZERO => arg.trunc(),
         FE_UPWARD => arg.ceil(),
@@ -1825,6 +1847,9 @@ pub const FUNCTIONS: FunctionExports = &[
     // Rounding direction
     export_c_func!(fegetround()),
     export_c_func!(fesetround(_)),
+    export_c_func!(fegetenv(_)),
+    export_c_func!(fesetenv(_)),
+
     // Remainder functions
     export_c_func!(fmod(_, _)),
     export_c_func!(fmodf(_, _)),
@@ -1901,10 +1926,9 @@ pub const FUNCTIONS: FunctionExports = &[
 /// the Open Group `fenv.h` reference
 /// <https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/fenv.h.html>.
 ///
-/// touchHLE exposes a zero-filled 8-byte `fenv_t` (matching ARMv7's
-/// `__fpu_control` + reserved layout): apps that pass `FE_DFL_ENV`
-/// to `fesetenv` will get the default environment (all flags clear,
-/// round-to-nearest).
+/// touchHLE exposes an 8-byte ARMv7 `fenv_t` containing `__fpscr` and a
+/// reserved word. The zero-filled `FE_DFL_ENV` therefore selects the default
+/// FPSCR environment with round-to-nearest and all exception flags clear.
 pub const CONSTANTS: ConstantExports = &[(
     "__FE_DFL_ENV",
     HostConstant::Custom(|env| {

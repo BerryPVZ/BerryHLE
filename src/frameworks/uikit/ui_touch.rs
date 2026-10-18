@@ -13,7 +13,7 @@ use super::ui_gesture_recognizer::{
     UISwipeGestureRecognizerDirectionLeft, UISwipeGestureRecognizerDirectionRight,
     UISwipeGestureRecognizerDirectionUp,
 };
-use crate::frameworks::core_graphics::{CGPoint, CGRect};
+use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect};
 use crate::frameworks::foundation::{NSInteger, NSTimeInterval, NSUInteger};
 use crate::mem::{GuestUSize, MutVoidPtr};
 use crate::objc::{
@@ -64,6 +64,9 @@ pub const UITouchPhaseBegan: UITouchPhase = 0;
 pub const UITouchPhaseMoved: UITouchPhase = 1;
 pub const UITouchPhaseStationary: UITouchPhase = 2;
 pub const UITouchPhaseEnded: UITouchPhase = 3;
+
+pub type UITouchType = NSInteger;
+pub const UITouchTypeDirect: UITouchType = 0;
 
 #[derive(Default)]
 pub struct State {
@@ -119,19 +122,20 @@ fn touches_for_view_delivery(env: &mut Environment, touches: id) -> id {
 /// at self-consistent offsets within the first 0x40 bytes; methods must
 /// never read it from the host object (a copy is not registered in the
 /// object map, so a host-side lookup would fail and return garbage).
+/// The layout is 0x40 bytes to match the stride guest engines use when they
+/// bit-copy a UITouch.
 #[repr(C)]
 struct UITouchIvars {
     /// Written by the runtime in `alloc_object_inner`; never touched by us.
     _isa: u32,
-    window: id,                // 0x04
-    view: id,                  // 0x08
-    phase: UITouchPhase,       // 0x0C
-    timestamp: NSTimeInterval, // 0x10
-    location: CGPoint,         // 0x18
+    window: id,                 // 0x04
+    view: id,                   // 0x08
+    phase: UITouchPhase,        // 0x0C
+    timestamp: NSTimeInterval,  // 0x10
+    location: CGPoint,          // 0x18
     previous_location: CGPoint, // 0x28
-    tap_count: u32,            // 0x38
-    // struct size: 0x40, matching the stride guest engines use when they
-    // bit-copy a UITouch.
+    tap_count: u32,             // 0x38
+    touch_type: UITouchType,    // 0x3C
 }
 
 /// Run `f` with the guest-memory ivars of the (possibly unregistered —
@@ -438,12 +442,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     });
     // The guest allocation must cover the ivars (see `UITouchIvars`): guest
     // engines bit-copy the whole 0x40-byte object and message the copy.
-    env.objc.alloc_object_sized(
+    let new_touch = env.objc.alloc_object_sized(
         this,
         std::mem::size_of::<UITouchIvars>() as GuestUSize,
         host_object,
         &mut env.mem,
-    )
+    );
+    touch_ivars(env, new_touch, |v| v.touch_type = UITouchTypeDirect);
+    new_touch
 }
 
 - (())dealloc {
@@ -559,6 +565,19 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (UITouchPhase)phase {
     touch_ivars(env, this, |v| v.phase)
+}
+
+- (UITouchType)type {
+    touch_ivars(env, this, |v| v.touch_type)
+}
+
+// Event::Touches* carries point coordinates but no hardware contact-area sample.
+- (CGFloat)majorRadius {
+    0.0
+}
+
+- (CGFloat)majorRadiusTolerance {
+    0.0
 }
 
 @end

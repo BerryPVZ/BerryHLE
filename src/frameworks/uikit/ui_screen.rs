@@ -6,7 +6,11 @@
 //! `UIScreen`.
 
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
-use crate::objc::{id, msg, msg_class, nil, objc_classes, ClassExports, TrivialHostObject, SEL};
+use crate::frameworks::foundation::NSInteger;
+use crate::objc::{
+    autorelease, id, msg, msg_class, nil, objc_classes, ClassExports, HostObject,
+    TrivialHostObject, SEL,
+};
 
 #[derive(Default)]
 pub struct State {
@@ -71,6 +75,84 @@ fn clamp_brightness(value: CGFloat) -> CGFloat {
     }
 }
 
+const UI_USER_INTERFACE_IDIOM_PHONE: NSInteger = 0;
+const UI_USER_INTERFACE_IDIOM_PAD: NSInteger = 1;
+const UI_USER_INTERFACE_SIZE_CLASS_COMPACT: NSInteger = 1;
+const UI_USER_INTERFACE_SIZE_CLASS_REGULAR: NSInteger = 2;
+
+#[derive(Default)]
+struct UITraitCollectionHostObject {
+    user_interface_idiom: NSInteger,
+    horizontal_size_class: NSInteger,
+    vertical_size_class: NSInteger,
+    display_scale: CGFloat,
+}
+impl HostObject for UITraitCollectionHostObject {}
+
+fn screen_trait_values(env: &mut crate::Environment) -> (NSInteger, NSInteger, NSInteger, CGFloat) {
+    if env.window.is_none() {
+        return (
+            UI_USER_INTERFACE_IDIOM_PHONE,
+            UI_USER_INTERFACE_SIZE_CLASS_COMPACT,
+            UI_USER_INTERFACE_SIZE_CLASS_REGULAR,
+            1.0,
+        );
+    }
+    let idiom = if env.window().device_family().is_ipad() {
+        UI_USER_INTERFACE_IDIOM_PAD
+    } else {
+        UI_USER_INTERFACE_IDIOM_PHONE
+    };
+    let landscape = matches!(
+        env.window().current_rotation(),
+        crate::window::DeviceOrientation::LandscapeLeft
+            | crate::window::DeviceOrientation::LandscapeRight
+    );
+    let (horizontal, vertical) = if idiom == UI_USER_INTERFACE_IDIOM_PAD {
+        (
+            UI_USER_INTERFACE_SIZE_CLASS_REGULAR,
+            UI_USER_INTERFACE_SIZE_CLASS_REGULAR,
+        )
+    } else if landscape {
+        (
+            UI_USER_INTERFACE_SIZE_CLASS_COMPACT,
+            UI_USER_INTERFACE_SIZE_CLASS_COMPACT,
+        )
+    } else {
+        (
+            UI_USER_INTERFACE_SIZE_CLASS_COMPACT,
+            UI_USER_INTERFACE_SIZE_CLASS_REGULAR,
+        )
+    };
+    (
+        idiom,
+        horizontal,
+        vertical,
+        env.window().screen_scale() as CGFloat,
+    )
+}
+
+fn new_trait_collection(
+    env: &mut crate::Environment,
+    user_interface_idiom: NSInteger,
+    horizontal_size_class: NSInteger,
+    vertical_size_class: NSInteger,
+    display_scale: CGFloat,
+) -> id {
+    let class = env.objc.get_known_class("UITraitCollection", &mut env.mem);
+    let collection = env.objc.alloc_object(
+        class,
+        Box::new(UITraitCollectionHostObject {
+            user_interface_idiom,
+            horizontal_size_class,
+            vertical_size_class,
+            display_scale,
+        }),
+        &mut env.mem,
+    );
+    autorelease(env, collection)
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -106,6 +188,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)autorelease { this }
 
 // MARK: - Geometry
+
+- (id)traitCollection {
+    let (idiom, horizontal, vertical, scale) = screen_trait_values(env);
+    new_trait_collection(env, idiom, horizontal, vertical, scale)
+}
 
 - (CGRect)bounds {
     let (width, height) = screen_size_for_current_orientation(env);
@@ -278,6 +365,54 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)displayLinkWithTarget:(id)target selector:(SEL)selector {
     msg_class![env; CADisplayLink displayLinkWithTarget:target selector:selector]
 }
+
+@end
+
+@implementation UITraitCollection: NSObject
+
++ (id)currentTraitCollection {
+    let screen: id = msg_class![env; UIScreen mainScreen];
+    msg![env; screen traitCollection]
+}
+
++ (id)traitCollectionWithUserInterfaceIdiom:(NSInteger)idiom {
+    let (_, _, _, scale) = screen_trait_values(env);
+    let (horizontal, vertical) = if idiom == UI_USER_INTERFACE_IDIOM_PAD {
+        (UI_USER_INTERFACE_SIZE_CLASS_REGULAR, UI_USER_INTERFACE_SIZE_CLASS_REGULAR)
+    } else {
+        (UI_USER_INTERFACE_SIZE_CLASS_COMPACT, UI_USER_INTERFACE_SIZE_CLASS_REGULAR)
+    };
+    new_trait_collection(env, idiom, horizontal, vertical, scale)
+}
+
++ (id)traitCollectionWithHorizontalSizeClass:(NSInteger)horizontalSizeClass
+                            verticalSizeClass:(NSInteger)verticalSizeClass {
+    let (idiom, _, _, scale) = screen_trait_values(env);
+    new_trait_collection(env, idiom, horizontalSizeClass, verticalSizeClass, scale)
+}
+
++ (id)traitCollectionWithDisplayScale:(CGFloat)displayScale {
+    let (idiom, horizontal, vertical, _) = screen_trait_values(env);
+    new_trait_collection(env, idiom, horizontal, vertical, displayScale)
+}
+
+- (NSInteger)userInterfaceIdiom {
+    env.objc.borrow::<UITraitCollectionHostObject>(this).user_interface_idiom
+}
+
+- (NSInteger)horizontalSizeClass {
+    env.objc.borrow::<UITraitCollectionHostObject>(this).horizontal_size_class
+}
+
+- (NSInteger)verticalSizeClass {
+    env.objc.borrow::<UITraitCollectionHostObject>(this).vertical_size_class
+}
+
+- (CGFloat)displayScale {
+    env.objc.borrow::<UITraitCollectionHostObject>(this).display_scale
+}
+
+- (NSInteger)layoutDirection { 0 }
 
 @end
 

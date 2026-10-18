@@ -1268,6 +1268,23 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)superview { env.objc.borrow::<UIViewHostObject>(this).superview }
 
+- (bool)isDescendantOfView:(id)ancestor {
+    if ancestor == nil {
+        return false;
+    }
+    let mut current = this;
+    for _ in 0..256 {
+        if current == nil {
+            return false;
+        }
+        if current == ancestor {
+            return true;
+        }
+        current = msg![env; current superview];
+    }
+    false
+}
+
 - (id)window {
     let mut window: id = env.objc.borrow::<UIViewHostObject>(this).superview;
     let window_class = env.objc.get_known_class("UIWindow", &mut env.mem);
@@ -1956,10 +1973,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)traitCollection {
-    // iOS ≥ 8 asks views for their trait collection. Returning nil is the
-    // documented legacy behaviour for views not in a trait environment and
-    // satisfies engines probing for size classes without crashing.
-    nil
+    let window: id = msg![env; this window];
+    let screen: id = if window == nil {
+        msg_class![env; UIScreen mainScreen]
+    } else {
+        msg![env; window screen]
+    };
+    msg![env; screen traitCollection]
 }
 
 - (CGSize)sizeThatFits:(CGSize)size { size }

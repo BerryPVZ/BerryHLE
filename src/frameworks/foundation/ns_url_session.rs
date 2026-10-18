@@ -85,6 +85,7 @@ struct NSURLSessionHostObject {
     configuration: id,
     delegate: id,
     delegate_queue: id,
+    session_description: id,
 }
 impl HostObject for NSURLSessionHostObject {}
 
@@ -591,6 +592,16 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow::<NSURLSessionHostObject>(this).delegate_queue
 }
 
+- (id)sessionDescription {
+    env.objc.borrow::<NSURLSessionHostObject>(this).session_description
+}
+- (())setSessionDescription:(id)description {
+    let copy: id = msg![env; description copy];
+    let old = env.objc.borrow::<NSURLSessionHostObject>(this).session_description;
+    env.objc.borrow_mut::<NSURLSessionHostObject>(this).session_description = copy;
+    release(env, old);
+}
+
 // MARK: - Task creation
 
 - (id)dataTaskWithRequest:(id)request {
@@ -677,10 +688,12 @@ pub const CLASSES: ClassExports = objc_classes! {
         configuration,
         delegate,
         delegate_queue,
+        session_description,
     } = env.objc.borrow::<NSURLSessionHostObject>(this);
     release(env, configuration);
     release(env, delegate);
     release(env, delegate_queue);
+    release(env, session_description);
     env.objc.dealloc_object(this, &mut env.mem);
 }
 

@@ -230,6 +230,12 @@ impl Cpu {
     pub fn set_cpsr(&mut self, cpsr: u32) {
         unsafe { touchHLE_DynarmicWrapper_set_cpsr(self.dynarmic_wrapper, cpsr) }
     }
+    pub fn fpscr(&self) -> u32 {
+        unsafe { touchHLE_DynarmicWrapper_fpscr(self.dynarmic_wrapper) }
+    }
+    pub fn set_fpscr(&mut self, fpscr: u32) {
+        unsafe { touchHLE_DynarmicWrapper_set_fpscr(self.dynarmic_wrapper, fpscr) }
+    }
 
     /// Start address of the instruction that raised the most recent
     /// [CpuError::UndefinedInstruction] or [CpuError::Breakpoint].

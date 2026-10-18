@@ -325,6 +325,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     true
 }
 
+- (bool)scanInteger:(MutPtr<NSInteger>)result {
+    msg![env; this scanInt:result]
+}
+
 - (bool)scanFloat:(MutPtr<f32>)result {
     skip_characters(env, this);
 
