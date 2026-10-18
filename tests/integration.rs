@@ -190,6 +190,8 @@ fn run_test_app(
     let binary_name = "touchHLE";
     let binary_path = target_dir().join(format!("{}{}", binary_name, env::consts::EXE_SUFFIX));
     let mut cmd = Command::new(binary_path);
+    // Use OpenAL Soft's silent backend so audio tests need no CI device.
+    cmd.env("ALSOFT_DRIVERS", "null");
     let output = cmd
         .arg(test_app_path)
         // headless mode avoids a distracting window briefly appearing during
@@ -309,6 +311,7 @@ fn test_app() -> Result<(), Box<dyn Error>> {
         stubs_lib_search_arg.as_str(),
         stubs_frameworks_search_arg.as_str(),
         "-ObjC",
+        "-fblocks",
         "-fno-objc-exceptions",
         // ARC is not available until IOS 5, so it can't be used.
         "-fno-objc-arc",
@@ -317,6 +320,8 @@ fn test_app() -> Result<(), Box<dyn Error>> {
         // itself (see ns_string::register_constant_strings), so no stub
         // exports it.
         "-Wl,-U,___CFConstantStringClassReference",
+        // Block classes are also provided directly by dyld, not the stubs.
+        "-Wl,-U,__NSConcreteGlobalBlock",
     ];
 
     // Generate symbol stubs.

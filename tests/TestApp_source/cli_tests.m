@@ -11,6 +11,7 @@
 #include <CoreFoundation/CFBundle.h>
 #include <CoreFoundation/CFDictionary.h>
 #include <CoreFoundation/CFNumber.h>
+#include <CoreFoundation/CFRunLoop.h>
 #include <CoreFoundation/CFString.h>
 #include <CoreFoundation/CFURL.h>
 #include <arpa/inet.h>
@@ -29,6 +30,7 @@
 #include <semaphore.h>
 #include <setjmp.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,6 +65,7 @@
 
 @interface NSDate : NSObject
 + (instancetype)dateWithTimeIntervalSinceNow:(NSTimeInterval)seconds;
+- (NSTimeInterval)timeIntervalSinceNow;
 @end
 
 extern NSString *const NSDefaultRunLoopMode;
@@ -115,7 +118,8 @@ int test_performSelectorOnMainThread_mainThreadDeferred(void) {
 
 int test_UIApplication_canOpenURL_own_registered_scheme(void) {
   NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-  UIApplication *application = [[UIApplication alloc] init];
+  UIApplication *application = [UIApplication sharedApplication];
+  if (application == nil) application = [[UIApplication alloc] init];
   NSURL *registered = [NSURL URLWithString:@"HYPERHLE-TEST://callback"];
   NSURL *unregistered =
       [NSURL URLWithString:@"hyperhle-unregistered://callback"];
@@ -133,6 +137,514 @@ int test_UIApplication_canOpenURL_own_registered_scheme(void) {
   }
   [pool drain];
   return 0;
+}
+
+@interface NSNumber (SelectorQueueTest)
++ (NSNumber *)numberWithInt:(int)value;
+- (int)intValue;
+@end
+
+@interface NSObject (SelectorQueueModes)
+- (void)performSelectorOnMainThread:(SEL)selector
+                         withObject:(id)object
+                      waitUntilDone:(BOOL)wait
+                              modes:(NSArray *)modes;
+@end
+
+// Separate delivery guarantees from timer/deadline behavior.
+static int selector_arguments_freed;
+@interface SelectorQueueArgument : NSObject {
+@public
+  int value;
+}
+- (int)intValue;
+@end
+@implementation SelectorQueueArgument
+- (int)intValue {
+  return value;
+}
+- (void)dealloc {
+  selector_arguments_freed++;
+  [super dealloc];
+}
+@end
+
+static pthread_t selector_main_thread;
+static int selector_order, selector_wrong_thread, selector_early;
+@interface SelectorQueueProbe : NSObject {
+@public
+  BOOL ready;
+}
+- (void)record:(id)value;
+@end
+@implementation SelectorQueueProbe
+- (void)record:(id)value {
+  if (!pthread_equal(pthread_self(), selector_main_thread))
+    selector_wrong_thread++;
+  if (!ready)
+    selector_early++;
+  selector_order = selector_order * 10 + [value intValue];
+}
+@end
+
+int test_selector_queue_order_and_initialization(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  SelectorQueueProbe *probe = [[SelectorQueueProbe alloc] init];
+  selector_main_thread = pthread_self();
+  selector_order = selector_wrong_thread = selector_early = 0;
+  selector_arguments_freed = 0;
+  for (int i = 1; i <= 2; i++) {
+    SelectorQueueArgument *argument = [[SelectorQueueArgument alloc] init];
+    argument->value = i;
+    [probe performSelectorOnMainThread:@selector(record:)
+                            withObject:argument
+                         waitUntilDone:NO];
+    [argument release];
+  }
+  int freed_before_delivery = selector_arguments_freed;
+  int immediate = selector_order;
+  probe->ready = YES;
+  [probe release]; // Queue must keep its target alive until delivery.
+  [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode
+                        beforeDate:[NSDate dateWithTimeIntervalSinceNow:1.0]];
+  int result = immediate == 0 && selector_order == 12 &&
+                       !selector_wrong_thread && !selector_early
+                   ? 0
+                   : -1;
+  [pool drain];
+  return result == 0 && !freed_before_delivery && selector_arguments_freed == 2
+             ? 0
+             : -2;
+}
+
+int test_selector_queue_explicit_and_common_modes(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  SelectorQueueProbe *probe = [[SelectorQueueProbe alloc] init];
+  probe->ready = YES;
+  selector_main_thread = pthread_self();
+  selector_order = selector_wrong_thread = selector_early = 0;
+  NSString *mode = @"TestAppSelectorMode";
+  [probe performSelectorOnMainThread:@selector(record:)
+                          withObject:@4
+                       waitUntilDone:YES
+                               modes:nil];
+  [probe performSelectorOnMainThread:@selector(record:)
+                          withObject:@5
+                       waitUntilDone:YES
+                               modes:[NSArray array]];
+  [probe performSelectorOnMainThread:@selector(record:)
+                          withObject:@1
+                       waitUntilDone:NO
+                               modes:[NSArray arrayWithObjects:mode, nil]];
+  CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true);
+  int premature = selector_order;
+  [[NSRunLoop mainRunLoop] runMode:mode
+                        beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+  int explicit_result = selector_order;
+  CFRunLoopAddCommonMode(CFRunLoopGetCurrent(), (CFStringRef)mode);
+  [probe performSelectorOnMainThread:@selector(record:)
+                          withObject:@2
+                       waitUntilDone:NO];
+  [[NSRunLoop mainRunLoop] runMode:mode
+                        beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+  int result = !premature && explicit_result == 1 && selector_order == 12 &&
+                       !selector_wrong_thread
+                   ? 0
+                   : -1;
+  [probe release];
+  [pool drain];
+  return result;
+}
+
+static int selector_requeue_inline;
+@interface SelectorRequeueProbe : NSObject {
+@public
+  BOOL nested;
+}
+- (void)step:(id)value;
+@end
+@implementation SelectorRequeueProbe
+- (void)step:(id)value {
+  selector_order = selector_order * 10 + [value intValue];
+  if ([value intValue] == 1) {
+    [self performSelectorOnMainThread:@selector(step:) withObject:@2 waitUntilDone:NO];
+    selector_requeue_inline = selector_order != 1;
+    if (nested)
+      [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode
+                      beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];
+  }
+}
+@end
+int test_selector_queue_callback_and_nested_delivery(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  SelectorRequeueProbe *probe = [[SelectorRequeueProbe alloc] init];
+  selector_order = selector_requeue_inline = 0;
+  [probe performSelectorOnMainThread:@selector(step:) withObject:@1 waitUntilDone:NO];
+  [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode
+                      beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];
+  int first_pass = selector_order;
+  [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode
+                      beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];
+  int second_pass = selector_order;
+  probe->nested = YES;
+  selector_order = 0;
+  [probe performSelectorOnMainThread:@selector(step:) withObject:@1 waitUntilDone:NO];
+  [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode
+                      beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];
+  int result = first_pass == 1 && second_pass == 12 && selector_order == 12 &&
+      !selector_requeue_inline ? 0 : -1;
+  [probe release];
+  [pool drain];
+  return result;
+}
+
+static pthread_mutex_t selector_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int selector_worker_done, selector_worker_observed;
+static BOOL selector_worker_wait;
+static void *selector_worker(void *object) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  [(id)object performSelectorOnMainThread:@selector(record:)
+                               withObject:@3
+                            waitUntilDone:selector_worker_wait];
+  pthread_mutex_lock(&selector_mutex);
+  selector_worker_observed = selector_worker_wait ? selector_order : -1;
+  selector_worker_done = 1;
+  pthread_mutex_unlock(&selector_mutex);
+  [pool drain];
+  return NULL;
+}
+static int check_selector_background(BOOL wait) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  SelectorQueueProbe *probe = [[SelectorQueueProbe alloc] init];
+  probe->ready = YES;
+  selector_main_thread = pthread_self();
+  selector_order = selector_wrong_thread = selector_early = 0;
+  selector_worker_done = selector_worker_observed = 0;
+  selector_worker_wait = wait;
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, selector_worker, probe))
+    return -1;
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
+  int done;
+  do {
+    [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode beforeDate:deadline];
+    pthread_mutex_lock(&selector_mutex);
+    done = selector_worker_done;
+    pthread_mutex_unlock(&selector_mutex);
+  } while ((!done || selector_order != 3) &&
+           [deadline timeIntervalSinceNow] > 0);
+  // On failure leave the probe alive for the pending request; the harness
+  // still rejects the failed result and bounds the entire guest session.
+  if (!done)
+    return -3;
+  pthread_join(thread, NULL);
+  int result = selector_order == 3 &&
+                       (!wait || selector_worker_observed == 3) &&
+                       !selector_wrong_thread
+                   ? 0
+                   : -2;
+  [probe release];
+  [pool drain];
+  return result;
+}
+
+int test_selector_queue_background_wait(void) {
+  return check_selector_background(YES);
+}
+int test_selector_queue_background_async(void) {
+  return check_selector_background(NO);
+}
+
+static int source_calls;
+static void runloop_source_perform(void *info) {
+  source_calls++;
+  if (info)
+    CFRunLoopStop(CFRunLoopGetCurrent());
+}
+static void ordered_runloop_source(void *info) {
+  source_calls = source_calls * 10 + (int)(intptr_t)info;
+}
+int test_runloop_sources_modes_and_stop(void) {
+  CFRunLoopRef loop = CFRunLoopGetCurrent();
+  CFRunLoopSourceContext context = {0};
+  context.perform = runloop_source_perform;
+  CFRunLoopSourceRef source = CFRunLoopSourceCreate(NULL, 0, &context);
+  CFStringRef mode = CFSTR("TestAppSourceMode");
+  source_calls = 0;
+  CFRunLoopAddSource(loop, source, mode);
+  CFRunLoopSourceSignal(source);
+  if (CFRunLoopRunInMode(CFSTR("TestAppEmptyMode"), 0, true) !=
+          kCFRunLoopRunFinished ||
+      source_calls)
+    return -1;
+  if (CFRunLoopRunInMode(mode, 0.2, true) != kCFRunLoopRunHandledSource ||
+      source_calls != 1)
+    return -2;
+  if (CFRunLoopRunInMode(mode, 0, true) != kCFRunLoopRunTimedOut ||
+      source_calls != 1)
+    return -3;
+  CFRunLoopRemoveSource(loop, source, mode);
+  CFRelease(source);
+  context.info = (void *)1;
+  source = CFRunLoopSourceCreate(NULL, 0, &context);
+  CFRunLoopAddSource(loop, source, mode);
+  CFRunLoopSourceSignal(source);
+  int stopped = CFRunLoopRunInMode(mode, 0.2, false);
+  CFRunLoopSourceSignal(source);
+  int handled_and_stopped = CFRunLoopRunInMode(mode, 0.2, true);
+  CFRunLoopSourceSignal(source);
+  int expired_and_stopped = CFRunLoopRunInMode(mode, 0, false);
+  CFRunLoopRemoveSource(loop, source, mode);
+  CFRelease(source);
+  context.perform = ordered_runloop_source;
+  context.info = (void *)1;
+  source = CFRunLoopSourceCreate(NULL, 1, &context);
+  context.info = (void *)2;
+  CFRunLoopSourceRef second = CFRunLoopSourceCreate(NULL, 2, &context);
+  CFRunLoopAddSource(loop, source, mode);
+  CFRunLoopAddSource(loop, second, mode);
+  CFRunLoopSourceSignal(source);
+  CFRunLoopSourceSignal(second);
+  source_calls = 0;
+  int one = CFRunLoopRunInMode(mode, 0.2, true);
+  int first_order = source_calls;
+  int two = CFRunLoopRunInMode(mode, 0.2, true);
+  CFRunLoopRemoveSource(loop, source, mode);
+  CFRunLoopRemoveSource(loop, second, mode);
+  CFRelease(source);
+  CFRelease(second);
+  return stopped == kCFRunLoopRunStopped &&
+      handled_and_stopped == kCFRunLoopRunHandledSource &&
+      expired_and_stopped == kCFRunLoopRunTimedOut &&
+      one == kCFRunLoopRunHandledSource && two == kCFRunLoopRunHandledSource &&
+      first_order == 1 && source_calls == 12 ? 0 : -4;
+}
+
+static int nested_result, nested_mode_restored;
+static void nested_runloop_source(void *info) {
+  nested_result = CFRunLoopRunInMode(CFSTR("TestAppNestedInner"), 0.2, false);
+  CFStringRef mode = CFRunLoopCopyCurrentMode(CFRunLoopGetCurrent());
+  nested_mode_restored = CFEqual(mode, CFSTR("TestAppNestedOuter"));
+  CFRelease(mode);
+}
+int test_runloop_nested_stop(void) {
+  CFRunLoopRef loop = CFRunLoopGetCurrent();
+  CFRunLoopSourceContext context = {0};
+  context.perform = nested_runloop_source;
+  CFRunLoopSourceRef outer = CFRunLoopSourceCreate(NULL, 0, &context);
+  context.perform = runloop_source_perform;
+  context.info = (void *)1;
+  CFRunLoopSourceRef inner = CFRunLoopSourceCreate(NULL, 0, &context);
+  CFRunLoopAddSource(loop, outer, CFSTR("TestAppNestedOuter"));
+  CFRunLoopAddSource(loop, inner, CFSTR("TestAppNestedInner"));
+  CFRunLoopSourceSignal(outer);
+  CFRunLoopSourceSignal(inner);
+  nested_result = nested_mode_restored = 0;
+  int result = CFRunLoopRunInMode(CFSTR("TestAppNestedOuter"), 0.3, true);
+  CFRunLoopRemoveSource(loop, outer, CFSTR("TestAppNestedOuter"));
+  CFRunLoopRemoveSource(loop, inner, CFSTR("TestAppNestedInner"));
+  CFRelease(outer);
+  CFRelease(inner);
+  return result == kCFRunLoopRunHandledSource &&
+                 nested_result == kCFRunLoopRunStopped && nested_mode_restored
+             ? 0
+             : -1;
+}
+
+// The old SDK has no dispatch headers; these are the public C signatures.
+typedef void *dispatch_queue_t;
+typedef uint64_t dispatch_time_t;
+extern dispatch_queue_t dispatch_get_main_queue(void);
+extern dispatch_time_t dispatch_time(dispatch_time_t when, int64_t delta);
+extern void dispatch_after(dispatch_time_t when, dispatch_queue_t queue,
+                           void (^block)(void));
+
+@interface NSTimer (InvocationSchedulingTest)
++ (instancetype)scheduledTimerWithTimeInterval:(NSTimeInterval)interval
+                                  invocation:(NSInvocation *)invocation
+                                     repeats:(BOOL)repeats;
+@end
+
+static int scheduled_dispatch_calls;
+
+static int check_scheduled_timer_default_mode(BOOL use_invocation) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  PerformSelectorOnMainThreadProbe *probe =
+      [[PerformSelectorOnMainThreadProbe alloc] init];
+  perform_selector_on_main_thread_calls = 0;
+  NSTimer *timer;
+  if (use_invocation) {
+    NSMethodSignature *signature =
+        [NSMethodSignature signatureWithObjCTypes:"v12@0:4@8"];
+    NSInvocation *invocation =
+        [NSInvocation invocationWithMethodSignature:signature];
+    [invocation setTarget:probe];
+    [invocation setSelector:@selector(signal:)];
+    id argument = nil;
+    [invocation setArgument:&argument atIndex:2];
+    [invocation retainArguments];
+    timer = [NSTimer scheduledTimerWithTimeInterval:0.01
+                                        invocation:invocation repeats:NO];
+  } else {
+    timer = [NSTimer scheduledTimerWithTimeInterval:0.01 target:probe
+        selector:@selector(signal:) userInfo:nil repeats:NO];
+  }
+  [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode
+                      beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+  int result = perform_selector_on_main_thread_calls == 1 ? 0 : -1;
+  [timer invalidate];
+  [probe release];
+  [pool drain];
+  return result;
+}
+
+int test_scheduled_timer_default_mode(void) {
+  return check_scheduled_timer_default_mode(NO);
+}
+
+int test_scheduled_invocation_timer_default_mode(void) {
+  return check_scheduled_timer_default_mode(YES);
+}
+
+extern void dispatch_after_f(dispatch_time_t when, dispatch_queue_t queue,
+                             void *context, void (*work)(void *));
+static void scheduled_dispatch_function(void *context) {
+  (*(int *)context)++;
+}
+static int check_dispatch_after_source(BOOL function, BOOL common_mode) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  CFStringRef mode = common_mode ? CFSTR("TestAppDispatchCommonMode")
+                                : kCFRunLoopDefaultMode;
+  CFRunLoopRef loop = CFRunLoopGetCurrent();
+  if (common_mode) CFRunLoopAddCommonMode(loop, mode);
+  // Keep the mode alive even after its one-shot timer is removed.
+  CFRunLoopSourceContext context = {0};
+  context.perform = runloop_source_perform;
+  CFRunLoopSourceRef source = CFRunLoopSourceCreate(NULL, 0, &context);
+  CFRunLoopAddSource(loop, source, mode);
+  scheduled_dispatch_calls = 0;
+  if (function)
+    dispatch_after_f(dispatch_time(0, 10000000), dispatch_get_main_queue(),
+                     &scheduled_dispatch_calls, scheduled_dispatch_function);
+  else
+    dispatch_after(dispatch_time(0, 10000000), dispatch_get_main_queue(), ^{
+      scheduled_dispatch_calls++;
+    });
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
+  BOOL ran = [[NSRunLoop mainRunLoop] runMode:(id)mode beforeDate:deadline];
+  int result = ran && scheduled_dispatch_calls == 1 ? 0 : -1;
+  if (result == 0 && [deadline timeIntervalSinceNow] < 0.5) result = -2;
+  // On failure still drain work so it cannot leak into later tests.
+  if (scheduled_dispatch_calls == 0)
+    [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode
+                        beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+  CFRunLoopRemoveSource(loop, source, mode);
+  CFRelease(source);
+  [pool drain];
+  return result;
+}
+int test_dispatch_after_default_mode(void) {
+  return check_dispatch_after_source(NO, NO);
+}
+int test_dispatch_after_f_default_mode(void) {
+  return check_dispatch_after_source(YES, NO);
+}
+int test_dispatch_after_common_mode(void) {
+  return check_dispatch_after_source(NO, YES);
+}
+extern int test_runloop_audio_queue(void);
+extern int test_runloop_audio_queue_null(void);
+extern int test_runloop_audio_unit_independent(void);
+
+int test_runloop_timer_waits_until_deadline(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  PerformSelectorOnMainThreadProbe *probe =
+      [[PerformSelectorOnMainThreadProbe alloc] init];
+  CFStringRef mode = CFSTR("TestAppTimerMode");
+  // A source keeps the mode alive after the one-shot timer fires.
+  CFRunLoopSourceContext context = {0};
+  context.perform = runloop_source_perform;
+  CFRunLoopSourceRef source = CFRunLoopSourceCreate(NULL, 0, &context);
+  CFRunLoopAddSource(CFRunLoopGetCurrent(), source, mode);
+  NSTimer *timer = [NSTimer timerWithTimeInterval:0.05
+                                           target:probe
+                                         selector:@selector(signal:)
+                                         userInfo:nil
+                                          repeats:NO];
+  CFRunLoopAddTimer(CFRunLoopGetCurrent(), (CFRunLoopTimerRef)timer, mode);
+  perform_selector_on_main_thread_calls = 0;
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:0.15];
+  BOOL ran = [[NSRunLoop mainRunLoop] runMode:(id)mode beforeDate:deadline];
+  int result = ran && perform_selector_on_main_thread_calls == 1 &&
+                       [deadline timeIntervalSinceNow] <= 0
+                   ? 0
+                   : -1;
+  [timer invalidate];
+  CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, mode);
+  CFRelease(source);
+  // A mode that starts with only one timer still reports that it ran,
+  // even if firing the timer removes its final registered object.
+  timer = [NSTimer timerWithTimeInterval:0.01 target:probe
+                  selector:@selector(signal:) userInfo:nil repeats:NO];
+  CFRunLoopAddTimer(CFRunLoopGetCurrent(), (CFRunLoopTimerRef)timer, mode);
+  perform_selector_on_main_thread_calls = 0;
+  ran = [[NSRunLoop mainRunLoop] runMode:(id)mode
+                beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+  if (!ran || perform_selector_on_main_thread_calls != 1) result = -2;
+  [timer invalidate];
+  [probe release];
+  [pool drain];
+  return result;
+}
+
+// A nil date polls ready work, like a date in the past; it is not infinity.
+int test_runloop_nil_date_polls(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  PerformSelectorOnMainThreadProbe *probe =
+      [[PerformSelectorOnMainThreadProbe alloc] init];
+  CFStringRef mode = CFSTR("TestAppNilDateMode");
+  NSTimer *timer = [NSTimer timerWithTimeInterval:0.3 target:probe
+                  selector:@selector(signal:) userInfo:nil repeats:NO];
+  CFRunLoopAddTimer(CFRunLoopGetCurrent(), (CFRunLoopTimerRef)timer, mode);
+  perform_selector_on_main_thread_calls = 0;
+  BOOL ran = [[NSRunLoop mainRunLoop] runMode:(id)mode beforeDate:nil];
+  int result = ran && perform_selector_on_main_thread_calls == 0 ? 0 : -1;
+  ran = [[NSRunLoop mainRunLoop] runMode:(id)mode
+                beforeDate:[NSDate dateWithTimeIntervalSinceNow:-1]];
+  if (result == 0 && (!ran || perform_selector_on_main_thread_calls != 0))
+    result = -2;
+  [timer invalidate];
+  // An expired deadline still dispatches a source that is already ready.
+  CFRunLoopSourceContext context = {0};
+  context.perform = runloop_source_perform;
+  CFRunLoopSourceRef source = CFRunLoopSourceCreate(NULL, 0, &context);
+  CFRunLoopAddSource(CFRunLoopGetCurrent(), source, mode);
+  CFRunLoopSourceSignal(source);
+  source_calls = 0;
+  ran = [[NSRunLoop mainRunLoop] runMode:(id)mode beforeDate:nil];
+  if (result == 0 && (!ran || source_calls != 1)) result = -3;
+  CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, mode);
+  CFRelease(source);
+  [probe release];
+  [pool drain];
+  return result;
+}
+
+int test_runloop_common_is_not_a_run_mode(void) {
+  CFRunLoopRef loop = CFRunLoopGetCurrent();
+  CFRunLoopSourceContext context = {0};
+  context.perform = runloop_source_perform;
+  CFRunLoopSourceRef source = CFRunLoopSourceCreate(NULL, 0, &context);
+  CFRunLoopAddSource(loop, source, kCFRunLoopCommonModes);
+  CFRunLoopSourceSignal(source);
+  source_calls = 0;
+  int common = CFRunLoopRunInMode(kCFRunLoopCommonModes, 0, true);
+  int calls_after_common = source_calls;
+  int normal = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true);
+  CFRunLoopRemoveSource(loop, source, kCFRunLoopCommonModes);
+  CFRelease(source);
+  return common == kCFRunLoopRunFinished && calls_after_common == 0 &&
+      normal == kCFRunLoopRunHandledSource && source_calls == 1 ? 0 : -1;
 }
 
 int test_NSBundle_subbundleCacheRetainsAutoreleasedBundle(void) {
@@ -402,6 +914,30 @@ int test_GKLocalPlayer_authenticateHandler_clearedByObserver(void) {
 }
 
 // === Main code ===
+
+@interface TrackingModeProbe : NSObject {
+@public
+  int calls;
+}
+- (void)signal:(id)object;
+@end
+@implementation TrackingModeProbe
+- (void)signal:(id)object { (void)object; calls++; }
+@end
+
+int test_UIApplication_tracking_is_common_mode(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  if ([UIApplication sharedApplication] == nil)
+    [[UIApplication alloc] init];
+  TrackingModeProbe *probe = [[TrackingModeProbe alloc] init];
+  [probe performSelectorOnMainThread:@selector(signal:) withObject:nil waitUntilDone:NO];
+  [[NSRunLoop mainRunLoop] runMode:@"UITrackingRunLoopMode"
+                      beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];
+  int result = probe->calls == 1 ? 0 : -1;
+  [probe release];
+  [pool drain];
+  return result;
+}
 
 int test_CGGeometry() {
   CGRect testRect;
@@ -6938,7 +7474,26 @@ struct {
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_withObject),
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_removeObserver),
     FUNC_DEF(test_performSelectorOnMainThread_mainThreadDeferred),
+    FUNC_DEF(test_selector_queue_order_and_initialization),
+    FUNC_DEF(test_selector_queue_explicit_and_common_modes),
+    FUNC_DEF(test_selector_queue_callback_and_nested_delivery),
+    FUNC_DEF(test_selector_queue_background_wait),
+    FUNC_DEF(test_selector_queue_background_async),
+    FUNC_DEF(test_runloop_sources_modes_and_stop),
+    FUNC_DEF(test_runloop_nested_stop),
+    FUNC_DEF(test_scheduled_timer_default_mode),
+    FUNC_DEF(test_scheduled_invocation_timer_default_mode),
+    FUNC_DEF(test_dispatch_after_default_mode),
+    FUNC_DEF(test_dispatch_after_f_default_mode),
+    FUNC_DEF(test_dispatch_after_common_mode),
+    FUNC_DEF(test_runloop_audio_queue),
+    FUNC_DEF(test_runloop_audio_queue_null),
+    FUNC_DEF(test_runloop_audio_unit_independent),
+    FUNC_DEF(test_runloop_timer_waits_until_deadline),
+    FUNC_DEF(test_runloop_nil_date_polls),
+    FUNC_DEF(test_runloop_common_is_not_a_run_mode),
     FUNC_DEF(test_UIApplication_canOpenURL_own_registered_scheme),
+    FUNC_DEF(test_UIApplication_tracking_is_common_mode),
     FUNC_DEF(test_NSBundle_subbundleCacheRetainsAutoreleasedBundle),
 };
 // clang-format on
