@@ -2157,20 +2157,34 @@ impl Environment {
     /// Remember that Unity's mandatory serialized player archive is unavailable.
     ///
     /// This records both a missing VFS node and an unreadable/empty archive
-    /// entry. The archive is not optional: once Unity has reported this failure
-    /// it calls `exit(1)` after partially initializing global state. Treating
-    /// that exit as a recoverable DRM-style exit leads to use-after-null and
-    /// bogus multi-gigabyte allocations, as the engine's cleanup path was not
+    /// entry. When the build has no other player data, the archive is not
+    /// optional: once Unity has reported this failure it calls `exit(1)` after
+    /// partially initializing global state. Treating that exit as a
+    /// recoverable DRM-style exit leads to use-after-null and bogus
+    /// multi-gigabyte allocations, as the engine's cleanup path was not
     /// designed to return to the app.
+    ///
+    /// Builds that ship their player data as loose files (`globalgamemanagers`
+    /// or, before Unity 5.4, `mainData`) have no archive at all; Unity logs
+    /// that it is "using local filesystem" and carries on, so nothing is
+    /// recorded for those.
     pub(crate) fn note_missing_unity_player_archive(&mut self, path: &str) {
-        let is_player_archive = path.rsplit_once('/').is_some_and(|(parent, file)| {
-            file.eq_ignore_ascii_case("data.unity3d")
-                && parent
-                    .rsplit('/')
-                    .next()
-                    .is_some_and(|component| component.eq_ignore_ascii_case("Data"))
-        });
+        let Some((data_dir, file)) = path.rsplit_once('/') else {
+            return;
+        };
+        let is_player_archive = file.eq_ignore_ascii_case("data.unity3d")
+            && data_dir
+                .rsplit('/')
+                .next()
+                .is_some_and(|component| component.eq_ignore_ascii_case("Data"));
         if !is_player_archive || self.missing_unity_player_archive.is_some() {
+            return;
+        }
+        let has_loose_player_data = ["globalgamemanagers", "mainData"].iter().any(|name| {
+            crate::libc::posix_io::resolve_existing_guest_path(self, &format!("{data_dir}/{name}"))
+                .is_some()
+        });
+        if has_loose_player_data {
             return;
         }
 

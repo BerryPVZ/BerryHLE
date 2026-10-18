@@ -453,6 +453,12 @@ impl Allocator {
         old_size: GuestUSize,
         new_size: GuestUSize,
     ) -> Option<GuestUSize> {
+        // Keep sizes (and so the base of the free remainder split off below)
+        // multiples of MIN_CHUNK_SIZE, like alloc() does. realloc() passes
+        // the guest's requested size, and an odd remainder base would make
+        // later allocations misaligned: an odd address handed out as a host
+        // function stub is entered in Thumb mode.
+        let new_size = new_size.checked_next_multiple_of(MIN_CHUNK_SIZE)?;
         let extra = new_size - old_size;
 
         // Only live allocations can be grown.
@@ -617,6 +623,21 @@ mod grow_in_place_tests {
         let a = alloc_at(&mut allocator, 16);
         allocator.free(a);
         assert!(allocator.grow_in_place(a, 16, 32).is_none());
+    }
+
+    #[test]
+    fn grow_in_place_keeps_allocations_aligned() {
+        let mut allocator = arena();
+        let a = alloc_at(&mut allocator, 16);
+        let b = alloc_at(&mut allocator, 256);
+        let _c = alloc_at(&mut allocator, 16);
+        allocator.free(b);
+        let grown = allocator.grow_in_place(a, 16, 0x8b).expect("should grow");
+        assert!(grown >= 0x8b);
+        assert_eq!(grown % 16, 0);
+        for _ in 0..4 {
+            assert_eq!(alloc_at(&mut allocator, 8) % 16, 0);
+        }
     }
 
     #[test]

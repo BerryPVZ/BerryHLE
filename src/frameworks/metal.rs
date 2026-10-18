@@ -704,8 +704,12 @@ const CLASSES: ClassExports = objc_classes! {
 
 };
 
-fn MTLCreateSystemDefaultDevice(env: &mut Environment) -> id {
-    msg_class![env; MTLDevice new]
+/// Returns nil, as on the Metal-less devices touchHLE emulates (iPhone 4S and
+/// older). This layer can't execute command buffers, so handing out a device
+/// made engines that check for Metal first, like Unity 5.6 (Granny), pick it
+/// and render nothing, instead of falling back to OpenGL ES.
+fn MTLCreateSystemDefaultDevice(_env: &mut Environment) -> id {
+    nil
 }
 
 pub const FUNCTIONS: crate::dyld::FunctionExports =

@@ -928,6 +928,21 @@ pub const CLASSES: ClassExports = objc_classes! {
     3
 }
 
+// Rotation notifications. The defaults do nothing, but they must exist:
+// Unity's trampoline (ObjCSetKnownInstanceMethod) asserts that the method it
+// overrides is already there, so a missing one ends the app at launch.
+- (())willRotateToInterfaceOrientation:(UIInterfaceOrientation)_orientation
+                              duration:(f64)_duration {
+}
+
+- (())didRotateFromInterfaceOrientation:(UIInterfaceOrientation)_orientation {
+}
+
+// UIContentContainer (iOS 8+).
+- (())viewWillTransitionToSize:(CGSize)_size
+     withTransitionCoordinator:(id)_coordinator {
+}
+
 - (id)childViewControllers {
     msg_class![env; NSArray new]
 }

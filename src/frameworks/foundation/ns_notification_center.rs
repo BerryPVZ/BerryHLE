@@ -231,7 +231,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())removeObserver:(id)observer
                 name:(NSNotificationName)name
               object:(id)object {
-    assert!(observer != nil); // TODO
+    // Foundation ignores a nil observer (Unity 5.6 removes one while starting
+    // up).
+    if observer == nil {
+        return;
+    }
 
     let name = if name == nil {
         None
