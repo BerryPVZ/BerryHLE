@@ -3707,19 +3707,8 @@ pub fn EAGLGetVersion(env: &mut Environment, major: MutPtr<u32>, minor: MutPtr<u
 
 pub const FUNCTIONS: FunctionExports = &[export_c_func!(EAGLGetVersion(_, _))];
 
-// Unity's older iOS players use `UnityView` (rather than `EAGLView`) as the
-// UIView owning their CAEAGLLayer. Keep the accepted names explicit: the view
-// must still be a UIView whose backing layer is this exact drawable, and the
-// checks below only attach it when it is detached and fills its parent.
-fn is_attachable_eagl_view_class_name(name: &str) -> bool {
-    name.contains("EAGLView")
-        || name == "UnityView"
-        || name.contains("UnityGLView")
-        || name.contains("UnityRenderingView")
-}
-
-// Attach a full-screen EAGL/Unity view that an app created but left detached,
-// so the window compositor and UIKit hit-testing both see the app's surface.
+// Attach a full-screen EAGLView that an app created but left detached, so the
+// window compositor and UIKit hit-testing both see the app's actual surface.
 fn attach_orphaned_eagl_view_to_root(env: &mut Environment, drawable: id) -> bool {
     if drawable == nil {
         return false;
@@ -3735,7 +3724,7 @@ fn attach_orphaned_eagl_view_to_root(env: &mut Environment, drawable: id) -> boo
     let view_class: crate::objc::Class = msg![env; view class];
     let view_class_name = env.objc.get_class_name(view_class).to_owned();
     let ui_view_class = env.objc.get_known_class("UIView", &mut env.mem);
-    if !is_attachable_eagl_view_class_name(&view_class_name)
+    if !view_class_name.contains("EAGLView")
         || !env.objc.class_is_subclass_of(view_class, ui_view_class)
     {
         return false;
@@ -3812,23 +3801,9 @@ fn attach_orphaned_eagl_view_to_root(env: &mut Environment, drawable: id) -> boo
         let _: () = msg![env; parent addSubview:view];
         let attached_superview: id = msg![env; view superview];
         if attached_superview == parent {
-            log!("Attached detached full-screen EAGL/Unity view {:?} to window hierarchy.", view);
+            log!("Attached detached full-screen EAGLView {:?} to window hierarchy.", view);
             return true;
         }
     }
     false
-}
-
-#[cfg(test)]
-mod orphaned_view_class_tests {
-    use super::is_attachable_eagl_view_class_name;
-
-    #[test]
-    fn recognizes_legacy_unity_render_views() {
-        assert!(is_attachable_eagl_view_class_name("UnityView"));
-        assert!(is_attachable_eagl_view_class_name("UnityGLView"));
-        assert!(is_attachable_eagl_view_class_name("UnityRenderingView"));
-        assert!(is_attachable_eagl_view_class_name("GameEAGLView"));
-        assert!(!is_attachable_eagl_view_class_name("UIView"));
-    }
 }
