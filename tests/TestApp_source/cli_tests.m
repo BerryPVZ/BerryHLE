@@ -4178,13 +4178,27 @@ int check_waits_for_other_thread_lock(FILE *file, void (*op)(FILE *),
   while (!started)
     pthread_cond_wait(&cv, &mu);
   pthread_mutex_unlock(&mu);
-  // Give the other thread time to reach `op`. If `op` does not wait, it
-  // finishes during this sleep.
-  usleep(100000);
+  // Wait on a condition rather than sleeping while the worker may be idle.
+  // A broken operation can report completion immediately; a blocking one
+  // cannot complete until we release the FILE lock below.
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  struct timespec deadline = {tv.tv_sec, tv.tv_usec * 1000 + 200000000};
+  if (deadline.tv_nsec >= 1000000000) {
+    deadline.tv_sec++;
+    deadline.tv_nsec -= 1000000000;
+  }
+  pthread_mutex_lock(&mu);
+  int wait_error = 0;
+  while (!done && !wait_error)
+    wait_error = pthread_cond_timedwait(&cv, &mu, &deadline);
+  pthread_mutex_unlock(&mu);
   if (while_locked != NULL)
     while_locked();
   pthread_mutex_lock(&mu);
   int done_before_unlock = done;
+  // The FILE lock protects this value too: a conforming formatter cannot
+  // store through %n while another thread owns its stream lock.
   int side_effect_before_unlock = side_effect != NULL ? *side_effect : -1;
   pthread_mutex_unlock(&mu);
   funlockfile(file);
@@ -4192,7 +4206,8 @@ int check_waits_for_other_thread_lock(FILE *file, void (*op)(FILE *),
   pthread_join(p, NULL);
   pthread_cond_destroy(&cv);
   pthread_mutex_destroy(&mu);
-  if (done_before_unlock != 0 || side_effect_before_unlock != -1)
+  if ((wait_error != 0 && wait_error != ETIMEDOUT) || done_before_unlock != 0 ||
+      side_effect_before_unlock != -1)
     return -3;
   if (done != 1 || (side_effect != NULL && *side_effect != 0))
     return -4;
@@ -4230,8 +4245,8 @@ void *read_one_byte_thread(void *arg) {
 
 // fread() keeps the stream locked while it waits for input: here a UDP
 // socket put in place of the stream's file descriptor. Only sockets can make
-// a read wait in touchHLE, and they need --allow-network-access; without it
-// the test is skipped.
+// a read wait in touchHLE. The integration harness enables loopback sockets;
+// missing socket support is a failure, never a successful skip.
 int test_fread_holds_lock_while_waiting() {
   FILE *file = tmpfile();
   if (file == NULL)
@@ -4241,10 +4256,6 @@ int test_fread_holds_lock_while_waiting() {
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   socklen_t addr_len = sizeof(addr);
   int receiver = socket(AF_INET, SOCK_DGRAM, 0);
-  if (receiver < 0 && errno == EPROTONOSUPPORT) {
-    fclose(file);
-    return 0;
-  }
   int sender = socket(AF_INET, SOCK_DGRAM, 0);
   if (receiver < 0 || sender < 0 ||
       bind(receiver, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
@@ -4270,7 +4281,8 @@ int test_fread_holds_lock_while_waiting() {
   int trylock_result = ftrylockfile(file);
   if (trylock_result == 0)
     funlockfile(file);
-  sendto(sender, "x", 1, 0, (struct sockaddr *)&addr, sizeof(addr));
+  if (sendto(sender, "x", 1, 0, (struct sockaddr *)&addr, sizeof(addr)) != 1)
+    return -6; // Harness deadline also bounds a worker blocked in fread.
   pthread_join(p, NULL);
   close(sender);
   fclose(file);
