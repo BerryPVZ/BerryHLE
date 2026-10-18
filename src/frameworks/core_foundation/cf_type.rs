@@ -54,14 +54,18 @@ pub fn CFEqual(env: &mut Environment, object1: CFTypeRef, object2: CFTypeRef) ->
         return false;
     }
 
-    // TODO: other classes
+    // CF types are toll-free bridged to Foundation objects, so -isEqual:
+    // gives the right answer for any of them. Keys of a
+    // kCFTypeDictionaryKeyCallBacks dictionary aren't always strings: Gravity
+    // Guy's GKLocalPlayer setup compares other objects here.
     let str_class: Class = msg_class![env; NSString class];
-    let object1_class: Class = msg![env; object1 class];
-    assert!(msg![env; object1_class isKindOfClass:str_class]);
-    let object2_class: Class = msg![env; object2 class];
-    assert!(msg![env; object2_class isKindOfClass:str_class]);
-    // TODO: use isEqual: once it is fixed
-    msg![env; object1 isEqualToString:object2]
+    let is_str1: bool = msg![env; object1 isKindOfClass:str_class];
+    let is_str2: bool = msg![env; object2 isKindOfClass:str_class];
+    if is_str1 && is_str2 {
+        msg![env; object1 isEqualToString:object2]
+    } else {
+        msg![env; object1 isEqual:object2]
+    }
 }
 
 pub fn CFHash(env: &mut Environment, object: CFTypeRef) -> CFHashCode {

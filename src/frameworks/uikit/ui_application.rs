@@ -182,6 +182,30 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setStatusBarOrientation:(UIInterfaceOrientation)orientation {
+    // touchHLE rotates the simulated device here, because many old games call
+    // this to pick their orientation and then rotate their drawing to match.
+    // Once a root view controller has been autorotated to landscape, though,
+    // its view has landscape bounds and the app draws for that, so going back
+    // to portrait would show its landscape frame cropped inside a portrait
+    // screen. On a real device the status bar call doesn't rotate the device
+    // either. cocos2d's UIViewController autorotation template does exactly
+    // this, calling [director setDeviceOrientation:kCCDeviceOrientationPortrait]
+    // after the view controller rotated (Gravity Guy).
+    if env.framework_state.uikit.autorotation_transform_applied
+        && matches!(orientation, UIDeviceOrientationPortrait | UIDeviceOrientationPortraitUpsideDown)
+        && env.window.as_ref().is_some_and(|window| {
+            matches!(
+                window.current_rotation(),
+                DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight
+            )
+        })
+    {
+        log_dbg!(
+            "setStatusBarOrientation:{} ignored: root view controller is autorotated to landscape",
+            orientation
+        );
+        return;
+    }
     match orientation {
         UIDeviceOrientationUnknown => {
             // Per Apple docs UIDeviceOrientationUnknown (0) means the

@@ -49,6 +49,9 @@ struct NSInvocationHostObject {
     retained_objects: Vec<id>,
     /// Копии C-строк, созданные через `retainArguments`
     copied_strings: Vec<MutPtr<u8>>,
+    /// r0 and r1 as the invoked method left them, which hold any scalar return
+    /// value of up to 8 bytes. Read by `getReturnValue:`.
+    return_value: [u32; 2],
 }
 impl HostObject for NSInvocationHostObject {}
 
@@ -260,6 +263,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         arguments_retained: false,
         retained_objects: Vec::new(),
         copied_strings: Vec::new(),
+        return_value: [0; 2],
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -283,6 +287,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         arguments_retained: false,
         retained_objects: Vec::new(),
         copied_strings: Vec::new(),
+        return_value: [0; 2],
     });
     let res = env.objc.alloc_object(this, host_object, &mut env.mem);
     autorelease(env, res)
@@ -522,8 +527,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         let ret_type: ConstPtr<u8> = msg![env; sig methodReturnType];
         if !ret_type.is_null() {
             let ret_char = env.mem.read(ret_type);
-            if ret_char != b'v' {
-                log!("Warning: NSInvocation return type is '{}', expected 'v'. Invoking anyway.", ret_char as char);
+            if ret_char == b'{' {
+                log!("Warning: NSInvocation struct return values are not supported. Invoking anyway.");
             }
         }
     }
@@ -617,7 +622,43 @@ pub const CLASSES: ClassExports = objc_classes! {
     objc_msgSend(env, target, selector.unwrap());
 
     let regs = env.cpu.regs_mut();
+    let return_value = [regs[0], regs[1]];
     regs[Cpu::SP] = old_sp;
+    env.objc.borrow_mut::<NSInvocationHostObject>(this).return_value = return_value;
+}
+
+// Struct return values (returned through a hidden pointer) aren't supported;
+// methodReturnLength is 0 for them, so nothing is copied.
+- (())getReturnValue:(MutVoidPtr)buffer {
+    if buffer.is_null() {
+        return;
+    }
+    let sig = env.objc.borrow::<NSInvocationHostObject>(this).sig;
+    let len: NSUInteger = msg![env; sig methodReturnLength];
+    let len = len.min(8);
+    let [lo, hi] = env.objc.borrow::<NSInvocationHostObject>(this).return_value;
+    let mut bytes = [0u8; 8];
+    bytes[..4].copy_from_slice(&lo.to_le_bytes());
+    bytes[4..].copy_from_slice(&hi.to_le_bytes());
+    env.mem.bytes_at_mut(buffer.cast(), len).copy_from_slice(&bytes[..len as usize]);
+}
+
+- (())setReturnValue:(MutVoidPtr)buffer {
+    if buffer.is_null() {
+        return;
+    }
+    let sig = env.objc.borrow::<NSInvocationHostObject>(this).sig;
+    let len: NSUInteger = msg![env; sig methodReturnLength];
+    let len = len.min(8);
+    let [lo, hi] = env.objc.borrow::<NSInvocationHostObject>(this).return_value;
+    let mut bytes = [0u8; 8];
+    bytes[..4].copy_from_slice(&lo.to_le_bytes());
+    bytes[4..].copy_from_slice(&hi.to_le_bytes());
+    bytes[..len as usize].copy_from_slice(env.mem.bytes_at(buffer.cast(), len));
+    env.objc.borrow_mut::<NSInvocationHostObject>(this).return_value = [
+        u32::from_le_bytes(bytes[..4].try_into().unwrap()),
+        u32::from_le_bytes(bytes[4..].try_into().unwrap()),
+    ];
 }
 
 - (())dealloc {
