@@ -207,9 +207,6 @@ pub const CLASSES: ClassExports = objc_classes! {
             retain(env, response);
             env.mem.write(response_ptr, response);
         }
-        if !error_ptr.is_null() {
-            env.mem.write(error_ptr, nil);
-        }
         return make_fake_success_data(env);
     }
 
@@ -223,9 +220,6 @@ pub const CLASSES: ClassExports = objc_classes! {
             if !response_ptr.is_null() {
                 retain(env, ns_response);
                 env.mem.write(response_ptr, ns_response);
-            }
-            if !error_ptr.is_null() {
-                env.mem.write(error_ptr, nil);
             }
             data
         }

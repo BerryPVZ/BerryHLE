@@ -147,9 +147,6 @@ pub const CLASSES: ClassExports = objc_classes! {
             if !format.is_null() {
                 env.mem.write(format, detected_format);
             }
-            if !error.is_null() {
-                env.mem.write(error, nil);
-            }
             let property_list = deserialize_plist(env, &root, opt);
             autorelease(env, property_list)
         }

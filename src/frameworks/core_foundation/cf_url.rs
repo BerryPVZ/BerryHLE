@@ -1271,9 +1271,9 @@ fn CFPropertyListCreateFromXMLData(
         xml_data,
         options,
     );
-    if !error_string.is_null() {
-        // Apple leaves the error string untouched on success; write NULL for
-        // determinism either way (callers only read it on failure).
+    // Apple leaves the error string untouched on success, and callers may
+    // pass an uninitialized pointer.
+    if result == nil && !error_string.is_null() {
         env.mem.write(error_string, nil);
     }
     result

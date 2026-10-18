@@ -498,10 +498,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 }
 
-- (i32)statusOfValueForKey:(id)_key error:(crate::mem::MutPtr<id>)error {
-    if !error.is_null() {
-        env.mem.write(error, nil);
-    }
+- (i32)statusOfValueForKey:(id)_key error:(crate::mem::MutPtr<id>)_error {
     // AVKeyValueStatusLoaded = 2
     2
 }

@@ -670,9 +670,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)initWithDevice:(id)device error:(crate::mem::MutPtr<id>)error {
     retain(env, device);
     env.objc.borrow_mut::<AVCaptureDeviceInputHostObject>(this).device = device;
-    if !error.is_null() {
-        env.mem.write(error, nil);
-    }
     this
 }
 

@@ -736,9 +736,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     let host = env.objc.borrow_mut::<AVAudioRecorderHostObject>(this);
     host.url = url;
     host.requested_format = Some(format);
-    if !out_error.is_null() {
-        env.mem.write(out_error, nil);
-    }
     this
 }
 

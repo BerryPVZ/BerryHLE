@@ -69,11 +69,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)dataWithJSONObject:(id)obj
                  options:(NSJSONWritingOptions)opt
                    error:(MutPtr<id>)error { // NSError **
-    if !error.is_null() {
-        env.mem.write(error, nil);
-    }
+    // `*error` is only written on failure: callers may pass an uninitialized
+    // pointer.
     if !is_valid_json_object_root(env, obj) {
         log!("NSJSONSerialization: top-level object is not a valid JSON object");
+        if !error.is_null() {
+            env.mem.write(error, nil);
+        }
         return nil;
     }
     let pretty = (opt & NSJSONWritingPrettyPrinted) != 0;
@@ -91,9 +93,21 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)JSONObjectWithData:(id)data // NSData *
                  options:(NSJSONReadingOptions)opt
                    error:(MutPtr<id>)error { // NSError **
-    if !error.is_null() {
+    let result = json_object_with_data(env, data, opt);
+    // `*error` is only written on failure: callers may pass an uninitialized
+    // pointer.
+    if result == nil && !error.is_null() {
         env.mem.write(error, nil);
     }
+    result
+}
+
+@end
+
+};
+
+/// Returns `nil` on failure.
+fn json_object_with_data(env: &mut Environment, data: id, opt: NSJSONReadingOptions) -> id {
     if data == nil {
         return nil;
     }
@@ -123,8 +137,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     if !allow_fragments {
         let arr_class = env.objc.get_known_class("NSArray", &mut env.mem);
         let dict_class = env.objc.get_known_class("NSDictionary", &mut env.mem);
-        let is_container: bool = msg![env; result isKindOfClass:arr_class]
-            || msg![env; result isKindOfClass:dict_class];
+        let is_container: bool =
+            msg![env; result isKindOfClass:arr_class] || msg![env; result isKindOfClass:dict_class];
         if !is_container {
             log!("NSJSONSerialization: top-level value is not an array or dictionary");
             return nil;
@@ -132,10 +146,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     autorelease(env, result)
 }
-
-@end
-
-};
 
 fn is_valid_json_object_root(env: &mut Environment, obj: id) -> bool {
     if obj == nil {

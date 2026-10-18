@@ -167,10 +167,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)initWithContentsOfURL:(id)url
                     options:(NSUInteger)_options
                       error:(MutVoidPtr)error_ptr {
-    if !error_ptr.is_null() {
-        env.mem.write(error_ptr.cast(), nil);
-    }
+    // `*error` is only written on failure: callers may pass an uninitialized
+    // pointer.
     if url == nil {
+        if !error_ptr.is_null() {
+            env.mem.write(error_ptr.cast(), nil);
+        }
         release(env, this);
         return nil;
     }
@@ -178,7 +180,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     let is_file: bool = msg![env; url isFileURL];
     if is_file {
         let path: id = msg![env; url path];
-        return msg![env; this initWithContentsOfFile:path];
+        let result: id = msg![env; this initWithContentsOfFile:path];
+        if result == nil && !error_ptr.is_null() {
+            env.mem.write(error_ptr.cast(), nil);
+        }
+        return result;
     }
 
     let result = crate::frameworks::foundation::url_loading::send(
@@ -452,10 +458,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     let success: bool = msg![env; this writeToFile:path atomically:false];
     if !success {
         log!("Warning: NSData writeToFile:options:error: failed");
-    }
-    if !error.is_null() {
-        let error_ptr: MutPtr<id> = error.cast();
-        env.mem.write(error_ptr, nil);
+        if !error.is_null() {
+            let error_ptr: MutPtr<id> = error.cast();
+            env.mem.write(error_ptr, nil);
+        }
     }
     success
 }

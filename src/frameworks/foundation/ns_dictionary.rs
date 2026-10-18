@@ -1098,18 +1098,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 // "NSDictionary+JSON"): serialize the receiver to a JSON string, dropping
 // the keys listed in `exclude_keys` and renaming keys per `translations`
 // (original key -> replacement key). The first argument is treated as an
-// NSError** out-parameter and set to nil, matching the convention callers
-// expect. A missing/failed serialization yields an empty string rather
-// than NULL so string-based call sites don't dereference nil.
-- (id)toJSONAs:(MutPtr<id>)out_error
+// NSError** out-parameter; this never fails, so it's left alone like Cocoa
+// does on success. A missing/failed serialization yields an empty string
+// rather than NULL so string-based call sites don't dereference nil.
+- (id)toJSONAs:(MutPtr<id>)_out_error
      excludingInArray:(id)exclude_keys
      withTranslations:(id)translations {
     use crate::frameworks::foundation::ns_json_serialization;
     use crate::frameworks::foundation::ns_string;
-
-    if !out_error.is_null() {
-        env.mem.write(out_error, nil);
-    }
 
     // Work on a mutable copy so the receiver is untouched.
     let working: id = msg![env; this mutableCopy];
