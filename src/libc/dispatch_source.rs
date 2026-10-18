@@ -13,8 +13,8 @@ use crate::objc::{id, msg, msg_class, nil, release, retain, Class};
 use crate::Environment;
 
 use super::dispatch::{
-    call_void_block, dispatch_after_delay_secs, dispatch_block_t, dispatch_queue_t, get_state,
-    State, DISPATCH_TIME_FOREVER, MAIN_QUEUE_PTR,
+    call_void_block, dispatch_after_delay_secs, dispatch_block_t, dispatch_queue_t,
+    dispatch_source_t, get_state, State, DISPATCH_TIME_FOREVER, MAIN_QUEUE_PTR,
 };
 
 const SOURCE_TYPE_READ: u32 = 0x4453_0001;
@@ -344,16 +344,16 @@ pub(super) fn dispatch_source_create(
     }
     let source = {
         let state = get_state(env);
-        let mut handle = state.next_source_handle.max(0x0400_0001);
-        while state.sources.contains_key(&handle) {
-            handle = handle.wrapping_add(4);
-            if handle < 0x0400_0001 {
-                handle = 0x0400_0001;
+        let mut source_handle = state.next_source_handle.max(0x0400_0001);
+        while state.sources.contains_key(&source_handle) {
+            source_handle = source_handle.wrapping_add(4);
+            if source_handle < 0x0400_0001 {
+                source_handle = 0x0400_0001;
             }
         }
-        state.next_source_handle = handle.wrapping_add(4);
+        state.next_source_handle = source_handle.wrapping_add(4);
         state.sources.insert(
-            handle,
+            source_handle,
             DispatchSource {
                 source_type: type_tag,
                 handle,
@@ -380,7 +380,7 @@ pub(super) fn dispatch_source_create(
                 event_timer: nil,
             },
         );
-        handle
+        source_handle
     };
     source_id(source)
 }

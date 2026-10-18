@@ -488,7 +488,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     let handler: id = if handler == nil {
         nil
     } else {
-        crate::libc::blocks::_Block_copy(env, handler.cast_void().cast_const()).cast()
+        crate::mem::Ptr::from_bits(
+            crate::libc::blocks::_Block_copy(env, handler.cast_void().cast_const()).to_bits(),
+        )
     };
     let task_identifier = {
         let host = env.objc.borrow_mut::<UIApplicationHostObject>(this);
