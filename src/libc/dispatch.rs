@@ -42,9 +42,6 @@ pub type dispatch_once_t = i32;
 #[allow(non_camel_case_types)]
 pub type dispatch_queue_t = MutVoidPtr;
 
-/// Opaque dispatch-source handle.
-#[allow(non_camel_case_types)]
-pub type dispatch_source_t = MutVoidPtr;
 
 /// Opaque group handle.
 #[allow(non_camel_case_types)]
