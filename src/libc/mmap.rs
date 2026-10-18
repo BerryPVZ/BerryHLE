@@ -55,6 +55,10 @@ fn mmap(
 
     // TODO: use vm_allocate() instead
     let ptr = env.mem.calloc(len);
+    if ptr.is_null() {
+        set_errno(env, ENOMEM);
+        return MAP_FAILED;
+    }
 
     if (flags & MAP_ANON) != 0 {
         assert!(ptr.to_bits() & PAGE_SIZE_ALIGN_MASK == 0);
@@ -116,10 +120,28 @@ fn mmap(
         }
     }
 
-    assert!(!env.libc_state.mmap.allocations.contains_key(&ptr));
-    env.libc_state.mmap.allocations.insert(ptr, len);
+    track_allocation(&mut env.libc_state.mmap.allocations, ptr, len);
 
     ptr
+}
+
+/// Track an mmap allocation, replacing any stale entry left behind after the
+/// guest heap recycled an address. `Mem::alloc` only returns addresses that are
+/// currently free, so an existing entry for that address cannot still describe
+/// a live allocation and must not turn guest behavior into a host panic.
+fn track_allocation(
+    allocations: &mut HashMap<MutVoidPtr, GuestUSize>,
+    ptr: MutVoidPtr,
+    len: GuestUSize,
+) {
+    if let Some(previous_len) = allocations.insert(ptr, len) {
+        log!(
+            "Warning: mmap: allocator reused {:?} while a stale mapping record remained (old length {}, new length {}); replacing it",
+            ptr,
+            previous_len,
+            len
+        );
+    }
 }
 
 /// `mmap` with `MAP_FIXED`: the mapping must be placed at exactly `addr`,
@@ -432,6 +454,18 @@ mod map_fixed_tests {
         let mut mem = Mem::new();
         mem.set_null_segment_size(PAGE_SIZE);
         mem
+    }
+
+    #[test]
+    fn recycled_mmap_address_replaces_stale_bookkeeping() {
+        let ptr = MutVoidPtr::from_bits(0x2000_0000);
+        let mut allocations = HashMap::new();
+        allocations.insert(ptr, PAGE_SIZE);
+
+        track_allocation(&mut allocations, ptr, PAGE_SIZE * 2);
+
+        assert_eq!(allocations.len(), 1);
+        assert_eq!(allocations.get(&ptr), Some(&(PAGE_SIZE * 2)));
     }
 
     /// What Boehm GC's `GC_unmap` does: map `PROT_NONE` pages over part of
