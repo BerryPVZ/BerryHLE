@@ -13,7 +13,9 @@ use crate::dyld::{ConstantExports, HostConstant};
 /// Whether guest in-app purchases are emulated ("Lucky Patcher"-style free
 /// buys). Off by default; `TOUCHHLE_IAP_EMULATION` in the environment forces
 /// it on at startup, and the Cheat Engine overlay's `IAP` button latches it
-/// per session.
+/// per session. While on, SystemConfiguration also reports a reachable
+/// Wi-Fi-style route for games that gate StoreKit on a connectivity preflight.
+/// This does not enable actual network access or emulate remote game servers.
 static IAP_EMULATION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `SKPaymentTransactionStatePurchased` — the transaction succeeded.

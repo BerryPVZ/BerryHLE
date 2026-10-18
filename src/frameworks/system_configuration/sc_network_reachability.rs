@@ -228,16 +228,31 @@ fn SCNetworkReachabilityCreateWithAddressPair(
     )
 }
 
+/// Report a Wi-Fi-style route for real networking or local StoreKit emulation.
+/// This is only a reachability hint: it must never enable sockets or HTTP.
+/// Unity and common Reachability wrappers check Reachable and ConnectionRequired
+/// before attempting StoreKit calls, even if the purchase itself is local.
+fn reachability_flags(network_access: bool, iap_emulation: bool) -> SCNetworkReachabilityFlags {
+    if network_access || iap_emulation {
+        kSCNetworkReachabilityFlagsReachable
+    } else {
+        0
+    }
+}
+
+fn current_flags(env: &Environment) -> SCNetworkReachabilityFlags {
+    reachability_flags(
+        env.options.network_access,
+        crate::frameworks::store_kit::emulation_enabled(),
+    )
+}
+
 fn SCNetworkReachabilityGetFlags(
     env: &mut Environment,
     _target: SCNetworkReachabilityRef,
     flags: MutPtr<SCNetworkReachabilityFlags>,
 ) -> bool {
-    let flags_value = if env.options.network_access {
-        kSCNetworkReachabilityFlagsReachable
-    } else {
-        0
-    };
+    let flags_value = current_flags(env);
     if !flags.is_null() {
         env.mem.write(flags, flags_value);
     }
@@ -307,13 +322,8 @@ fn SCNetworkReachabilityScheduleWithRunLoop(
         )
     };
     if let Some(callback) = callback {
-        let flags = if env.options.network_access {
-            kSCNetworkReachabilityFlagsReachable
-                | kSCNetworkReachabilityFlagsIsDirect
-                | kSCNetworkReachabilityFlagsIsWWAN
-        } else {
-            0
-        };
+        // Match GetFlags: do not invent a cellular/direct connection here.
+        let flags = current_flags(env);
         let _: () = callback.call_from_host(env, (target, flags, info));
         let retired = env
             .objc
