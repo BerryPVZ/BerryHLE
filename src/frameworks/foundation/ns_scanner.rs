@@ -6,7 +6,7 @@
 //! The `NSScanner` class.
 
 use crate::frameworks::foundation::ns_string::{from_u16_vec, to_rust_string};
-use crate::frameworks::foundation::{unichar, NSNotFound, NSRange, NSUInteger};
+use crate::frameworks::foundation::{unichar, NSInteger, NSNotFound, NSRange, NSUInteger};
 use crate::mem::MutPtr;
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
