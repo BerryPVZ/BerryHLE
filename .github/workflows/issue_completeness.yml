@@ -1,0 +1,28 @@
+name: Close incomplete issues
+
+# Closes new issues that are missing a log, an IPA link or a description of the
+# bug, and reopens them when an edit adds what was missing. The check itself
+# lives in .github/scripts/issue-completeness.js.
+
+on:
+  issues:
+    types: [opened, edited]
+
+permissions:
+  issues: write
+
+concurrency:
+  group: issue-completeness-${{ github.event.issue.number }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const { run } = require('./.github/scripts/issue-completeness.js');
+            await run({ github, context, core });
