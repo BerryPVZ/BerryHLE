@@ -207,12 +207,12 @@ pub struct ObjC {
     /// `method_exchangeImplementations` can round-trip host implementations.
     pub(super) imp_tokens: FxHashMap<crate::mem::GuestUSize, methods::IMP>,
 
-    /// Cache of token pointers minted for host `IMP`s, keyed by the
-    /// (defining class, selector) whose implementation the token stands in
-    /// for. Keeps the token pointer stable so that
+    /// Cache of token pointers minted for host `IMP`s, keyed by the address
+    /// of the host implementation. Each token is a callable stub for that
+    /// implementation. Keeps the token pointer stable so that
     /// `method_getImplementation(m) == method_getImplementation(m)` holds,
     /// matching Apple's behaviour.
-    pub(super) host_imp_tokens: FxHashMap<(Class, SEL), crate::mem::MutVoidPtr>,
+    pub(super) host_imp_tokens: FxHashMap<usize, crate::mem::MutVoidPtr>,
 }
 
 impl ObjC {

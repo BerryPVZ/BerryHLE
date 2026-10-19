@@ -1634,18 +1634,29 @@ fn set_imp_at(env: &mut crate::Environment, cls: Class, sel: SEL, imp: IMP) {
 /// Convert an [IMP] into the guest pointer that Apple's `IMP` type is (a
 /// function pointer). Guest implementations expose their real code address;
 /// host (Rust-backed) implementations have no guest address, so we mint a
-/// stable token pointer for the (class, selector) and remember which host
-/// IMP it stands for, allowing it to be round-tripped back through
+/// stable, callable stub for the host IMP and remember which IMP it stands
+/// for, allowing it to be round-tripped back through
 /// `method_setImplementation` / `method_exchangeImplementations`.
-fn imp_to_guest_ptr(env: &mut crate::Environment, cls: Class, sel: SEL, imp: IMP) -> ConstVoidPtr {
+fn imp_to_guest_ptr(env: &mut crate::Environment, _cls: Class, _sel: SEL, imp: IMP) -> ConstVoidPtr {
     match imp {
         IMP::Guest(gf) => gf.to_ptr(),
-        IMP::Host(_) => {
-            let token = if let Some(&t) = env.objc.host_imp_tokens.get(&(cls, sel)) {
+        IMP::Host(host_imp) => {
+            // The token must be callable: swizzling code commonly stores the
+            // original IMP and later calls it directly (Firebase Analytics'
+            // screen tracking does this for -[UIViewController viewDidAppear:]).
+            // So it is a real SVC stub that calls the host implementation with
+            // the caller's registers, just like a message send would. Tokens
+            // are keyed by the implementation itself rather than by
+            // (class, selector), because a stub keeps calling the host
+            // function it was made for even after the method is swizzled.
+            let key = host_imp as *const dyn HostIMP as *const () as usize;
+            let token = if let Some(&t) = env.objc.host_imp_tokens.get(&key) {
                 t
             } else {
-                let t = env.mem.alloc(4);
-                env.objc.host_imp_tokens.insert((cls, sel), t);
+                let stub = env.dyld.create_guest_function(&mut env.mem, "[host IMP]", host_imp);
+                env.cpu.invalidate_cache_range(stub.addr_without_thumb_bit(), 8);
+                let t = MutVoidPtr::from_bits(stub.addr_with_thumb_bit());
+                env.objc.host_imp_tokens.insert(key, t);
                 t
             };
             env.objc.imp_tokens.insert(token.to_bits(), imp);
