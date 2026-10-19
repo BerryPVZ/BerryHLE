@@ -1852,12 +1852,13 @@ fn rebuild_page_dots(
     *dots = make_page_dots(env, main_view, screen_size, page_count);
 }
 
-const DOCK_ICON_SIZE: CGFloat = 54.0;
-const DOCK_ICON_TOP: CGFloat = 7.0;
+const DOCK_ICON_SIZE: CGFloat = 64.0;
+const DOCK_ICON_TOP: CGFloat = 5.0;
 const DOCK_LABEL_HEIGHT: CGFloat = 12.0;
-/// Keeps the dock shortcuts close together on wide screens instead of
-/// stretching them to the screen edges.
-const DOCK_MAX_GAP: CGFloat = 96.0;
+/// The dock shortcuts sit close together in the middle of the dock instead of
+/// being spread out to the screen edges.
+const DOCK_MIN_GAP: CGFloat = 12.0;
+const DOCK_MAX_GAP: CGFloat = 30.0;
 
 /// Builds the old-iOS dock at the bottom of the home screen. The shortcuts
 /// live outside the paged grid, so they stay in place while pages slide.
@@ -1877,7 +1878,7 @@ fn make_dock(env: &mut Environment, delegate: id, main_view: id, screen_size: CG
     let count: CGFloat = 3.0;
     let side_inset: CGFloat = 10.0;
     let gap = ((width - side_inset * 2.0 - DOCK_ICON_SIZE * count) / (count - 1.0))
-        .clamp(4.0, DOCK_MAX_GAP);
+        .clamp(DOCK_MIN_GAP, DOCK_MAX_GAP);
     let first_x = (width - (DOCK_ICON_SIZE * count + gap * (count - 1.0))) / 2.0;
 
     let plus_image = make_icon_from_text(env, "+", 50.0, -6.0, (0.25, 0.25, 0.25, 1.0));

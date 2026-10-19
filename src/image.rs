@@ -117,6 +117,29 @@ impl Image {
         self.dimensions
     }
 
+    /// Width times height, in pixels.
+    pub fn area(&self) -> u64 {
+        u64::from(self.dimensions.0) * u64::from(self.dimensions.1)
+    }
+
+    /// Whether this image is useless as an app icon: empty, fully transparent,
+    /// or a solid black rectangle. Some bundles ship such placeholder or mask
+    /// images that are larger than the real icon.
+    pub fn is_blank_or_solid_black(&self) -> bool {
+        let pixels = self.pixels();
+        if pixels.is_empty() {
+            return true;
+        }
+        for rgba in pixels.chunks_exact(4) {
+            // Pixels are premultiplied, so a fully transparent pixel is all
+            // zeroes and a solid black one is black with a non-zero alpha.
+            if rgba[3] > 8 && (rgba[0] > 8 || rgba[1] > 8 || rgba[2] > 8) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Get image data as bytes (8 bits per channel sRGB RGBA with premultiplied
     /// alpha). Rows are in top-to-bottom order.
     pub fn pixels(&self) -> &[u8] {
@@ -411,6 +434,33 @@ pub fn decode_pvrtc_with_alpha(
 #[cfg(test)]
 mod tests {
     use super::{decode_pvrtc_with_alpha, icon_corner_radius};
+
+    #[test]
+    fn blank_and_solid_black_images_are_rejected_as_icons() {
+        use super::Image;
+
+        // Transparent placeholder.
+        let transparent = Image::from_pixels(2, 2, vec![0; 2 * 2 * 4]);
+        assert!(transparent.is_blank_or_solid_black());
+
+        // Opaque black placeholder.
+        let mut black_pixels = Vec::new();
+        for _ in 0..4 {
+            black_pixels.extend_from_slice(&[0, 0, 0, 255]);
+        }
+        let black = Image::from_pixels(2, 2, black_pixels);
+        assert!(black.is_blank_or_solid_black());
+
+        // A real icon has at least one lit pixel.
+        let mut icon_pixels = Vec::new();
+        for _ in 0..4 {
+            icon_pixels.extend_from_slice(&[0, 0, 0, 255]);
+        }
+        icon_pixels[0] = 200;
+        let icon = Image::from_pixels(2, 2, icon_pixels);
+        assert!(!icon.is_blank_or_solid_black());
+        assert_eq!(icon.area(), 4);
+    }
 
     #[test]
     fn icon_corner_radius_scales_with_resolution() {
