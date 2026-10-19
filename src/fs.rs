@@ -283,7 +283,12 @@ impl ToOwned for GuestPath {
 }
 
 /// Like [PathBuf] but for the virtual filesystem.
-#[derive(Debug, Clone, Default)]
+///
+/// Equality, ordering and hashing are those of the path string. They are
+/// derived here so that guest paths can be sorted and used as `HashSet` /
+/// `HashMap` keys (e.g. when an app bundle's icon candidates are deduplicated
+/// and ordered by resolution).
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GuestPathBuf(String);
 impl From<String> for GuestPathBuf {
     fn from(string: String) -> GuestPathBuf {

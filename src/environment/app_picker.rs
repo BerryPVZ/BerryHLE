@@ -9,8 +9,8 @@ use crate::frameworks::core_graphics::cg_bitmap_context::{
 };
 use crate::frameworks::core_graphics::cg_color_space::CGColorSpaceCreateDeviceRGB;
 use crate::frameworks::core_graphics::cg_context::{
-    CGContextFillRect, CGContextRelease, CGContextRestoreGState, CGContextSaveGState,
-    CGContextScaleCTM, CGContextSetRGBFillColor, CGContextTranslateCTM,
+    CGContextFillRect, CGContextRelease, CGContextScaleCTM, CGContextSetRGBFillColor,
+    CGContextTranslateCTM,
 };
 use crate::frameworks::core_graphics::cg_image::{self, kCGImageAlphaPremultipliedLast};
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
@@ -19,6 +19,9 @@ use crate::frameworks::foundation::ns_string;
 use crate::frameworks::foundation::NSInteger;
 use crate::frameworks::uikit::ui_font::{
     UITextAlignmentCenter, UITextAlignmentLeft, UITextAlignmentRight,
+};
+use crate::frameworks::uikit::ui_gesture_recognizer::{
+    UISwipeGestureRecognizerDirectionLeft, UISwipeGestureRecognizerDirectionRight,
 };
 use crate::frameworks::uikit::ui_graphics::{UIGraphicsPopContext, UIGraphicsPushContext};
 use crate::frameworks::uikit::ui_view::ui_control::ui_button::UIButtonTypeCustom;
@@ -301,6 +304,9 @@ struct AppPickerDelegateHostObject {
     icon_touch_cancelled: bool,
     delete_cancel: bool,
     delete_confirm: bool,
+    /// Set when the horizontal swipe recognizers fire (old-iOS page change).
+    swipe_left: bool,
+    swipe_right: bool,
 }
 impl HostObject for AppPickerDelegateHostObject {}
 
@@ -448,6 +454,12 @@ const CLASSES: ClassExports = objc_classes! {
 - (())deleteConfirm {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).delete_confirm = true;
 }
+- (())swipeLeft {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).swipe_left = true;
+}
+- (())swipeRight {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).swipe_right = true;
+}
 - (())openFileManager {
     // Assert (see above).
     let _ = env.objc.borrow_mut::<AppPickerDelegateHostObject>(this);
@@ -492,14 +504,9 @@ fn show_app_picker_gui(
             _ => panic!(),
         };
         let mut image = Image::from_bytes(bytes).unwrap();
-        // should match Bundle::load_icon()
-        // Use a slightly smaller corner radius for larger icons for a cleaner look.
-        let corner_radius_px = 12.0;
-        image.round_corners(
-            corner_radius_px,
-            /* four_corners: */ true,
-            /* add_sheen: */ true,
-        );
+        // Should match Bundle::load_icon(): the corner radius scales with the
+        // icon's resolution.
+        image.round_icon_corners(/* add_sheen: */ true);
         image
     };
     let environment = Environment::new_without_app(options, icon)?;
@@ -533,13 +540,9 @@ fn app_picker_inner(
     let window: id = msg![env; window initWithFrame:bounds];
 
     let app_frame: CGRect = msg![env; screen applicationFrame];
-    let main_view: id = msg_class![env; UIView alloc];
-    let main_view: id = msg![env; main_view initWithFrame:app_frame];
-    () = msg![env; window addSubview:main_view];
 
     // Wallpaper
     let mut found_wallpaper = false;
-    let mut have_wallpaper = false;
     let mut wallpaper_view: Option<id> = None;
     for candidate in paths::WALLPAPER_FILES {
         let candidate = paths::user_data_base_path().join(candidate);
@@ -567,17 +570,22 @@ fn app_picker_inner(
         let image: id = msg_class![env; UIImage imageWithCGImage:image];
         let wallpaper: id = msg_class![env; UIImageView alloc];
         let wallpaper: id = msg![env; wallpaper initWithImage:image];
+        // The wallpaper also covers the status bar strip above the
+        // application frame, like the old iOS home screen.
+        let status_offset = app_frame.origin.y;
         () = msg![env; wallpaper setFrame:(CGRect {
             origin: CGPoint {
                 x: 0.0,
                 y: 0.0,
             },
-            size: app_frame.size,
+            size: CGSize {
+                width: app_frame.size.width,
+                height: app_frame.size.height + status_offset,
+            },
         })];
-        () = msg![env; wallpaper setAlpha:(0.5 as CGFloat)];
-        () = msg![env; main_view addSubview:wallpaper];
+        () = msg![env; wallpaper setAlpha:(1.0 as CGFloat)];
+        () = msg![env; window addSubview:wallpaper];
         wallpaper_view = Some(wallpaper);
-        have_wallpaper = true;
         break;
     }
     if !found_wallpaper {
@@ -590,77 +598,45 @@ fn app_picker_inner(
         );
     }
 
-    // Build label
-    let version_label = {
-        let label_frame = CGRect {
-            origin: CGPoint {
-                x: 0.0,
-                y: app_picker_version_label_top(app_frame.size.height),
-            },
-            size: CGSize {
-                width: app_frame.size.width - 5.0,
-                height: APP_PICKER_VERSION_LABEL_HEIGHT,
-            },
-        };
-        let label: id = msg_class![env; UILabel alloc];
-        let label: id = msg![env; label initWithFrame:label_frame];
-        let text = ns_string::from_rust_string(
-            env,
-            format!("{HYPERHLE_FORK_NAME} ({})", crate::COMMIT_HASH),
-        );
-        () = msg![env; label setText:text];
-        () = msg![env; label setTextAlignment:UITextAlignmentRight];
-        let font_size: CGFloat = 12.0;
-        let font: id = msg_class![env; UIFont systemFontOfSize:font_size];
-        () = msg![env; label setFont:font];
-        let text_color: id = if have_wallpaper {
-            msg_class![env; UIColor whiteColor]
-        } else {
-            msg_class![env; UIColor lightGrayColor]
-        };
-        () = msg![env; label setTextColor:text_color];
-        let bg_color: id = msg_class![env; UIColor clearColor];
-        () = msg![env; label setBackgroundColor:bg_color];
-        () = msg![env; main_view addSubview:label];
-        label
-    };
-
-    let brand_color: id = if crate::branding() == "UNOFFICIAL" {
-        msg_class![env; UIColor redColor]
+    // Old-iOS status bar, drawn in the strip above the application frame. It
+    // sits above the wallpaper, while the (transparent) main view is added
+    // after it: the home screen shows the bar through the main view, but the
+    // opaque Settings screen slides over it.
+    let (status_bar, status_time_label, status_charge_view) = if app_frame.origin.y >= 12.0 {
+        let (bar, time, charge) = make_status_bar(env, bounds.size.width, app_frame.origin.y);
+        () = msg![env; window addSubview:bar];
+        // The level is cached at window creation, so reading it here is safe
+        // even on Android (no JNI on this coroutine stack).
+        update_battery_indicator(env, charge, crate::window::cached_battery_status());
+        (Some(bar), Some(time), Some(charge))
     } else {
-        msg_class![env; UIColor grayColor]
+        (None, None, None)
     };
 
-    let title_frame = CGRect {
-        origin: CGPoint { x: 12.0, y: 8.0 },
-        size: CGSize {
-            width: app_frame.size.width - 24.0,
-            height: 34.0,
-        },
-    };
-    let title: id = msg_class![env; UILabel alloc];
-    let title: id = msg![env; title initWithFrame:title_frame];
-    let text = ns_string::from_rust_string(env, HYPERHLE_FORK_NAME.to_string());
-    () = msg![env; title setText:text];
-    () = msg![env; title setTextAlignment:UITextAlignmentCenter];
-    let font_size: CGFloat = 28.0;
-    let font: id = msg_class![env; UIFont boldSystemFontOfSize:font_size];
-    () = msg![env; title setFont:font];
-    () = msg![env; title setTextColor:brand_color];
-    let bg_color: id = msg_class![env; UIColor clearColor];
-    () = msg![env; title setBackgroundColor:bg_color];
-    () = msg![env; main_view addSubview:title];
+    let main_view: id = msg_class![env; UIView alloc];
+    let main_view: id = msg![env; main_view initWithFrame:app_frame];
+    () = msg![env; window addSubview:main_view];
+
+    // Old-iOS home screen paging: swipe left/right anywhere on the home screen.
+    // The recognizers are attached to the main view, so touches that land on
+    // icons or on the dock are seen too.
+    let swipe_left_selector = env.objc.lookup_selector("swipeLeft").unwrap();
+    let swipe_right_selector = env.objc.lookup_selector("swipeRight").unwrap();
+    let swipe_left: id = msg_class![env; UISwipeGestureRecognizer alloc];
+    let swipe_left: id = msg![env;
+        swipe_left initWithTarget:delegate action:swipe_left_selector];
+    () = msg![env; swipe_left setDirection:UISwipeGestureRecognizerDirectionLeft];
+    () = msg![env; main_view addGestureRecognizer:swipe_left];
+    let swipe_right: id = msg_class![env; UISwipeGestureRecognizer alloc];
+    let swipe_right: id = msg![env;
+        swipe_right initWithTarget:delegate action:swipe_right_selector];
+    () = msg![env; swipe_right setDirection:UISwipeGestureRecognizerDirectionRight];
+    () = msg![env; main_view addGestureRecognizer:swipe_right];
 
     let mut icon_grid_stuff = match &mut apps {
         Ok(ref mut apps) => {
-            let mut icon_grid_stuff = make_icon_grid(
-                env,
-                delegate,
-                main_view,
-                app_frame,
-                apps.len(),
-                have_wallpaper,
-            );
+            let mut icon_grid_stuff =
+                make_icon_grid(env, delegate, main_view, app_frame, apps.len());
             update_icon_grid(env, &mut icon_grid_stuff, apps, 0, 0);
             Some(icon_grid_stuff)
         }
@@ -685,6 +661,51 @@ fn app_picker_inner(
             () = msg![env; main_view addSubview:label];
             None
         }
+    };
+
+    // Old-iOS page dots, and the dock with the shortcuts that aren't apps.
+    let mut page_dots = Vec::new();
+    if let Some(ref grid) = icon_grid_stuff {
+        page_dots = make_page_dots(env, main_view, app_frame.size, grid.pages.len());
+        update_page_dots(env, &page_dots, 0);
+    }
+    let dock = make_dock(env, delegate, main_view, app_frame.size);
+    // Build stamp on the page-dot row, right-aligned like the one in the
+    // reference home screen. It is added after the dock so nothing covers it.
+    let version_label = {
+        let label_frame = CGRect {
+            origin: CGPoint {
+                x: 0.0,
+                y: app_picker_dots_top(app_frame.size.height) - 2.0,
+            },
+            size: CGSize {
+                width: app_frame.size.width - 8.0,
+                height: 12.0,
+            },
+        };
+        let label: id = msg_class![env; UILabel alloc];
+        let label: id = msg![env; label initWithFrame:label_frame];
+        let text = ns_string::from_rust_string(
+            env,
+            format!("{HYPERHLE_FORK_NAME} ({})", crate::COMMIT_HASH),
+        );
+        () = msg![env; label setText:text];
+        () = msg![env; label setTextAlignment:UITextAlignmentRight];
+        let font_size: CGFloat = 10.0;
+        let font: id = msg_class![env; UIFont systemFontOfSize:font_size];
+        () = msg![env; label setFont:font];
+        let text_color: id = msg_class![env; UIColor lightGrayColor];
+        () = msg![env; label setTextColor:text_color];
+        let bg_color: id = msg_class![env; UIColor clearColor];
+        () = msg![env; label setBackgroundColor:bg_color];
+        let shadow = ui_color(env, 0.0, 0.0, 0.0, 0.7);
+        () = msg![env; label setShadowColor:shadow];
+        () = msg![env; label setShadowOffset:(CGSize {
+            width: 0.0,
+            height: 1.0,
+        })];
+        () = msg![env; main_view addSubview:label];
+        label
     };
 
     let mut quick_options_cheat_engine = quick_options_trainer_enabled(&env.options);
@@ -738,8 +759,9 @@ fn app_picker_inner(
     let mut current_page: usize = 0;
     // Discard arrow presses made before the picker was shown.
     PENDING_ARROW_KEY.store(0, Ordering::Relaxed);
-    // If the user taps the "+" tile, this records the .ipa files that existed
-    // at that moment; once a new one shows up, the app list is re-enumerated.
+    // If the user taps the dock's "Add .ipa" shortcut, this records the .ipa
+    // files that existed at that moment; once a new one shows up, the app list
+    // is re-enumerated.
     let mut awaited_ipa: Option<IpaWatch> = None;
     // The app icon under a finger that may turn into a long press, and when
     // the finger went down.
@@ -748,6 +770,19 @@ fn app_picker_inner(
     let mut long_pressed_icon: Option<id> = None;
     // Index of the app whose delete dialog is open, if any.
     let mut pending_delete: Option<usize> = None;
+
+    // The status bar clock and battery only need refreshing now and then.
+    let mut status_time = status_bar_time_string();
+    let mut status_time_updated_at = Instant::now();
+    let mut status_battery_updated_at = Instant::now();
+
+    let mut chrome_views: Vec<id> = Vec::with_capacity(3 + page_dots.len());
+    if let Some(bar) = status_bar {
+        chrome_views.push(bar);
+    }
+    chrome_views.push(dock);
+    chrome_views.push(version_label);
+    chrome_views.extend(page_dots.iter().copied());
 
     let main_run_loop: id = msg_class![env; NSRunLoop mainRunLoop];
     if let Some(ref grid) = icon_grid_stuff {
@@ -758,8 +793,7 @@ fn app_picker_inner(
             grid,
             app_frame.size,
             wallpaper_view,
-            title,
-            version_label,
+            &chrome_views,
         );
         PENDING_ARROW_KEY.store(0, Ordering::Relaxed);
     }
@@ -767,30 +801,108 @@ fn app_picker_inner(
     // process exits.
     let app_path = loop {
         run_run_loop_single_iteration(env, main_run_loop);
-        // Left/right arrow keys switch pages, like tapping the page arrows.
-        let arrow = PENDING_ARROW_KEY.swap(0, Ordering::Relaxed);
-        if arrow != 0 {
-            let settings_view = settings.main_view;
-            let settings_open: bool = !msg![env; settings_view isHidden];
-            let grid = icon_grid_stuff.as_mut().unwrap();
-            let new_page = if arrow > 0 {
-                current_page + 1
-            } else {
-                current_page.wrapping_sub(1)
-            };
-            if !settings_open && pending_delete.is_none() && new_page < grid.pages.len() {
-                slide_to_page(
-                    env,
-                    main_run_loop,
-                    delegate,
-                    grid,
-                    apps.as_mut().unwrap(),
-                    new_page,
-                    arrow as CGFloat,
-                );
-                current_page = new_page;
+
+        if status_time_updated_at.elapsed() >= Duration::from_secs(10) {
+            status_time_updated_at = Instant::now();
+            let now = status_bar_time_string();
+            if now != status_time {
+                status_time = now;
+                if let Some(label) = status_time_label {
+                    let text = ns_string::from_rust_string(env, status_time.clone());
+                    () = msg![env; label setText:text];
+                    release(env, text);
+                }
             }
         }
+
+        // Keep the battery indicator in sync with the real battery level. The
+        // refresh itself must happen on the SDL thread on Android (SDL's
+        // battery query uses JNI), and the picker runs on a coroutine stack.
+        if let Some(charge) = status_charge_view {
+            if status_battery_updated_at.elapsed() >= Duration::from_secs(30) {
+                status_battery_updated_at = Instant::now();
+                if env.window.is_some() {
+                    env.on_parent_stack_in_coroutine(|_, _| crate::window::refresh_battery_cache());
+                }
+                update_battery_indicator(env, charge, crate::window::cached_battery_status());
+            }
+        }
+
+        // Left/right arrow keys switch pages, like a swipe does.
+        let arrow = PENDING_ARROW_KEY.swap(0, Ordering::Relaxed);
+        if arrow != 0 {
+            if let Some(grid) = icon_grid_stuff.as_mut() {
+                let settings_view = settings.main_view;
+                let settings_open: bool = !msg![env; settings_view isHidden];
+                let new_page = if arrow > 0 {
+                    current_page + 1
+                } else {
+                    current_page.wrapping_sub(1)
+                };
+                if !settings_open && pending_delete.is_none() && new_page < grid.pages.len() {
+                    slide_to_page(
+                        env,
+                        main_run_loop,
+                        delegate,
+                        grid,
+                        apps.as_mut().unwrap(),
+                        new_page,
+                        arrow as CGFloat,
+                    );
+                    current_page = new_page;
+                    update_page_dots(env, &page_dots, current_page);
+                }
+            }
+        }
+
+        // Swipes are recognized when the finger lifts, so they can end on an
+        // icon without opening it.
+        let (swipe_left, swipe_right) = {
+            let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
+            (
+                std::mem::take(&mut host_obj.swipe_left),
+                std::mem::take(&mut host_obj.swipe_right),
+            )
+        };
+        if swipe_left || swipe_right {
+            {
+                let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
+                host_obj.icon_tapped = nil;
+                host_obj.icon_touch_down = nil;
+                host_obj.icon_touch_cancelled = false;
+                host_obj.add_ipa = false;
+                host_obj.settings_show = false;
+                host_obj.settings_hide = false;
+            }
+            press = None;
+            long_pressed_icon = None;
+            if let Some(grid) = icon_grid_stuff.as_mut() {
+                let settings_view = settings.main_view;
+                let settings_open: bool = !msg![env; settings_view isHidden];
+                let new_page = if swipe_left {
+                    current_page + 1
+                } else {
+                    current_page.saturating_sub(1)
+                };
+                if !settings_open && pending_delete.is_none() && new_page < grid.pages.len() {
+                    if new_page != current_page {
+                        slide_to_page(
+                            env,
+                            main_run_loop,
+                            delegate,
+                            grid,
+                            apps.as_mut().unwrap(),
+                            new_page,
+                            if swipe_left { 1.0 } else { -1.0 },
+                        );
+                        current_page = new_page;
+                        update_page_dots(env, &page_dots, current_page);
+                    }
+                }
+            }
+            continue;
+        }
+
         let (touch_down_icon, touch_cancelled, icon_tapped) = {
             let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
             (
@@ -811,13 +923,9 @@ fn app_picker_inner(
         if let Some((button, pressed_at)) = press {
             if pressed_at.elapsed() >= APP_LONG_PRESS_DURATION {
                 press = None;
-                let app_idx = match icon_grid_stuff
+                let app_idx = icon_grid_stuff
                     .as_ref()
-                    .and_then(|grid| grid.icon_map.get(&button))
-                {
-                    Some(&TappedIcon::App(app_idx)) => Some(app_idx),
-                    _ => None,
-                };
+                    .and_then(|grid| grid.icon_map.get(&button).copied());
                 let name = app_idx.and_then(|app_idx| {
                     apps.as_ref()
                         .ok()
@@ -843,8 +951,14 @@ fn app_picker_inner(
             if long_pressed_icon.take() == Some(icon_tapped) {
                 continue;
             }
-            match icon_grid_stuff.as_ref().unwrap().icon_map.get(&icon_tapped) {
-                Some(&TappedIcon::App(app_idx)) => {
+            match icon_grid_stuff
+                .as_ref()
+                .unwrap()
+                .icon_map
+                .get(&icon_tapped)
+                .copied()
+            {
+                Some(app_idx) => {
                     let app_path = apps.as_ref().unwrap()[app_idx].path.clone();
                     echo!("Picked: {}", app_path.display());
                     // iOS-style launch: the icon travels to the middle of the
@@ -861,31 +975,6 @@ fn app_picker_inner(
                         icon_image,
                     );
                     break app_path;
-                }
-                Some(&TappedIcon::ChangePage(page_idx)) => {
-                    let direction: CGFloat = if page_idx > current_page { 1.0 } else { -1.0 };
-                    slide_to_page(
-                        env,
-                        main_run_loop,
-                        delegate,
-                        icon_grid_stuff.as_mut().unwrap(),
-                        apps.as_mut().unwrap(),
-                        page_idx,
-                        direction,
-                    );
-                    current_page = page_idx;
-                }
-                Some(&TappedIcon::AddIpa) => {
-                    // Handled by the main loop body below (next iteration).
-                    env.objc
-                        .borrow_mut::<AppPickerDelegateHostObject>(delegate)
-                        .add_ipa = true;
-                }
-                Some(&TappedIcon::Settings) => {
-                    // Handled by the main loop body below (next iteration).
-                    env.objc
-                        .borrow_mut::<AppPickerDelegateHostObject>(delegate)
-                        .settings_show = true;
                 }
                 None => (), // Tapped on a black space
             }
@@ -1049,7 +1138,16 @@ fn app_picker_inner(
                 match result {
                     Ok(()) => {
                         if let Some(grid) = icon_grid_stuff.as_mut() {
-                            reload_app_grid(env, grid, &mut apps, &mut current_page, &apps_dir);
+                            let page_count =
+                                reload_app_grid(env, grid, &mut apps, &mut current_page, &apps_dir);
+                            rebuild_page_dots(
+                                env,
+                                main_view,
+                                app_frame.size,
+                                &mut page_dots,
+                                page_count,
+                            );
+                            update_page_dots(env, &page_dots, current_page);
                         }
                     }
                     Err(e) => echo!("Couldn't delete app: {}", e),
@@ -1092,7 +1190,16 @@ fn app_picker_inner(
             {
                 watch.dirty = false;
                 if let Some(grid) = icon_grid_stuff.as_mut() {
-                    reload_app_grid(env, grid, &mut apps, &mut current_page, &apps_dir);
+                    let page_count =
+                        reload_app_grid(env, grid, &mut apps, &mut current_page, &apps_dir);
+                    rebuild_page_dots(
+                        env,
+                        main_view,
+                        app_frame.size,
+                        &mut page_dots,
+                        page_count,
+                    );
+                    update_page_dots(env, &page_dots, current_page);
                 }
             }
         }
@@ -1167,35 +1274,93 @@ fn app_picker_inner(
 
 const HYPERHLE_FORK_NAME: &str = "HyperHLE-Fork";
 
-const APP_PICKER_VERSION_LABEL_HEIGHT: CGFloat = 15.0;
-const APP_PICKER_VERSION_LABEL_BOTTOM_INSET: CGFloat = 5.0;
-const APP_PICKER_FOOTER_GAP: CGFloat = 10.0;
-const APP_PICKER_GRID_TOP: CGFloat = 44.0;
+/// Old-iOS home screen layout: a fixed 4×4 icon grid above a row of page dots,
+/// and a translucent dock along the bottom edge.
+const APP_PICKER_ICON_COLS: usize = 4;
 const APP_PICKER_ICON_ROWS: usize = 4;
+const APP_PICKER_GRID_TOP: CGFloat = 6.0;
+const APP_PICKER_SIDE_MARGIN: CGFloat = 10.0;
+const APP_PICKER_ICON_MAX_SIZE: CGFloat = 60.0;
+const APP_PICKER_ICON_MIN_SIZE: CGFloat = 24.0;
+const APP_PICKER_ICON_GAP_X_MIN: CGFloat = 10.0;
+const APP_PICKER_ICON_GAP_X_MAX: CGFloat = 20.0;
+const APP_PICKER_LABEL_HEIGHT: CGFloat = 14.0;
+const APP_PICKER_LABEL_TOP_GAP: CGFloat = 2.0;
+const APP_PICKER_ROW_GAP_MIN: CGFloat = 2.0;
+const APP_PICKER_DOTS_ROW_HEIGHT: CGFloat = 18.0;
+const APP_PICKER_DOCK_HEIGHT: CGFloat = 88.0;
 
+const PAGE_DOT_SIZE: CGFloat = 7.0;
+const PAGE_DOT_GAP: CGFloat = 9.0;
+
+/// Side length of the bitmap used for app and dock icons. The on-screen size
+/// is chosen separately by [app_picker_layout] so that the grid always fits.
 const ICON_SIZE: CGSize = CGSize {
     width: 72.0,
     height: 72.0,
 };
-const ICON_IMAGE_INSET: CGFloat = 9.0;
-const ICON_LABEL_TOP_GAP: CGFloat = 2.0;
-const ICON_ROW_GAP: CGFloat = 2.0;
 
-fn app_picker_version_label_top(app_height: CGFloat) -> CGFloat {
-    app_height - APP_PICKER_VERSION_LABEL_HEIGHT - APP_PICKER_VERSION_LABEL_BOTTOM_INSET
+/// Vertical centre-line of the page-dot row, just above the dock.
+fn app_picker_dots_top(app_height: CGFloat) -> CGFloat {
+    app_picker_grid_bottom(app_height) + (APP_PICKER_DOTS_ROW_HEIGHT - PAGE_DOT_SIZE) / 2.0
 }
 
-/// The bottom edge of the icon grid (the footer area is now empty space).
+/// The bottom edge of the icon grid: the page-dot/version row sits below it.
 fn app_picker_grid_bottom(app_height: CGFloat) -> CGFloat {
-    app_picker_version_label_top(app_height) - APP_PICKER_FOOTER_GAP
+    app_height - APP_PICKER_DOCK_HEIGHT - APP_PICKER_DOTS_ROW_HEIGHT
 }
 
-fn app_picker_icon_grid_num_rows(app_height: CGFloat, label_height: CGFloat) -> usize {
-    let grid_bottom = app_picker_grid_bottom(app_height);
-    let cell_content_height = ICON_SIZE.height + ICON_LABEL_TOP_GAP + label_height;
-    let cell_step_y = cell_content_height + ICON_ROW_GAP;
-    let available_height = (grid_bottom - APP_PICKER_GRID_TOP - cell_content_height).max(0.0);
-    ((available_height / cell_step_y).floor() as usize + 1).clamp(1, APP_PICKER_ICON_ROWS)
+/// Geometry of the 4×4 icon grid.
+#[derive(Clone, Copy, Debug)]
+struct AppPickerLayout {
+    /// Side length of one (square) icon cell.
+    icon_size: CGFloat,
+    /// Horizontal distance between icon cells.
+    icon_gap_x: CGFloat,
+    /// Vertical distance between icon rows.
+    icon_gap_y: CGFloat,
+    /// Top-left corner of the first icon cell.
+    grid_origin: CGPoint,
+    /// Size of an icon label, also used to space the rows.
+    label_size: CGSize,
+}
+
+fn app_picker_layout(screen_width: CGFloat, screen_height: CGFloat) -> AppPickerLayout {
+    let cols = APP_PICKER_ICON_COLS as CGFloat;
+    let rows = APP_PICKER_ICON_ROWS as CGFloat;
+    let inner_width = (screen_width - APP_PICKER_SIDE_MARGIN * 2.0).max(1.0);
+    let row_chrome = APP_PICKER_LABEL_TOP_GAP + APP_PICKER_LABEL_HEIGHT;
+    let available_height = (app_picker_grid_bottom(screen_height) - APP_PICKER_GRID_TOP).max(1.0);
+
+    // The icons must fit both across (four columns) and down (four rows plus
+    // labels). Small screens get smaller icons rather than fewer cells.
+    let icon_by_width = (inner_width - APP_PICKER_ICON_GAP_X_MIN * (cols - 1.0)) / cols;
+    let icon_by_height =
+        (available_height - rows * row_chrome - APP_PICKER_ROW_GAP_MIN * (rows - 1.0)) / rows;
+    let icon_size = icon_by_width
+        .min(icon_by_height)
+        .clamp(APP_PICKER_ICON_MIN_SIZE, APP_PICKER_ICON_MAX_SIZE)
+        .floor();
+    let icon_gap_x = ((inner_width - icon_size * cols) / (cols - 1.0))
+        .clamp(0.0, APP_PICKER_ICON_GAP_X_MAX);
+    let grid_width = icon_size * cols + icon_gap_x * (cols - 1.0);
+    let cell_height = icon_size + row_chrome;
+    let icon_gap_y = ((available_height - rows * cell_height) / (rows - 1.0))
+        .max(APP_PICKER_ROW_GAP_MIN);
+
+    AppPickerLayout {
+        icon_size,
+        icon_gap_x,
+        icon_gap_y,
+        grid_origin: CGPoint {
+            x: (screen_width - grid_width) / 2.0,
+            y: APP_PICKER_GRID_TOP,
+        },
+        label_size: CGSize {
+            width: icon_size + icon_gap_x,
+            height: APP_PICKER_LABEL_HEIGHT,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -1203,17 +1368,26 @@ mod layout_tests {
     use super::*;
 
     #[test]
-    fn classic_phone_picker_has_four_icon_rows() {
+    fn classic_phone_picker_has_four_by_four_grid() {
         // A visible status bar leaves `UIScreen.applicationFrame` at 320x460.
-        assert_eq!(app_picker_icon_grid_num_rows(460.0, 12.0), APP_PICKER_ICON_ROWS);
-    }
-}
+        let layout = app_picker_layout(320.0, 460.0);
+        assert_eq!(APP_PICKER_ICON_COLS, 4);
+        assert_eq!(APP_PICKER_ICON_ROWS, 4);
+        assert_eq!(layout.icon_size, 60.0);
 
-enum TappedIcon {
-    App(usize),
-    ChangePage(usize),
-    AddIpa,
-    Settings,
+        let last_row_bottom = layout.grid_origin.y
+            + 4.0 * layout.icon_size
+            + 3.0 * layout.icon_gap_y
+            + 4.0 * (APP_PICKER_LABEL_TOP_GAP + APP_PICKER_LABEL_HEIGHT);
+        assert!(last_row_bottom <= app_picker_grid_bottom(460.0) + 0.5);
+    }
+
+    #[test]
+    fn pages_hold_one_gridful_of_apps() {
+        assert_eq!(compute_pages(16, 0), vec![0..0]);
+        assert_eq!(compute_pages(16, 16), vec![0..16]);
+        assert_eq!(compute_pages(16, 17), vec![0..16, 16..17]);
+    }
 }
 
 /// One full set of icon-grid cells on its own container view. Two of these
@@ -1231,12 +1405,9 @@ struct IconGridStuff {
     /// Width of the picker screen, used by the page slide animation.
     screen_width: CGFloat,
     placeholder_icon: Option<id>,
-    prev_icon: Option<id>,
-    next_icon: Option<id>,
-    plus_icon: Option<id>,
-    settings_icon: Option<id>,
     pages: Vec<std::ops::Range<usize>>,
-    icon_map: HashMap<id, TappedIcon>,
+    /// Maps an on-screen icon cell's button to the app it shows.
+    icon_map: HashMap<id, usize>,
 }
 
 fn make_icon_grid(
@@ -1245,29 +1416,17 @@ fn make_icon_grid(
     main_view: id,
     app_frame: CGRect,
     total_app_count: usize,
-    have_wallpaper: bool,
 ) -> IconGridStuff {
-    let num_cols = if app_frame.size.width >= 380.0 {
-        4
-    } else if app_frame.size.width >= 270.0 {
-        3
-    } else {
-        2
-    };
-    let num_cols_f = num_cols as CGFloat;
-    let label_size = CGSize {
-        width: 74.0,
-        height: 12.0,
-    };
-    let icon_gap_x: CGFloat = 19.0;
-    let icon_gap_y = ICON_LABEL_TOP_GAP + label_size.height + ICON_ROW_GAP;
-    let grid_top = APP_PICKER_GRID_TOP;
-    let num_rows = app_picker_icon_grid_num_rows(app_frame.size.height, label_size.height);
-    let icon_grid_width = (ICON_SIZE.width * num_cols_f) + icon_gap_x * (num_cols_f - 1.0);
-    let icon_grid_origin = CGPoint {
-        x: (app_frame.size.width - icon_grid_width) / 2.0,
-        y: grid_top,
-    };
+    let layout = app_picker_layout(app_frame.size.width, app_frame.size.height);
+    let num_cols = APP_PICKER_ICON_COLS;
+    let num_rows = APP_PICKER_ICON_ROWS;
+    let cell_step_x = layout.icon_size + layout.icon_gap_x;
+    let cell_step_y =
+        layout.icon_size + APP_PICKER_LABEL_TOP_GAP + layout.label_size.height + layout.icon_gap_y;
+
+    // The icon image view is inset slightly so the rounded corners aren't
+    // clipped.
+    let icon_inset = (layout.icon_size * 0.03).max(0.0);
 
     let icon_tapped_sel = env.objc.lookup_selector("iconTapped:").unwrap();
     let icon_touch_down_sel = env.objc.lookup_selector("iconTouchDown:").unwrap();
@@ -1298,23 +1457,26 @@ fn make_icon_grid(
             // Rounding is needed here to avoid a blurry or offset image.
             let icon_frame = CGRect {
                 origin: CGPoint {
-                    x: (icon_grid_origin.x + (col as CGFloat) * (ICON_SIZE.width + icon_gap_x))
-                        .round(),
-                    y: (icon_grid_origin.y + (row as CGFloat) * (ICON_SIZE.height + icon_gap_y))
-                        .round(),
+                    x: (layout.grid_origin.x + (col as CGFloat) * cell_step_x).round(),
+                    y: (layout.grid_origin.y + (row as CGFloat) * cell_step_y).round(),
                 },
-                size: ICON_SIZE,
+                size: CGSize {
+                    width: layout.icon_size,
+                    height: layout.icon_size,
+                },
             };
             let icon_button: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
             () = msg![env; icon_button setFrame:icon_frame];
             let image_view: id = msg![env; icon_button imageView];
             let bounds: CGRect = msg![env; icon_button bounds];
-            let inset = ICON_IMAGE_INSET;
             () = msg![env; image_view setFrame:(CGRect {
-                origin: CGPoint { x: inset, y: inset },
+                origin: CGPoint {
+                    x: icon_inset,
+                    y: icon_inset,
+                },
                 size: CGSize {
-                    width: (bounds.size.width - inset * 2.0).max(1.0),
-                    height: (bounds.size.height - inset * 2.0).max(1.0),
+                    width: (bounds.size.width - icon_inset * 2.0).max(1.0),
+                    height: (bounds.size.height - icon_inset * 2.0).max(1.0),
                 },
             })];
             let layer: id = msg![env; image_view layer];
@@ -1338,27 +1500,29 @@ fn make_icon_grid(
             // Rounding is needed here to avoid blurry text.
             let label_frame = CGRect {
                 origin: CGPoint {
-                    x: (icon_frame.origin.x - (label_size.width - ICON_SIZE.width) / 2.0).round(),
-                    y: (icon_frame.origin.y + ICON_SIZE.height + ICON_LABEL_TOP_GAP).round(),
+                    x: (icon_frame.origin.x
+                        - (layout.label_size.width - layout.icon_size) / 2.0)
+                        .round(),
+                    y: (icon_frame.origin.y + layout.icon_size + APP_PICKER_LABEL_TOP_GAP)
+                        .round(),
                 },
-                size: label_size,
+                size: layout.label_size,
             };
             let label: id = msg_class![env; UILabel alloc];
             let label: id = msg![env; label initWithFrame:label_frame];
             () = msg![env; label setTextAlignment:UITextAlignmentCenter];
-            let font_size: CGFloat = label_size.height - 2.0;
-            let font: id = if have_wallpaper {
-                msg_class![env; UIFont systemFontOfSize:font_size]
-            } else {
-                msg_class![env; UIFont boldSystemFontOfSize:font_size]
-            };
+            let font_size: CGFloat = layout.label_size.height - 3.0;
+            let font: id = msg_class![env; UIFont boldSystemFontOfSize:font_size];
             () = msg![env; label setFont:font];
-            let text_color: id = if have_wallpaper {
-                msg_class![env; UIColor whiteColor]
-            } else {
-                msg_class![env; UIColor lightGrayColor]
-            };
+            // White with a soft shadow, like the old iOS home screen.
+            let text_color: id = msg_class![env; UIColor whiteColor];
             () = msg![env; label setTextColor:text_color];
+            let shadow_color = ui_color(env, 0.0, 0.0, 0.0, 0.7);
+            () = msg![env; label setShadowColor:shadow_color];
+            () = msg![env; label setShadowOffset:(CGSize {
+                width: 0.0,
+                height: 1.0,
+            })];
             let bg_color: id = msg_class![env; UIColor clearColor];
             () = msg![env; label setBackgroundColor:bg_color];
             () = msg![env; container addSubview:label];
@@ -1371,7 +1535,6 @@ fn make_icon_grid(
         });
     }
 
-    // TODO: Use UIScrollView pagination and UIPageControl once available.
     let total_slots = containers[0].cells.len();
     let pages = compute_pages(total_slots, total_app_count);
 
@@ -1380,50 +1543,32 @@ fn make_icon_grid(
         visible: 0,
         screen_width: app_frame.size.width,
         placeholder_icon: None,
-        prev_icon: None,
-        next_icon: None,
-        plus_icon: None,
-        settings_icon: None,
         pages,
         icon_map: HashMap::new(),
     }
 }
 
-/// Work out which apps go on each page of the icon grid.
-///
-/// Page 0 reserves its first two slots for the "add IPA" (+) tile and the
-/// Settings tile; the remaining slots are used for the prev/next arrows (when
-/// relevant) and the apps.
+/// Work out which apps go on each page of the icon grid. Every page is a full
+/// 4×4 grid; the "+" tile and Settings live in the dock instead of taking
+/// grid slots.
 fn compute_pages(total_slots: usize, total_app_count: usize) -> Vec<std::ops::Range<usize>> {
-    let mut pages = Vec::new();
-    if total_app_count == 0 {
-        pages.push(0..0);
-        return pages;
-    }
-    let mut start = 0;
-    while start < total_app_count {
-        let page_idx = pages.len();
-        let has_prev = start != 0;
-        let fixed_slots = usize::from(has_prev) + if page_idx == 0 { 2 } else { 0 };
-        let mut app_slots = total_slots.saturating_sub(fixed_slots).max(1);
-        let remaining = total_app_count - start;
-        if remaining > app_slots {
-            // Leave a slot for the "next" arrow.
-            app_slots = (app_slots - 1).max(1);
-        }
-        let end = (start + app_slots).min(total_app_count);
-        pages.push(start..end);
-        start = end;
-    }
-    pages
+    let total_slots = total_slots.max(1);
+    let page_count = ((total_app_count + total_slots - 1) / total_slots).max(1);
+    (0..page_count)
+        .map(|page_idx| {
+            let start = page_idx * total_slots;
+            start..(start + total_slots).min(total_app_count)
+        })
+        .collect()
 }
 
-fn make_icon_from_glyph(
+/// Renders a rounded, glossed app icon with the given background colour.
+/// `draw` paints on top of the background at bitmap resolution, in
+/// top-left-origin coordinates (y grows downwards).
+fn make_icon(
     env: &mut Environment,
-    glyph: char,
-    font_size: CGFloat,
-    baseline_offset: CGFloat,
     bg_color: (CGFloat, CGFloat, CGFloat, CGFloat),
+    draw: impl FnOnce(&mut Environment, id),
 ) -> id {
     let ui_scale = env.options.ui_scale.get() as CGFloat;
     let color_space = CGColorSpaceCreateDeviceRGB(env);
@@ -1442,11 +1587,10 @@ fn make_icon_from_glyph(
     let scaled_width = ICON_SIZE.width * ui_scale;
     let scaled_height = ICON_SIZE.height * ui_scale;
 
-    // Compensate for row order inversion. The offset is in bitmap pixels,
-    // so it must be scaled along with everything else.
-    CGContextSaveGState(env, context);
+    // The bitmap's rows are stored bottom-up; flip the transform so the
+    // background and `draw` can use screen-like top-down coordinates.
     CGContextTranslateCTM(env, context, 0.0, scaled_height);
-    CGContextScaleCTM(env, context, ui_scale, -ui_scale);
+    CGContextScaleCTM(env, context, 1.0, -1.0);
 
     let (r, g, b, a) = bg_color;
     CGContextSetRGBFillColor(env, context, r, g, b, a);
@@ -1455,44 +1599,65 @@ fn make_icon_from_glyph(
         context,
         CGRect {
             origin: CGPoint { x: 0.0, y: 0.0 },
-            size: ICON_SIZE,
+            size: CGSize {
+                width: scaled_width,
+                height: scaled_height,
+            },
         },
     );
-    CGContextRestoreGState(env, context);
 
-    // Draw the glyph at 1:1 device pixels with a larger font, so it is
-    // rasterized at the higher resolution instead of being upscaled by
-    // the CTM (which would make it blurry).
-    CGContextTranslateCTM(env, context, 0.0, scaled_height);
-    CGContextScaleCTM(env, context, 1.0, -1.0);
-
-    let font: id = msg_class![env; UIFont systemFontOfSize:(font_size * ui_scale)];
-    let glyph_string: id = ns_string::from_rust_string(env, [glyph].into_iter().collect());
-    let glyph_size: CGSize = msg![env; glyph_string sizeWithFont:font];
-    CGContextSetRGBFillColor(env, context, 1.0, 1.0, 1.0, 1.0); // white
-    let glyph_origin = CGPoint {
-        x: scaled_width / 2.0 - glyph_size.width / 2.0,
-        y: scaled_height / 2.0 - glyph_size.height / 2.0 + baseline_offset * ui_scale,
-    };
-    let _: CGSize = msg![env; glyph_string drawAtPoint:glyph_origin withFont:font];
-    release(env, glyph_string);
+    draw(env, context);
 
     UIGraphicsPopContext(env);
 
     let cg_image = CGBitmapContextCreateImage(env, context);
-    // This radius should match the one in src/bundle.rs, adjusted for the
-    // bitmap resolution.
-    cg_image::borrow_image_mut(&mut env.objc, cg_image).round_corners(
-        12.0 * ui_scale,
-        /* four_corners: */ true,
-        /* add_sheen: */ true,
-    );
+    // Same gloss and (resolution-scaled) corner radius as `Bundle::load_icon()`.
+    cg_image::borrow_image_mut(&mut env.objc, cg_image)
+        .round_icon_corners(/* add_sheen: */ true);
     CGContextRelease(env, context);
 
     let ui_image: id = msg_class![env; UIImage imageWithCGImage:cg_image];
     release(env, cg_image);
 
     ui_image
+}
+
+/// Builds an icon with white text in the middle, e.g. "+" or "WWW".
+fn make_icon_from_text(
+    env: &mut Environment,
+    text: &str,
+    font_size: CGFloat,
+    baseline_offset: CGFloat,
+    bg_color: (CGFloat, CGFloat, CGFloat, CGFloat),
+) -> id {
+    make_icon(env, bg_color, |env, context| {
+        let ui_scale = env.options.ui_scale.get() as CGFloat;
+        let scaled_width = ICON_SIZE.width * ui_scale;
+        let scaled_height = ICON_SIZE.height * ui_scale;
+        let font: id = msg_class![env; UIFont systemFontOfSize:(font_size * ui_scale)];
+        let string: id = ns_string::from_rust_string(env, text.to_string());
+        let size: CGSize = msg![env; string sizeWithFont:font];
+        CGContextSetRGBFillColor(env, context, 1.0, 1.0, 1.0, 1.0); // white
+        let origin = CGPoint {
+            x: scaled_width / 2.0 - size.width / 2.0,
+            y: scaled_height / 2.0 - size.height / 2.0 + baseline_offset * ui_scale,
+        };
+        let _: CGSize = msg![env; string drawAtPoint:origin withFont:font];
+        release(env, string);
+    })
+}
+
+/// Builds the blue folder icon used by the dock's "File manager" shortcut.
+fn make_folder_icon(env: &mut Environment) -> id {
+    make_icon(env, (0.13, 0.42, 0.85, 1.0), |env, context| {
+        let s = env.options.ui_scale.get() as CGFloat;
+        // Tab, body, then a lighter stripe for the gloss.
+        CGContextSetRGBFillColor(env, context, 0.45, 0.68, 0.96, 1.0);
+        CGContextFillRect(env, context, rect(8.0 * s, 14.0 * s, 22.0 * s, 10.0 * s));
+        CGContextFillRect(env, context, rect(8.0 * s, 21.0 * s, 56.0 * s, 38.0 * s));
+        CGContextSetRGBFillColor(env, context, 0.80, 0.90, 1.0, 1.0);
+        CGContextFillRect(env, context, rect(11.0 * s, 26.0 * s, 50.0 * s, 4.0 * s));
+    })
 }
 
 /// Fills one page container (`container_idx`) of the icon grid with the apps
@@ -1511,49 +1676,9 @@ fn update_icon_grid(
     }
 
     let app_idx_range = icon_grid_stuff.pages[page_idx].clone();
-    let have_prev_icon = page_idx != 0;
-    let have_next_icon = app_idx_range.end != apps.len();
-
     let mut icon_iter = cells.iter();
 
-    if have_prev_icon {
-        let &(icon_button, label) = icon_iter.next().unwrap();
-        let image = *icon_grid_stuff.prev_icon.get_or_insert_with(|| {
-            make_icon_from_glyph(env, '←', 50.0, -9.0, (0.25, 0.25, 0.25, 1.0))
-        });
-        () = msg![env; icon_button setImage:image forState:UIControlStateNormal];
-        () = msg![env; label setText:(ns_string::get_static_str(env, ""))];
-        icon_grid_stuff
-            .icon_map
-            .insert(icon_button, TappedIcon::ChangePage(page_idx - 1));
-    }
-
-    // The iOS-style "+" tile on the first page lets the user add a new app
-    // by picking an .ipa file, which then gets copied into the apps folder.
-    if page_idx == 0 {
-        let &(icon_button, label) = icon_iter.next().unwrap();
-        let image = *icon_grid_stuff.plus_icon.get_or_insert_with(|| {
-            make_icon_from_glyph(env, '+', 50.0, -6.0, (0.25, 0.25, 0.25, 1.0))
-        });
-        () = msg![env; icon_button setImage:image forState:UIControlStateNormal];
-        () = msg![env; label setText:(ns_string::get_static_str(env, ""))];
-        icon_grid_stuff
-            .icon_map
-            .insert(icon_button, TappedIcon::AddIpa);
-
-        // The Settings app sits right after the "+" tile.
-        let &(icon_button, label) = icon_iter.next().unwrap();
-        let image = *icon_grid_stuff
-            .settings_icon
-            .get_or_insert_with(|| make_settings_app_icon(env));
-        () = msg![env; icon_button setImage:image forState:UIControlStateNormal];
-        () = msg![env; label setText:(ns_string::get_static_str(env, "Settings"))];
-        icon_grid_stuff
-            .icon_map
-            .insert(icon_button, TappedIcon::Settings);
-    }
-
-    for app_idx in app_idx_range.clone() {
+    for app_idx in app_idx_range {
         let app = &mut apps[app_idx];
 
         let &(icon_button, label) = icon_iter.next().unwrap();
@@ -1566,7 +1691,7 @@ fn update_icon_grid(
 
         let image = app.icon_ui_image.unwrap_or_else(|| {
             *icon_grid_stuff.placeholder_icon.get_or_insert_with(|| {
-                make_icon_from_glyph(env, '?', 40.0, 0.0, (0.5, 0.5, 0.5, 1.0))
+                make_icon_from_text(env, "?", 40.0, 0.0, (0.5, 0.5, 0.5, 1.0))
             })
         });
         () = msg![env; icon_button setImage:image forState:UIControlStateNormal];
@@ -1576,28 +1701,351 @@ fn update_icon_grid(
             .get_or_insert_with(|| ns_string::from_rust_string(env, app.display_name.clone()));
         () = msg![env; label setText:text];
 
-        icon_grid_stuff
-            .icon_map
-            .insert(icon_button, TappedIcon::App(app_idx));
+        icon_grid_stuff.icon_map.insert(icon_button, app_idx);
     }
 
-    if have_next_icon {
-        let &(icon_button, label) = icon_iter.next().unwrap();
-        let image = *icon_grid_stuff.next_icon.get_or_insert_with(|| {
-            make_icon_from_glyph(env, '→', 50.0, -9.0, (0.25, 0.25, 0.25, 1.0))
-        });
-        () = msg![env; icon_button setImage:image forState:UIControlStateNormal];
-        () = msg![env; label setText:(ns_string::get_static_str(env, ""))];
-        icon_grid_stuff
-            .icon_map
-            .insert(icon_button, TappedIcon::ChangePage(page_idx + 1));
-    }
-
-    // There may be remaining spaces might need to be blanked.
+    // Blank the unused cells at the end of the last page.
     for &(icon_button, label) in icon_iter {
         () = msg![env; icon_button setImage:nil forState:UIControlStateNormal];
         () = msg![env; label setText:(ns_string::get_static_str(env, ""))];
     }
+}
+
+/// Builds a fake old-iOS status bar: signal bars, carrier, clock and battery.
+/// Returns the bar itself, the clock label and the battery charge bar, which
+/// the event loop updates.
+fn make_status_bar(env: &mut Environment, width: CGFloat, height: CGFloat) -> (id, id, id) {
+    let clear: id = msg_class![env; UIColor clearColor];
+    let bar = new_view(env, rect(0.0, 0.0, width, height), clear);
+    let white: id = msg_class![env; UIColor whiteColor];
+    let shadow = ui_color(env, 0.0, 0.0, 0.0, 0.7);
+
+    // Signal strength: four white bars of increasing height.
+    let signal_width: CGFloat = 3.0;
+    let signal_gap: CGFloat = 1.5;
+    let signal_bottom = height - 4.0;
+    for (idx, signal_height) in [4.0 as CGFloat, 6.0, 8.0, 10.0].iter().enumerate() {
+        let signal = new_view(
+            env,
+            rect(
+                5.0 + idx as CGFloat * (signal_width + signal_gap),
+                signal_bottom - *signal_height,
+                signal_width,
+                *signal_height,
+            ),
+            white,
+        );
+        () = msg![env; bar addSubview:signal];
+    }
+
+    let carrier = new_label(
+        env,
+        rect(27.0, 1.0, width * 0.35, height - 2.0),
+        "HyperHLE",
+        12.0,
+        true,
+        white,
+    );
+    () = msg![env; carrier setShadowColor:shadow];
+    () = msg![env; carrier setShadowOffset:(CGSize {
+        width: 0.0,
+        height: 1.0,
+    })];
+    () = msg![env; bar addSubview:carrier];
+
+    let time = new_label(
+        env,
+        rect(0.0, 1.0, width, height - 2.0),
+        &status_bar_time_string(),
+        12.0,
+        true,
+        white,
+    );
+    () = msg![env; time setTextAlignment:UITextAlignmentCenter];
+    () = msg![env; time setShadowColor:shadow];
+    () = msg![env; time setShadowOffset:(CGSize {
+        width: 0.0,
+        height: 1.0,
+    })];
+    () = msg![env; bar addSubview:time];
+
+    // Battery: a white rounded shell with a black inside and a charge bar.
+    let battery = new_view(env, rect(width - BATTERY_RIGHT_INSET, 5.0, 24.0, 11.0), white);
+    let battery_layer: id = msg![env; battery layer];
+    () = msg![env; battery_layer setCornerRadius:(2.5 as CGFloat)];
+    () = msg![env; bar addSubview:battery];
+
+    let black: id = msg_class![env; UIColor blackColor];
+    let battery_inner = new_view(
+        env,
+        rect(width - BATTERY_RIGHT_INSET + 1.5, 6.5, 21.0, 8.0),
+        black,
+    );
+    () = msg![env; bar addSubview:battery_inner];
+    let charge = new_view(
+        env,
+        rect(width - BATTERY_CHARGE_LEFT, 7.5, BATTERY_CHARGE_MAX_WIDTH, 6.0),
+        white,
+    );
+    () = msg![env; bar addSubview:charge];
+    let nub = new_view(env, rect(width - BATTERY_RIGHT_INSET + 24.5, 8.5, 2.0, 4.0), white);
+    () = msg![env; bar addSubview:nub];
+
+    (bar, time, charge)
+}
+
+/// Left edge of the battery shell, measured from the right of the screen.
+const BATTERY_RIGHT_INSET: CGFloat = 31.0;
+/// Left edge of the charge bar, measured from the right of the screen.
+const BATTERY_CHARGE_LEFT: CGFloat = 28.5;
+/// Width of the charge bar when the battery is full.
+const BATTERY_CHARGE_MAX_WIDTH: CGFloat = 15.0;
+
+/// Updates the status bar's battery charge bar for the given percentage and
+/// charging state, like the old iOS status bar: the fill grows with the level
+/// and turns red when the battery is low.
+fn update_battery_indicator(
+    env: &mut Environment,
+    charge_view: id,
+    level: Option<(i32, crate::window::BatteryState)>,
+) {
+    let (percent, charging) = match level {
+        Some((percent, state)) if percent >= 0 => {
+            let charging = matches!(
+                state,
+                crate::window::BatteryState::Charging | crate::window::BatteryState::Full
+            );
+            (percent.clamp(0, 100) as CGFloat, charging)
+        }
+        // No battery information (a desktop, or SDL couldn't read the level):
+        // show a full battery, as the picker always did before the level was
+        // wired up. SDL reports -1 when the level is unknown.
+        _ => (100.0, false),
+    };
+    let full: id = msg_class![env; UIColor whiteColor];
+    let color: id = if charging {
+        ui_color(env, 0.20, 0.85, 0.30, 1.0)
+    } else if percent <= 20.0 {
+        ui_color(env, 0.90, 0.15, 0.15, 1.0)
+    } else {
+        full
+    };
+    () = msg![env; charge_view setBackgroundColor:color];
+    let width = if percent <= 0.0 {
+        0.0
+    } else {
+        (BATTERY_CHARGE_MAX_WIDTH * percent / 100.0).max(1.5)
+    };
+    let frame: CGRect = msg![env; charge_view frame];
+    () = msg![env; charge_view setFrame:(rect(
+        frame.origin.x,
+        7.5,
+        width,
+        6.0
+    ))];
+}
+
+#[cfg(unix)]
+fn status_bar_time_string() -> String {
+    // SAFETY: `localtime_r` only writes into the provided `tm`.
+    let tm = unsafe {
+        let mut now: libc::time_t = 0;
+        libc::time(&mut now);
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&now, &mut tm).is_null() {
+            return "9:41".to_string();
+        }
+        tm
+    };
+    let hour = tm.tm_hour.rem_euclid(12);
+    let hour = if hour == 0 { 12 } else { hour };
+    let suffix = if tm.tm_hour < 12 { "AM" } else { "PM" };
+    format!("{}:{:02} {}", hour, tm.tm_min, suffix)
+}
+
+#[cfg(not(unix))]
+fn status_bar_time_string() -> String {
+    "9:41".to_string()
+}
+
+/// Creates the page-dot row. The caller fills in the current page with
+/// [update_page_dots].
+fn make_page_dots(
+    env: &mut Environment,
+    main_view: id,
+    screen_size: CGSize,
+    page_count: usize,
+) -> Vec<id> {
+    let mut dots = Vec::with_capacity(page_count);
+    // Old iOS only shows the indicator when there is more than one page.
+    if page_count <= 1 {
+        return dots;
+    }
+    let count = page_count as CGFloat;
+    let total_width = PAGE_DOT_SIZE * count + PAGE_DOT_GAP * (count - 1.0);
+    let first_x = (screen_size.width - total_width) / 2.0;
+    let y = app_picker_dots_top(screen_size.height);
+    let inactive = ui_color(env, 0.75, 0.75, 0.75, 0.45);
+    for idx in 0..page_count {
+        let dot = new_view(
+            env,
+            rect(
+                first_x + idx as CGFloat * (PAGE_DOT_SIZE + PAGE_DOT_GAP),
+                y,
+                PAGE_DOT_SIZE,
+                PAGE_DOT_SIZE,
+            ),
+            inactive,
+        );
+        let layer: id = msg![env; dot layer];
+        () = msg![env; layer setCornerRadius:(PAGE_DOT_SIZE / 2.0)];
+        () = msg![env; main_view addSubview:dot];
+        dots.push(dot);
+    }
+    dots
+}
+
+/// Highlights the dot of the current page.
+fn update_page_dots(env: &mut Environment, dots: &[id], current_page: usize) {
+    let active: id = msg_class![env; UIColor whiteColor];
+    let inactive = ui_color(env, 0.75, 0.75, 0.75, 0.45);
+    for (idx, &dot) in dots.iter().enumerate() {
+        let color = if idx == current_page { active } else { inactive };
+        () = msg![env; dot setBackgroundColor:color];
+    }
+}
+
+/// Re-creates the page dots after the number of pages changes.
+fn rebuild_page_dots(
+    env: &mut Environment,
+    main_view: id,
+    screen_size: CGSize,
+    dots: &mut Vec<id>,
+    page_count: usize,
+) {
+    for &dot in dots.iter() {
+        () = msg![env; dot removeFromSuperview];
+    }
+    dots.clear();
+    *dots = make_page_dots(env, main_view, screen_size, page_count);
+}
+
+const DOCK_ICON_SIZE: CGFloat = 60.0;
+const DOCK_ICON_TOP: CGFloat = 5.0;
+const DOCK_LABEL_HEIGHT: CGFloat = 12.0;
+/// The dock shortcuts sit close together in the middle of the dock instead of
+/// being spread out to the screen edges.
+const DOCK_MIN_GAP: CGFloat = 14.0;
+const DOCK_MAX_GAP: CGFloat = 26.0;
+
+/// Builds the old-iOS dock at the bottom of the home screen. The shortcuts
+/// live outside the paged grid, so they stay in place while pages slide.
+fn make_dock(env: &mut Environment, delegate: id, main_view: id, screen_size: CGSize) -> id {
+    let width = screen_size.width;
+    let top = screen_size.height - APP_PICKER_DOCK_HEIGHT;
+    let background = ui_color(env, 1.0, 1.0, 1.0, 0.15);
+    let dock = new_view(
+        env,
+        rect(0.0, top, width, APP_PICKER_DOCK_HEIGHT),
+        background,
+    );
+    let hairline_color = ui_color(env, 1.0, 1.0, 1.0, 0.35);
+    let hairline = new_view(env, rect(0.0, 0.0, width, 1.0), hairline_color);
+    () = msg![env; dock addSubview:hairline];
+
+    let count: CGFloat = 3.0;
+    let side_inset: CGFloat = 10.0;
+    let gap = ((width - side_inset * 2.0 - DOCK_ICON_SIZE * count) / (count - 1.0))
+        .clamp(DOCK_MIN_GAP, DOCK_MAX_GAP);
+    let first_x = (width - (DOCK_ICON_SIZE * count + gap * (count - 1.0))) / 2.0;
+
+    let plus_image = make_icon_from_text(env, "+", 50.0, -6.0, (0.25, 0.25, 0.25, 1.0));
+    let settings_image = make_settings_app_icon(env);
+    let folder_image = make_folder_icon(env);
+
+    make_dock_item(
+        env,
+        delegate,
+        dock,
+        first_x,
+        plus_image,
+        "Add .ipa",
+        "addIpa",
+    );
+    make_dock_item(
+        env,
+        delegate,
+        dock,
+        first_x + DOCK_ICON_SIZE + gap,
+        settings_image,
+        "Settings",
+        "settingsShow",
+    );
+    make_dock_item(
+        env,
+        delegate,
+        dock,
+        first_x + 2.0 * (DOCK_ICON_SIZE + gap),
+        folder_image,
+        "File manager",
+        "openFileManager",
+    );
+    () = msg![env; main_view addSubview:dock];
+    dock
+}
+
+/// Adds one icon + label shortcut to the dock.
+fn make_dock_item(
+    env: &mut Environment,
+    delegate: id,
+    dock: id,
+    x: CGFloat,
+    image: id,
+    label_text: &str,
+    action: &str,
+) {
+    let icon_button: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+    () = msg![env; icon_button setFrame:(rect(
+        x,
+        DOCK_ICON_TOP,
+        DOCK_ICON_SIZE,
+        DOCK_ICON_SIZE
+    ))];
+    () = msg![env; icon_button setImage:image forState:UIControlStateNormal];
+    let image_view: id = msg![env; icon_button imageView];
+    () = msg![env; image_view setFrame:(rect(0.0, 0.0, DOCK_ICON_SIZE, DOCK_ICON_SIZE))];
+    let layer: id = msg![env; image_view layer];
+    let gravity = ns_string::get_static_str(env, "resizeAspect");
+    () = msg![env; layer setContentsGravity:gravity];
+    let selector = env.objc.lookup_selector(action).unwrap();
+    () = msg![env; icon_button addTarget:delegate
+                                  action:selector
+                        forControlEvents:UIControlEventTouchUpInside];
+    () = msg![env; dock addSubview:icon_button];
+
+    let label_width = DOCK_ICON_SIZE + 30.0;
+    let white: id = msg_class![env; UIColor whiteColor];
+    let label = new_label(
+        env,
+        rect(
+            x - (label_width - DOCK_ICON_SIZE) / 2.0,
+            DOCK_ICON_TOP + DOCK_ICON_SIZE + 3.0,
+            label_width,
+            DOCK_LABEL_HEIGHT,
+        ),
+        label_text,
+        10.5,
+        true,
+        white,
+    );
+    () = msg![env; label setTextAlignment:UITextAlignmentCenter];
+    let shadow = ui_color(env, 0.0, 0.0, 0.0, 0.65);
+    () = msg![env; label setShadowColor:shadow];
+    () = msg![env; label setShadowOffset:(CGSize {
+        width: 0.0,
+        height: 1.0,
+    })];
+    () = msg![env; dock addSubview:label];
 }
 
 /// Helper to build a `CGRect` from its components.
@@ -1681,7 +2129,7 @@ const HOME_UNLOCK_BASE_PUSH_FACTOR: CGFloat = 0.55;
 /// Extra radial distance multiplier applied to each cell's offset from the
 /// grid center so outer rows/columns stay separated from inner ones in flight.
 const HOME_UNLOCK_RADIAL_MULT: CGFloat = 1.85;
-/// Duration of the page slide when pressing the arrow tiles.
+/// Duration of the page slide after a swipe or arrow-key press.
 const PAGE_SLIDE_DURATION: Duration = Duration::from_millis(320);
 /// Duration of the "app icon zooms to the middle, screen fades to black"
 /// animation played when an app is picked.
@@ -1824,16 +2272,16 @@ fn apply_unlock_step(
     cells: &[(id, id)],
     targets: &[UnlockCellTarget],
     wallpaper: Option<id>,
-    title: id,
-    version_label: id,
+    chrome_views: &[id],
     t: f64,
 ) {
     let chrome_alpha = ease_out_cubic(t.clamp(0.0, 1.0)) as CGFloat;
     if let Some(wallpaper) = wallpaper {
-        () = msg![env; wallpaper setAlpha:(0.5 * chrome_alpha)];
+        () = msg![env; wallpaper setAlpha:chrome_alpha];
     }
-    () = msg![env; title setAlpha:chrome_alpha];
-    () = msg![env; version_label setAlpha:chrome_alpha];
+    for &view in chrome_views {
+        () = msg![env; view setAlpha:chrome_alpha];
+    }
 
     for (&(icon_button, label), target) in cells.iter().zip(targets.iter()) {
         let (dx, dy, label_dy, scale, alpha) = unlock_cell_state_at(target, t);
@@ -1860,8 +2308,7 @@ fn play_home_screen_unlock_animation(
     grid: &IconGridStuff,
     screen_size: CGSize,
     wallpaper: Option<id>,
-    title: id,
-    version_label: id,
+    chrome_views: &[id],
 ) {
     let cells = grid.containers[grid.visible].cells.clone();
     let mut icon_centers = Vec::with_capacity(cells.len());
@@ -1881,7 +2328,7 @@ fn play_home_screen_unlock_animation(
 
     // Render the initial off-screen state once before starting the timer so
     // first-frame texture creation doesn't eat into the animation duration.
-    apply_unlock_step(env, &cells, &targets, wallpaper, title, version_label, 0.0);
+    apply_unlock_step(env, &cells, &targets, wallpaper, chrome_views, 0.0);
     run_run_loop_single_iteration(env, run_loop);
     {
         let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
@@ -1895,15 +2342,16 @@ fn play_home_screen_unlock_animation(
         delegate,
         HOME_UNLOCK_DURATION,
         |env, t| {
-            apply_unlock_step(env, &cells, &targets, wallpaper, title, version_label, t);
+            apply_unlock_step(env, &cells, &targets, wallpaper, chrome_views, t);
         },
     );
 
     if let Some(wallpaper) = wallpaper {
-        () = msg![env; wallpaper setAlpha:(0.5 as CGFloat)];
+        () = msg![env; wallpaper setAlpha:(1.0 as CGFloat)];
     }
-    () = msg![env; title setAlpha:(1.0 as CGFloat)];
-    () = msg![env; version_label setAlpha:(1.0 as CGFloat)];
+    for &view in chrome_views {
+        () = msg![env; view setAlpha:(1.0 as CGFloat)];
+    }
     for &(icon_button, label) in &cells {
         () = msg![env; icon_button setTransform:CGAffineTransformIdentity];
         () = msg![env; icon_button setAlpha:(1.0 as CGFloat)];
@@ -2050,8 +2498,8 @@ fn make_settings_app_icon(env: &mut Environment) -> id {
         "/res/settings_icon.png"
     ));
     let mut image = Image::from_bytes(bytes).unwrap();
-    // Same corner radius and gloss as `Bundle::load_icon()`.
-    image.round_corners(12.0, /* four_corners: */ true, /* add_sheen: */ true);
+    // Same resolution-aware corner radius and gloss as `Bundle::load_icon()`.
+    image.round_icon_corners(/* add_sheen: */ true);
     let cg_image = cg_image::from_image(env, image);
     let ui_image: id = msg_class![env; UIImage imageWithCGImage:cg_image];
     release(env, cg_image);
@@ -2954,19 +3402,19 @@ fn make_settings_dropdown(
 
 /// Re-reads the apps directory and redraws the icon grid to match. The current
 /// page is kept if it still exists. If the directory can't be read, nothing
-/// changes.
+/// changes. Returns the new number of pages, for the page dots.
 fn reload_app_grid(
     env: &mut Environment,
     grid: &mut IconGridStuff,
     apps: &mut Result<Vec<AppInfo>, String>,
     current_page: &mut usize,
     apps_dir: &Path,
-) {
+) -> usize {
     let mut new_apps = match enumerate_apps(apps_dir) {
         Ok(new_apps) => new_apps,
         Err(e) => {
             log!("Warning: couldn't reload the apps directory: {}", e);
-            return;
+            return grid.pages.len();
         }
     };
     grid.pages = compute_pages(grid.containers[0].cells.len(), new_apps.len());
@@ -2976,6 +3424,7 @@ fn reload_app_grid(
     let visible = grid.visible;
     update_icon_grid(env, grid, &mut new_apps, *current_page, visible);
     *apps = Ok(new_apps);
+    grid.pages.len()
 }
 
 /// Width and height of the delete dialog's box, and the height of its row of

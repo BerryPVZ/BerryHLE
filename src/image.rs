@@ -169,6 +169,19 @@ impl Image {
         }
     }
 
+    /// Rounds off the corners and adds the gloss of an iOS app icon.
+    ///
+    /// Unlike [Self::round_corners], the corner radius follows the icon's
+    /// resolution: a 57×57 icon (the original iPhone size) gets a 12px
+    /// radius, an `@2x` 114×114 icon gets twice that, and a large iPad or
+    /// `@3x` icon gets proportionally more. A fixed radius makes
+    /// high-resolution icons look almost square.
+    pub fn round_icon_corners(&mut self, add_sheen: bool) {
+        let (width, height) = self.dimensions();
+        let radius = icon_corner_radius(width.min(height));
+        self.round_corners(radius, /* four_corners: */ true, add_sheen);
+    }
+
     // TODO: Eventually this should be in Core Animation instead?
     /// Modify the image to mask it with one to four anti-aliased rounded
     /// corners, and add sheen if desired.
@@ -305,6 +318,21 @@ impl Drop for Image {
     }
 }
 
+/// Side length of the original iPhone app icon, which the classic corner
+/// radius below is defined for.
+const CLASSIC_ICON_SIZE: f32 = 57.0;
+/// Corner radius of a classic 57×57 iOS app icon.
+const CLASSIC_ICON_CORNER_RADIUS: f32 = 12.0;
+
+/// Corner radius, in pixels, for a square app icon of the given side length.
+///
+/// iOS always rounds app icon corners by a fixed fraction of the icon size;
+/// touchHLE only used a fixed radius, which under-rounds high-resolution
+/// (`@2x`, `@3x`, iPad) icons.
+pub fn icon_corner_radius(icon_side: u32) -> f32 {
+    (CLASSIC_ICON_CORNER_RADIUS * icon_side as f32 / CLASSIC_ICON_SIZE).max(1.0)
+}
+
 /// Approximate implementation of sRGB gamma encoding.
 pub fn gamma_encode(intensity: f32) -> f32 {
     // TODO: This doesn't implement the linear section near zero.
@@ -382,7 +410,18 @@ pub fn decode_pvrtc_with_alpha(
 
 #[cfg(test)]
 mod tests {
-    use super::decode_pvrtc_with_alpha;
+    use super::{decode_pvrtc_with_alpha, icon_corner_radius};
+
+    #[test]
+    fn icon_corner_radius_scales_with_resolution() {
+        // The classic 57×57 icon keeps the radius touchHLE always used.
+        assert_eq!(icon_corner_radius(57), 12.0);
+        // @2x and @3x icons get proportionally larger corners.
+        assert_eq!(icon_corner_radius(114), 24.0);
+        assert_eq!(icon_corner_radius(171), 36.0);
+        // Tiny placeholder icons still get a visible, non-zero radius.
+        assert!(icon_corner_radius(1) >= 1.0);
+    }
 
     fn decode_checksum(width: u32, height: u32, is_2bit: bool) -> u64 {
         let compressed_size = width as usize * height as usize / if is_2bit { 4 } else { 2 };

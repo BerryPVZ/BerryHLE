@@ -596,12 +596,45 @@ pub enum Event {
     ArrowKey(i8),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BatteryState {
     Unknown,
     OnBattery,
     NoBattery,
     Charging,
     Full,
+}
+
+impl BatteryState {
+    fn from_sdl(status: SDL_PowerState) -> BatteryState {
+        match status {
+            SDL_PowerState::SDL_POWERSTATE_UNKNOWN => BatteryState::Unknown,
+            SDL_PowerState::SDL_POWERSTATE_ON_BATTERY => BatteryState::OnBattery,
+            SDL_PowerState::SDL_POWERSTATE_NO_BATTERY => BatteryState::NoBattery,
+            SDL_PowerState::SDL_POWERSTATE_CHARGING => BatteryState::Charging,
+            SDL_PowerState::SDL_POWERSTATE_CHARGED => BatteryState::Full,
+        }
+    }
+
+    fn tag(self) -> u8 {
+        match self {
+            BatteryState::Unknown => 0,
+            BatteryState::OnBattery => 1,
+            BatteryState::NoBattery => 2,
+            BatteryState::Charging => 3,
+            BatteryState::Full => 4,
+        }
+    }
+
+    fn from_tag(tag: u8) -> BatteryState {
+        match tag {
+            1 => BatteryState::OnBattery,
+            2 => BatteryState::NoBattery,
+            3 => BatteryState::Charging,
+            4 => BatteryState::Full,
+            _ => BatteryState::Unknown,
+        }
+    }
 }
 
 pub enum GLVersion {
@@ -2903,57 +2936,66 @@ pub fn show_error_messagebox(window: Option<&Window>, error_message: &str) {
 
 /// Get current battery state from SDL2.
 ///
-/// Returns:
-/// - pct: i32 - percentage of battery remaining.
-/// - status: [BatteryState] - the current status of the battery
-///   (unplugged, charging, full, etc.)
-/// Battery state cached once at window creation. Guest code runs on a
-/// coroutine stack where JNI calls abort on Android (see populate_battery_cache),
-/// so [UIDevice batteryLevel] must never reach SDL_GetPowerInfo directly.
-static BATTERY_CACHE: std::sync::OnceLock<(i32, BatteryState)> = std::sync::OnceLock::new();
+/// Battery state is cached at window creation and refreshed by
+/// [refresh_battery_cache]. Guest code runs on a coroutine stack where JNI
+/// calls abort on Android (see [populate_battery_cache]), so
+/// [UIDevice batteryLevel] must never reach SDL_GetPowerInfo directly.
+static BATTERY_CACHED: AtomicBool = AtomicBool::new(false);
+static BATTERY_PERCENT: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(-1);
+static BATTERY_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Read the battery once, from the real SDLThread stack. JNI (Android) is only
-/// safe here — this runs before guest emulation starts on a coroutine stack.
-pub fn populate_battery_cache() {
-    let mut pct = 0;
-    let status = unsafe { sdl2_sys::SDL_GetPowerInfo(null_mut(), &mut pct) };
-    let state = match status {
-        SDL_PowerState::SDL_POWERSTATE_UNKNOWN => BatteryState::Unknown,
-        SDL_PowerState::SDL_POWERSTATE_ON_BATTERY => BatteryState::OnBattery,
-        SDL_PowerState::SDL_POWERSTATE_NO_BATTERY => BatteryState::NoBattery,
-        SDL_PowerState::SDL_POWERSTATE_CHARGING => BatteryState::Charging,
-        SDL_PowerState::SDL_POWERSTATE_CHARGED => BatteryState::Full,
-    };
-    let _ = BATTERY_CACHE.set((pct, state));
-}
-
-pub fn get_battery_status() -> (i32, BatteryState) {
-    if let Some(&(pct, ref state)) = BATTERY_CACHE.get() {
-        let state = match *state {
-            BatteryState::Unknown => BatteryState::Unknown,
-            BatteryState::OnBattery => BatteryState::OnBattery,
-            BatteryState::NoBattery => BatteryState::NoBattery,
-            BatteryState::Charging => BatteryState::Charging,
-            BatteryState::Full => BatteryState::Full,
-        };
-        return (pct, state);
-    }
-    // Not cached yet (headless/window-less use): query directly.
+/// Query SDL for the battery. Only call this where JNI calls are safe (the
+/// real SDLThread stack), see [populate_battery_cache].
+fn read_battery_status() -> (i32, BatteryState) {
     let mut pct = 0;
     // Unfortunately, Rust-SDL2 does not expose this function yet.
     // iPhoneOS does not measure the battery in seconds remaining,
     // so we discard this argument.
     let status = unsafe { sdl2_sys::SDL_GetPowerInfo(null_mut(), &mut pct) };
-    (
-        pct,
-        match status {
-            SDL_PowerState::SDL_POWERSTATE_UNKNOWN => BatteryState::Unknown,
-            SDL_PowerState::SDL_POWERSTATE_ON_BATTERY => BatteryState::OnBattery,
-            SDL_PowerState::SDL_POWERSTATE_NO_BATTERY => BatteryState::NoBattery,
-            SDL_PowerState::SDL_POWERSTATE_CHARGING => BatteryState::Charging,
-            SDL_PowerState::SDL_POWERSTATE_CHARGED => BatteryState::Full,
-        },
-    )
+    (pct, BatteryState::from_sdl(status))
+}
+
+/// Read the battery once, from the real SDLThread stack. JNI (Android) is only
+/// safe here — this runs before guest emulation starts on a coroutine stack.
+pub fn populate_battery_cache() {
+    refresh_battery_cache();
+}
+
+/// Re-read the battery and update the cache.
+///
+/// Like [populate_battery_cache], this must be called from a stack where JNI
+/// calls are safe on Android (the SDL thread), e.g. through
+/// [crate::Environment::on_parent_stack_in_coroutine]. The app picker uses it
+/// to keep its status bar battery indicator up to date.
+pub fn refresh_battery_cache() {
+    let (pct, state) = read_battery_status();
+    BATTERY_PERCENT.store(pct, Ordering::Relaxed);
+    BATTERY_STATE.store(state.tag(), Ordering::Relaxed);
+    BATTERY_CACHED.store(true, Ordering::Release);
+}
+
+/// The cached battery reading, if one has been taken yet.
+///
+/// This never calls into SDL, so it is safe from any thread or coroutine. The
+/// value is a percentage (0 to 100, or -1 if unknown) and the state.
+pub fn cached_battery_status() -> Option<(i32, BatteryState)> {
+    BATTERY_CACHED
+        .load(Ordering::Acquire)
+        .then(|| {
+            (
+                BATTERY_PERCENT.load(Ordering::Relaxed),
+                BatteryState::from_tag(BATTERY_STATE.load(Ordering::Relaxed)),
+            )
+        })
+}
+
+pub fn get_battery_status() -> (i32, BatteryState) {
+    if let Some(status) = cached_battery_status() {
+        return status;
+    }
+    // Not cached yet (headless/window-less use): query directly.
+    read_battery_status()
 }
 
 pub fn get_preferred_language_codes(env: &mut Environment) -> Vec<String> {

@@ -174,16 +174,48 @@ pub fn user_data_base_path() -> Cow<'static, Path> {
     }
 }
 
+/// The Android application id, as set by `applicationId` in
+/// `android/app/build.gradle`. The documents provider is registered with
+/// `${applicationId}.provider` as its authority, so this must be kept in sync
+/// with the Gradle file (only the branding suffix is appended separately).
+const ANDROID_APPLICATION_ID: &str = "org.hyperhle.fork";
+
+/// The authority of the documents provider that exposes the user data
+/// directory to the system file manager on Android. A build with branding
+/// (e.g. "UNOFFICIAL") gets `applicationIdSuffix`ed, so the authority carries
+/// the lowercased branding too.
+fn android_documents_authority() -> String {
+    let branding = crate::branding();
+    if branding.is_empty() {
+        format!("{ANDROID_APPLICATION_ID}.provider")
+    } else {
+        format!(
+            "{ANDROID_APPLICATION_ID}.{}.provider",
+            branding.to_lowercase()
+        )
+    }
+}
+
+/// A `content://` URI for one document of the provider above, using the
+/// `…/document/<document id>` form that `DocumentsContract` understands. The
+/// document id is a single path segment, so the slashes in it (the provider
+/// uses hierarchical ids like `root/<name>`) must be percent-encoded.
+fn android_document_uri(document_id: &str) -> String {
+    format!(
+        "content://{}/document/{}",
+        android_documents_authority(),
+        document_id.replace('/', "%2F")
+    )
+}
+
 /// Get a URI that can be used to open a file manager or similar for the path
 /// that [user_data_base_path] represents.
 pub fn url_for_opening_user_data_dir() -> Result<String, String> {
     if std::env::consts::OS == "android" {
         // See DocumentsProvider.kt, app/build.gradle and AndroidManifest.xml
-        let brand = crate::branding();
         Ok(format!(
-            "content://org.touchhle.android{}{}.provider/root/root",
-            if brand.is_empty() { "" } else { "." },
-            brand.to_lowercase()
+            "content://{}/root/root",
+            android_documents_authority()
         ))
     } else {
         let path = user_data_base_path()
@@ -209,13 +241,9 @@ pub fn url_for_opening_apps_dir() -> Result<String, String> {
         // folder, but the app's Documents directory is shown in "On My iPhone".
         Ok("shareddocuments://".to_string())
     } else if std::env::consts::OS == "android" {
-        let brand = crate::branding();
-        Ok(format!(
-            "content://org.touchhle.android{}{}.provider/root/root/{}",
-            if brand.is_empty() { "" } else { "." },
-            brand.to_lowercase(),
-            APPS_DIR
-        ))
+        // Opening the apps folder directly, rather than the provider's root,
+        // so the file manager starts where the games are.
+        Ok(android_document_uri(&format!("root/{APPS_DIR}")))
     } else {
         let path = apps_dir
             .canonicalize()
