@@ -8,11 +8,9 @@
 //!
 //! We currently support blocking TCP and UDP guest sockets on IPv4 and IPv6 addresses.
 //!
-//! Because fine grain control is needed, those are implemented as
-//! _non-blocking_ host sockets. Moreover, app usage of select() is
-//! (optimistically) assumed to check for data readiness before calling
-//! any of blocking functions.
-//! (Check related functions for more details and remediation.)
+//! Host sockets are non-blocking so the emulator can poll them safely. Blocking
+//! guest calls poll and yield the guest thread; `O_NONBLOCK` and `MSG_DONTWAIT`
+//! still return `EAGAIN` immediately.
 //!
 //! Other note: Rust std::net APIs are "too high level" sometimes,
 //! thus some workarounds need to be implemented.
@@ -66,6 +64,7 @@ const SO_LINGER: i32 = 0x80;
 const SO_SNDBUF: i32 = 0x1001;
 const SO_RCVBUF: i32 = 0x1002;
 const SO_NOSIGPIPE: i32 = 0x1022;
+const MSG_DONTWAIT: i32 = 0x80;
 
 #[derive(Copy, Clone, Debug)]
 #[repr(C, packed)]
@@ -1496,6 +1495,72 @@ fn recv(
     recvfrom(env, socket, buffer, length, flags, Ptr::null(), Ptr::null())
 }
 
+fn blocking_recvfrom_should_wait(nonblocking: bool, flags: i32, has_host_socket: bool) -> bool {
+    !nonblocking && flags & MSG_DONTWAIT == 0 && has_host_socket
+}
+
+fn try_recvfrom(
+    env: &mut Environment,
+    socket: i32,
+    type_: i32,
+    buffer: MutVoidPtr,
+    length: GuestUSize,
+    peek: bool,
+) -> Result<(usize, Option<SocketAddr>), i32> {
+    let Some(socket_host_object) = env.libc_state.socket.sockets.get(&socket) else {
+        return Err(EBADF);
+    };
+    if socket_host_object.type_ != type_ {
+        return Err(EBADF);
+    }
+
+    match type_ {
+        SOCK_DGRAM => {
+            let Some(udp_socket) = socket_host_object.udp_socket.as_ref() else {
+                return Err(EAGAIN);
+            };
+            let buf = env.mem.bytes_at_mut(buffer.cast(), length);
+            let result = if peek {
+                udp_socket.peek_from(buf)
+            } else {
+                udp_socket.recv_from(buf)
+            };
+            match result {
+                Ok((read, address)) => Ok((read, Some(address))),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Err(EAGAIN),
+                Err(e) => {
+                    log!("recvfrom: UDP socket {socket} IO error: {e}");
+                    Err(EIO)
+                }
+            }
+        }
+        SOCK_STREAM => {
+            let Some(mut tcp_stream) = socket_host_object.tcp_stream.as_ref() else {
+                return Err(ENOTCONN);
+            };
+            let buf = env.mem.bytes_at_mut(buffer.cast(), length);
+            let read = match if peek {
+                tcp_stream.peek(buf)
+            } else {
+                tcp_stream.read(buf)
+            } {
+                Ok(read) => read,
+                Err(ref e) if e.kind() == io::ErrorKind::ConnectionReset => {
+                    log!("recvfrom: TCP socket {socket}: ConnectionReset");
+                    return Err(ECONNRESET);
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Err(EAGAIN),
+                Err(e) => {
+                    log!("recvfrom: TCP socket {socket} IO error: {e}");
+                    return Err(EIO);
+                }
+            };
+            Ok((read, tcp_stream.peer_addr().ok()))
+        }
+        _ => Err(ESOCKTNOSUPPORT),
+    }
+}
+
 fn recvfrom(
     env: &mut Environment,
     socket: i32,
@@ -1540,15 +1605,13 @@ fn recvfrom(
         return -1;
     }
 
-    // MSG_PEEK is the flag real apps actually use; MSG_DONTWAIT,
-    // MSG_WAITALL and MSG_NOSIGNAL are no-ops because host sockets are
-    // always non-blocking and we never raise SIGPIPE. Anything else is
-    // ignored with a warning rather than asserted away.
+    // MSG_PEEK and MSG_DONTWAIT are handled below; MSG_WAITALL is currently a
+    // no-op and MSG_NOSIGNAL is unnecessary because we never raise SIGPIPE.
     const MSG_PEEK: i32 = 0x1;
-    const MSG_DONTWAIT: i32 = 0x80;
     const MSG_WAITALL: i32 = 0x40;
     const MSG_NOSIGNAL: i32 = 0x800;
     let peek = flags & MSG_PEEK != 0;
+    let nonblocking = is_nonblocking(env, socket);
     let ignored = flags & !(MSG_PEEK | MSG_DONTWAIT | MSG_WAITALL | MSG_NOSIGNAL);
     if ignored != 0 {
         log!(
@@ -1558,138 +1621,50 @@ fn recvfrom(
         );
     }
 
-    let (num_bytes_read, addr) = match type_ {
-        SOCK_DGRAM => {
-            // A UDP socket with no host socket yet (never bound nor sent
-            // to) has nothing to receive; EAGAIN fits the non-blocking
-            // model instead of crashing on the unwrap.
-            let udp_socket = match env
-                .libc_state
-                .socket
-                .sockets
-                .get(&socket)
-                .and_then(|s| s.udp_socket.as_ref())
-            {
-                Some(udp) => udp,
-                None => {
+    // RakNet's RecvFromLoop uses a blocking UDP socket and immediately retries
+    // after a negative recvfrom result. Returning EAGAIN while idle makes that
+    // guest thread spin instead of waiting for a packet.
+    loop {
+        match try_recvfrom(env, socket, type_, buffer, length, peek) {
+            Ok((num_bytes_read, addr)) => {
+                if let Some(addr) = addr {
+                    if !address.is_null() {
+                        write_sockaddr_bounded(env, address, address_len, addr, domain);
+                    }
+                }
+                log_dbg!(
+                    "recvfrom: Socket {} received {} bytes from addr {:?}",
+                    socket,
+                    num_bytes_read,
+                    addr
+                );
+                // Cap at i32::MAX so a huge (guest-bug) count can never fail the
+                // conversion to the ssize_t-compatible return type.
+                return num_bytes_read.min(i32::MAX as usize) as i32;
+            }
+            Err(EAGAIN) => {
+                let has_host_socket =
+                    State::get(env)
+                        .sockets
+                        .get(&socket)
+                        .is_some_and(|socket| match type_ {
+                            SOCK_DGRAM => socket.udp_socket.is_some(),
+                            SOCK_STREAM => socket.tcp_stream.is_some(),
+                            _ => false,
+                        });
+                if blocking_recvfrom_should_wait(nonblocking, flags, has_host_socket) {
+                    env.sleep(BLOCKING_IO_POLL_INTERVAL);
+                } else {
                     set_errno(env, EAGAIN);
                     return -1;
                 }
-            };
-            let buf = env.mem.bytes_at_mut(buffer.cast(), length);
-            let (read, addr) = if peek {
-                // MSG_PEEK: look at the next datagram without consuming it.
-                match udp_socket.peek_from(buf) {
-                    Ok(n) => n,
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        set_errno(env, EAGAIN);
-                        return -1;
-                    }
-                    Err(e) => {
-                        // Any other peek error: report EIO instead of
-                        // crashing the host.
-                        log!("recvfrom: UDP socket {socket} peek failed: {e}");
-                        set_errno(env, EIO);
-                        return -1;
-                    }
-                }
-            } else {
-                match udp_socket.recv_from(buf) {
-                    Ok(n) => n,
-                    // FIX: was unimplemented!() — return EAGAIN so the app's
-                    // non-blocking network loop can retry without crashing.
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        log_dbg!(
-                            "recvfrom: UDP socket {} no data yet (WouldBlock), \
-                        returning EAGAIN for thread {}",
-                            socket,
-                            env.current_thread
-                        );
-                        set_errno(env, EAGAIN);
-                        return -1;
-                    }
-                    Err(e) => {
-                        log!("recvfrom: UDP socket {socket} IO error: {e}");
-                        set_errno(env, EIO);
-                        return -1;
-                    }
-                }
-            };
-            if !address.is_null() {
-                write_sockaddr_bounded(env, address, address_len, addr, domain);
             }
-            (read, Ok(addr))
-        }
-        SOCK_STREAM => {
-            // recv(2) on a connected stream socket may be given an address
-            // buffer; BSD fills it with the peer address. Some apps rely on
-            // that instead of asserting it stays untouched.
-            // A TCP socket that was never connected has no stream;
-            // report ENOTCONN instead of crashing on the unwrap.
-            let (read, peer) = {
-                let mut tcp_stream = match env
-                    .libc_state
-                    .socket
-                    .sockets
-                    .get(&socket)
-                    .and_then(|s| s.tcp_stream.as_ref())
-                {
-                    Some(stream) => stream,
-                    None => {
-                        set_errno(env, ENOTCONN);
-                        return -1;
-                    }
-                };
-                let buf = env.mem.bytes_at_mut(buffer.cast(), length);
-                let read = match if peek {
-                    tcp_stream.peek(buf)
-                } else {
-                    tcp_stream.read(buf)
-                } {
-                    Ok(n) => n,
-                    Err(ref e) if e.kind() == io::ErrorKind::ConnectionReset => {
-                        set_errno(env, ECONNRESET);
-                        log!("recvfrom: TCP socket {}: ConnectionReset => -1", socket);
-                        return -1;
-                    }
-                    // FIX: was unimplemented!() — return EAGAIN so the app's
-                    // non-blocking network loop can retry without crashing.
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        log_dbg!(
-                            "recvfrom: TCP socket {} no data yet (WouldBlock), \
-                            returning EAGAIN for thread {}",
-                            socket,
-                            env.current_thread
-                        );
-                        set_errno(env, EAGAIN);
-                        return -1;
-                    }
-                    Err(e) => {
-                        log!("recvfrom: TCP socket {socket} IO error: {e}");
-                        set_errno(env, EIO);
-                        return -1;
-                    }
-                };
-                (read, tcp_stream.peer_addr().ok())
-            };
-            if !address.is_null() {
-                if let Some(peer) = peer {
-                    write_sockaddr_bounded(env, address, address_len, peer, domain);
-                }
+            Err(errno) => {
+                set_errno(env, errno);
+                return -1;
             }
-            (read, peer.ok_or(()))
         }
-        _ => unreachable!(),
-    };
-    log_dbg!(
-        "recvfrom: Socket {} received {} bytes from addr {:?}",
-        socket,
-        num_bytes_read,
-        addr.ok()
-    );
-    // Cap at i32::MAX so a huge (guest-bug) count can never fail the
-    // conversion to the ssize_t-compatible return type.
-    num_bytes_read.min(i32::MAX as usize) as i32
+    }
 }
 
 fn send(
@@ -2374,7 +2349,7 @@ pub fn read_socket(
     let deadline = std::time::Instant::now() + BLOCKING_IO_TIMEOUT;
 
     loop {
-        let res = recv(env, socket, buffer, length, 0);
+        let res = recv(env, socket, buffer, length, MSG_DONTWAIT);
         if res >= 0 {
             // 0 means the peer closed the connection, i.e. EOF.
             log_dbg!("read on socket {} => {} bytes", socket, res);
@@ -2594,8 +2569,16 @@ fn unspecified_socket_addr(domain: i32) -> SocketAddr {
 }
 
 #[cfg(test)]
-mod ipv6_socket_tests {
+mod socket_tests {
     use super::*;
+
+    #[test]
+    fn recvfrom_waiting_respects_nonblocking_flags_and_socket_state() {
+        assert!(blocking_recvfrom_should_wait(false, 0, true));
+        assert!(!blocking_recvfrom_should_wait(true, 0, true));
+        assert!(!blocking_recvfrom_should_wait(false, MSG_DONTWAIT, true));
+        assert!(!blocking_recvfrom_should_wait(false, 0, false));
+    }
 
     #[test]
     fn ipv4_sockaddr_round_trips() {
