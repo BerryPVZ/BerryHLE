@@ -2731,6 +2731,19 @@ impl Environment {
             self.cpu.regs_mut()[cpu::Cpu::PC] = fault_pc;
         }
 
+        // Some NEON instructions are missing from dynarmic and raise an
+        // UndefinedInstruction. Perform them in software and carry on.
+        if is_undefined_instruction && self.is_guest_code_address(fault_pc) {
+            let guest_mem = &self.mem;
+            let read_u16 = |addr: u32| Some(guest_mem.read(mem::ConstPtr::<u16>::from_bits(addr)));
+            if let Some(len) =
+                cpu::asimd_fallback::emulate(fault_pc, is_thumb, read_u16, self.cpu.extregs_mut())
+            {
+                self.cpu.regs_mut()[cpu::Cpu::PC] = fault_pc.wrapping_add(len);
+                return;
+            }
+        }
+
         if self.gdb_server.is_none() {
             // Bypass guest traps without framework stubs. Games can hit an
             // UndefinedInstruction (abort/__builtin_trap) or a Breakpoint

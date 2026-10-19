@@ -105,6 +105,11 @@ com.polarbit.waveblazer: --landscape-left
 # Command & Conquer: Red Alert
 com.ea.candcra.row: --landscape-left
 
+# Reiner Knizia's Ra
+# (landscape-only; the root view controller only autorotates once the device
+# is already landscape when its view is added to the window)
+ca.codito.Ra: --landscape-left
+
 # Defender chronicles
 # (force composition fixes black boxes on Android Adreno GPUs)
 com.chillingo.defenderchronicles: --landscape-left --force-composition

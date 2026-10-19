@@ -323,6 +323,8 @@ public:
 
   const std::uint32_t *regs() const { return &cpu->Regs().front(); }
   std::uint32_t *regs() { return &cpu->Regs().front(); }
+  const std::uint32_t *extregs() const { return &cpu->ExtRegs().front(); }
+  std::uint32_t *extregs() { return &cpu->ExtRegs().front(); }
 
   std::uint32_t cpsr() const { return cpu->Cpsr(); }
   void set_cpsr(std::uint32_t cpsr) { cpu->SetCpsr(cpsr); }
@@ -392,6 +394,13 @@ touchHLE_DynarmicWrapper_regs_const(const DynarmicWrapper *cpu) {
 }
 std::uint32_t *touchHLE_DynarmicWrapper_regs_mut(DynarmicWrapper *cpu) {
   return cpu->regs();
+}
+const std::uint32_t *
+touchHLE_DynarmicWrapper_extregs_const(const DynarmicWrapper *cpu) {
+  return cpu->extregs();
+}
+std::uint32_t *touchHLE_DynarmicWrapper_extregs_mut(DynarmicWrapper *cpu) {
+  return cpu->extregs();
 }
 
 std::uint32_t touchHLE_DynarmicWrapper_cpsr(const DynarmicWrapper *cpu) {

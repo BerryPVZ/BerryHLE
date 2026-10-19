@@ -1026,6 +1026,13 @@ Type mismatch when sending message {} to {:?}!
             .map(|co| (co.name.clone(), co.is_metaclass))
         {
             let sel_name = selector.as_str(&env.mem).to_owned();
+            if let Some(result) =
+                fake_openfeint_should_autorotate(env, &class_name_for_log, is_metaclass, &sel_name)
+            {
+                env.cpu.regs_mut()[0] = result.into();
+                env.cpu.regs_mut()[1] = 0;
+                return;
+            }
             if try_cocos_missing_selector_compat(
                 env,
                 receiver,
@@ -1107,6 +1114,41 @@ fn fake_class_message_result(class_name: &str, is_metaclass: bool, selector: &st
         ("OpenFeint", true, "hasUserSetFeintAccess") => Some(1),
         _ => None,
     }
+}
+
+/// `+[OpenFeint shouldAutorotateToInterfaceOrientation:
+/// withSupportedOrientations:andCount:]` answers whether the orientation is
+/// in the list the app passes. OpenFeint games forward their view
+/// controller's `shouldAutorotateToInterfaceOrientation:` to it (the cocos2d
+/// RootViewController template does), so answering NO, as a nil receiver
+/// would, stops UIKit from ever rotating them to landscape. Reiner Knizia's
+/// Ra then draws its landscape scenes into a portrait view.
+fn fake_openfeint_should_autorotate(
+    env: &mut Environment,
+    class_name: &str,
+    is_metaclass: bool,
+    selector: &str,
+) -> Option<bool> {
+    if (class_name, is_metaclass, selector)
+        != (
+            "OpenFeint",
+            true,
+            "shouldAutorotateToInterfaceOrientation:withSupportedOrientations:andCount:",
+        )
+    {
+        return None;
+    }
+    let regs = env.cpu.regs();
+    let (orientation, list, sp) = (regs[2], regs[3], regs[crate::cpu::Cpu::SP]);
+    let count: u32 = env.mem.read(ConstPtr::from_bits(sp));
+    // Real apps pass the four interface orientations at most; the bound only
+    // guards against reading garbage if the arguments are bogus.
+    let supported = list != 0
+        && (0..count.min(8)).any(|i| {
+            let item: u32 = env.mem.read(ConstPtr::from_bits(list + i * 4));
+            item == orientation
+        });
+    Some(supported)
 }
 
 fn objc_ret_f32(env: &mut Environment, value: f32) {
