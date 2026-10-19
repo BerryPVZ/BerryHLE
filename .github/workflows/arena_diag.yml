@@ -1,0 +1,135 @@
+# TEMPORARY diagnostic workflow for the Arena coding session. It runs
+# `cargo check` on the app-picker branch and publishes the compiler output as a
+# check-run, so the sandbox (which has no Rust toolchain) can read it through
+# the GitHub API. Delete this file once the branch has been verified.
+name: Arena compile diagnostics
+
+on:
+  push:
+    branches: ["arena/60976192-hyperhle-fork"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout touchHLE
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            build-essential \
+            pkg-config \
+            libasound2-dev \
+            libpulse-dev \
+            libsndio-dev \
+            libdbus-1-dev \
+            libudev-dev \
+            libx11-dev \
+            libxext-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxrandr-dev \
+            libxss-dev \
+            libxxf86vm-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            wayland-protocols \
+            libgl1-mesa-dev \
+            libegl1-mesa-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@master
+
+      - name: Get Boost
+        run: |
+          curl -sSL -o boost.tar.gz \
+            "https://archives.boost.io/release/1.81.0/source/boost_1_81_0.tar.gz"
+          mkdir -p vendor
+          tar xzf boost.tar.gz -C vendor
+          mv vendor/boost_1_81_0 vendor/boost
+
+      - name: Setup CMake
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: "~3.29.0"
+
+      - name: cargo check
+        id: check
+        continue-on-error: true
+        run: |
+          set +e
+          cargo check > check.log 2>&1
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+          tail -n 40 check.log || true
+
+      - name: cargo check --all-targets
+        id: check_all
+        continue-on-error: true
+        run: |
+          set +e
+          cargo check --all-targets > check_all.log 2>&1
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+          tail -n 40 check_all.log || true
+
+      - name: Publish diagnostics
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          CHECK_STATUS: ${{ steps.check.outputs.status }}
+          CHECK_ALL_STATUS: ${{ steps.check_all.outputs.status }}
+        with:
+          script: |
+            const fs = require('fs');
+            function tail(path, max) {
+              try {
+                const text = fs.readFileSync(path, 'utf8');
+                return text.length > max ? text.slice(text.length - max) : text;
+              } catch (e) {
+                return '(no log: ' + e + ')';
+              }
+            }
+            const checkStatus = process.env.CHECK_STATUS || '?';
+            const checkAllStatus = process.env.CHECK_ALL_STATUS || '?';
+            const ok = checkStatus === '0' && checkAllStatus === '0';
+            const body = [
+              'cargo check: ' + checkStatus,
+              'cargo check --all-targets: ' + checkAllStatus,
+              '',
+              '===== cargo check =====',
+              tail('check.log', 30000),
+              '',
+              '===== cargo check --all-targets =====',
+              tail('check_all.log', 30000),
+            ].join('\n');
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'arena cargo check diagnostics',
+              head_sha: context.sha,
+              status: 'completed',
+              conclusion: ok ? 'success' : 'failure',
+              output: {
+                title: ok ? 'cargo check succeeded' : 'cargo check failed',
+                summary: ok
+                  ? 'Both cargo check runs succeeded.'
+                  : 'See text for the compiler output.',
+                text: body,
+              },
+            });
