@@ -1797,9 +1797,10 @@ pub fn is_socket(env: &mut Environment, fd: FileDescriptor) -> bool {
 /// Set or clear `O_NONBLOCK` on `fd`, like `fcntl(F_SETFL)` and
 /// `ioctl(FIONBIO)` do.
 ///
-/// The socket implementation honours this when deciding whether `read(2)` and
-/// `write(2)` may wait for the peer, so a socket switched to non-blocking mode
-/// with `ioctl()` behaves the same as one switched with `fcntl()`.
+/// The socket implementation honours this when deciding whether `read(2)`,
+/// `write(2)` and `recvfrom(2)` may wait for the peer, so a socket switched to
+/// non-blocking mode with `ioctl()` behaves the same as one switched with
+/// `fcntl()`.
 pub fn set_nonblocking(env: &mut Environment, fd: FileDescriptor, nonblocking: bool) {
     if fd < NORMAL_FILENO_BASE {
         return;
@@ -1816,10 +1817,10 @@ pub fn set_nonblocking(env: &mut Environment, fd: FileDescriptor, nonblocking: b
 /// Whether `fd` is open with `O_NONBLOCK` (set via `open()` or
 /// `fcntl(F_SETFL)`).
 ///
-/// The socket implementation uses this to decide whether `read(2)`/`write(2)`
-/// on a socket may wait for the peer or must report `EAGAIN` immediately (see
-/// [crate::libc::sys::socket::read_socket]). Unknown and closed descriptors are
-/// reported as blocking, which is the guest's default.
+/// The socket implementation uses this to decide whether `read(2)`, `write(2)`
+/// or `recvfrom(2)` may wait for the peer or must report `EAGAIN` immediately
+/// (see [crate::libc::sys::socket::read_socket]). Unknown and closed
+/// descriptors are reported as blocking, which is the guest's default.
 pub fn is_nonblocking(env: &Environment, fd: FileDescriptor) -> bool {
     if fd < NORMAL_FILENO_BASE {
         return false;
