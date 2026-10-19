@@ -9,8 +9,8 @@ use crate::frameworks::core_graphics::cg_bitmap_context::{
 };
 use crate::frameworks::core_graphics::cg_color_space::CGColorSpaceCreateDeviceRGB;
 use crate::frameworks::core_graphics::cg_context::{
-    CGContextFillRect, CGContextRelease, CGContextRestoreGState, CGContextSaveGState,
-    CGContextScaleCTM, CGContextSetRGBFillColor, CGContextTranslateCTM,
+    CGContextFillRect, CGContextRelease, CGContextScaleCTM, CGContextSetRGBFillColor,
+    CGContextTranslateCTM,
 };
 use crate::frameworks::core_graphics::cg_image::{self, kCGImageAlphaPremultipliedLast};
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
