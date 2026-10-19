@@ -625,22 +625,26 @@ impl Environment {
                 log!("Warning: {}", e);
             }
 
-            let launch_image_path = bundle.launch_image_path(&fs, device_family);
-            let launch_image = if fs.is_file(&launch_image_path) {
-                let res = fs
-                    .read(launch_image_path)
-                    .map_err(|_| "Could not read launch image file".to_string())
-                    .and_then(|bytes| {
-                        image::Image::from_bytes(&bytes)
-                            .map_err(|e| format!("Could not parse launch image: {e}"))
-                    });
-                if let Err(ref e) = res {
-                    log!("Warning: {}", e);
-                };
-                res.ok()
-            } else {
-                None
-            };
+            // `launch_image_path` already resolved the spelling of the file
+            // that exists in the bundle, so no extra is_file() check here:
+            // doing an exact-match check on the plist's spelling instead was
+            // what made the picker log "Using launch image" for a file that
+            // then silently wasn't shown.
+            let launch_image = bundle
+                .launch_image_path(&fs, device_family)
+                .and_then(|path| {
+                    let res = fs
+                        .read(path)
+                        .map_err(|_| "Could not read launch image file".to_string())
+                        .and_then(|bytes| {
+                            image::Image::from_bytes(&bytes)
+                                .map_err(|e| format!("Could not parse launch image: {e}"))
+                        });
+                    if let Err(ref e) = res {
+                        log!("Warning: {}", e);
+                    };
+                    res.ok()
+                });
             Some(Box::new(window::Window::new(
                 &format!(
                     "{} (touchHLE {}{}{})",

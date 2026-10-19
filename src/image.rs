@@ -123,20 +123,25 @@ impl Image {
     }
 
     /// Whether this image is useless as an app icon: empty, fully transparent,
-    /// or a solid black rectangle. Some bundles ship such placeholder or mask
-    /// images that are larger than the real icon.
+    /// or a single flat colour (e.g. a solid black square). Some bundles ship
+    /// such placeholder or mask images that are larger than the real icon.
+    ///
+    /// Note that a *black logo on a transparent background* is a real icon:
+    /// it has varying alpha, so it is not a flat colour and is accepted.
     pub fn is_blank_or_solid_black(&self) -> bool {
         let pixels = self.pixels();
-        if pixels.is_empty() {
+        if pixels.len() < 4 {
             return true;
         }
+        let first = [pixels[0], pixels[1], pixels[2], pixels[3]];
         for rgba in pixels.chunks_exact(4) {
-            // Pixels are premultiplied, so a fully transparent pixel is all
-            // zeroes and a solid black one is black with a non-zero alpha.
-            if rgba[3] > 8 && (rgba[0] > 8 || rgba[1] > 8 || rgba[2] > 8) {
+            // Anything that differs from the first pixel means real artwork
+            // (including a black shape drawn with varying alpha).
+            if rgba.iter().zip(first.iter()).any(|(a, b)| a.abs_diff(*b) > 8) {
                 return false;
             }
         }
+        // Fully transparent, or one flat colour all the way through.
         true
     }
 
@@ -451,7 +456,7 @@ mod tests {
         let black = Image::from_pixels(2, 2, black_pixels);
         assert!(black.is_blank_or_solid_black());
 
-        // A real icon has at least one lit pixel.
+        // A real icon is not a flat colour.
         let mut icon_pixels = Vec::new();
         for _ in 0..4 {
             icon_pixels.extend_from_slice(&[0, 0, 0, 255]);
@@ -460,6 +465,16 @@ mod tests {
         let icon = Image::from_pixels(2, 2, icon_pixels);
         assert!(!icon.is_blank_or_solid_black());
         assert_eq!(icon.area(), 4);
+
+        // A black logo on a transparent background is a real icon too: it has
+        // varying alpha even though every visible pixel is black.
+        let mut logo_pixels = Vec::new();
+        for _ in 0..3 {
+            logo_pixels.extend_from_slice(&[0, 0, 0, 0]);
+        }
+        logo_pixels.extend_from_slice(&[0, 0, 0, 255]);
+        let logo = Image::from_pixels(2, 2, logo_pixels);
+        assert!(!logo.is_blank_or_solid_black());
     }
 
     #[test]

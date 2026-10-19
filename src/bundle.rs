@@ -168,7 +168,19 @@ impl Bundle {
             .join(self.plist["CFBundleExecutable"].as_string().unwrap())
     }
 
-    pub fn launch_image_path(&self, fs: &Fs, device_family: DeviceFamily) -> GuestPathBuf {
+    /// Find the launch image for the given device family.
+    ///
+    /// Returns [None] if the bundle has no launch image. The returned path uses
+    /// the spelling stored in the bundle: app bundles were built on
+    /// case-insensitive volumes, so a plist entry like `Default@2x.png` may
+    /// match a file actually named `default@2x.png`. Returning the spelling
+    /// from the plist for such a file made the caller's exact-match check fail
+    /// even though the log said the image was being used.
+    pub fn launch_image_path(
+        &self,
+        fs: &Fs,
+        device_family: DeviceFamily,
+    ) -> Option<GuestPathBuf> {
         // Check if there's a custom base name in plist
         let base_name = self
             .plist
@@ -210,18 +222,41 @@ impl Bundle {
             ]
         };
 
-        // Find the first existing file
-        for candidate in &candidates {
-            let path = self.path.join(candidate);
-            if fs.read(&path).is_ok() {
-                log!("Using launch image: {}", candidate);
-                return path;
-            }
+        if let Some(path) = self.first_existing_file(fs, candidates.iter().map(String::as_str)) {
+            log!("Using launch image: {}", path.as_str());
+            return Some(path);
         }
 
-        // Final fallback
-        log!("Warning: No launch image found, using Default.png");
-        self.path.join("Default.png")
+        // Final fallback: a plain `Default.png` in the bundle, whatever the
+        // plist said.
+        if let Some(path) = self.first_existing_file(fs, ["Default.png"].into_iter()) {
+            log!("Using launch image: {}", path.as_str());
+            return Some(path);
+        }
+
+        log!("Warning: No launch image found");
+        None
+    }
+
+    /// The first of `names` that exists in the bundle root, with the spelling
+    /// that is actually stored there.
+    fn first_existing_file<'a>(
+        &self,
+        fs: &Fs,
+        names: impl Iterator<Item = &'a str>,
+    ) -> Option<GuestPathBuf> {
+        for name in names {
+            let path = self.path.join(name);
+            // Resolve the case first: `fs.is_file()` matches the VFS spelling
+            // exactly, while the plist may use another case.
+            let Some(resolved) = fs.resolve_case_insensitive_path(&path) else {
+                continue;
+            };
+            if fs.is_file(&resolved) {
+                return Some(resolved);
+            }
+        }
+        None
     }
 
     pub fn status_bar_hidden(&self) -> bool {
@@ -360,7 +395,7 @@ impl Bundle {
         };
         let mut candidates: Vec<GuestPathBuf> = names
             .filter(|name| is_icon_file_name(name))
-            .map(|name| self.path.join(*name))
+            .map(|name| self.path.join(name))
             .collect();
         candidates.sort();
         candidates
@@ -416,7 +451,10 @@ impl Bundle {
             }
         }
 
-        if best.as_ref().is_none_or(Image::is_blank_or_solid_black) {
+        if best
+            .as_ref()
+            .is_none_or(|image| image.is_blank_or_solid_black())
+        {
             // Nothing usable from the plist: scan the bundle for the best icon
             // file it has (e.g. `iTunesArtwork`).
             let mut strays: Vec<(u64, Vec<u8>)> = self

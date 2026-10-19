@@ -504,14 +504,9 @@ fn show_app_picker_gui(
             _ => panic!(),
         };
         let mut image = Image::from_bytes(bytes).unwrap();
-        // should match Bundle::load_icon()
-        // Use a slightly smaller corner radius for larger icons for a cleaner look.
-        let corner_radius_px = 12.0;
-        image.round_corners(
-            corner_radius_px,
-            /* four_corners: */ true,
-            /* add_sheen: */ true,
-        );
+        // Should match Bundle::load_icon(): the corner radius scales with the
+        // icon's resolution.
+        image.round_icon_corners(/* add_sheen: */ true);
         image
     };
     let environment = Environment::new_without_app(options, icon)?;
@@ -607,12 +602,15 @@ fn app_picker_inner(
     // sits above the wallpaper, while the (transparent) main view is added
     // after it: the home screen shows the bar through the main view, but the
     // opaque Settings screen slides over it.
-    let (status_bar, status_time_label) = if app_frame.origin.y >= 12.0 {
-        let (bar, time) = make_status_bar(env, bounds.size.width, app_frame.origin.y);
+    let (status_bar, status_time_label, status_charge_view) = if app_frame.origin.y >= 12.0 {
+        let (bar, time, charge) = make_status_bar(env, bounds.size.width, app_frame.origin.y);
         () = msg![env; window addSubview:bar];
-        (Some(bar), Some(time))
+        // The level is cached at window creation, so reading it here is safe
+        // even on Android (no JNI on this coroutine stack).
+        update_battery_indicator(env, charge, crate::window::cached_battery_status());
+        (Some(bar), Some(time), Some(charge))
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     let main_view: id = msg_class![env; UIView alloc];
@@ -773,9 +771,10 @@ fn app_picker_inner(
     // Index of the app whose delete dialog is open, if any.
     let mut pending_delete: Option<usize> = None;
 
-    // The status bar clock only needs refreshing now and then.
+    // The status bar clock and battery only need refreshing now and then.
     let mut status_time = status_bar_time_string();
     let mut status_time_updated_at = Instant::now();
+    let mut status_battery_updated_at = Instant::now();
 
     let mut chrome_views: Vec<id> = Vec::with_capacity(3 + page_dots.len());
     if let Some(bar) = status_bar {
@@ -813,6 +812,19 @@ fn app_picker_inner(
                     () = msg![env; label setText:text];
                     release(env, text);
                 }
+            }
+        }
+
+        // Keep the battery indicator in sync with the real battery level. The
+        // refresh itself must happen on the SDL thread on Android (SDL's
+        // battery query uses JNI), and the picker runs on a coroutine stack.
+        if let Some(charge) = status_charge_view {
+            if status_battery_updated_at.elapsed() >= Duration::from_secs(30) {
+                status_battery_updated_at = Instant::now();
+                if env.window.is_some() {
+                    env.on_parent_stack_in_coroutine(|_, _| crate::window::refresh_battery_cache());
+                }
+                update_battery_indicator(env, charge, crate::window::cached_battery_status());
             }
         }
 
@@ -1276,7 +1288,7 @@ const APP_PICKER_LABEL_HEIGHT: CGFloat = 14.0;
 const APP_PICKER_LABEL_TOP_GAP: CGFloat = 2.0;
 const APP_PICKER_ROW_GAP_MIN: CGFloat = 2.0;
 const APP_PICKER_DOTS_ROW_HEIGHT: CGFloat = 18.0;
-const APP_PICKER_DOCK_HEIGHT: CGFloat = 92.0;
+const APP_PICKER_DOCK_HEIGHT: CGFloat = 100.0;
 
 const PAGE_DOT_SIZE: CGFloat = 7.0;
 const PAGE_DOT_GAP: CGFloat = 9.0;
@@ -1694,8 +1706,9 @@ fn update_icon_grid(
 }
 
 /// Builds a fake old-iOS status bar: signal bars, carrier, clock and battery.
-/// Returns the bar itself and the clock label, which the event loop updates.
-fn make_status_bar(env: &mut Environment, width: CGFloat, height: CGFloat) -> (id, id) {
+/// Returns the bar itself, the clock label and the battery charge bar, which
+/// the event loop updates.
+fn make_status_bar(env: &mut Environment, width: CGFloat, height: CGFloat) -> (id, id, id) {
     let clear: id = msg_class![env; UIColor clearColor];
     let bar = new_view(env, rect(0.0, 0.0, width, height), clear);
     let white: id = msg_class![env; UIColor whiteColor];
@@ -1751,20 +1764,79 @@ fn make_status_bar(env: &mut Environment, width: CGFloat, height: CGFloat) -> (i
     () = msg![env; bar addSubview:time];
 
     // Battery: a white rounded shell with a black inside and a charge bar.
-    let battery = new_view(env, rect(width - 31.0, 5.0, 24.0, 11.0), white);
+    let battery = new_view(env, rect(width - BATTERY_RIGHT_INSET, 5.0, 24.0, 11.0), white);
     let battery_layer: id = msg![env; battery layer];
     () = msg![env; battery_layer setCornerRadius:(2.5 as CGFloat)];
     () = msg![env; bar addSubview:battery];
 
     let black: id = msg_class![env; UIColor blackColor];
-    let battery_inner = new_view(env, rect(width - 29.5, 6.5, 21.0, 8.0), black);
+    let battery_inner = new_view(
+        env,
+        rect(width - BATTERY_RIGHT_INSET + 1.5, 6.5, 21.0, 8.0),
+        black,
+    );
     () = msg![env; bar addSubview:battery_inner];
-    let charge = new_view(env, rect(width - 28.5, 7.5, 15.0, 6.0), white);
+    let charge = new_view(
+        env,
+        rect(width - BATTERY_CHARGE_LEFT, 7.5, BATTERY_CHARGE_MAX_WIDTH, 6.0),
+        white,
+    );
     () = msg![env; bar addSubview:charge];
-    let nub = new_view(env, rect(width - 6.5, 8.5, 2.0, 4.0), white);
+    let nub = new_view(env, rect(width - BATTERY_RIGHT_INSET + 24.5, 8.5, 2.0, 4.0), white);
     () = msg![env; bar addSubview:nub];
 
-    (bar, time)
+    (bar, time, charge)
+}
+
+/// Left edge of the battery shell, measured from the right of the screen.
+const BATTERY_RIGHT_INSET: CGFloat = 31.0;
+/// Left edge of the charge bar, measured from the right of the screen.
+const BATTERY_CHARGE_LEFT: CGFloat = 28.5;
+/// Width of the charge bar when the battery is full.
+const BATTERY_CHARGE_MAX_WIDTH: CGFloat = 15.0;
+
+/// Updates the status bar's battery charge bar for the given percentage and
+/// charging state, like the old iOS status bar: the fill grows with the level
+/// and turns red when the battery is low.
+fn update_battery_indicator(
+    env: &mut Environment,
+    charge_view: id,
+    level: Option<(i32, crate::window::BatteryState)>,
+) {
+    let (percent, charging) = match level {
+        Some((percent, state)) if percent >= 0 => {
+            let charging = matches!(
+                state,
+                crate::window::BatteryState::Charging | crate::window::BatteryState::Full
+            );
+            (percent.clamp(0, 100) as CGFloat, charging)
+        }
+        // No battery information (a desktop, or SDL couldn't read the level):
+        // show a full battery, as the picker always did before the level was
+        // wired up. SDL reports -1 when the level is unknown.
+        _ => (100.0, false),
+    };
+    let full: id = msg_class![env; UIColor whiteColor];
+    let color: id = if charging {
+        ui_color(env, 0.20, 0.85, 0.30, 1.0)
+    } else if percent <= 20.0 {
+        ui_color(env, 0.90, 0.15, 0.15, 1.0)
+    } else {
+        full
+    };
+    () = msg![env; charge_view setBackgroundColor:color];
+    let width = if percent <= 0.0 {
+        0.0
+    } else {
+        (BATTERY_CHARGE_MAX_WIDTH * percent / 100.0).max(1.5)
+    };
+    let frame: CGRect = msg![env; charge_view frame];
+    () = msg![env; charge_view setFrame:(rect(
+        frame.origin.x,
+        7.5,
+        width,
+        6.0
+    ))];
 }
 
 #[cfg(unix)]
@@ -1852,13 +1924,13 @@ fn rebuild_page_dots(
     *dots = make_page_dots(env, main_view, screen_size, page_count);
 }
 
-const DOCK_ICON_SIZE: CGFloat = 64.0;
-const DOCK_ICON_TOP: CGFloat = 5.0;
+const DOCK_ICON_SIZE: CGFloat = 72.0;
+const DOCK_ICON_TOP: CGFloat = 4.0;
 const DOCK_LABEL_HEIGHT: CGFloat = 12.0;
 /// The dock shortcuts sit close together in the middle of the dock instead of
 /// being spread out to the screen edges.
-const DOCK_MIN_GAP: CGFloat = 12.0;
-const DOCK_MAX_GAP: CGFloat = 30.0;
+const DOCK_MIN_GAP: CGFloat = 8.0;
+const DOCK_MAX_GAP: CGFloat = 18.0;
 
 /// Builds the old-iOS dock at the bottom of the home screen. The shortcuts
 /// live outside the paged grid, so they stay in place while pages slide.
@@ -1951,7 +2023,7 @@ fn make_dock_item(
         env,
         rect(
             x - (label_width - DOCK_ICON_SIZE) / 2.0,
-            DOCK_ICON_TOP + DOCK_ICON_SIZE + 2.0,
+            DOCK_ICON_TOP + DOCK_ICON_SIZE + 3.0,
             label_width,
             DOCK_LABEL_HEIGHT,
         ),
