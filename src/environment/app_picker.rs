@@ -1405,9 +1405,6 @@ struct IconGridStuff {
     /// Width of the picker screen, used by the page slide animation.
     screen_width: CGFloat,
     placeholder_icon: Option<id>,
-    /// Side length, in physical pixels, that icons are drawn at. Icons are
-    /// pre-scaled to this so the compositor samples them 1:1.
-    icon_pixel_size: u32,
     pages: Vec<std::ops::Range<usize>>,
     /// Maps an on-screen icon cell's button to the app it shows.
     icon_map: HashMap<id, usize>,
@@ -1428,16 +1425,8 @@ fn make_icon_grid(
         layout.icon_size + APP_PICKER_LABEL_TOP_GAP + layout.label_size.height + layout.icon_gap_y;
 
     // The icon image view is inset slightly so the rounded corners aren't
-    // clipped. The compositor draws it at `ui_scale` physical pixels per point,
-    // so icons are pre-scaled to (about) that size: large icons are then
-    // downsampled once, with an area-average filter, instead of being resampled
-    // by the GPU with plain bilinear filtering (which looks soft/aliased).
-    // The full cell size is used rather than the inset one, so the bitmap is
-    // still big enough if the button lays its image view out at full size.
+    // clipped.
     let icon_inset = (layout.icon_size * 0.03).max(0.0);
-    let icon_pixel_size = (layout.icon_size * env.options.ui_scale.get() as CGFloat)
-        .round()
-        .max(1.0) as u32;
 
     let icon_tapped_sel = env.objc.lookup_selector("iconTapped:").unwrap();
     let icon_touch_down_sel = env.objc.lookup_selector("iconTouchDown:").unwrap();
@@ -1554,7 +1543,6 @@ fn make_icon_grid(
         visible: 0,
         screen_width: app_frame.size.width,
         placeholder_icon: None,
-        icon_pixel_size,
         pages,
         icon_map: HashMap::new(),
     }
@@ -1682,7 +1670,6 @@ fn update_icon_grid(
     page_idx: usize,
     container_idx: usize,
 ) {
-    let icon_pixel_size = icon_grid_stuff.icon_pixel_size;
     let cells = icon_grid_stuff.containers[container_idx].cells.clone();
     for &(icon_button, _) in &cells {
         icon_grid_stuff.icon_map.remove(&icon_button);
@@ -1697,10 +1684,6 @@ fn update_icon_grid(
         let &(icon_button, label) = icon_iter.next().unwrap();
 
         if let Some(icon) = app.icon.take() {
-            // Downscale once, here, to the exact size the icon is drawn at.
-            // `resized_to_fit` never upscales, so small icons keep their
-            // original pixels instead of being blurred twice.
-            let icon = icon.resized_to_fit(icon_pixel_size, icon_pixel_size);
             let image = cg_image::from_image(env, icon);
             let image: id = msg_class![env; UIImage imageWithCGImage:image];
             app.icon_ui_image = Some(image);
@@ -1952,8 +1935,8 @@ const DOCK_ICON_TOP: CGFloat = 5.0;
 const DOCK_LABEL_HEIGHT: CGFloat = 12.0;
 /// The dock shortcuts sit close together in the middle of the dock instead of
 /// being spread out to the screen edges.
-const DOCK_MIN_GAP: CGFloat = 8.0;
-const DOCK_MAX_GAP: CGFloat = 18.0;
+const DOCK_MIN_GAP: CGFloat = 14.0;
+const DOCK_MAX_GAP: CGFloat = 26.0;
 
 /// Builds the old-iOS dock at the bottom of the home screen. The shortcuts
 /// live outside the paged grid, so they stay in place while pages slide.

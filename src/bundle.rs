@@ -385,102 +385,51 @@ impl Bundle {
             .unwrap_or_else(|| self.path.join("Icon.png"))
     }
 
-    /// Every image file in the bundle that looks like an app icon, whatever
-    /// the `Info.plist` says. Old games often ship a large `iTunesArtwork` or
-    /// `Icon-72@2x.png` that the plist never mentions, while the plist points
-    /// at a tiny 57×57 `Icon.png`.
-    fn stray_icon_path_candidates(&self, fs: &Fs) -> Vec<GuestPathBuf> {
-        let Ok(names) = fs.enumerate(&self.path) else {
-            return Vec::new();
-        };
-        let mut candidates: Vec<GuestPathBuf> = names
-            .filter(|name| is_icon_file_name(name))
-            .map(|name| self.path.join(name))
-            .collect();
-        // `enumerate` iterates a hash map, so sort for a deterministic order
-        // (used as the tie-break between equally large images).
-        candidates.sort();
-        candidates
-    }
-
     /// Load icon and round off its corners (and add sheen if needed) for
     /// display.
-    ///
-    /// The plist names are only a hint: old bundles often ship several icons
-    /// (`Icon.png` 57×57, `Icon@2x.png` 114×114, `Icon-72@2x.png` 144×144, …),
-    /// and some ship placeholder images that are larger than the real icon.
-    /// So instead of taking the first file that exists, this looks at *every*
-    /// icon-like file in the bundle, ranks them by resolution (PNG and JPEG
-    /// headers are enough, so nothing is decoded twice), and decodes them
-    /// largest-first until a usable image is found. A large icon is what keeps
-    /// the picker sharp: it is drawn at roughly 113 physical pixels on a
-    /// 2× display, so a 57×57 icon would be noticeably blurry.
     pub fn load_icon(&self, fs: &Fs) -> Result<Image, String> {
-        // Gather unique candidate paths. The plist spelling must be resolved
-        // case-insensitively: the bundle was built on a case-insensitive
-        // volume, so e.g. "Icon@2x.png" in the plist may be stored as
-        // "icon@2x.png" in the VFS.
-        let mut paths: Vec<GuestPathBuf> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for path in self.icon_path_candidates() {
-            let resolved = fs
-                .resolve_case_insensitive_path(&path)
-                .unwrap_or(path);
-            if seen.insert(resolved.clone()) {
-                paths.push(resolved);
-            }
-        }
-        for path in self.stray_icon_path_candidates(fs) {
-            if seen.insert(path.clone()) {
-                paths.push(path);
-            }
-        }
-
-        // Rank the files by resolution using their headers, then keep only the
-        // paths: the image data is re-read in ranked order below, so a bundle
-        // with many icons doesn't hold all of them in memory at once.
-        let mut ranked: Vec<(u64, usize, GuestPathBuf)> = Vec::new();
-        for path in paths {
-            let Ok(bytes) = fs.read(&path) else {
-                continue;
-            };
-            let area = image_area(&bytes);
-            let order = ranked.len();
-            ranked.push((area, order, path));
-        }
-        // Largest first; `sort_by_key` is stable, so equal sizes keep the
-        // plist-first order.
-        ranked.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-
-        // Decode largest-first. The first image that isn't a blank/flat
-        // placeholder wins; the largest placeholder is kept as a last resort.
+        let candidates = self.icon_path_candidates();
+        // Old bundles usually ship several icon files: `Icon.png` is 57×57
+        // while `Icon@2x.png` is 114×114, and there may be even bigger iPad
+        // variants. Picking the first file that exists (which may be the
+        // small one) makes the app picker show a blurry, upscaled icon, so
+        // decode every candidate and keep the highest-resolution one.
         let mut best: Option<Image> = None;
         let mut best_area: u64 = 0;
+        let mut found_any = false;
         let mut last_err: Option<String> = None;
-        for (_, _, path) in &ranked {
-            let Ok(bytes) = fs.read(path) else {
-                continue;
+        for path in &candidates {
+            let bytes = match fs.read(path) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    last_err = Some(format!("missing: {}", path.as_str()));
+                    continue;
+                }
             };
+            found_any = true;
             match Image::from_bytes(&bytes) {
                 Ok(image) => {
-                    if !image.is_blank_or_solid_black() {
-                        best = Some(image);
-                        break;
-                    }
-                    let area = image.area();
+                    let (width, height) = image.dimensions();
+                    let area = u64::from(width) * u64::from(height);
                     if area > best_area {
                         best_area = area;
                         best = Some(image);
                     }
                 }
-                Err(e) => last_err = Some(format!("Could not parse icon image: {e}")),
+                Err(e) => {
+                    last_err = Some(format!("Could not parse icon image: {e}"));
+                }
             }
         }
-
         let Some(mut image) = best else {
             // Mirror the historical phrasing so any tooling that scrapes
-            // the warning still recognises it.
-            return Err(last_err.unwrap_or_else(|| "Could not read icon file".to_string()));
+            // the warning still recognises it. If some icon files existed but
+            // none could be decoded, report why instead.
+            return Err(if found_any {
+                last_err.unwrap_or_else(|| "Could not parse icon image".to_string())
+            } else {
+                "Could not read icon file".to_string()
+            });
         };
         // UIPrerenderedIcon is used to avoid iOS applying a sheen effect,
         // should be boolean, but some apps use a string, so we check both.
@@ -628,165 +577,6 @@ impl Bundle {
             vec![DeviceFamily::iPhone]
         } else {
             families
-        }
-    }
-}
-
-/// Pixel area of a PNG or JPEG image, read from its header, or 0 if the
-/// format isn't recognised. Only used to rank icon candidates, so a cheap
-/// header parse is enough and large icons are never decoded just to compare
-/// their sizes.
-fn image_area(bytes: &[u8]) -> u64 {
-    let png = png_area(bytes);
-    if png > 0 {
-        return png;
-    }
-    jpeg_area(bytes)
-}
-
-/// Area of a JPEG image, found by walking its marker segments until a
-/// start-of-frame marker (SOF0/SOF1/SOF2, …) with the frame size. Returns 0
-/// for anything that is not a JPEG or has no readable frame header.
-fn jpeg_area(bytes: &[u8]) -> u64 {
-    // SOI marker.
-    if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
-        return 0;
-    }
-    let mut i = 2;
-    // Every marker needs at least two length bytes plus five header bytes for
-    // SOF, hence the +9.
-    while i + 9 <= bytes.len() {
-        if bytes[i] != 0xFF {
-            i += 1;
-            continue;
-        }
-        let marker = bytes[i + 1];
-        // Standalone markers (TEM, RSTn, SOI, EOI) have no length field.
-        if marker == 0x01 || (0xD0..=0xD9).contains(&marker) {
-            i += 2;
-            continue;
-        }
-        let length = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
-        if length < 2 {
-            return 0;
-        }
-        // SOF markers carry the frame dimensions; C4 (DHT), C8 (JPG) and
-        // CC (DAC) share the C0..CF range but are not frame headers.
-        let is_sof =
-            (0xC0..=0xCF).contains(&marker) && marker != 0xC4 && marker != 0xC8 && marker != 0xCC;
-        if is_sof {
-            let height = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]) as u64;
-            let width = u16::from_be_bytes([bytes[i + 7], bytes[i + 8]]) as u64;
-            return width * height;
-        }
-        i += 2 + length;
-    }
-    0
-}
-
-/// Width times height of a PNG file, read from its header without decoding
-/// the image. Returns 0 for other formats or malformed files.
-fn png_area(bytes: &[u8]) -> u64 {
-    const PNG_MAGIC: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
-    // The IHDR chunk must come first: 8-byte magic, 4-byte length, "IHDR",
-    // then the width and height as big-endian u32.
-    if bytes.len() < 24 || bytes[..8] != PNG_MAGIC || &bytes[12..16] != b"IHDR" {
-        return 0;
-    }
-    let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
-    let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
-    u64::from(width) * u64::from(height)
-}
-
-/// Whether a file name in an app bundle looks like an app icon:
-/// `Icon.png`, `Icon@2x.png`, `Icon-72.png`, `Icon-Small@2x.png`,
-/// `AppIcon60x60@2x.png`, `iTunesArtwork`, and so on.
-fn is_icon_file_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    // Strip the extension and any @2x/@3x and ~ipad/~iphone decorations.
-    let stem = lower.split('.').next().unwrap_or("");
-    let stem = stem.split('@').next().unwrap_or(stem);
-    let stem = stem.split('~').next().unwrap_or(stem);
-    // `iTunesArtwork`/`iTunesArtwork@2x` have no file extension, but they are
-    // usually the largest (and sharpest) artwork in the bundle.
-    if !lower.contains('.') && stem == "itunesartwork" {
-        return true;
-    }
-    let is_image =
-        lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg");
-    is_image && is_icon_stem(stem)
-}
-
-/// Whether a name stem (extension and `@2x`/`~ipad` decorations removed) is an
-/// icon name: `icon`, `icon-72`, `icon_57`, `appicon60x60`, … Anything else
-/// that merely starts with "icon" (e.g. `icons_background`) is not an icon,
-/// even if it is large; otherwise it could win the "biggest icon" search.
-fn is_icon_stem(stem: &str) -> bool {
-    for prefix in ["appicon", "icon"] {
-        if let Some(rest) = stem.strip_prefix(prefix) {
-            return match rest.chars().next() {
-                None => true,
-                Some(c) => c.is_ascii_digit() || c == '-' || c == '_',
-            };
-        }
-    }
-    false
-}
-
-#[cfg(test)]
-mod icon_area_tests {
-    use super::{image_area, jpeg_area};
-
-    #[test]
-    fn jpeg_area_reads_the_frame_size() {
-        let mut bytes = vec![0xFF, 0xD8]; // SOI
-        // APP0 segment: marker, length (2 bytes length field + payload).
-        bytes.extend_from_slice(&[0xFF, 0xE0, 0x00, 0x04, 0xAA, 0xBB]);
-        // SOF0: length 17, precision 8, height 512, width 432, 3 components.
-        bytes.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 0x08]);
-        bytes.extend_from_slice(&512u16.to_be_bytes());
-        bytes.extend_from_slice(&432u16.to_be_bytes());
-        bytes.push(0x03);
-        assert_eq!(jpeg_area(&bytes), 512 * 432);
-        assert_eq!(image_area(&bytes), 512 * 432);
-        // Not a JPEG at all.
-        assert_eq!(jpeg_area(b"\x89PNG\r\n\x1a\n"), 0);
-    }
-}
-
-#[cfg(test)]
-mod icon_file_name_tests {
-    use super::is_icon_file_name;
-
-    #[test]
-    fn recognises_common_icon_names() {
-        for name in [
-            "Icon.png",
-            "icon.png",
-            "Icon@2x.png",
-            "Icon-72@2x.png",
-            "Icon-Small-50.png",
-            "AppIcon60x60@2x.png",
-            "iTunesArtwork",
-            "iTunesArtwork@2x",
-            "AppIcon.jpg",
-        ] {
-            assert!(is_icon_file_name(name), "{name} should be an icon file");
-        }
-    }
-
-    #[test]
-    fn ignores_other_bundle_files() {
-        for name in [
-            "Default.png",
-            "Default@2x.png",
-            "Info.plist",
-            "game.dat",
-            "IconSheet.png.plist",
-            "icons_background.png",
-            "pic.png",
-        ] {
-            assert!(!is_icon_file_name(name), "{name} should not be an icon");
         }
     }
 }
