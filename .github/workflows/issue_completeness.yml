@@ -18,10 +18,10 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@main
         with:
           sparse-checkout: .github/scripts
-      - uses: actions/github-script@v7
+      - uses: actions/github-script@main
         with:
           script: |
             const { run } = require('./.github/scripts/issue-completeness.js');
