@@ -1429,13 +1429,15 @@ fn make_icon_grid(
 
     // The icon image view is inset slightly so the rounded corners aren't
     // clipped. The compositor draws it at `ui_scale` physical pixels per point,
-    // so icons are pre-scaled to exactly that size: large icons are then
+    // so icons are pre-scaled to (about) that size: large icons are then
     // downsampled once, with an area-average filter, instead of being resampled
     // by the GPU with plain bilinear filtering (which looks soft/aliased).
+    // The full cell size is used rather than the inset one, so the bitmap is
+    // still big enough if the button lays its image view out at full size.
     let icon_inset = (layout.icon_size * 0.03).max(0.0);
-    let icon_view_size = (layout.icon_size - icon_inset * 2.0).max(1.0);
-    let icon_pixel_size =
-        (icon_view_size * env.options.ui_scale.get() as CGFloat).round().max(1.0) as u32;
+    let icon_pixel_size = (layout.icon_size * env.options.ui_scale.get() as CGFloat)
+        .round()
+        .max(1.0) as u32;
 
     let icon_tapped_sel = env.objc.lookup_selector("iconTapped:").unwrap();
     let icon_touch_down_sel = env.objc.lookup_selector("iconTouchDown:").unwrap();
