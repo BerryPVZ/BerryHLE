@@ -16,6 +16,8 @@ use crate::mem::{ConstPtr, GuestUSize, Mem, MutPtr, Ptr, SafeRead, SafeWrite};
 // Import functions from C++
 use touchHLE_dynarmic_wrapper::*;
 
+pub mod asimd_fallback;
+
 type VAddr = u32;
 pub type CpuContext = touchHLE_DynarmicContext;
 
@@ -190,6 +192,21 @@ impl Cpu {
         unsafe {
             let ptr = touchHLE_DynarmicWrapper_regs_mut(self.dynarmic_wrapper);
             &mut *(ptr as *mut [u32; 16])
+        }
+    }
+
+    /// The VFP/Advanced SIMD register file, as 32 64-bit D registers (each
+    /// stored as its low word followed by its high word).
+    pub fn extregs(&self) -> &[u32; 64] {
+        unsafe {
+            let ptr = touchHLE_DynarmicWrapper_extregs_const(self.dynarmic_wrapper);
+            &*(ptr as *const [u32; 64])
+        }
+    }
+    pub fn extregs_mut(&mut self) -> &mut [u32; 64] {
+        unsafe {
+            let ptr = touchHLE_DynarmicWrapper_extregs_mut(self.dynarmic_wrapper);
+            &mut *(ptr as *mut [u32; 64])
         }
     }
 
