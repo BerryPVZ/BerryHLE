@@ -71,6 +71,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 #[derive(Default)]
 struct CGImageHostObject {
     image: Image,
+    /// Whether this image came from a 16-bit RGB bitmap context (5 bits per
+    /// component, top bit unused). The pixels are still stored as RGBA8; this
+    /// only changes the format the image reports to the app.
+    rgb555: bool,
 }
 impl HostObject for CGImageHostObject {}
 
@@ -91,9 +95,26 @@ pub fn CGImageRetain(env: &mut Environment, c: CGImageRef) -> CGImageRef {
 }
 
 pub fn from_image(env: &mut Environment, image: Image) -> CGImageRef {
-    let host_obj = Box::new(CGImageHostObject { image });
+    let host_obj = Box::new(CGImageHostObject {
+        image,
+        rgb555: false,
+    });
     let class = env.objc.get_known_class("_touchHLE_CGImage", &mut env.mem);
     env.objc.alloc_object(class, host_obj, &mut env.mem)
+}
+
+/// Like [from_image], for an image made from a 16-bit RGB bitmap context.
+/// Apps can look at the reported format to pick how to convert the image:
+/// DoDonPachi Resurrection only keeps its sprites' transparency if the image
+/// says it is 16 bits per pixel.
+pub fn from_rgb555_image(env: &mut Environment, image: Image) -> CGImageRef {
+    let cg_image = from_image(env, image);
+    env.objc.borrow_mut::<CGImageHostObject>(cg_image).rgb555 = true;
+    cg_image
+}
+
+fn is_rgb555(env: &Environment, image: CGImageRef) -> bool {
+    env.objc.borrow::<CGImageHostObject>(image).rgb555
 }
 
 pub fn borrow_image(objc: &ObjC, image: CGImageRef) -> &Image {
@@ -169,9 +190,12 @@ fn CGImageCreateWithJPEGDataProvider(
     from_image(env, image)
 }
 
-fn CGImageGetAlphaInfo(_env: &mut Environment, image: CGImageRef) -> CGImageAlphaInfo {
+fn CGImageGetAlphaInfo(env: &mut Environment, image: CGImageRef) -> CGImageAlphaInfo {
     if image.is_null() {
         return kCGImageAlphaNone;
+    }
+    if is_rgb555(env, image) {
+        return kCGImageAlphaNoneSkipFirst;
     }
     kCGImageAlphaPremultipliedLast
 }
@@ -208,9 +232,12 @@ pub fn CGImageGetHeight(env: &mut Environment, image: CGImageRef) -> GuestUSize 
     height
 }
 
-fn CGImageGetBitsPerPixel(_env: &mut Environment, image: CGImageRef) -> GuestUSize {
+fn CGImageGetBitsPerPixel(env: &mut Environment, image: CGImageRef) -> GuestUSize {
     if image.is_null() {
         return 0;
+    }
+    if is_rgb555(env, image) {
+        return 16;
     }
     32
 }
@@ -235,9 +262,12 @@ fn CGImageGetDataProvider(env: &mut Environment, image: CGImageRef) -> CGDataPro
     autorelease(env, cg_data_provider)
 }
 
-fn CGImageGetBitsPerComponent(_: &mut Environment, image: CGImageRef) -> GuestUSize {
+fn CGImageGetBitsPerComponent(env: &mut Environment, image: CGImageRef) -> GuestUSize {
     if image.is_null() {
         return 0;
+    }
+    if is_rgb555(env, image) {
+        return 5;
     }
     8
 }

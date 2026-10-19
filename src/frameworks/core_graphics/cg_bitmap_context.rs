@@ -73,7 +73,12 @@ pub fn CGBitmapContextCreate(
 
     let (data, data_is_owned, bytes_per_row) = if data.is_null() {
         let bytes_per_row = if bytes_per_row == 0 {
-            width.checked_mul(component_count).unwrap()
+            let bytes_per_pixel = if bits_per_component == 5 {
+                2
+            } else {
+                component_count
+            };
+            width.checked_mul(bytes_per_pixel).unwrap()
         } else {
             bytes_per_row
         };
@@ -158,7 +163,7 @@ pub fn CGBitmapContextCreateImage(env: &mut Environment, context: CGContextRef) 
     let host_obj = env.objc.borrow::<CGContextHostObject>(context);
     let CGContextSubclass::CGBitmapContext(bitmap_data) = host_obj.subclass;
 
-    if bitmap_data.bits_per_component != 8 {
+    if !matches!(bitmap_data.bits_per_component, 5 | 8) {
         log!("Warning: CGBitmapContextCreateImage called with bits_per_component = {}, which is not fully supported yet.", bitmap_data.bits_per_component);
     }
 
@@ -182,6 +187,12 @@ pub fn CGBitmapContextCreateImage(env: &mut Environment, context: CGContextRef) 
                 continue;
             }
 
+            if is_rgb555(&bitmap_data) {
+                let (r, g, b) = read_rgb555(&bitmap_data, raw_pixels, pixel_start);
+                normalized_pixels.extend_from_slice(&[r, g, b, 255]);
+                continue;
+            }
+
             let r = raw_pixels.get(pixel_start + r_offset).copied().unwrap_or(0);
             let g = raw_pixels.get(pixel_start + g_offset).copied().unwrap_or(0);
             let b = raw_pixels.get(pixel_start + b_offset).copied().unwrap_or(0);
@@ -199,10 +210,12 @@ pub fn CGBitmapContextCreateImage(env: &mut Environment, context: CGContextRef) 
         }
     }
 
-    cg_image::from_image(
-        env,
-        Image::from_pixel_vec(normalized_pixels, (bitmap_data.width, bitmap_data.height)),
-    )
+    let image = Image::from_pixel_vec(normalized_pixels, (bitmap_data.width, bitmap_data.height));
+    if is_rgb555(&bitmap_data) {
+        cg_image::from_rgb555_image(env, image)
+    } else {
+        cg_image::from_image(env, image)
+    }
 }
 
 fn components_for_rgb(bitmap_info: CGBitmapInfo) -> Result<GuestUSize, ()> {
@@ -267,6 +280,9 @@ fn bytes_per_pixel(data: &CGBitmapContextData) -> GuestUSize {
         alpha_info,
         ..
     } = data;
+    if is_rgb555(data) {
+        return 2;
+    }
     if bits_per_component != 8 {
         // We don't currently support 16-bit-per-component or float bitmap
         // contexts. Clamp to the 8-bit interpretation so callers don't crash
@@ -282,6 +298,46 @@ fn bytes_per_pixel(data: &CGBitmapContextData) -> GuestUSize {
         kCGColorSpaceGenericGray => components_for_gray(alpha_info).unwrap_or(1),
         _ => components_for_rgb(alpha_info).unwrap_or(4),
     }
+}
+
+/// Whether this is the 16-bit RGB layout: 5 bits per component in a 16-bit
+/// word whose top bit is unused (`kCGImageAlphaNoneSkipFirst`). It is the
+/// only bits-per-component other than 8 that iPhone OS bitmap contexts
+/// support. DoDonPachi Resurrection wraps its 16-bit texture data in one.
+fn is_rgb555(data: &CGBitmapContextData) -> bool {
+    data.bits_per_component == 5
+}
+
+fn rgb555_word_to_bytes(data: &CGBitmapContextData, word: u16) -> [u8; 2] {
+    if data.byte_order == kCGImageByteOrder16Little {
+        word.to_le_bytes()
+    } else {
+        word.to_be_bytes()
+    }
+}
+
+/// Read the pixel at byte offset `idx` as 8-bit components.
+fn read_rgb555(data: &CGBitmapContextData, pixels: &[u8], idx: usize) -> (u8, u8, u8) {
+    let bytes = [pixels[idx], pixels[idx + 1]];
+    let word = if data.byte_order == kCGImageByteOrder16Little {
+        u16::from_le_bytes(bytes)
+    } else {
+        u16::from_be_bytes(bytes)
+    };
+    // Replicate the top bits into the bottom ones so 0x1f becomes 0xff.
+    let expand = |c: u16| ((c << 3) | (c >> 2)) as u8;
+    (
+        expand((word >> 10) & 0x1f),
+        expand((word >> 5) & 0x1f),
+        expand(word & 0x1f),
+    )
+}
+
+/// Write 8-bit components to the pixel at byte offset `idx`.
+fn write_rgb555(data: &CGBitmapContextData, pixels: &mut [u8], idx: usize, rgb: (u8, u8, u8)) {
+    let (r, g, b) = rgb;
+    let word = (u16::from(r) >> 3) << 10 | (u16::from(g) >> 3) << 5 | u16::from(b) >> 3;
+    pixels[idx..idx + 2].copy_from_slice(&rgb555_word_to_bytes(data, word));
 }
 
 fn get_pixels<'a>(data: &CGBitmapContextData, mem: &'a mut Mem) -> &'a mut [u8] {
@@ -363,6 +419,15 @@ fn get_pixel(
     pixels: &mut [u8],
     first_component_idx: usize,
 ) -> (f32, f32, f32, f32) {
+    if is_rgb555(data) {
+        let (r, g, b) = read_rgb555(data, pixels, first_component_idx);
+        return (
+            gamma_decode(r as f32 / 255.0),
+            gamma_decode(g as f32 / 255.0),
+            gamma_decode(b as f32 / 255.0),
+            1.0,
+        );
+    }
     let pixel_offset = pixel_offsets(data);
     let pixel = (
         pixels[first_component_idx + pixel_offset.0] as f32 / 255.0,
@@ -416,6 +481,11 @@ fn put_pixel(
         pixel
     };
     let (r, g, b) = (gamma_encode(r), gamma_encode(g), gamma_encode(b));
+    if is_rgb555(data) {
+        let rgb = ((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8);
+        write_rgb555(data, pixels, first_component_idx, rgb);
+        return;
+    }
     let pixel_offset = pixel_offsets(data);
     match data.alpha_info {
         kCGImageAlphaOnly => {
