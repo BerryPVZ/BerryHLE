@@ -460,13 +460,6 @@ const CLASSES: ClassExports = objc_classes! {
 - (())swipeRight {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).swipe_right = true;
 }
-- (())openHomepage {
-    let _ = env.objc.borrow_mut::<AppPickerDelegateHostObject>(this);
-
-    if let Err(e) = crate::window::open_url(env, "https://touchhle.org/") {
-        echo!("Couldn't open touchHLE.org: {}", e);
-    }
-}
 - (())openFileManager {
     // Assert (see above).
     let _ = env.objc.borrow_mut::<AppPickerDelegateHostObject>(this);
@@ -1866,10 +1859,12 @@ fn rebuild_page_dots(
 const DOCK_ICON_SIZE: CGFloat = 54.0;
 const DOCK_ICON_TOP: CGFloat = 7.0;
 const DOCK_LABEL_HEIGHT: CGFloat = 12.0;
+/// Keeps the dock shortcuts close together on wide screens instead of
+/// stretching them to the screen edges.
+const DOCK_MAX_GAP: CGFloat = 96.0;
 
-/// Builds the old-iOS dock at the bottom of the home screen. The four
-/// shortcuts live outside the paged grid, so they stay in place while pages
-/// slide.
+/// Builds the old-iOS dock at the bottom of the home screen. The shortcuts
+/// live outside the paged grid, so they stay in place while pages slide.
 fn make_dock(env: &mut Environment, delegate: id, main_view: id, screen_size: CGSize) -> id {
     let width = screen_size.width;
     let top = screen_size.height - APP_PICKER_DOCK_HEIGHT;
@@ -1883,15 +1878,15 @@ fn make_dock(env: &mut Environment, delegate: id, main_view: id, screen_size: CG
     let hairline = new_view(env, rect(0.0, 0.0, width, 1.0), hairline_color);
     () = msg![env; dock addSubview:hairline];
 
-    let count: CGFloat = 4.0;
+    let count: CGFloat = 3.0;
     let side_inset: CGFloat = 10.0;
-    let gap = ((width - side_inset * 2.0 - DOCK_ICON_SIZE * count) / (count - 1.0)).max(4.0);
+    let gap = ((width - side_inset * 2.0 - DOCK_ICON_SIZE * count) / (count - 1.0))
+        .clamp(4.0, DOCK_MAX_GAP);
     let first_x = (width - (DOCK_ICON_SIZE * count + gap * (count - 1.0))) / 2.0;
 
     let plus_image = make_icon_from_text(env, "+", 50.0, -6.0, (0.25, 0.25, 0.25, 1.0));
     let settings_image = make_settings_app_icon(env);
     let folder_image = make_folder_icon(env);
-    let homepage_image = make_icon_from_text(env, "WWW", 20.0, 0.0, (0.10, 0.55, 0.30, 1.0));
 
     make_dock_item(
         env,
@@ -1920,16 +1915,6 @@ fn make_dock(env: &mut Environment, delegate: id, main_view: id, screen_size: CG
         "File manager",
         "openFileManager",
     );
-    make_dock_item(
-        env,
-        delegate,
-        dock,
-        first_x + 3.0 * (DOCK_ICON_SIZE + gap),
-        homepage_image,
-        "touchHLE.org",
-        "openHomepage",
-    );
-
     () = msg![env; main_view addSubview:dock];
     dock
 }
@@ -1963,7 +1948,7 @@ fn make_dock_item(
                         forControlEvents:UIControlEventTouchUpInside];
     () = msg![env; dock addSubview:icon_button];
 
-    let label_width = DOCK_ICON_SIZE + 18.0;
+    let label_width = DOCK_ICON_SIZE + 30.0;
     let white: id = msg_class![env; UIColor whiteColor];
     let label = new_label(
         env,
@@ -1974,7 +1959,7 @@ fn make_dock_item(
             DOCK_LABEL_HEIGHT,
         ),
         label_text,
-        11.0,
+        10.5,
         true,
         white,
     );
