@@ -453,10 +453,11 @@ fn CGFontGetAscent(env: &mut Environment, font: CGFontRef) -> i32 {
         return 0;
     }
     if is_data_provider_font(env, font) {
-        let host = env.objc.borrow::<CGFontHostObject>(font);
-        let upm = host.font.units_per_em() as f32;
-        // rusttype's ascent at scale=upm gives design units directly
-        let ascent = host.font.ascent(upm / 1.125); // undo the iPhone scale
+        let (ascent, _, _) = env
+            .objc
+            .borrow::<CGFontHostObject>(font)
+            .font
+            .design_v_metrics();
         return ascent.round() as i32;
     }
     let ascender: f32 = msg![env; font ascender];
@@ -476,9 +477,11 @@ fn CGFontGetDescent(env: &mut Environment, font: CGFontRef) -> i32 {
         return 0;
     }
     if is_data_provider_font(env, font) {
-        let host = env.objc.borrow::<CGFontHostObject>(font);
-        let upm = host.font.units_per_em() as f32;
-        let descent = host.font.descent(upm / 1.125);
+        let (_, descent, _) = env
+            .objc
+            .borrow::<CGFontHostObject>(font)
+            .font
+            .design_v_metrics();
         return descent.round() as i32;
     }
     let descender: f32 = msg![env; font descender];
@@ -498,9 +501,11 @@ fn CGFontGetLeading(env: &mut Environment, font: CGFontRef) -> i32 {
         return 0;
     }
     if is_data_provider_font(env, font) {
-        let host = env.objc.borrow::<CGFontHostObject>(font);
-        let upm = host.font.units_per_em() as f32;
-        let line_gap = host.font.line_gap(upm / 1.125);
+        let (_, _, line_gap) = env
+            .objc
+            .borrow::<CGFontHostObject>(font)
+            .font
+            .design_v_metrics();
         return line_gap.round() as i32;
     }
     let leading: f32 = msg![env; font leading];

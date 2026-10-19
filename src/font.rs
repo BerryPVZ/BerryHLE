@@ -128,10 +128,27 @@ impl Font {
         2048
     }
 
+    /// The rusttype [Scale] at which one em is `font_size` pixels, which is
+    /// what Core Graphics means by a font size. rusttype's scale is the
+    /// height from descent to ascent instead, so the two differ by a factor
+    /// that depends on the font: about 1.12 for the bundled fonts (hence the
+    /// UIKit fudge factor in [scale]), but over 1.5 for e.g. Papyrus.
+    fn em_scale(&self, font_size: f32) -> Scale {
+        let v_metrics = self.rt().v_metrics_unscaled();
+        let height_per_em = (v_metrics.ascent - v_metrics.descent) / self.units_per_em() as f32;
+        Scale::uniform(font_size * height_per_em)
+    }
+
+    /// Returns the ascent, descent and line gap in design units.
+    pub fn design_v_metrics(&self) -> (f32, f32, f32) {
+        let v_metrics = self.rt().v_metrics_unscaled();
+        (v_metrics.ascent, v_metrics.descent, v_metrics.line_gap)
+    }
+
     /// Returns the advance width (in design units) for a glyph.
     pub fn glyph_advance(&self, glyph_id: GlyphId) -> i32 {
         let upm = self.units_per_em() as f32;
-        let g = self.rt().glyph(glyph_id).scaled(Scale::uniform(upm));
+        let g = self.rt().glyph(glyph_id).scaled(self.em_scale(upm));
         g.h_metrics().advance_width.round() as i32
     }
 
@@ -190,7 +207,7 @@ impl Font {
     /// Returns the left side bearing (in design units) for a glyph.
     pub fn glyph_left_side_bearing(&self, glyph_id: GlyphId) -> i32 {
         let upm = self.units_per_em() as f32;
-        let g = self.rt().glyph(glyph_id).scaled(Scale::uniform(upm));
+        let g = self.rt().glyph(glyph_id).scaled(self.em_scale(upm));
         g.h_metrics().left_side_bearing.round() as i32
     }
 
@@ -202,7 +219,7 @@ impl Font {
         let g = self
             .rt()
             .glyph(glyph_id)
-            .scaled(Scale::uniform(upm))
+            .scaled(self.em_scale(upm))
             .positioned(Point { x: 0.0, y: 0.0 });
         match g.pixel_bounding_box() {
             Some(bb) => {
@@ -671,16 +688,15 @@ impl Font {
             .max(1.0);
 
         let start = Point { x: 0.0, y: 0.0 };
+        let glyph_scale = self.em_scale(font_size * tmp_font_scale);
         // This code is adapted from documentation of [rusttype::Font::layout].
         let iter = self
             .rt()
             .glyphs_for(glyphs.into_iter())
             .scan((None, 0.0), |(last, x), g| {
-                let g = g.scaled(scale(font_size * tmp_font_scale));
+                let g = g.scaled(glyph_scale);
                 if let Some(last) = last {
-                    *x += self
-                        .rt()
-                        .pair_kerning(scale(font_size * tmp_font_scale), *last, g.id());
+                    *x += self.rt().pair_kerning(glyph_scale, *last, g.id());
                 }
                 let w = g.h_metrics().advance_width;
                 let next = g.positioned(start + vector(*x, 0.0));
@@ -802,7 +818,7 @@ impl Font {
             let g = self
                 .rt()
                 .glyph(*glyph_id)
-                .scaled(scale(font_size))
+                .scaled(self.em_scale(font_size))
                 .positioned(Point { x, y: 0.0 });
 
             let Some(glyph_bounds) = g.pixel_bounding_box() else {
@@ -855,7 +871,7 @@ impl Font {
             let g = self
                 .rt()
                 .glyph(*glyph_id)
-                .scaled(scale(font_size))
+                .scaled(self.em_scale(font_size))
                 .positioned(Point {
                     x: current_x,
                     y: 0.0,
