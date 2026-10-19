@@ -27,6 +27,17 @@ body:
       placeholder: '1.0'
     validations:
       required: true
+  - type: textarea
+    attributes:
+      label: IPA link(s)
+      description: |
+        Direct download link(s) to the `.ipa` (or zipped `.app`). One link per
+        line. App Store pages are not accepted. Issues without one are closed
+        automatically.
+      placeholder: |
+        https://example.com/app.ipa
+    validations:
+      required: true
   - type: input
     attributes:
       label: touchHLE version
@@ -52,11 +63,14 @@ body:
       required: true
   - type: textarea
     attributes:
-      label: If touchHLE crashed, please paste the log output.
+      label: Log output
       description: |
         On Android, this is the log.txt file. On Windows or macOS, it's visible
-        in the Terminal/Command Prompt/PowerShell.
+        in the Terminal/Command Prompt/PowerShell. Issues without a log are
+        closed automatically.
       render: 'text'
+    validations:
+      required: true
   - type: checkboxes
     attributes:
       label: By submitting this issue, I certify that…

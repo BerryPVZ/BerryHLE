@@ -30,6 +30,17 @@ body:
       placeholder: '1.0'
     validations:
       required: true
+  - type: textarea
+    attributes:
+      label: IPA link(s)
+      description: |
+        Direct download link(s) to the `.ipa` (or zipped `.app`). One link per
+        line. App Store pages are not accepted. Issues without one are closed
+        automatically.
+      placeholder: |
+        https://example.com/app.ipa
+    validations:
+      required: true
   - type: input
     attributes:
       label: App DB report link (if available)
@@ -81,10 +92,11 @@ body:
         On Android, this is the `log.txt` file. On Windows / macOS / Linux, this
         is the output visible in the Terminal / Command Prompt / PowerShell that
         ran touchHLE. Please paste as much as possible, especially around the
-        moment the bug occurs.
+        moment the bug occurs. Issues without a log are closed
+        automatically.
       render: 'text'
     validations:
-      required: false
+      required: true
   - type: textarea
     attributes:
       label: Screenshots or video (optional)
