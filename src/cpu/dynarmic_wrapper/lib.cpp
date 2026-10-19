@@ -258,8 +258,37 @@ public:
   }
 };
 
+// CP15 is the system control coprocessor. On iPhone OS, the only CP15 register
+// user-mode code reads is c13/c0/3 (TPIDRURO, the read-only thread ID
+// register): libSystem keeps the current thread's thread-specific data array
+// there, and code built against it (Unity's IL2CPP runtime, for one) inlines
+// `pthread_getspecific` as `mrc p15, 0, rX, c13, c0, 3` plus a load. Reading it
+// from a host-owned word that is updated on every guest thread switch gives
+// each thread its own TSD array, as on a real device. Everything else is
+// ignored like on the other coprocessors.
+class ArmDynarmicCP15 final : public ArmDynarmicIgnoredCoprocessor {
+  std::uint32_t *tpidruro;
+
+public:
+  explicit ArmDynarmicCP15(std::uint32_t *tpidruro) : tpidruro(tpidruro) {}
+
+  CallbackOrAccessOneWord CompileGetOneWord(bool two, unsigned opc1,
+                                            CoprocReg CRn, CoprocReg CRm,
+                                            unsigned opc2) override {
+    if (!two && opc1 == 0 && CRn == CoprocReg::C13 && CRm == CoprocReg::C0 &&
+        opc2 == 3) {
+      return tpidruro;
+    }
+    return ArmDynarmicIgnoredCoprocessor::CompileGetOneWord(two, opc1, CRn, CRm,
+                                                            opc2);
+  }
+};
+
 class DynarmicWrapper {
   Environment env;
+  // Value of the CP15 TPIDRURO register, see ArmDynarmicCP15. Compiled guest
+  // code reads it through a pointer, so it must stay at a fixed address.
+  std::uint32_t tpidruro = 0;
   std::unique_ptr<Dynarmic::A32::Jit> cpu;
   std::unique_ptr<Dynarmic::ExclusiveMonitor> mon;
   std::array<std::uint8_t *, Dynarmic::A32::UserConfig::NUM_PAGE_TABLE_ENTRIES>
@@ -273,6 +302,7 @@ public:
       user_config.coprocessors[cp] =
           std::make_shared<ArmDynarmicIgnoredCoprocessor>();
     }
+    user_config.coprocessors[15] = std::make_shared<ArmDynarmicCP15>(&tpidruro);
     mon = std::make_unique<Dynarmic::ExclusiveMonitor>(1);
     user_config.global_monitor = mon.get();
     // PERF: opt into dynarmic's "unsafe" optimizations. Only the
@@ -330,6 +360,7 @@ public:
   void set_cpsr(std::uint32_t cpsr) { cpu->SetCpsr(cpsr); }
   std::uint32_t fpscr() const { return cpu->Fpscr(); }
   void set_fpscr(std::uint32_t fpscr) { cpu->SetFpscr(fpscr); }
+  void set_tpidruro(std::uint32_t value) { tpidruro = value; }
 
 
   std::uint32_t last_exception_pc() const { return env.last_exception_pc; }
@@ -416,6 +447,10 @@ std::uint32_t touchHLE_DynarmicWrapper_fpscr(const DynarmicWrapper *cpu) {
 void touchHLE_DynarmicWrapper_set_fpscr(DynarmicWrapper *cpu,
                                         std::uint32_t fpscr) {
   cpu->set_fpscr(fpscr);
+}
+void touchHLE_DynarmicWrapper_set_tpidruro(DynarmicWrapper *cpu,
+                                           std::uint32_t value) {
+  cpu->set_tpidruro(value);
 }
 
 

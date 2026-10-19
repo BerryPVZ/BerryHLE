@@ -64,6 +64,7 @@ extern "C" {
     pub fn touchHLE_DynarmicWrapper_set_cpsr(cpu: *mut touchHLE_DynarmicWrapper, cpsr: u32);
     pub fn touchHLE_DynarmicWrapper_fpscr(cpu: *const touchHLE_DynarmicWrapper) -> u32;
     pub fn touchHLE_DynarmicWrapper_set_fpscr(cpu: *mut touchHLE_DynarmicWrapper, fpscr: u32);
+    pub fn touchHLE_DynarmicWrapper_set_tpidruro(cpu: *mut touchHLE_DynarmicWrapper, value: u32);
 
     pub fn touchHLE_DynarmicWrapper_last_exception_pc(
         cpu: *const touchHLE_DynarmicWrapper,

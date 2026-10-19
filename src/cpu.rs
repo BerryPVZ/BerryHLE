@@ -253,6 +253,12 @@ impl Cpu {
     pub fn set_fpscr(&mut self, fpscr: u32) {
         unsafe { touchHLE_DynarmicWrapper_set_fpscr(self.dynarmic_wrapper, fpscr) }
     }
+    /// Set the value guest code reads from the CP15 TPIDRURO register
+    /// (`mrc p15, 0, rX, c13, c0, 3`). This is per-thread state that is not
+    /// part of [CpuContext], so it must be set again on every thread switch.
+    pub fn set_tpidruro(&mut self, value: u32) {
+        unsafe { touchHLE_DynarmicWrapper_set_tpidruro(self.dynarmic_wrapper, value) }
+    }
 
     /// Start address of the instruction that raised the most recent
     /// [CpuError::UndefinedInstruction] or [CpuError::Breakpoint].

@@ -4,6 +4,13 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 //! Thread-specific data keys.
+//!
+//! The values live in host-side maps, but each thread also gets a guest
+//! thread-specific data (TSD) array that mirrors them, indexed by key. The
+//! CPU's TPIDRURO register points at the current thread's array, like on a
+//! real device: code built against iPhone OS's libSystem may inline
+//! `pthread_getspecific` as a TPIDRURO read plus a load from the array,
+//! bypassing the function entirely.
 
 use crate::abi::GuestFunction;
 use crate::dyld::{export_c_func, FunctionExports};
@@ -17,6 +24,48 @@ pub struct State {
     /// vector. The tuple contains the map of thread-specific data pointers plus
     /// the destructor pointer.
     keys: Vec<(HashMap<ThreadId, MutVoidPtr>, GuestFunction)>,
+    /// Each thread's guest TSD array, see the module documentation.
+    tsd_arrays: HashMap<ThreadId, MutPtr<MutVoidPtr>>,
+}
+
+/// Number of slots in a guest TSD array. Matches libpthread's
+/// `_INTERNAL_POSIX_THREAD_KEYS_END`. Keys beyond this still work through
+/// the functions, they just aren't mirrored.
+const TSD_SLOTS: u32 = 768;
+
+/// Get the address of a thread's guest TSD array (allocating it if needed),
+/// which is the value of the TPIDRURO register while that thread is running.
+pub fn tsd_array_for_thread(env: &mut Environment, thread: ThreadId) -> MutPtr<MutVoidPtr> {
+    if let Some(&array) = get_state(env).tsd_arrays.get(&thread) {
+        return array;
+    }
+    let array: MutPtr<MutVoidPtr> = env.mem.alloc(TSD_SLOTS * 4).cast();
+    let state = &env.libc_state.pthread.key;
+    for (idx, (data, _)) in state.keys.iter().enumerate() {
+        if let Some(&value) = data.get(&thread) {
+            let key = idx as u32 + 1;
+            if key < TSD_SLOTS {
+                env.mem.write(array + key, value);
+            }
+        }
+    }
+    get_state(env).tsd_arrays.insert(thread, array);
+    array
+}
+
+/// Write a value to a key's slot in a thread's guest TSD array, if it has one.
+fn mirror_to_tsd_array(
+    env: &mut Environment,
+    thread: ThreadId,
+    key: pthread_key_t,
+    value: MutVoidPtr,
+) {
+    if key >= TSD_SLOTS {
+        return;
+    }
+    if let Some(&array) = get_state(env).tsd_arrays.get(&thread) {
+        env.mem.write(array + key, value);
+    }
 }
 
 fn get_state(env: &mut Environment) -> &mut State {
@@ -73,6 +122,7 @@ fn pthread_setspecific(env: &mut Environment, key: pthread_key_t, value: ConstVo
         return 22; // EINVAL
     };
     data.insert(current_thread, value.cast_mut());
+    mirror_to_tsd_array(env, current_thread, key, value.cast_mut());
     0 // success
 }
 
@@ -89,7 +139,10 @@ fn pthread_key_delete(env: &mut Environment, key: pthread_key_t) -> i32 {
     };
     let state = get_state(env);
     if let Some((data, _)) = state.keys.get_mut(idx) {
-        data.clear();
+        let threads: Vec<ThreadId> = data.drain().map(|(thread, _)| thread).collect();
+        for thread in threads {
+            mirror_to_tsd_array(env, thread, key, Ptr::null());
+        }
         log_dbg!("pthread_key_delete({}) cleared per-thread values", key);
         0
     } else {

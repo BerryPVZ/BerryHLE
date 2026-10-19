@@ -1018,6 +1018,7 @@ impl Environment {
         };
 
         env.trainer = crate::trainer::Trainer::new(!env.options.trainer_disabled);
+        env.set_tpidruro_for_current_thread();
 
         if env.options.dumping_options.any() {
             env.dump_file =
@@ -2287,6 +2288,14 @@ impl Environment {
         self.threads[self.current_thread].host_context = old_context.take();
         *old_context = Some(new_host_ctx);
         self.current_thread = new_thread;
+        self.set_tpidruro_for_current_thread();
+    }
+
+    /// Point the CPU's TPIDRURO register at the current thread's guest
+    /// thread-specific data array. See [libc::pthread::key].
+    fn set_tpidruro_for_current_thread(&mut self) {
+        let array = libc::pthread::key::tsd_array_for_thread(self, self.current_thread);
+        self.cpu.set_tpidruro(array.to_bits());
     }
 
     fn is_recoverable_guest_cpu_error(error: &cpu::CpuError) -> bool {
