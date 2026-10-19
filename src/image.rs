@@ -122,6 +122,83 @@ impl Image {
         u64::from(self.dimensions.0) * u64::from(self.dimensions.1)
     }
 
+    /// A copy of this image scaled down to fit within `max_width`×`max_height`,
+    /// preserving the aspect ratio. An image that already fits is returned
+    /// unchanged: icons are never upscaled, because that only makes them
+    /// blurrier.
+    ///
+    /// Downscaling uses an area-average (box) filter, which keeps icons crisp
+    /// when they are much larger than their on-screen size. The compositor
+    /// otherwise samples e.g. a 512×512 `iTunesArtwork` down to ~113 pixels
+    /// with plain bilinear filtering, which looks soft and aliased.
+    ///
+    /// Only the pixel data is resampled; the caller is expected to round the
+    /// corners afterwards (see [Image::round_icon_corners]).
+    pub fn resized_to_fit(&self, max_width: u32, max_height: u32) -> Image {
+        let (src_width, src_height) = self.dimensions;
+        if src_width == 0 || src_height == 0 || max_width == 0 || max_height == 0 {
+            return self.clone();
+        }
+        let src = self.pixels();
+        let expected_len = src_width as usize * src_height as usize * 4;
+        if src.len() < expected_len {
+            return self.clone();
+        }
+        if src_width <= max_width && src_height <= max_height {
+            return self.clone();
+        }
+        let scale = (max_width as f64 / src_width as f64)
+            .min(max_height as f64 / src_height as f64);
+        let dst_width = ((src_width as f64 * scale).round() as u32).clamp(1, max_width);
+        let dst_height = ((src_height as f64 * scale).round() as u32).clamp(1, max_height);
+
+        // Pixels are premultiplied, so averaging channels is correct.
+        let mut dst = vec![0u8; dst_width as usize * dst_height as usize * 4];
+        let x_ratio = src_width as f64 / dst_width as f64;
+        let y_ratio = src_height as f64 / dst_height as f64;
+        let src_stride = src_width as usize * 4;
+        for dy in 0..dst_height {
+            let y0 = dy as f64 * y_ratio;
+            let y1 = y0 + y_ratio;
+            let sy_start = y0.floor() as usize;
+            let sy_end = (y1.ceil() as u32).min(src_height) as usize;
+            for dx in 0..dst_width {
+                let x0 = dx as f64 * x_ratio;
+                let x1 = x0 + x_ratio;
+                let sx_start = x0.floor() as usize;
+                let sx_end = (x1.ceil() as u32).min(src_width) as usize;
+                let mut sum = [0.0f64; 4];
+                let mut total = 0.0f64;
+                for sy in sy_start..sy_end {
+                    let wy = (y1.min(sy as f64 + 1.0) - y0.max(sy as f64)).max(0.0);
+                    if wy == 0.0 {
+                        continue;
+                    }
+                    for sx in sx_start..sx_end {
+                        let wx = (x1.min(sx as f64 + 1.0) - x0.max(sx as f64)).max(0.0);
+                        if wx == 0.0 {
+                            continue;
+                        }
+                        let weight = wx * wy;
+                        let i = sy * src_stride + sx * 4;
+                        sum[0] += f64::from(src[i]) * weight;
+                        sum[1] += f64::from(src[i + 1]) * weight;
+                        sum[2] += f64::from(src[i + 2]) * weight;
+                        sum[3] += f64::from(src[i + 3]) * weight;
+                        total += weight;
+                    }
+                }
+                let o = dy as usize * dst_width as usize * 4 + dx as usize * 4;
+                if total > 0.0 {
+                    for c in 0..4 {
+                        dst[o + c] = (sum[c] / total).round().clamp(0.0, 255.0) as u8;
+                    }
+                }
+            }
+        }
+        Image::from_pixels(dst_width, dst_height, dst)
+    }
+
     /// Whether this image is useless as an app icon: empty, fully transparent,
     /// or a single flat colour (e.g. a solid black square). Some bundles ship
     /// such placeholder or mask images that are larger than the real icon.
@@ -475,6 +552,38 @@ mod tests {
         logo_pixels.extend_from_slice(&[0, 0, 0, 255]);
         let logo = Image::from_pixels(2, 2, logo_pixels);
         assert!(!logo.is_blank_or_solid_black());
+    }
+
+    #[test]
+    fn resized_to_fit_downscales_and_never_upscales() {
+        // 4×4 image: left half black, right half white (premultiplied RGBA).
+        let mut pixels = Vec::new();
+        for _ in 0..4 {
+            for x in 0..4 {
+                let value = if x < 2 { 0 } else { 255 };
+                pixels.extend_from_slice(&[value, value, value, 255]);
+            }
+        }
+        let image = Image::from_pixels(4, 4, pixels);
+
+        // Exact 2× downscale: each output pixel is the average of a 2×2 block.
+        let half = image.resized_to_fit(2, 2);
+        assert_eq!(half.dimensions(), (2, 2));
+        assert_eq!(
+            half.pixels(),
+            &[
+                0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255,
+            ]
+        );
+
+        // The aspect ratio is preserved when only one axis is constrained.
+        assert_eq!(image.resized_to_fit(2, 1).dimensions(), (1, 1));
+
+        // Images that already fit are returned as they are: no upscaling,
+        // which would only blur a small icon further.
+        let small = Image::from_pixels(2, 2, vec![0; 16]);
+        assert_eq!(small.resized_to_fit(8, 8).dimensions(), (2, 2));
+        assert_eq!(small.resized_to_fit(8, 8).pixels(), small.pixels());
     }
 
     #[test]
