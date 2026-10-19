@@ -705,10 +705,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (CGRect)statusBarFrame {
-    // Report a zero-height status bar since we don't render one.
+    // We don't render a status bar, so report what iOS reports for a hidden
+    // one: CGRectZero. A 320-wide frame breaks cocos2d's CCMenu, which in
+    // landscape subtracts the status bar's width (its height on screen) from
+    // the window height when centring itself, pushing menus such as Forlorn's
+    // Play button off the bottom of the screen.
     CGRect {
         origin: crate::frameworks::core_graphics::CGPoint { x: 0.0, y: 0.0 },
-        size: crate::frameworks::core_graphics::CGSize { width: 320.0, height: 0.0 },
+        size: crate::frameworks::core_graphics::CGSize { width: 0.0, height: 0.0 },
     }
 }
 

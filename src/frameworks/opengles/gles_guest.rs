@@ -12,6 +12,7 @@ use crate::frameworks::opengles::software_vao::{self, ArrayPointer, FixedArray};
 use crate::gles::{gles11_raw as gles11, GuestGlesCallGuard, GLES};
 use crate::mem::{ConstPtr, ConstVoidPtr, GuestISize, GuestUSize, Mem, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::nil;
+use crate::window::DeviceFamily;
 use crate::Environment;
 use std::collections::HashMap;
 use std::slice::from_raw_parts;
@@ -574,6 +575,21 @@ fn glGetString(env: &mut Environment, name: GLenum) -> ConstPtr<GLubyte> {
         return str;
     }
 
+    // The original iPhone, iPhone 3G and first two iPod touch generations use
+    // the PowerVR MBX, which has no NPOT texture support. Every later device
+    // has an SGX, whose ES 1.1 driver also advertises
+    // GL_APPLE_texture_2D_limited_npot. cocos2d checks for it before loading
+    // NPOT .pvr/.pvr.ccz textures and refuses to load them without it, which
+    // left sprites in Forlorn drawn as plain white boxes.
+    let is_mbx_device = matches!(
+        env.options.device_family,
+        Some(
+            DeviceFamily::iPhone
+                | DeviceFamily::iPhone3G
+                | DeviceFamily::iPodTouch
+                | DeviceFamily::iPodTouch2
+        )
+    );
     let s: &[u8] = if !is_es2 {
         match name {
             gles11::VENDOR => b"Imagination Technologies",
@@ -613,7 +629,15 @@ fn glGetString(env: &mut Environment, name: GLenum) -> ConstPtr<GLubyte> {
             _ => b"Unknown",
         }
     };
-    let new_str = env.mem.alloc_and_write_cstr(s).cast_const();
+    let npot_prefix: &[u8] = if !is_es2 && name == gles11::EXTENSIONS && !is_mbx_device {
+        b"GL_APPLE_texture_2D_limited_npot "
+    } else {
+        b""
+    };
+    let new_str = env
+        .mem
+        .alloc_and_write_cstr(&[npot_prefix, s].concat())
+        .cast_const();
     env.framework_state
         .opengles
         .strings_cache

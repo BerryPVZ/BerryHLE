@@ -47,14 +47,14 @@ pub use classes::{
     method_setImplementation, objc_alloc, objc_allocWithZone, objc_allocateClassPair,
     objc_autorelease, objc_autoreleasePoolPop, objc_autoreleasePoolPush,
     objc_autoreleaseReturnValue, objc_begin_catch, objc_classes, objc_copyClassList,
-    objc_copyClassNamesForImage, objc_disposeClassPair, objc_end_catch, objc_exception_throw,
-    objc_getClass, objc_getClassList, objc_getMetaClass, objc_getProtocol, objc_getRequiredClass,
-    objc_lookUpClass, objc_readClassPair, objc_registerClassPair, objc_release, objc_retain,
-    objc_retainAutorelease, objc_retainAutoreleaseReturnValue, objc_retainAutoreleasedReturnValue,
-    objc_retainBlock, objc_storeStrong, objc_unsafeClaimAutoreleasedReturnValue, object_getClass,
-    object_getClassName, object_getIndexedIvars, protocol_conformsToProtocol,
-    protocol_getMethodDescription, protocol_getName, swift_getInitializedObjCClass, Class,
-    ClassExports, ClassTemplate,
+    objc_copyClassNamesForImage, objc_copyImageNames, objc_disposeClassPair, objc_end_catch,
+    objc_exception_throw, objc_getClass, objc_getClassList, objc_getMetaClass, objc_getProtocol,
+    objc_getRequiredClass, objc_lookUpClass, objc_readClassPair, objc_registerClassPair,
+    objc_release, objc_retain, objc_retainAutorelease, objc_retainAutoreleaseReturnValue,
+    objc_retainAutoreleasedReturnValue, objc_retainBlock, objc_storeStrong,
+    objc_unsafeClaimAutoreleasedReturnValue, object_getClass, object_getClassName,
+    object_getIndexedIvars, protocol_conformsToProtocol, protocol_getMethodDescription,
+    protocol_getName, swift_getInitializedObjCClass, Class, ClassExports, ClassTemplate,
 };
 pub use messages::{
     autorelease, msg, msg_class, msg_send, msg_send_no_initialize, msg_send_no_type_checking,
@@ -207,12 +207,12 @@ pub struct ObjC {
     /// `method_exchangeImplementations` can round-trip host implementations.
     pub(super) imp_tokens: FxHashMap<crate::mem::GuestUSize, methods::IMP>,
 
-    /// Cache of token pointers minted for host `IMP`s, keyed by the
-    /// (defining class, selector) whose implementation the token stands in
-    /// for. Keeps the token pointer stable so that
+    /// Cache of token pointers minted for host `IMP`s, keyed by the address
+    /// of the host implementation. Each token is a callable stub for that
+    /// implementation. Keeps the token pointer stable so that
     /// `method_getImplementation(m) == method_getImplementation(m)` holds,
     /// matching Apple's behaviour.
-    pub(super) host_imp_tokens: FxHashMap<(Class, SEL), crate::mem::MutVoidPtr>,
+    pub(super) host_imp_tokens: FxHashMap<usize, crate::mem::MutVoidPtr>,
 }
 
 impl ObjC {
@@ -471,6 +471,7 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(objc_copyClassList(_)),
     export_c_func!(protocol_conformsToProtocol(_, _)),
     export_c_func!(objc_copyClassNamesForImage(_, _)),
+    export_c_func!(objc_copyImageNames(_)),
     export_c_func!(object_getIndexedIvars(_)),
     // `_objc_deallocOnMainThreadHelper` (one leading underscore in the C
     // name) is exported by libobjc as the Mach-O symbol
