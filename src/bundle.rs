@@ -354,22 +354,48 @@ impl Bundle {
     /// display.
     pub fn load_icon(&self, fs: &Fs) -> Result<Image, String> {
         let candidates = self.icon_path_candidates();
+        // Old bundles usually ship several icon files: `Icon.png` is 57×57
+        // while `Icon@2x.png` is 114×114, and there may be even bigger iPad
+        // variants. Picking the first file that exists (which may be the
+        // small one) makes the app picker show a blurry, upscaled icon, so
+        // decode every candidate and keep the highest-resolution one.
+        let mut best: Option<Image> = None;
+        let mut best_area: u64 = 0;
+        let mut found_any = false;
         let mut last_err: Option<String> = None;
-        let bytes = candidates.iter().find_map(|path| match fs.read(path) {
-            Ok(bytes) => Some(bytes),
-            Err(_) => {
-                last_err = Some(format!("missing: {}", path.as_str()));
-                None
+        for path in &candidates {
+            let bytes = match fs.read(path) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    last_err = Some(format!("missing: {}", path.as_str()));
+                    continue;
+                }
+            };
+            found_any = true;
+            match Image::from_bytes(&bytes) {
+                Ok(image) => {
+                    let (width, height) = image.dimensions();
+                    let area = u64::from(width) * u64::from(height);
+                    if area > best_area {
+                        best_area = area;
+                        best = Some(image);
+                    }
+                }
+                Err(e) => {
+                    last_err = Some(format!("Could not parse icon image: {e}"));
+                }
             }
-        });
-        let bytes = bytes.ok_or_else(|| {
+        }
+        let Some(mut image) = best else {
             // Mirror the historical phrasing so any tooling that scrapes
-            // the warning still recognises it.
-            "Could not read icon file".to_string()
-        })?;
-        let _ = last_err;
-        let mut image =
-            Image::from_bytes(&bytes).map_err(|e| format!("Could not parse icon image: {e}"))?;
+            // the warning still recognises it. If some icon files existed but
+            // none could be decoded, report why instead.
+            return Err(if found_any {
+                last_err.unwrap_or_else(|| "Could not parse icon image".to_string())
+            } else {
+                "Could not read icon file".to_string()
+            });
+        };
         // UIPrerenderedIcon is used to avoid iOS applying a sheen effect,
         // should be boolean, but some apps use a string, so we check both.
         // See https://developer.apple.com/library/archive/qa/qa1614/_index.html
@@ -380,12 +406,10 @@ impl Bundle {
             .and_then(|v| v.as_boolean().or(v.as_string().map(|s| s == "YES")))
             .unwrap_or(false);
         // iPhone OS icons are 57px by 57px and the OS always applies a
-        // 10px radius rounded corner (see e.g. documentation of
-        // UIPrerenderedIcon). If the icon is larger for some reason,
-        // let's scale to match.
-        // Use a slightly smaller fixed corner radius for higher-resolution icons.
-        let corner_radius = 12.0;
-        image.round_corners(corner_radius, /* four_corners: */ true, add_sheen);
+        // rounded corner (see e.g. documentation of UIPrerenderedIcon). The
+        // radius scales with the icon's resolution, so `@2x`/`@3x` icons get
+        // proportionally rounded corners rather than nearly square ones.
+        image.round_icon_corners(add_sheen);
         Ok(image)
     }
 

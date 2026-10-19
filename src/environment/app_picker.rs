@@ -1593,13 +1593,9 @@ fn make_icon(
     UIGraphicsPopContext(env);
 
     let cg_image = CGBitmapContextCreateImage(env, context);
-    // This radius should match the one in src/bundle.rs, adjusted for the
-    // bitmap resolution.
-    cg_image::borrow_image_mut(&mut env.objc, cg_image).round_corners(
-        12.0 * ui_scale,
-        /* four_corners: */ true,
-        /* add_sheen: */ true,
-    );
+    // Same gloss and (resolution-scaled) corner radius as `Bundle::load_icon()`.
+    cg_image::borrow_image_mut(&mut env.objc, cg_image)
+        .round_icon_corners(/* add_sheen: */ true);
     CGContextRelease(env, context);
 
     let ui_image: id = msg_class![env; UIImage imageWithCGImage:cg_image];
@@ -2423,8 +2419,8 @@ fn make_settings_app_icon(env: &mut Environment) -> id {
         "/res/settings_icon.png"
     ));
     let mut image = Image::from_bytes(bytes).unwrap();
-    // Same corner radius and gloss as `Bundle::load_icon()`.
-    image.round_corners(12.0, /* four_corners: */ true, /* add_sheen: */ true);
+    // Same resolution-aware corner radius and gloss as `Bundle::load_icon()`.
+    image.round_icon_corners(/* add_sheen: */ true);
     let cg_image = cg_image::from_image(env, image);
     let ui_image: id = msg_class![env; UIImage imageWithCGImage:cg_image];
     release(env, cg_image);
