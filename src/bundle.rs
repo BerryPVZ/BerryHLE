@@ -714,7 +714,23 @@ fn is_icon_file_name(name: &str) -> bool {
     }
     let is_image =
         lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg");
-    is_image && (stem.starts_with("icon") || stem.starts_with("appicon"))
+    is_image && is_icon_stem(stem)
+}
+
+/// Whether a name stem (extension and `@2x`/`~ipad` decorations removed) is an
+/// icon name: `icon`, `icon-72`, `icon_57`, `appicon60x60`, … Anything else
+/// that merely starts with "icon" (e.g. `icons_background`) is not an icon,
+/// even if it is large; otherwise it could win the "biggest icon" search.
+fn is_icon_stem(stem: &str) -> bool {
+    for prefix in ["appicon", "icon"] {
+        if let Some(rest) = stem.strip_prefix(prefix) {
+            return match rest.chars().next() {
+                None => true,
+                Some(c) => c.is_ascii_digit() || c == '-' || c == '_',
+            };
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -767,6 +783,7 @@ mod icon_file_name_tests {
             "Info.plist",
             "game.dat",
             "IconSheet.png.plist",
+            "icons_background.png",
             "pic.png",
         ] {
             assert!(!is_icon_file_name(name), "{name} should not be an icon");
