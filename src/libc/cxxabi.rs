@@ -285,6 +285,47 @@ pub(crate) fn unwind_to_app_frame(env: &mut Environment) -> Option<GuestFunction
 
 const THROW_LOOP_LIMIT: u32 = 512;
 
+/// Hand a C++ ABI call back to the app's own bundled runtime.
+///
+/// When the app ships a complete SjLj runtime (libgcc_s + libc++abi or
+/// libstdc++), that runtime can unwind `throw`/`catch` for real: it walks the
+/// SjLj jmpbuf chain and runs the personality routine. touchHLE's own
+/// implementation can only fake a non-local return, which skips the guest's
+/// catch block and makes the throwing code run again every time (seen as an
+/// endless `Il2CppExceptionWrapper` loop in Unity/IL2CPP games).
+///
+/// A host entry point can still be reached through a stale or `dlsym`-created
+/// host stub, so forward the call to the guest implementation as a tail call.
+/// The guest function returns to our caller's LR, exactly as a real
+/// implementation of the intercepted function would.
+fn forward_to_guest_cxxabi(env: &mut Environment, name: &str, args: &[u32]) -> bool {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static FORWARD_LOGS: AtomicU32 = AtomicU32::new(0);
+
+    let Some(addr) = env.dyld.guest_cxxabi_export(name) else {
+        return false;
+    };
+    let target = GuestFunction::from_addr_with_thumb_bit(addr);
+    {
+        let regs = env.cpu.regs_mut();
+        for (i, &value) in args.iter().enumerate().take(4) {
+            regs[i] = value;
+        }
+    }
+    env.cpu.branch(target);
+    env.note_guest_control_flow_redirect();
+
+    if FORWARD_LOGS.fetch_add(1, Ordering::Relaxed) < 8 {
+        log!(
+            "Forwarded {} to the guest C++ runtime at {:#010x} (real SjLj unwinding).",
+            name,
+            target.addr_with_thumb_bit()
+        );
+    }
+    true
+}
+
+
 fn note_exception_throw(key: &str) -> u32 {
     use std::sync::atomic::{AtomicU32, Ordering};
     static LAST_THROW_KEY: Mutex<String> = Mutex::new(String::new());
@@ -325,7 +366,19 @@ fn __cxa_increment_exception_refcount(_env: &mut Environment, _exception: MutVoi
     // The exception object is intentionally retained by the emulator.
 }
 
-fn __cxa_throw(env: &mut Environment, _exc: MutVoidPtr, tinfo: ConstVoidPtr, _dtor: GuestFunction) {
+fn __cxa_throw(env: &mut Environment, exception: MutVoidPtr, tinfo: ConstVoidPtr, dtor: GuestFunction) {
+    if forward_to_guest_cxxabi(
+        env,
+        "___cxa_throw",
+        &[
+            exception.to_bits(),
+            tinfo.to_bits(),
+            dtor.addr_with_thumb_bit(),
+        ],
+    ) {
+        return;
+    }
+
     // Itanium type_info layout (32-bit):
     //   +0  vptr
     //   +4  const char *name
@@ -364,11 +417,13 @@ fn __cxa_throw(env: &mut Environment, _exc: MutVoidPtr, tinfo: ConstVoidPtr, _dt
         log!(
             "Warning: Exception loop detected: {} threw {} times in a row. \
              touchHLE's SjLj bypass is returning into a caller that re-throws \
-             every iteration. Returning to caller to break the loop; the \
-             guest will likely abort on its own shortly.",
+             every iteration. Stopping the guest instead of spinning forever.",
             type_name,
             count
         );
+        // Returning to the caller just re-enters the same throw site. With no
+        // catch block reached, the only truthful outcome is termination.
+        env.request_guest_termination();
         return;
     }
 
@@ -382,6 +437,9 @@ fn __cxa_throw(env: &mut Environment, _exc: MutVoidPtr, tinfo: ConstVoidPtr, _dt
 }
 
 fn __cxa_rethrow(env: &mut Environment) {
+    if forward_to_guest_cxxabi(env, "___cxa_rethrow", &[]) {
+        return;
+    }
     log!("__cxa_rethrow — bypassing");
     if unwind_to_app_frame(env).is_none() {
         log!(
@@ -811,13 +869,23 @@ fn __dynamic_cast(
 // fall through to the same frame-pointer bypass as __cxa_throw.
 
 #[allow(non_snake_case)]
-fn _Unwind_SjLj_Register(_env: &mut Environment, _jmpbuf: MutVoidPtr) {}
+fn _Unwind_SjLj_Register(env: &mut Environment, jmpbuf: MutVoidPtr) {
+    // The guest libgcc registers its SjLj frames itself. A host-side no-op
+    // would leave the chain empty and make the guest unwinder miss every
+    // catch block, so forward if the app brought its own runtime.
+    forward_to_guest_cxxabi(env, "__Unwind_SjLj_Register", &[jmpbuf.to_bits()]);
+}
 
 #[allow(non_snake_case)]
-fn _Unwind_SjLj_Unregister(_env: &mut Environment, _jmpbuf: MutVoidPtr) {}
+fn _Unwind_SjLj_Unregister(env: &mut Environment, jmpbuf: MutVoidPtr) {
+    forward_to_guest_cxxabi(env, "__Unwind_SjLj_Unregister", &[jmpbuf.to_bits()]);
+}
 
 #[allow(non_snake_case)]
-fn _Unwind_SjLj_RaiseException(env: &mut Environment, _exc: MutVoidPtr) -> i32 {
+fn _Unwind_SjLj_RaiseException(env: &mut Environment, exc: MutVoidPtr) -> i32 {
+    if forward_to_guest_cxxabi(env, "__Unwind_SjLj_RaiseException", &[exc.to_bits()]) {
+        return 0;
+    }
     // Break runaway exception loops (e.g. `operator new` retrying a refused
     // huge allocation and re-throwing bad_alloc every iteration). Key on the
     // throwing call site (LR) so unrelated throws don't share a counter.
@@ -853,7 +921,10 @@ fn _Unwind_SjLj_RaiseException(env: &mut Environment, _exc: MutVoidPtr) -> i32 {
 }
 
 #[allow(non_snake_case)]
-fn _Unwind_SjLj_Resume(env: &mut Environment, _exc: MutVoidPtr) {
+fn _Unwind_SjLj_Resume(env: &mut Environment, exc: MutVoidPtr) {
+    if forward_to_guest_cxxabi(env, "__Unwind_SjLj_Resume", &[exc.to_bits()]) {
+        return;
+    }
     log!("_Unwind_SjLj_Resume — bypassing");
     if unwind_to_app_frame(env).is_none() {
         log!(
@@ -864,7 +935,14 @@ fn _Unwind_SjLj_Resume(env: &mut Environment, _exc: MutVoidPtr) {
 }
 
 #[allow(non_snake_case)]
-fn _Unwind_SjLj_Resume_or_Rethrow(env: &mut Environment, _exc: MutVoidPtr) -> i32 {
+fn _Unwind_SjLj_Resume_or_Rethrow(env: &mut Environment, exc: MutVoidPtr) -> i32 {
+    if forward_to_guest_cxxabi(
+        env,
+        "__Unwind_SjLj_Resume_or_Rethrow",
+        &[exc.to_bits()],
+    ) {
+        return 0;
+    }
     log!("_Unwind_SjLj_Resume_or_Rethrow — bypassing");
     if unwind_to_app_frame(env).is_none() {
         log!(

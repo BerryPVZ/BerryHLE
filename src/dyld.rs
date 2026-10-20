@@ -451,6 +451,15 @@ pub struct Dyld {
     swift_data_slots: HashMap<String, u32>,
     cxxabi_typeinfo_vtable_kinds: HashMap<u32, CxxAbiTypeInfoKind>,
     guest_sjlj_runtime_available: bool,
+    /// Guest (bundled dylib) implementations of the Itanium/SjLj C++ ABI.
+    ///
+    /// When an app ships a complete SjLj runtime (libgcc_s + libc++abi /
+    /// libstdc++), its own unwinder can handle `throw`/`catch` correctly.
+    /// Host-side stubs can only fake a non-local return, so resolving any of
+    /// these symbols to the host breaks C++ exception handling. This map is
+    /// built from *defined* symbols (not just external ones) so that a
+    /// non-exported-but-defined `___cxa_throw` still wins over the host stub.
+    guest_cxxabi_exports: HashMap<String, u32>,
 }
 
 impl Dyld {
@@ -486,6 +495,7 @@ impl Dyld {
             swift_data_slots: HashMap::new(),
             cxxabi_typeinfo_vtable_kinds: HashMap::new(),
             guest_sjlj_runtime_available: false,
+            guest_cxxabi_exports: HashMap::new(),
         }
     }
 
@@ -496,6 +506,15 @@ impl Dyld {
         self.cxxabi_typeinfo_vtable_kinds
             .get(&typeinfo_vtable_addrpoint)
             .copied()
+    }
+
+    /// Guest address of a bundled C++ ABI implementation, if the app ships a
+    /// working SjLj runtime and defines the symbol itself.
+    pub(crate) fn guest_cxxabi_export(&self, name: &str) -> Option<u32> {
+        if !self.guest_sjlj_runtime_available {
+            return None;
+        }
+        self.guest_cxxabi_exports.get(name).copied()
     }
 
     pub fn return_to_host_routine(&self) -> GuestFunction {
@@ -525,6 +544,22 @@ impl Dyld {
             "Guest C++ SjLj runtime available: {}",
             self.guest_sjlj_runtime_available
         );
+        self.guest_cxxabi_exports.clear();
+        if self.guest_sjlj_runtime_available {
+            for bin in bins {
+                for (name, &addr) in bin.exported_symbols.iter() {
+                    if addr != 0 && is_guest_cxxabi_symbol(name) {
+                        self.guest_cxxabi_exports
+                            .entry(name.clone())
+                            .or_insert(addr);
+                    }
+                }
+            }
+            log!(
+                "Guest C++ ABI implementations: {} symbols will bypass host stubs",
+                self.guest_cxxabi_exports.len()
+            );
+        }
         self.return_to_host_routine =
             Some(write_return_to_host_routine(mem, Self::SVC_RETURN_TO_HOST));
         self.thread_exit_routine = Some(write_return_to_host_routine(mem, Self::SVC_THREAD_EXIT));
@@ -915,9 +950,7 @@ impl Dyld {
             let offset: u32 = mem.read(ptr_ptr).to_bits();
             let guest_cxxabi_export =
                 if self.guest_sjlj_runtime_available && is_guest_cxxabi_symbol(name) {
-                    bins.iter()
-                        .find_map(|other_bin| other_bin.external_symbols.get(name))
-                        .copied()
+                    self.guest_cxxabi_export(name)
                 } else {
                     None
                 };
@@ -1291,6 +1324,19 @@ impl Dyld {
                     mem.write(ptr_ptr, Ptr::from_bits(addr));
                     continue 'ptr_loop;
                 }
+            }
+
+            // A defined-but-not-external C++ ABI symbol (common in
+            // libc++abi.dylib, whose `___cxa_throw` is not marked N_EXT)
+            // would otherwise fall through to the host stub below.
+            if let Some(addr) = self.guest_cxxabi_export(symbol) {
+                register_cxxabi_typeinfo_vtable(
+                    symbol,
+                    addr,
+                    &mut self.cxxabi_typeinfo_vtable_kinds,
+                );
+                mem.write(ptr_ptr, Ptr::from_bits(addr));
+                continue 'ptr_loop;
             }
 
             if symbol == "dyld_stub_binder" || symbol == "_dyld_stub_binder" {
@@ -1794,10 +1840,7 @@ impl Dyld {
         };
 
         if self.guest_sjlj_runtime_available && is_guest_cxxabi_symbol(symbol) {
-            if let Some(&addr) = bins
-                .iter()
-                .find_map(|dylib| dylib.external_symbols.get(symbol))
-            {
+            if let Some(addr) = self.guest_cxxabi_export(symbol) {
                 register_cxxabi_typeinfo_vtable(
                     symbol,
                     addr,
@@ -2021,6 +2064,14 @@ impl Dyld {
 
         if let Some(stub) = self.cxxabi_intercept(mem, symbol) {
             return Ok(stub);
+        }
+
+        // `dlsym`-style lookups must not hand out a host C++ ABI stub when the
+        // app brought its own working SjLj runtime: the host can only fake a
+        // non-local return, which makes `throw` skip the guest's catch block
+        // and re-throw forever. Return the real guest implementation instead.
+        if let Some(addr) = self.guest_cxxabi_export(symbol) {
+            return Ok(GuestFunction::from_addr_with_thumb_bit(addr));
         }
 
         let &(symbol, f) = search_host_dylibs(|dylib| dylib.function_exports, symbol).ok_or(())?;
