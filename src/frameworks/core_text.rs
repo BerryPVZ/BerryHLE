@@ -52,8 +52,8 @@ use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::{get_static_str, to_rust_string};
 use crate::frameworks::foundation::{unichar, NSRange, NSUInteger};
 use crate::frameworks::uikit::ui_font::{
-    custom_font_of_uifont, draw_font_glyph, font_from_uifont, is_uifont,
-    new_uifont_with_custom_font,
+    custom_font_of_uifont, draw_font_glyph, font_for_text, font_from_uifont, is_uifont,
+    new_uifont_with_custom_font, new_uifont_with_name,
 };
 use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr, Ptr};
 use crate::objc::{
@@ -396,7 +396,8 @@ fn CTFontCreateWithName(
         return nil;
     }
     let size = if size == 0.0 { 12.0 } else { size };
-    let font: id = msg_class![env; UIFont fontWithName:name size:size];
+    let name = to_rust_string(env, name).into_owned();
+    let font = new_uifont_with_name(env, &name, size);
     retain(env, font);
     alloc_font(env, font)
 }
@@ -594,7 +595,7 @@ fn CTLineGetTypographicBounds(
     let descender_val: CGFloat = msg![env; font descender];
     let leading_val: CGFloat = msg![env; font leading];
     let text_str = to_rust_string(env, text).into_owned();
-    let font_obj = font_from_uifont(env, font).unwrap_or_else(Font::sans_regular);
+    let font_obj = font_for_text(env, font, &text_str).unwrap_or_else(Font::sans_regular);
     let width = font_obj.calculate_text_size(size, &text_str, None).0;
     if !ascent.is_null() {
         env.mem.write(ascent, ascent_val);
@@ -617,7 +618,7 @@ fn CTLineGetImageBounds(env: &mut Environment, line: CTLineRef, _context: id) ->
     let size: CGFloat = msg![env; font pointSize];
     let ascent_val: CGFloat = msg![env; font ascender];
     let text_str = to_rust_string(env, text).into_owned();
-    let font_obj = font_from_uifont(env, font).unwrap_or_else(Font::sans_regular);
+    let font_obj = font_for_text(env, font, &text_str).unwrap_or_else(Font::sans_regular);
     let (w, h) = font_obj.calculate_text_size(size, &text_str, None);
     CGRect {
         origin: CGPoint {
@@ -639,7 +640,7 @@ fn CTLineDraw(env: &mut Environment, line: CTLineRef, context: id) {
     let font = line_font(env, line);
     let size: CGFloat = msg![env; font pointSize];
     let text_str = to_rust_string(env, text).into_owned();
-    let font_obj = font_from_uifont(env, font).unwrap_or_else(Font::sans_regular);
+    let font_obj = font_for_text(env, font, &text_str).unwrap_or_else(Font::sans_regular);
     let needs_y_flip = CGContextGetCTM(env, context).d > 0.0;
     if needs_y_flip {
         let height = CGBitmapContextGetHeight(env, context) as CGFloat;
@@ -766,7 +767,8 @@ fn CTRunGetGlyphs(env: &mut Environment, run: CTRunRef, range: CFRange, buffer: 
     let Some((start, end)) = glyph_range_for_run(range, count) else {
         return;
     };
-    let font = font_from_uifont(env, ui_font).unwrap_or_else(Font::sans_regular);
+    let text_str = to_rust_string(env, text).into_owned();
+    let font = font_for_text(env, ui_font, &text_str).unwrap_or_else(Font::sans_regular);
     for (output_index, text_index) in (start..end).enumerate() {
         let character: unichar = msg![env; text characterAtIndex:(text_index as NSUInteger)];
         env.mem.write(buffer + output_index as u32, glyph_for_code_unit(&font, character));
@@ -852,7 +854,8 @@ fn CTRunGetPositions(env: &mut Environment, run: CTRunRef, range: CFRange, buffe
     let Some((start, end)) = glyph_range_for_run(range, count) else {
         return;
     };
-    let font = font_from_uifont(env, ui_font).unwrap_or_else(Font::sans_regular);
+    let text_str = to_rust_string(env, text).into_owned();
+    let font = font_for_text(env, ui_font, &text_str).unwrap_or_else(Font::sans_regular);
     let size: CGFloat = msg![env; ui_font pointSize];
     let glyphs: Vec<GlyphId> = (0..end)
         .map(|text_index| {
@@ -976,7 +979,14 @@ fn CTFontGetGlyphsForCharacters(
     }
     // Resolve the backing UIFont, then its rasterizable Font.
     let ui_font = env.objc.borrow::<CTFontHostObject>(font).font;
-    let font_obj = font_from_uifont(env, ui_font).unwrap_or_else(Font::sans_regular);
+    let mut text = String::new();
+    for index in 0..count as u32 {
+        let code_unit: unichar = env.mem.read(characters + index);
+        if let Some(character) = char::from_u32(code_unit as u32) {
+            text.push(character);
+        }
+    }
+    let font_obj = font_for_text(env, ui_font, &text).unwrap_or_else(Font::sans_regular);
     let mut all_mapped = true;
     for i in 0..count as u32 {
         let c: unichar = env.mem.read(characters + i);
@@ -1087,7 +1097,7 @@ fn CTFramesetterSuggestFrameSizeWithConstraints(
     let (text, font, _) = string_and_font_from_attr_string(env, attr_string);
     let size: CGFloat = msg![env; font pointSize];
     let text_str = to_rust_string(env, text).into_owned();
-    let font_obj = font_from_uifont(env, font).unwrap_or_else(Font::sans_regular);
+    let font_obj = font_for_text(env, font, &text_str).unwrap_or_else(Font::sans_regular);
 
     let wrap = if constraints.width.is_finite() && constraints.width > 0.0 {
         Some((constraints.width, WrapMode::Word))

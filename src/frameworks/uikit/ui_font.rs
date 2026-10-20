@@ -71,12 +71,59 @@ enum FontKind {
 struct UIFontHostObject {
     size: CGFloat,
     kind: FontKind,
-    /// A font the app supplied itself (e.g. via `CTFontCreateWithGraphicsFont`
-    /// on a `CGFont` loaded from its bundle). Used instead of `kind`'s
-    /// built-in font for drawing and metrics.
+    /// A resolved font face that is not represented by `kind`, such as a
+    /// Core Graphics font or a legacy system-font alias.
     custom: Option<Font>,
 }
 impl HostObject for UIFontHostObject {}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum FontFace {
+    BuiltIn(FontKind),
+    SimplifiedChinese,
+}
+
+/// Resolve legacy iOS font names used by the Chinese-text compatibility fix.
+/// These CJK/Unicode aliases are routed to touchHLE's Simplified Chinese
+/// fallback; other names keep the existing built-in font substitutions. This
+/// shared mapping keeps UIKit, Core Text, and Core Graphics on the same font
+/// data and Unicode cmap.
+fn resolve_legacy_chinese_font_face(name: &str) -> FontFace {
+    match name {
+        "ArialUnicodeMS" | "Arial Unicode MS" | "STHeitiSC-Light" | "STHeitiSC-Medium"
+        | "STHeitiSC-Regular" | "STHeitiTC-Light" | "STHeitiTC-Medium" | "STHeiti-Light"
+        | "STHeiti-Medium" => FontFace::SimplifiedChinese,
+        _ => FontFace::BuiltIn(get_equivalent_font(name).unwrap_or(FontKind::SansRegular)),
+    }
+}
+
+fn resolve_font_name(env: &mut Environment, name: &str) -> (FontKind, Option<Font>) {
+    match resolve_legacy_chinese_font_face(name) {
+        FontFace::BuiltIn(kind) => (kind, None),
+        FontFace::SimplifiedChinese => {
+            let font = env
+                .framework_state
+                .uikit
+                .ui_font
+                .sans_regular_zh
+                .get_or_insert_with(Font::sans_regular_zh)
+                .clone();
+            (FontKind::SansRegular, Some(font))
+        }
+    }
+}
+
+/// Create a UIFont using the shared resolver used by the Core Text and
+/// Core Graphics font-name entry points.
+pub fn new_uifont_with_name(env: &mut Environment, name: &str, size: CGFloat) -> id {
+    let (kind, custom) = resolve_font_name(env, name);
+    let host_object = UIFontHostObject { size, kind, custom };
+    let class = env.objc.get_known_class("UIFont", &mut env.mem);
+    let new = env
+        .objc
+        .alloc_object(class, Box::new(host_object), &mut env.mem);
+    autorelease(env, new)
+}
 
 pub type UILineBreakMode = NSInteger;
 pub const UILineBreakModeWordWrap: UILineBreakMode = 0;
@@ -239,24 +286,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 + (id)fontWithName:(id)fontName size:(CGFloat)fontSize {
     if fontName == nil {
-        let host_object = UIFontHostObject {
-            kind: FontKind::SansRegular,
-            size: fontSize,
-            custom: None,
-        };
-        let new = env.objc.alloc_object(this, Box::new(host_object), &mut env.mem);
-        return autorelease(env, new);
+        return new_uifont_with_name(env, "Helvetica", fontSize);
     }
     let font_name = to_rust_string(env, fontName).to_string();
-    let host_object = UIFontHostObject {
-        kind: get_equivalent_font(&font_name).unwrap_or({
-            FontKind::SansRegular
-        }),
-        size: fontSize,
-        custom: None,
-    };
-    let new = env.objc.alloc_object(this, Box::new(host_object), &mut env.mem);
-    autorelease(env, new)
+    new_uifont_with_name(env, &font_name, fontSize)
 }
 
 - (id)initWithCoder:(id)coder {
@@ -272,14 +305,16 @@ pub const CLASSES: ClassExports = objc_classes! {
         font_size = msg![env; coder decodeFloatForKey:key_size];
     }
 
-    let kind = if font_name != nil {
-        let name_str = to_rust_string(env, font_name).to_string();
-        get_equivalent_font(&name_str).unwrap_or(FontKind::SansRegular)
+    let (kind, custom) = if font_name != nil {
+        let name = to_rust_string(env, font_name).to_string();
+        resolve_font_name(env, &name)
     } else {
-        FontKind::SansRegular
+        (FontKind::SansRegular, None)
     };
-    env.objc.borrow_mut::<UIFontHostObject>(this).size = font_size as CGFloat;
-    env.objc.borrow_mut::<UIFontHostObject>(this).kind = kind;
+    let host = env.objc.borrow_mut::<UIFontHostObject>(this);
+    host.size = font_size as CGFloat;
+    host.kind = kind;
+    host.custom = custom;
 
     this
 }
@@ -506,10 +541,22 @@ fn convert_line_break_mode(ui_mode: UILineBreakMode) -> WrapMode {
 /// Japanese, Korean) Unicode blocks that the bundled Latin/serif fonts can't
 /// render and which require the Noto Sans CJK fallback.
 fn is_cjk_char(c: u32) -> bool {
-    (0x3000..=0x30FF).contains(&c)
+    (0x2E80..=0x2FFF).contains(&c)
+        || (0x3000..=0x30FF).contains(&c)
+        || (0x3100..=0x312F).contains(&c)
+        || (0x3130..=0x318F).contains(&c)
+        || (0x3190..=0x31FF).contains(&c)
+        || (0x3200..=0x33FF).contains(&c)
         || (0xFF00..=0xFFEF).contains(&c)
-        || (0x4e00..=0x9FA0).contains(&c)
+        || (0x4E00..=0x9FFF).contains(&c)
         || (0x3400..=0x4DBF).contains(&c)
+        || (0xA000..=0xA4CF).contains(&c)
+        || (0xAC00..=0xD7AF).contains(&c)
+        || (0xF900..=0xFAFF).contains(&c)
+        || (0xFE30..=0xFE4F).contains(&c)
+        || (0x1B000..=0x1B16F).contains(&c)
+        || (0x20000..=0x2FA1F).contains(&c)
+        || (0x30000..=0x323AF).contains(&c)
 }
 
 /// Returns `true` if the codepoint belongs to one of the Arabic Unicode blocks.
@@ -523,8 +570,14 @@ fn is_arabic_char(c: u32) -> bool {
     (0xFE70..=0xFEFF).contains(&c) // Arabic Presentation Forms-B
 }
 
+fn font_maps_text(font: &Font, text: &str) -> bool {
+    text.chars()
+        .all(|c| c.is_control() || font.glyph_id_for_unicode(c).0 != 0)
+}
+
+/// Select a touchHLE font with coverage for the supplied Unicode text.
 #[rustfmt::skip]
-fn get_font<'a>(state: &'a mut State, kind: FontKind, text: &str) -> &'a Font {
+fn get_font(env: &mut Environment, kind: FontKind, text: &str) -> Font {
     let mut needs_cjk = false;
     let mut needs_arabic = false;
     for c in text.chars() {
@@ -546,20 +599,40 @@ fn get_font<'a>(state: &'a mut State, kind: FontKind, text: &str) -> &'a Font {
         FontKind::SerifBold | FontKind::SerifBoldItalic
     );
 
-   if needs_cjk {
-    if is_bold {
-        return state.sans_bold_zh.get_or_insert_with(Font::sans_bold_zh);
-    }
-    return state.sans_regular_zh.get_or_insert_with(Font::sans_regular_zh);
-}
-    if needs_arabic {
+    if needs_cjk {
+        let state = &mut env.framework_state.uikit.ui_font;
         if is_bold {
-            return state.sans_bold_ar.get_or_insert_with(Font::sans_bold_ar);
+            return state.sans_bold_zh.get_or_insert_with(Font::sans_bold_zh).clone();
         }
-        return state.sans_regular_ar.get_or_insert_with(Font::sans_regular_ar);
+        return state.sans_regular_zh.get_or_insert_with(Font::sans_regular_zh).clone();
+    }
+    if needs_arabic {
+        let state = &mut env.framework_state.uikit.ui_font;
+        if is_bold {
+            return state.sans_bold_ar.get_or_insert_with(Font::sans_bold_ar).clone();
+        }
+        return state.sans_regular_ar.get_or_insert_with(Font::sans_regular_ar).clone();
     }
 
-    state.get_font_by_kind(kind)
+    env.framework_state.uikit.ui_font.get_font_by_kind(kind).clone()
+}
+
+/// Select the font used for a particular string, applying touchHLE's built-in
+/// Unicode fallbacks when the requested font cannot map the text.
+pub fn font_for_text(env: &mut Environment, obj: id, text: &str) -> Option<Font> {
+    if !is_uifont(env, obj) {
+        return None;
+    }
+    let (kind, custom) = {
+        let host = env.objc.borrow::<UIFontHostObject>(obj);
+        (host.kind, host.custom.clone())
+    };
+    if let Some(font) = custom {
+        if font_maps_text(&font, text) {
+            return Some(font);
+        }
+    }
+    Some(get_font(env, kind, text))
 }
 
 pub fn size_with_font(
@@ -568,15 +641,14 @@ pub fn size_with_font(
     text: &str,
     constrained: Option<(CGSize, UILineBreakMode)>,
 ) -> CGSize {
-    let host_object = env.objc.borrow::<UIFontHostObject>(font);
-    let font = get_font(
-        &mut env.framework_state.uikit.ui_font,
-        host_object.kind,
-        text,
-    );
+    let size = {
+        let host_object = env.objc.borrow::<UIFontHostObject>(font);
+        host_object.size
+    };
+    let font = font_for_text(env, font, text).unwrap_or_else(Font::sans_regular);
     let wrap = constrained.map(|(size, ui_mode)| (size.width, convert_line_break_mode(ui_mode)));
 
-    let (width, height) = font.calculate_text_size(host_object.size, text, wrap);
+    let (width, height) = font.calculate_text_size(size, text, wrap);
     CGSize { width, height }
 }
 
@@ -586,15 +658,14 @@ pub fn break_lines_with_font<'a>(
     text: &'a str,
     constrained: Option<(CGSize, UILineBreakMode)>,
 ) -> Vec<(f32, &'a str)> {
-    let host_object = env.objc.borrow::<UIFontHostObject>(font);
-    let font = get_font(
-        &mut env.framework_state.uikit.ui_font,
-        host_object.kind,
-        text,
-    );
+    let size = {
+        let host_object = env.objc.borrow::<UIFontHostObject>(font);
+        host_object.size
+    };
+    let font = font_for_text(env, font, text).unwrap_or_else(Font::sans_regular);
     let wrap = constrained.map(|(size, ui_mode)| (size.width, convert_line_break_mode(ui_mode)));
 
-    font.break_lines(host_object.size, text, wrap)
+    font.break_lines(size, text, wrap)
 }
 
 #[inline(always)]
@@ -652,22 +723,19 @@ pub fn draw_at_point(
     width_and_line_break_mode: Option<(CGFloat, UILineBreakMode)>,
 ) -> CGSize {
     let context = UIGraphicsGetCurrentContext(env);
-    let host_object = env.objc.borrow::<UIFontHostObject>(font);
-
-    let font = get_font(
-        &mut env.framework_state.uikit.ui_font,
-        host_object.kind,
-        text,
-    );
+    let size = {
+        let host_object = env.objc.borrow::<UIFontHostObject>(font);
+        host_object.size
+    };
+    let font = font_for_text(env, font, text).unwrap_or_else(Font::sans_regular);
     let width_and_line_break_mode =
         width_and_line_break_mode.map(|(width, ui_mode)| (width, convert_line_break_mode(ui_mode)));
     let clip_x = width_and_line_break_mode.map(|(width, _)| point.x..(point.x + width));
-    let (width, height) =
-        font.calculate_text_size(host_object.size, text, width_and_line_break_mode);
+    let (width, height) = font.calculate_text_size(size, text, width_and_line_break_mode);
     let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
     let fill_color = drawer.rgb_fill_color();
     font.draw(
-        host_object.size,
+        size,
         text,
         (point.x, point.y),
         width_and_line_break_mode,
@@ -688,12 +756,11 @@ pub fn draw_in_rect(
     let context = UIGraphicsGetCurrentContext(env);
     let text_size = size_with_font(env, font, text, Some((rect.size, line_break_mode)));
 
-    let host_object = env.objc.borrow::<UIFontHostObject>(font);
-    let font = get_font(
-        &mut env.framework_state.uikit.ui_font,
-        host_object.kind,
-        text,
-    );
+    let size = {
+        let host_object = env.objc.borrow::<UIFontHostObject>(font);
+        host_object.size
+    };
+    let font = font_for_text(env, font, text).unwrap_or_else(Font::sans_regular);
     let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
     let fill_color = drawer.rgb_fill_color();
     let (origin_x_offset, alignment) = match alignment {
@@ -703,7 +770,7 @@ pub fn draw_in_rect(
         _ => (0.0, TextAlignment::Left),
     };
     font.draw(
-        host_object.size,
+        size,
         text,
         (rect.origin.x + origin_x_offset, rect.origin.y),
         Some((rect.size.width, convert_line_break_mode(line_break_mode))),
@@ -737,7 +804,6 @@ fn get_equivalent_font(system_font: &str) -> Option<FontKind> {
         "Arial-ItalicMT"                   => Some(FontKind::SansItalic),
         "Arial-BoldItalicMT"               => Some(FontKind::SansBoldItalic),
         "ArialRoundedMTBold"               => Some(FontKind::SansBold),
-        "ArialUnicodeMS"                   => None,
         "Helvetica"                        => Some(FontKind::SansRegular),
         "Helvetica-Bold"                   => Some(FontKind::SansBold),
         "Helvetica-Oblique"                => Some(FontKind::SansItalic),

@@ -104,7 +104,14 @@ impl RasterGlyph<'_> {
 
 impl Font {
     pub fn glyph_id_for_char(&self, c: u16) -> GlyphId {
-        self.rt().glyph(char::from_u32(c as u32).unwrap()).id()
+        self.glyph_id_for_unicode(char::from_u32(c as u32).unwrap())
+    }
+
+    /// Look up a glyph using the font's Unicode cmap for a full codepoint.
+    /// Unlike `glyph_id_for_char`, this also supports supplementary-plane
+    /// characters that cannot be represented by a single UTF-16 code unit.
+    pub fn glyph_id_for_unicode(&self, c: char) -> GlyphId {
+        self.rt().glyph(c).id()
     }
 
     /// Returns the total number of glyphs in the font.
@@ -196,7 +203,10 @@ impl Font {
         match glyph.pixel_bounding_box() {
             Some(bb) => (
                 bb.min.x as f32,
-                bb.min.y as f32,
+                // As in `glyph_bbox`, CoreText returns a baseline-relative
+                // rect in a y-up coordinate system, while rusttype's raster
+                // bounds have y increasing downwards.
+                -(bb.max.y as f32),
                 (bb.max.x - bb.min.x) as f32,
                 (bb.max.y - bb.min.y) as f32,
             ),
@@ -224,7 +234,11 @@ impl Font {
         match g.pixel_bounding_box() {
             Some(bb) => {
                 let x = bb.min.x as f32;
-                let y = bb.min.y as f32;
+                // rusttype's raster bounds use a top-left origin with y
+                // increasing downwards. CGFont glyph bounds are in the
+                // Core Graphics font coordinate system (baseline origin,
+                // y increasing upwards), so the lower edge is -bb.max.y.
+                let y = -(bb.max.y as f32);
                 let w = (bb.max.x - bb.min.x) as f32;
                 let h = (bb.max.y - bb.min.y) as f32;
                 (x, y, w, h)
