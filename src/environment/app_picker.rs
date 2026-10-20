@@ -466,9 +466,11 @@ const CLASSES: ClassExports = objc_classes! {
 
     match paths::url_for_opening_apps_dir() {
         Ok(url) => {
-            // Our `openURL:` implementation is bypassed because it doesn't
-            // allow non-web URLs.
-            let url_res = crate::window::open_url(env, &url);
+            // On Android the file manager needs URI permissions granted
+            // explicitly for our DocumentsProvider. Using the dedicated
+            // file-manager path ensures vnd.android.document/directory MIME
+            // type and FLAG_GRANT_READ/_WRITE_URI_PERMISSION are set.
+            let url_res = crate::window::open_file_manager_url(env, &url);
             if let Err(e) = url_res {
                 echo!("Couldn't open file manager at {:?}: {}", url, e);
             } else {
