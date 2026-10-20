@@ -451,7 +451,8 @@ pub struct Dyld {
     swift_data_slots: HashMap<String, u32>,
     cxxabi_typeinfo_vtable_kinds: HashMap<u32, CxxAbiTypeInfoKind>,
     guest_sjlj_runtime_available: bool,
-    /// Guest (bundled dylib) implementations of the Itanium/SjLj C++ ABI.
+    /// Guest (main executable or bundled dylib) implementations of the
+    /// Itanium/SjLj C++ ABI.
     ///
     /// When an app ships a complete SjLj runtime (libgcc_s + libc++abi /
     /// libstdc++), its own unwinder can handle `throw`/`catch` correctly.
@@ -508,8 +509,8 @@ impl Dyld {
             .copied()
     }
 
-    /// Guest address of a bundled C++ ABI implementation, if the app ships a
-    /// working SjLj runtime and defines the symbol itself.
+    /// Guest address of an app-provided C++ ABI implementation, if the app
+    /// ships a working SjLj runtime and defines the symbol itself.
     pub(crate) fn guest_cxxabi_export(&self, name: &str) -> Option<u32> {
         if !self.guest_sjlj_runtime_available {
             return None;
