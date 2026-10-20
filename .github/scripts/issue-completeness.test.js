@@ -7,7 +7,7 @@ const { checkIssue, run, LABEL, MARKER } = require('./issue-completeness.js');
 
 const CERTIFY = `### By submitting this issue, I certify that…
 
-- [x] I have searched existing issues and this is not a duplicate.`;
+- [x] I have searched existing issues and this is not a duplicate`;
 
 function fixForm({ ipa, bug, log }) {
   return `### App / game name
@@ -41,10 +41,8 @@ const LOG = `touchHLE UNOFFICIAL v0.2.3 (f0fcd6e-dirty)
 touchHLE::window: Using bundled ANGLE for Android OpenGL ES`;
 
 test('complete fix request passes', () => {
-  assert.deepStrictEqual(
-    checkIssue(fixForm({ ipa: IPA, bug: BUG, log: LOG })).missing,
-    [],
-  );
+  const body = fixForm({ ipa: IPA, bug: BUG, log: LOG });
+  assert.deepStrictEqual(checkIssue(body), { missing: [], needsLog: false });
 });
 
 test('App Store link is not enough', () => {
@@ -56,10 +54,11 @@ test('App Store link is not enough', () => {
   assert.deepStrictEqual(checkIssue(body).missing, ['a direct IPA link']);
 });
 
-test('the log is optional', () => {
+test('a missing log is noted but optional', () => {
   for (const log of ['', '...', '_No response_', IPA]) {
     const body = fixForm({ ipa: IPA, bug: BUG, log });
-    assert.deepStrictEqual(checkIssue(body).missing, [], log);
+    const result = checkIssue(body);
+    assert.deepStrictEqual(result, { missing: [], needsLog: true }, log);
   }
 });
 
@@ -71,17 +70,27 @@ test('empty answers are missing', () => {
   ]);
 });
 
-test('IPA links with parentheses count', () => {
+test('IPA link pasted into the log field is not a log', () => {
   const ipa =
     'https://archive.org/download/x/BackStab-(com.gameloft.BackStab)-1.0.0.ipa';
-  const body = fixForm({ ipa: `[BackStab](${ipa})`, bug: BUG, log: '' });
-  assert.deepStrictEqual(checkIssue(body).missing, []);
+  const body = fixForm({ ipa: `[BackStab](${ipa})`, bug: BUG, log: ipa });
+  assert.deepStrictEqual(checkIssue(body), { missing: [], needsLog: true });
+});
+
+test('linked or attached logs count', () => {
+  for (const log of [
+    '[touchHLE_log.txt](https://github.com/user-attachments/files/33634357/touchHLE_log.txt)',
+    "Here's the log: https://www.dropbox.com/scl/fi/abc/touchHLE_log.txt?dl=0",
+  ]) {
+    const body = fixForm({ ipa: IPA, bug: BUG, log });
+    assert.strictEqual(checkIssue(body).needsLog, false, log);
+  }
 });
 
 test('deprecated form with only the checkbox is missing everything', () => {
   const body = `### By submitting this issue, I certify that…
 
-- [x] I understand this form is deprecated and I should use the “Request a fix for a specific game / app” form.`;
+- [x] I understand this form is deprecated and I should use the “Request a fix for a specific game / app” form`;
   assert.strictEqual(checkIssue(body).missing.length, 2);
 });
 
@@ -105,14 +114,14 @@ ${CERTIFY}`;
 });
 
 test('feature requests only need a description', () => {
-  const body = `### Describe the feature or issue.
+  const body = `### Describe the feature or issue
 
 Please add an option to cap the frame rate so games use less battery.
 
 ${CERTIFY}`;
-  assert.deepStrictEqual(checkIssue(body).missing, []);
+  assert.deepStrictEqual(checkIssue(body), { missing: [], needsLog: false });
   assert.deepStrictEqual(
-    checkIssue('### Describe the feature or issue.\n\n_No response_').missing,
+    checkIssue('### Describe the feature or issue\n\n_No response_').missing,
     ['a description of the bug'],
   );
 });
@@ -157,7 +166,7 @@ _Filed via the HyperHLE Telegram fix bot._`;
   assert.deepStrictEqual(checkIssue(attached).missing, []);
 
   const noLog = body.replace(/<details>[\s\S]*<\/details>/, '_none provided_');
-  assert.deepStrictEqual(checkIssue(noLog).missing, []);
+  assert.deepStrictEqual(checkIssue(noLog), { missing: [], needsLog: true });
 });
 
 // A fake Octokit that records the calls run() makes.
@@ -211,6 +220,63 @@ test('run closes an incomplete issue with a comment and label', async () => {
   assert.deepStrictEqual(calls[1][1].labels, [LABEL]);
   assert.strictEqual(calls[2][1].state, 'closed');
   assert.strictEqual(calls[2][1].state_reason, 'not_planned');
+});
+
+test('run mentions the missing log when closing for something else', async () => {
+  const { calls, github } = fakeGithub();
+  const body = fixForm({ ipa: '', bug: BUG, log: '' });
+  await run({ github, context: ctx({ body }), core });
+  assert.match(calls[0][1].body, /a direct IPA link/);
+  assert.match(calls[0][1].body, /no log/);
+  assert.strictEqual(calls.at(-1)[1].state, 'closed');
+});
+
+test('run comments on a missing log without closing', async () => {
+  const { calls, github } = fakeGithub();
+  const body = fixForm({ ipa: IPA, bug: BUG, log: '' });
+  await run({ github, context: ctx({ body }), core });
+  assert.deepStrictEqual(
+    calls.map((c) => c[0]),
+    ['createComment'],
+  );
+  assert.match(calls[0][1].body, /@someone/);
+  assert.match(calls[0][1].body, /staying open/);
+  assert.match(calls[0][1].body, /no log/);
+});
+
+test('run thanks the author once the log is added', async () => {
+  const { calls: first, github: g1 } = fakeGithub();
+  const noLog = fixForm({ ipa: IPA, bug: BUG, log: '' });
+  await run({ github: g1, context: ctx({ body: noLog }), core });
+  const ours = { id: 3, user: { type: 'Bot' }, body: first[0][1].body };
+
+  const { calls, github } = fakeGithub([ours]);
+  const body = fixForm({ ipa: IPA, bug: BUG, log: LOG });
+  await run({ github, context: ctx({ body }, 'edited'), core });
+  assert.deepStrictEqual(
+    calls.map((c) => c[0]),
+    ['updateComment'],
+  );
+  assert.strictEqual(calls[0][1].comment_id, 3);
+  assert.match(calls[0][1].body, /Thanks for adding the log/);
+
+  // A repeated edit without a log leaves the note as it is.
+  const { calls: again, github: g3 } = fakeGithub([ours]);
+  await run({ github: g3, context: ctx({ body: noLog }, 'edited'), core });
+  assert.deepStrictEqual(again, []);
+});
+
+test('run reopens without a log but still asks for one', async () => {
+  const ours = { id: 99, user: { type: 'Bot' }, body: `${MARKER}\nclosed` };
+  const { calls, github } = fakeGithub([ours]);
+  const body = fixForm({ ipa: IPA, bug: BUG, log: '' });
+  const issue = { body, state: 'closed', labels: [{ name: LABEL }] };
+  await run({ github, context: ctx(issue, 'edited'), core });
+  assert.deepStrictEqual(
+    calls.map((c) => c[0]),
+    ['update', 'removeLabel', 'updateComment'],
+  );
+  assert.match(calls[2][1].body, /reopened, but it has no log/);
 });
 
 test('run leaves complete issues alone', async () => {
