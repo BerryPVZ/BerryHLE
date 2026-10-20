@@ -150,38 +150,23 @@ public class MainActivity extends SDLActivity {
         if (act == null || uriStr == null || uriStr.isEmpty()) {
             return -1;
         }
-        // First try with directory MIME type and grant flags via chooser
+        // ACTION_VIEW with a directory MIME type is not consistently handled
+        // by Android file managers (many devices have no matching activity).
+        // Use the Storage Access Framework's tree picker instead; it is backed
+        // by DocumentsProvider and works even when no third-party file manager
+        // is installed. EXTRA_INITIAL_URI asks Android 8+ to start in the
+        // touchHLE apps directory.
         try {
             android.net.Uri uri = android.net.Uri.parse(uriStr);
-            android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_VIEW);
-            intent.setDataAndType(uri, "vnd.android.document/directory");
-            intent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
-                    | android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-                    | android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
-            // Also grant via ClipData for Android 5+ chooser handling
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
-                intent.setClipData(android.content.ClipData.newRawUri("", uri));
-            }
-            act.startActivity(android.content.Intent.createChooser(intent, "Open with"));
-            return 0;
-        } catch (Throwable t) {
-            Log.w(TAG, "openContentUri with MIME failed for " + uriStr + ", trying fallback", t);
-        }
-        // Fallback: plain VIEW without MIME type
-        try {
-            android.net.Uri uri = android.net.Uri.parse(uriStr);
-            android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_VIEW);
-            intent.setData(uri);
-            intent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
-                    | android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-                    | android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
-                intent.setClipData(android.content.ClipData.newRawUri("", uri));
+            android.content.Intent intent = new android.content.Intent(
+                    android.content.Intent.ACTION_OPEN_DOCUMENT_TREE);
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                intent.putExtra(android.provider.DocumentsContract.EXTRA_INITIAL_URI, uri);
             }
             act.startActivity(intent);
             return 0;
         } catch (Throwable t) {
-            Log.e(TAG, "openContentUri failed for " + uriStr, t);
+            Log.e(TAG, "openContentUri tree picker failed for " + uriStr, t);
             return -1;
         }
     }
