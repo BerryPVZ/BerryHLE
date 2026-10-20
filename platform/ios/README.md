@@ -12,9 +12,9 @@ fork, so report problems here rather than there.
 
 ## Downloads
 
-Every run of the [HyperHLE CI workflow](https://github.com/KlugKlugTG/HyperHLE-Fork/actions/workflows/HyperHLE_release.yml)
+Every run of the [HyperHLE CI workflow](https://github.com/KlugKlugTG/HyperHLE-Reborn/actions/workflows/HyperHLE_release.yml)
 uploads the three IPAs below as separate artifacts, and
-[releases](https://github.com/KlugKlugTG/HyperHLE-Fork/releases) attach them
+[releases](https://github.com/KlugKlugTG/HyperHLE-Reborn/releases) attach them
 too:
 
 | Your iOS | IPA | How JIT gets enabled |

@@ -48,7 +48,7 @@ done
 
 android_apk=""
 for candidate in \
-    artifacts/android/HyperHLE-Fork.apk \
+    artifacts/android/HyperHLE-Reborn.apk \
     artifacts/android/touchHLE.apk
 do
     if [ -e "$candidate" ]; then

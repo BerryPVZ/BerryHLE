@@ -687,7 +687,7 @@ fn app_picker_inner(
         let label: id = msg![env; label initWithFrame:label_frame];
         let text = ns_string::from_rust_string(
             env,
-            format!("{HYPERHLE_FORK_NAME} ({})", crate::COMMIT_HASH),
+            format!("{HYPERHLE_REBORN_NAME} ({})", crate::COMMIT_HASH),
         );
         () = msg![env; label setText:text];
         () = msg![env; label setTextAlignment:UITextAlignmentRight];
@@ -1272,7 +1272,7 @@ fn app_picker_inner(
     (app_path, option_args)
 }
 
-const HYPERHLE_FORK_NAME: &str = "HyperHLE-Fork";
+const HYPERHLE_REBORN_NAME: &str = "HyperHLE-Reborn";
 
 /// Old-iOS home screen layout: a fixed 4×4 icon grid above a row of page dots,
 /// and a translucent dock along the bottom edge.
@@ -3024,7 +3024,7 @@ fn setup_settings(
     let footer = new_label(
         env,
         rect(0.0, y, width, 18.0),
-        &format!("{HYPERHLE_FORK_NAME} ({})", crate::COMMIT_HASH),
+        &format!("{HYPERHLE_REBORN_NAME} ({})", crate::COMMIT_HASH),
         12.0,
         false,
         gray_text,

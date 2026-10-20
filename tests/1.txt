@@ -348,7 +348,7 @@ touchHLE::window: Received app-did-enter-background event.
 im here
 
 touchHLE UNOFFICIAL v0.2.3 (47a3927-dirty) — https://touchhle.org/
-Built from branch "trunk" of "KlugKlugTG/HyperHLE-Fork" by GitHub Actions workflow run https://github.com/KlugKlugTG/HyperHLE-Fork/actions/runs/34129384929.
+Built from branch "trunk" of "KlugKlugTG/HyperHLE-Reborn" by GitHub Actions workflow run https://github.com/KlugKlugTG/HyperHLE-Reborn/actions/runs/34129384929.
 
 touchHLE: Base path for touchHLE files: /storage/emulated/0/Android/data/org.touchhle.android.unofficial/files
 No app specified, opening app picker. Use the --help flag to see command-line usage.
