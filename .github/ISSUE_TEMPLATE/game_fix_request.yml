@@ -1,22 +1,22 @@
 name: Request a fix for a specific game / app
-description: Use this form to request that a specific game or app be fixed in this fork of touchHLE.
+description: Use this form to request that a specific game or app be fixed in this fork of touchHLE
 labels: ["game fix request"]
 body:
   - type: markdown
     attributes:
       value: |
         Use this form to request a fix for a specific game or app in this fork of
-        touchHLE. Unlike upstream, this fork accepts requests to investigate and
-        fix specific games (for example: Angry Birds, MM Park, etc.).
+        touchHLE, unlike upstream, this fork accepts requests to investigate and
+        fix specific games (for example: Angry Birds, MM Park, etc.)
 
         Before opening a request, please:
         - Check the app compatibility database to
-          see if the app is already known to work or is being tracked.
+          see if the app is already known to work or is being tracked
         - Search [existing issues](https://github.com/j92580498-max/touchHLE/issues)
-          to avoid duplicates.
+          to avoid duplicates
 
         Filling out as many fields as possible (logs, version, OS) makes it much
-        more likely the issue can actually be reproduced and fixed.
+        more likely the issue can actually be reproduced and fixed
   - type: input
     attributes:
       label: App / game name
@@ -26,7 +26,7 @@ body:
   - type: input
     attributes:
       label: App version
-      description: The version of the app/game (as shown in its Info.plist or in the App Store metadata).
+      description: The version of the app/game (as shown in its Info.plist or in the App Store metadata)
       placeholder: '1.0'
     validations:
       required: true
@@ -34,9 +34,9 @@ body:
     attributes:
       label: IPA link(s)
       description: |
-        Direct download link(s) to the `.ipa` (or zipped `.app`). One link per
-        line. App Store pages are not accepted. Issues without one are closed
-        automatically.
+        Direct download link(s) to the `.ipa` (or zipped `.app`), one link per
+        line, App Store pages are not accepted, issues without one are closed
+        automatically
       placeholder: |
         https://example.com/app.ipa
     validations:
@@ -44,13 +44,13 @@ body:
   - type: input
     attributes:
       label: App DB report link (if available)
-      description: Link to the app's entry in the touchHLE compatibility database, if one exists.
+      description: Link to the app's entry in the touchHLE compatibility database, if one exists
     validations:
       required: false
   - type: input
     attributes:
       label: touchHLE version (this fork)
-      description: The version or commit hash of this fork that you tested.
+      description: The version or commit hash of this fork that you tested
       placeholder: 'v0.2.2 / commit abcdef0'
     validations:
       required: true
@@ -70,7 +70,7 @@ body:
     attributes:
       label: What is the problem with the app?
       description: |
-        Describe the issue as precisely as possible. What did you do? What did
+        Describe the issue as precisely as possible, what did you do? What did
         you expect to happen? What actually happened? Where in the game does it
         fail (boot, menu, level load, gameplay)?
     validations:
@@ -78,7 +78,7 @@ body:
   - type: textarea
     attributes:
       label: Steps to reproduce
-      description: A numbered list of steps that reliably triggers the problem.
+      description: A numbered list of steps that reliably triggers the problem
       placeholder: |
         1. Launch the app
         2. Tap "Play"
@@ -89,31 +89,30 @@ body:
     attributes:
       label: Log output
       description: |
-        On Android, this is the `log.txt` file. On Windows / macOS / Linux, this
+        On Android, this is the `log.txt` file, on Windows / macOS / Linux, this
         is the output visible in the Terminal / Command Prompt / PowerShell that
-        ran touchHLE. Please paste as much as possible, especially around the
-        moment the bug occurs. Issues without a log are closed
-        automatically.
+        ran touchHLE, please paste as much as possible, especially around the
+        moment the bug occurs
       render: 'text'
     validations:
       required: true
   - type: textarea
     attributes:
       label: Screenshots or video (optional)
-      description: Drag and drop images or short videos that show the problem.
+      description: Drag and drop images or short videos that show the problem
     validations:
       required: false
   - type: checkboxes
     attributes:
       label: By submitting this issue, I certify that…
       options:
-        - label: I have searched existing issues and this is not a duplicate.
+        - label: I have searched existing issues and this is not a duplicate
           required: true
-        - label: I legally own the app / game I am asking about.
+        - label: I legally own the app / game I am asking about
           required: true
-        - label: I understand that linking to, discussing or asking for pirated content is not permitted, and will lead to an immediate ban.
+        - label: I understand that linking to, discussing or asking for pirated content is not permitted, and will lead to an immediate ban
           required: true
-        - label: I understand that “Abandonware” and illegal copies of free games are also pirated content.
+        - label: I understand that “Abandonware” and illegal copies of free games are also pirated content
           required: true
-        - label: I understand that fixes are best-effort and there is no guarantee that this specific app will be made to work.
+        - label: I understand that fixes are best-effort and there is no guarantee that this specific app will be made to work
           required: true

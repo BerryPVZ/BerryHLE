@@ -1,5 +1,6 @@
-// Closes issues that are missing a log, an IPA link or a description of the
-// bug, and reopens them once an edit adds what was missing.
+// Closes issues that are missing an IPA link or a description of the bug, and
+// reopens them once an edit adds what was missing. A missing log is optional:
+// it is pointed out in a comment but never closes the issue.
 //
 // Used by .github/workflows/issue_completeness.yml through
 // actions/github-script. checkIssue() is pure so it can be tested locally:
@@ -8,6 +9,8 @@
 const LABEL = 'incomplete report';
 const SKIP_LABEL = 'skip auto-close';
 const MARKER = '<!-- hyperhle-issue-completeness -->';
+// Tags our comment while it asks for a log, so adding one can thank the author.
+const LOG_MARKER = '<!-- hyperhle-needs-log -->';
 const TELEGRAM_FOOTER = 'Filed via the HyperHLE Telegram fix bot.';
 const MAINTAINERS = ['OWNER', 'MEMBER', 'COLLABORATOR'];
 
@@ -116,21 +119,32 @@ function checkIssue(body) {
 
   const missing = [];
   if (!description) missing.push('a description of the bug');
-  if (!isFeature) {
-    if (!ipa) missing.push('a direct IPA link');
-    if (!log) missing.push('a log');
-  }
-  return { missing };
+  if (!isFeature && !ipa) missing.push('a direct IPA link');
+  return { missing, needsLog: !isFeature && !log };
 }
 
-function comment(missing, author) {
+const LOG_NOTE = `it has no log from the run that failed, a log is optional but makes the problem much easier to fix, please **edit this issue** to add one if you can
+${LOG_MARKER}`;
+
+function closeComment(missing, needsLog, author) {
   const list = missing.map((m) => `- ${m}`).join('\n');
+  const log = needsLog ? `\n\nAlso, ${LOG_NOTE}` : '';
   return `${MARKER}
 Hi @${author}, this issue has been closed automatically because it is missing:
 
 ${list}
 
-Every bug report or fix request needs a description of the bug, a direct link to the IPA (not an App Store page) and the log from the run that failed. Please **edit this issue** to add what is missing and it will be reopened automatically.`;
+Every bug report or fix request needs a description of the bug and a direct link to the IPA (not an App Store page), please **edit this issue** to add what is missing and it will be reopened automatically${log}`;
+}
+
+function logComment(author) {
+  return `${MARKER}\nHi @${author}, this issue is staying open, but ${LOG_NOTE}`;
+}
+
+function reopenComment(needsLog) {
+  const log = needsLog ? `, but ${LOG_NOTE}` : '';
+  return `${MARKER}
+Thanks! The issue now has everything it needs, so it has been reopened${log}`;
 }
 
 async function run({ github, context, core }) {
@@ -140,36 +154,50 @@ async function run({ github, context, core }) {
   const viaTelegram = (issue.body || '').includes(TELEGRAM_FOOTER);
 
   if (issue.pull_request || labels.includes(SKIP_LABEL)) return;
-  // Edits only matter for issues this workflow closed, so editing an issue
-  // filed before it existed never closes it.
-  if (context.payload.action === 'edited' && !labels.includes(LABEL)) return;
   if (MAINTAINERS.includes(issue.author_association) && !viaTelegram) {
     core.info('Issue opened by a maintainer, skipping.');
     return;
   }
 
-  const { missing } = checkIssue(issue.body);
+  const { missing, needsLog } = checkIssue(issue.body);
   core.info(`Missing: ${missing.join(', ') || 'nothing'}`);
+  core.info(`Log: ${needsLog ? 'missing' : 'present or not needed'}`);
   const params = { owner, repo, issue_number: issue.number };
 
   const comments = await github.paginate(github.rest.issues.listComments, params);
   const ours = comments.find(
     (c) => c.user.type === 'Bot' && c.body.includes(MARKER),
   );
+  // Edits only matter for issues this workflow commented on, so editing an
+  // issue filed before it existed never closes it.
+  if (context.payload.action === 'edited' && !labels.includes(LABEL) && !ours) {
+    return;
+  }
+
+  const say = async (body) => {
+    if (!ours) {
+      await github.rest.issues.createComment({ ...params, body });
+    } else if (ours.body !== body) {
+      await github.rest.issues.updateComment({
+        owner,
+        repo,
+        comment_id: ours.id,
+        body,
+      });
+    }
+  };
 
   if (missing.length === 0) {
-    // Only reopen issues this workflow closed, never ones a maintainer did.
-    if (issue.state === 'closed' && labels.includes(LABEL)) {
+    if (issue.state === 'closed') {
+      // Only reopen issues this workflow closed, never ones a maintainer did.
+      if (!labels.includes(LABEL)) return;
       await github.rest.issues.update({ ...params, state: 'open' });
       await github.rest.issues.removeLabel({ ...params, name: LABEL });
-      if (ours) {
-        await github.rest.issues.updateComment({
-          owner,
-          repo,
-          comment_id: ours.id,
-          body: `${MARKER}\nThanks! The issue now has everything it needs, so it has been reopened.`,
-        });
-      }
+      await say(reopenComment(needsLog));
+    } else if (needsLog) {
+      await say(logComment(issue.user.login));
+    } else if (ours && ours.body.includes(LOG_MARKER)) {
+      await say(`${MARKER}\nThanks for adding the log!`);
     }
     return;
   }
@@ -177,17 +205,7 @@ async function run({ github, context, core }) {
   // A closed issue is either already handled or was closed by a maintainer.
   if (issue.state !== 'open') return;
 
-  const body = comment(missing, issue.user.login);
-  if (ours) {
-    await github.rest.issues.updateComment({
-      owner,
-      repo,
-      comment_id: ours.id,
-      body,
-    });
-  } else {
-    await github.rest.issues.createComment({ ...params, body });
-  }
+  await say(closeComment(missing, needsLog, issue.user.login));
   await github.rest.issues.addLabels({ ...params, labels: [LABEL] });
   await github.rest.issues.update({
     ...params,
