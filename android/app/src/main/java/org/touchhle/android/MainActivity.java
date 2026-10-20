@@ -88,8 +88,9 @@ public class MainActivity extends SDLActivity {
     // to notify the emulated app that a page finished loading in a real
     // WebView overlay. Payload packs (overlay id, action) into one long.
 
-    // Request code for the system file picker started by this activity.
+    // Request codes for system document pickers started by this activity.
     private static final int REQUEST_ADD_IPA = 1;
+    private static final int REQUEST_OPEN_APPS_FOLDER = 2;
 
     // =====================================================================
     // Real WebView overlay support (called from Rust via JNI; see
@@ -150,38 +151,36 @@ public class MainActivity extends SDLActivity {
         if (act == null || uriStr == null || uriStr.isEmpty()) {
             return -1;
         }
-        // First try with directory MIME type and grant flags via chooser
+        // ACTION_VIEW with a directory MIME type is not consistently handled
+        // by Android file managers (many devices have no matching activity).
+        // Use the Storage Access Framework's tree picker instead; it is backed
+        // by DocumentsProvider and works even when no third-party file manager
+        // is installed. EXTRA_INITIAL_URI asks Android 8+ to start in the
+        // touchHLE apps directory.
         try {
-            android.net.Uri uri = android.net.Uri.parse(uriStr);
-            android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_VIEW);
-            intent.setDataAndType(uri, "vnd.android.document/directory");
-            intent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
-                    | android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-                    | android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
-            // Also grant via ClipData for Android 5+ chooser handling
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
-                intent.setClipData(android.content.ClipData.newRawUri("", uri));
+            final android.net.Uri uri = android.net.Uri.parse(uriStr);
+            final android.content.Intent intent = new android.content.Intent(
+                    android.content.Intent.ACTION_OPEN_DOCUMENT_TREE);
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                intent.putExtra(android.provider.DocumentsContract.EXTRA_INITIAL_URI, uri);
             }
-            act.startActivity(android.content.Intent.createChooser(intent, "Open with"));
+            // ACTION_OPEN_DOCUMENT_TREE is an activity-for-result contract.
+            // Start it on the UI thread and use startActivityForResult rather
+            // than a fire-and-forget startActivity; some Android versions do
+            // not present the picker reliably without the result contract.
+            act.runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        act.startActivityForResult(intent, REQUEST_OPEN_APPS_FOLDER);
+                    } catch (Throwable t) {
+                        Log.e(TAG, "Couldn't launch apps folder picker for " + uri, t);
+                    }
+                }
+            });
             return 0;
         } catch (Throwable t) {
-            Log.w(TAG, "openContentUri with MIME failed for " + uriStr + ", trying fallback", t);
-        }
-        // Fallback: plain VIEW without MIME type
-        try {
-            android.net.Uri uri = android.net.Uri.parse(uriStr);
-            android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_VIEW);
-            intent.setData(uri);
-            intent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
-                    | android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-                    | android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
-                intent.setClipData(android.content.ClipData.newRawUri("", uri));
-            }
-            act.startActivity(intent);
-            return 0;
-        } catch (Throwable t) {
-            Log.e(TAG, "openContentUri failed for " + uriStr, t);
+            Log.e(TAG, "openContentUri tree picker setup failed for " + uriStr, t);
             return -1;
         }
     }

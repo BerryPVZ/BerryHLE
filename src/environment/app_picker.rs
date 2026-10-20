@@ -66,6 +66,23 @@ struct AppInfo {
     icon_ui_image: Option<id>,
 }
 
+const LAST_APP_FILE: &str = "touchHLE_last_app.txt";
+
+fn last_app_record_path() -> PathBuf {
+    paths::user_data_base_path().join(LAST_APP_FILE)
+}
+
+fn read_last_app_path() -> Option<PathBuf> {
+    let value = std::fs::read_to_string(last_app_record_path()).ok()?;
+    Some(PathBuf::from(value.trim()))
+}
+
+fn remember_last_app_path(path: &Path) {
+    if let Err(error) = std::fs::write(last_app_record_path(), path.to_string_lossy().as_bytes()) {
+        log!("Warning: couldn't save last launched app path: {error}");
+    }
+}
+
 pub fn app_picker(options: Options) -> Result<(PathBuf, Vec<String>), String> {
     let apps_dir = paths::user_data_base_path().join(paths::APPS_DIR);
 
@@ -271,6 +288,7 @@ struct AppPickerDelegateHostObject {
     // Set by the add-app tile; kept separately from icon_tapped because the
     // picker needs to wait for a newly copied IPA to settle before reloading.
     add_ipa: bool,
+    recent_app_tapped: bool,
     settings_show: bool,
     settings_hide: bool,
     scale_hack_default: bool,
@@ -460,25 +478,8 @@ const CLASSES: ClassExports = objc_classes! {
 - (())swipeRight {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).swipe_right = true;
 }
-- (())openFileManager {
-    // Assert (see above).
-    let _ = env.objc.borrow_mut::<AppPickerDelegateHostObject>(this);
-
-    match paths::url_for_opening_apps_dir() {
-        Ok(url) => {
-            // On Android the file manager needs URI permissions granted
-            // explicitly for our DocumentsProvider. Using the dedicated
-            // file-manager path ensures vnd.android.document/directory MIME
-            // type and FLAG_GRANT_READ/_WRITE_URI_PERMISSION are set.
-            let url_res = crate::window::open_file_manager_url(env, &url);
-            if let Err(e) = url_res {
-                echo!("Couldn't open file manager at {:?}: {}", url, e);
-            } else {
-                echo!("Opened game folder at {:?}, returning to the picker.", url);
-            }
-        },
-        Err(e) => echo!("Couldn't open file manager: {}", e),
-    }
+- (())openRecentApp {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).recent_app_tapped = true;
 }
 
 @end
@@ -631,6 +632,27 @@ fn app_picker_inner(
     () = msg![env; swipe_right setDirection:UISwipeGestureRecognizerDirectionRight];
     () = msg![env; main_view addGestureRecognizer:swipe_right];
 
+    // Resolve the last launched app for the dock shortcut. The record is a
+    // path under the apps directory, and is ignored if that app was removed.
+    let remembered_app_path = read_last_app_path();
+    let recent_app = apps.as_mut().ok().and_then(|apps| {
+        let app = apps.iter_mut().find(|app| {
+            remembered_app_path.as_ref().is_some_and(|path| path == &app.path)
+        })?;
+        let image = if let Some(icon) = app.icon.as_ref() {
+            let cg_image = cg_image::from_image(env, icon.clone());
+            msg_class![env; UIImage imageWithCGImage:cg_image]
+        } else {
+            make_icon_from_text(
+                env,
+                &app.display_name.chars().take(2).collect::<String>(),
+                28.0,
+                0.0,
+                (0.35, 0.35, 0.35, 1.0),
+            )
+        };
+        Some((app.path.clone(), app.display_name.clone(), image))
+    });
     let mut icon_grid_stuff = match &mut apps {
         Ok(ref mut apps) => {
             let mut icon_grid_stuff =
@@ -667,7 +689,13 @@ fn app_picker_inner(
         page_dots = make_page_dots(env, main_view, app_frame.size, grid.pages.len());
         update_page_dots(env, &page_dots, 0);
     }
-    let dock = make_dock(env, delegate, main_view, app_frame.size);
+    let dock = make_dock(
+        env,
+        delegate,
+        main_view,
+        app_frame.size,
+        recent_app.as_ref().map(|(_, name, image)| (name.as_str(), *image)),
+    );
     // Build stamp on the page-dot row, right-aligned like the one in the
     // reference home screen. It is added after the dock so nothing covers it.
     let version_label = {
@@ -958,6 +986,7 @@ fn app_picker_inner(
             {
                 Some(app_idx) => {
                     let app_path = apps.as_ref().unwrap()[app_idx].path.clone();
+                    remember_last_app_path(&app_path);
                     echo!("Picked: {}", app_path.display());
                     // iOS-style launch: the icon travels to the middle of the
                     // screen while the screen fades to black.
@@ -979,6 +1008,12 @@ fn app_picker_inner(
             continue;
         }
         let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
+        if std::mem::take(&mut host_obj.recent_app_tapped) {
+            if let Some((path, _, _)) = recent_app.as_ref() {
+                echo!("Picked last launched app: {}", path.display());
+                break path.clone();
+            }
+        }
         if std::mem::take(&mut host_obj.add_ipa) {
             // Snapshot the .ipa files that exist right now, so that when the
             // system file picker finishes, we can detect the new file and
@@ -1645,19 +1680,6 @@ fn make_icon_from_text(
     })
 }
 
-/// Builds the blue folder icon used by the dock's "File manager" shortcut.
-fn make_folder_icon(env: &mut Environment) -> id {
-    make_icon(env, (0.13, 0.42, 0.85, 1.0), |env, context| {
-        let s = env.options.ui_scale.get() as CGFloat;
-        // Tab, body, then a lighter stripe for the gloss.
-        CGContextSetRGBFillColor(env, context, 0.45, 0.68, 0.96, 1.0);
-        CGContextFillRect(env, context, rect(8.0 * s, 14.0 * s, 22.0 * s, 10.0 * s));
-        CGContextFillRect(env, context, rect(8.0 * s, 21.0 * s, 56.0 * s, 38.0 * s));
-        CGContextSetRGBFillColor(env, context, 0.80, 0.90, 1.0, 1.0);
-        CGContextFillRect(env, context, rect(11.0 * s, 26.0 * s, 50.0 * s, 4.0 * s));
-    })
-}
-
 /// Fills one page container (`container_idx`) of the icon grid with the apps
 /// of `page_idx`. The other container is left alone, so it can keep showing
 /// the previous page while a slide animation runs.
@@ -1938,7 +1960,13 @@ const DOCK_MAX_GAP: CGFloat = 26.0;
 
 /// Builds the old-iOS dock at the bottom of the home screen. The shortcuts
 /// live outside the paged grid, so they stay in place while pages slide.
-fn make_dock(env: &mut Environment, delegate: id, main_view: id, screen_size: CGSize) -> id {
+fn make_dock(
+    env: &mut Environment,
+    delegate: id,
+    main_view: id,
+    screen_size: CGSize,
+    recent_app: Option<(&str, id)>,
+) -> id {
     let width = screen_size.width;
     let top = screen_size.height - APP_PICKER_DOCK_HEIGHT;
     let background = ui_color(env, 1.0, 1.0, 1.0, 0.15);
@@ -1959,7 +1987,7 @@ fn make_dock(env: &mut Environment, delegate: id, main_view: id, screen_size: CG
 
     let plus_image = make_icon_from_text(env, "+", 50.0, -6.0, (0.25, 0.25, 0.25, 1.0));
     let settings_image = make_settings_app_icon(env);
-    let folder_image = make_folder_icon(env);
+    let recent_placeholder = make_icon_from_text(env, "↻", 34.0, 0.0, (0.25, 0.25, 0.25, 1.0));
 
     make_dock_item(
         env,
@@ -1979,14 +2007,17 @@ fn make_dock(env: &mut Environment, delegate: id, main_view: id, screen_size: CG
         "Settings",
         "settingsShow",
     );
+    let (recent_label, recent_image) = recent_app
+        .map(|(name, image)| (name, image))
+        .unwrap_or(("Recent app", recent_placeholder));
     make_dock_item(
         env,
         delegate,
         dock,
         first_x + 2.0 * (DOCK_ICON_SIZE + gap),
-        folder_image,
-        "File manager",
-        "openFileManager",
+        recent_image,
+        recent_label,
+        "openRecentApp",
     );
     () = msg![env; main_view addSubview:dock];
     dock
