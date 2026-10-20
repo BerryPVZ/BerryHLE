@@ -351,6 +351,7 @@ fn default_signal_action(env: &mut Environment, signum: i32) {
             crate::libc::stdlib::recover_or_end_guest_termination(
                 env,
                 &format!("raise({signum}) [signal {name}]"),
+                crate::environment::GuestTermination::Signal(signum),
             );
         }
         _ => {

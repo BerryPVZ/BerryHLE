@@ -8,6 +8,7 @@
 
 use crate::abi::{CallFromHost, GuestFunction};
 use crate::dyld::{export_c_func, export_c_func_aliased, FunctionExports};
+use crate::environment::GuestTermination;
 use crate::fs::{resolve_path, GuestPath};
 use crate::libc::clocale::{setlocale, LC_CTYPE};
 use crate::libc::errno::{set_errno, EINVAL};
@@ -873,19 +874,27 @@ pub(crate) fn recover_guest_termination(env: &mut Environment, termination: &str
 ///
 /// This only requests a return through the active host boundary; it never exits
 /// or panics the emulator process directly.
-pub(crate) fn end_guest_termination(env: &mut Environment, termination: &str) {
+pub(crate) fn end_guest_termination(
+    env: &mut Environment,
+    termination: &str,
+    result: GuestTermination,
+) {
     echo!(
         "App called {}; ending the guest session through the return-to-host \
          path.",
         termination
     );
-    env.request_guest_termination();
+    env.request_guest_termination(result);
 }
 
 /// Resume a validated app caller when possible, otherwise end only the guest.
-pub(crate) fn recover_or_end_guest_termination(env: &mut Environment, termination: &str) {
+pub(crate) fn recover_or_end_guest_termination(
+    env: &mut Environment,
+    termination: &str,
+    result: GuestTermination,
+) {
     if !recover_guest_termination(env, termination) {
-        end_guest_termination(env, termination);
+        end_guest_termination(env, termination, result);
     }
 }
 
@@ -909,7 +918,7 @@ fn exit(env: &mut Environment, exit_code: i32) {
             termination,
             path
         );
-        end_guest_termination(env, &termination);
+        end_guest_termination(env, &termination, GuestTermination::Exit(exit_code));
         return;
     }
     if recover_guest_termination(env, &termination) {
@@ -928,7 +937,7 @@ fn exit(env: &mut Environment, exit_code: i32) {
         }
     }
 
-    end_guest_termination(env, &termination);
+    end_guest_termination(env, &termination, GuestTermination::Exit(exit_code));
 }
 
 /// Shared implementation for termination functions that do not run `atexit`
@@ -936,7 +945,7 @@ fn exit(env: &mut Environment, exit_code: i32) {
 fn immediate_exit(env: &mut Environment, name: &str, exit_code: i32) {
     set_errno(env, 0);
     let termination = format!("{name}({exit_code})");
-    recover_or_end_guest_termination(env, &termination);
+    recover_or_end_guest_termination(env, &termination, GuestTermination::Exit(exit_code));
 }
 
 fn _exit(env: &mut Environment, exit_code: i32) {
@@ -966,7 +975,11 @@ fn abort(env: &mut Environment) {
     {
         return;
     }
-    recover_or_end_guest_termination(env, "abort()");
+    recover_or_end_guest_termination(
+        env,
+        "abort()",
+        GuestTermination::Signal(SIGABRT),
+    );
 }
 
 fn bsearch(
@@ -1445,7 +1458,11 @@ fn __assert_rtn(
         file_str,
         line
     );
-    recover_or_end_guest_termination(env, "__assert_rtn()");
+    recover_or_end_guest_termination(
+        env,
+        "__assert_rtn()",
+        GuestTermination::Signal(SIGABRT),
+    );
 }
 
 fn __assert(env: &mut Environment, expr: ConstPtr<u8>, file: ConstPtr<u8>, line: i32) {
@@ -1457,7 +1474,11 @@ fn __assert(env: &mut Environment, expr: ConstPtr<u8>, file: ConstPtr<u8>, line:
         file_str,
         line
     );
-    recover_or_end_guest_termination(env, "__assert()");
+    recover_or_end_guest_termination(
+        env,
+        "__assert()",
+        GuestTermination::Signal(SIGABRT),
+    );
 }
 
 fn __assert_fail(
@@ -1477,7 +1498,11 @@ fn __assert_fail(
         file_str,
         line
     );
-    recover_or_end_guest_termination(env, "__assert_fail()");
+    recover_or_end_guest_termination(
+        env,
+        "__assert_fail()",
+        GuestTermination::Signal(SIGABRT),
+    );
 }
 
 fn read_cstr_safe(env: &mut Environment, ptr: ConstPtr<u8>) -> String {

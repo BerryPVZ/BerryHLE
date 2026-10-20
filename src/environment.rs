@@ -130,6 +130,24 @@ pub static LAST_HOST_CALL_SYMBOL_PTR: std::sync::atomic::AtomicUsize =
 pub static LAST_HOST_CALL_SYMBOL_LEN: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// How a guest process ended, independently of the host process.
+#[derive(Clone, Copy, Debug)]
+pub enum GuestTermination {
+    Exit(i32),
+    Signal(i32),
+}
+
+impl GuestTermination {
+    /// Map the guest result to a CLI or SDL process status.
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Self::Exit(code) => code & 0xff,
+            // Shell convention; do not send a host signal to the emulator.
+            Self::Signal(signal) => 128 + signal,
+        }
+    }
+}
+
 /// The struct containing the entire emulator state. Methods are provided for
 /// execution and management of threads.
 pub struct Environment {
@@ -192,7 +210,7 @@ pub struct Environment {
     /// A guest `exit`/`abort` had no safe frame to recover to. This is consumed
     /// at the existing return-to-host boundary so it cannot terminate the host
     /// process from inside a linked libc function.
-    guest_termination_requested: bool,
+    guest_termination_requested: Option<GuestTermination>,
     /// A required Unity player archive could not be resolved or read from the
     /// mounted bundle. Continuing after Unity calls its fatal exit would
     /// execute a half-initialized engine, so termination recovery is disabled
@@ -967,7 +985,7 @@ impl Environment {
 
                         env.run_call();
 
-                        if env.guest_termination_requested {
+                        if env.guest_termination_requested.is_some() {
                             echo!(
                                 "Guest requested controlled termination; returning to the host."
                             );
@@ -1028,7 +1046,7 @@ impl Environment {
             last_deliberate_trap_bypass: None,
             cpu_error_bypass_lr_count: 0,
             cpu_skipped_instruction_sites: HashMap::new(),
-            guest_termination_requested: false,
+            guest_termination_requested: None,
             missing_unity_player_archive: None,
             guest_control_flow_redirected: false,
             host_to_guest_stack_frames: Vec::new(),
@@ -1216,7 +1234,7 @@ impl Environment {
             last_deliberate_trap_bypass: None,
             cpu_error_bypass_lr_count: 0,
             cpu_skipped_instruction_sites: HashMap::new(),
-            guest_termination_requested: false,
+            guest_termination_requested: None,
             missing_unity_player_archive: None,
             guest_control_flow_redirected: false,
             host_to_guest_stack_frames: Vec::new(),
@@ -1288,7 +1306,7 @@ impl Environment {
             last_deliberate_trap_bypass: None,
             cpu_error_bypass_lr_count: 0,
             cpu_skipped_instruction_sites: HashMap::new(),
-            guest_termination_requested: false,
+            guest_termination_requested: None,
             missing_unity_player_archive: None,
             guest_control_flow_redirected: false,
             host_to_guest_stack_frames: Vec::new(),
@@ -1875,7 +1893,7 @@ impl Environment {
 
     /// Run the emulator. This is the main loop and won't return until app exit.
     /// Only `main.rs` should call this.
-    pub fn run(mut self) {
+    pub(crate) fn run(mut self) -> Option<GuestTermination> {
         let mut curr_host_context = self.threads[0].host_context.take().unwrap();
         let panic_cell = self.panic_cell.clone();
         let mut stepping = false;
@@ -1886,7 +1904,7 @@ impl Environment {
                 let thread = &mut self.threads[self.current_thread];
                 assert!(thread.host_context.is_none());
                 thread.host_context = Some(curr_host_context);
-                return;
+                return None;
             }
 
             if stepping {
@@ -2026,18 +2044,18 @@ impl Environment {
                 self.stall_diag();
             }
 
-            if kill_current_thread && self.guest_termination_requested {
+            if kill_current_thread && self.guest_termination_requested.is_some() {
                 echo!("Guest session ended through the controlled return-to-host path.");
-                return;
+                return self.guest_termination_requested;
             }
-            if self.guest_termination_requested {
+            if self.guest_termination_requested.is_some() {
                 // A host callback may have yielded before its linked-function
                 // dispatch reached the return-to-host check. Put this live
                 // context back so `Environment::drop` can unwind it safely,
                 // then stop before the scheduler resumes another guest thread.
                 self.threads[self.current_thread].host_context = old_context.take();
                 echo!("Guest session ended while returning from a host callback.");
-                return;
+                return self.guest_termination_requested;
             }
 
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2154,13 +2172,13 @@ impl Environment {
     /// Linked libc functions use this when an `exit`/`abort` cannot be safely
     /// unwound. The request is observed by the CPU loop after the host function
     /// returns, so no guest instruction after a `noreturn` call is executed.
-    pub(crate) fn request_guest_termination(&mut self) {
-        self.guest_termination_requested = true;
+    pub(crate) fn request_guest_termination(&mut self, termination: GuestTermination) {
+        self.guest_termination_requested = Some(termination);
     }
 
     /// Whether a linked guest termination function has requested session end.
     pub(crate) fn is_guest_termination_requested(&self) -> bool {
-        self.guest_termination_requested
+        self.guest_termination_requested.is_some()
     }
 
     /// Whether the current thread is still inside the call chain in which a
@@ -3571,7 +3589,7 @@ impl Environment {
 
                             let guest_control_flow_redirected =
                                 std::mem::take(&mut self.guest_control_flow_redirected);
-                            if self.guest_termination_requested {
+                            if self.guest_termination_requested.is_some() {
                                 log_dbg!(
                                     "Guest termination requested on thread {}; \
                                      returning through the host boundary.",
@@ -3666,7 +3684,7 @@ impl Environment {
             );
             return;
         }
-        if self.guest_termination_requested {
+        if self.guest_termination_requested.is_some() {
             log_dbg!(
                 "Guest termination is pending on thread {}; returning to host.",
                 initial_thread
