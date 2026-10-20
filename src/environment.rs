@@ -49,7 +49,7 @@ pub struct Thread {
     pub blocked_by: ThreadBlock,
     /// Container for thread local state of various child modules
     pub thread_local_framework_state: frameworks::ThreadLocalState,
-    /// After a secondary thread finishes, this is set to the returned value.
+    /// The thread's return value, including an explicit main-thread pthread_exit.
     return_value: Option<MutVoidPtr>,
     /// Context object containing the CPU state for this thread.
     ///
@@ -196,25 +196,15 @@ pub struct Environment {
     /// pointer. See `debug_cpu_error`.
     cpu_error_bypass_last_lr: Option<u32>,
     cpu_error_bypass_lr_count: u32,
-    /// The thread and stack pointer of the most recent *deliberate* guest trap
-    /// (`udf`/`trap`/`bkpt`) that was bypassed. A deliberate trap means the
-    /// guest decided its own process is dead (failed assert, unhandled
-    /// managed exception, `__builtin_trap`); bypassing it keeps the emulator
-    /// alive but leaves that call chain running on state its author never
-    /// intended to be reachable. See `guest_trap_bypass_still_on_stack`.
-    last_deliberate_trap_bypass: Option<(ThreadId, u32)>,
     /// Per-site counters for instructions dynarmic could not decode inside a
     /// code section and that were skipped as no-ops (keyed on the fault PC).
     /// Only used to rate-limit logging. See `debug_cpu_error`.
     cpu_skipped_instruction_sites: HashMap<u32, u32>,
-    /// A guest `exit`/`abort` had no safe frame to recover to. This is consumed
-    /// at the existing return-to-host boundary so it cannot terminate the host
-    /// process from inside a linked libc function.
+    /// Guest process result, consumed at the return-to-host boundary without
+    /// terminating the host process inside a linked libc function.
     guest_termination_requested: Option<GuestTermination>,
     /// A required Unity player archive could not be resolved or read from the
-    /// mounted bundle. Continuing after Unity calls its fatal exit would
-    /// execute a half-initialized engine, so termination recovery is disabled
-    /// for this guest session.
+    /// mounted bundle. Retained to report the first missing archive once.
     missing_unity_player_archive: Option<String>,
     /// A linked host function deliberately redirected the guest PC. This skips
     /// the normal post-SVC return, which would overwrite the new continuation
@@ -985,11 +975,22 @@ impl Environment {
 
                         env.run_call();
 
+                        let exited_via_pthread = env.threads[0].return_value.is_some();
+                        if exited_via_pthread {
+                            env.exit_if_last_thread();
+                        } else if entry_point_is_lc_main && !env.is_guest_termination_requested() {
+                            // LC_MAIN enters main directly: dyld normally
+                            // passes its return value to exit(), including
+                            // the registered atexit handlers.
+                            let code = env.cpu.regs()[0] as i32;
+                            crate::libc::stdlib::exit(env, code);
+                        }
+
                         if env.guest_termination_requested.is_some() {
                             echo!(
                                 "Guest requested controlled termination; returning to the host."
                             );
-                        } else {
+                        } else if !exited_via_pthread {
                             panic!("Main function exited unexpectedly!");
                         }
                     })
@@ -1043,7 +1044,6 @@ impl Environment {
             cpu_error_bypass_count: 0,
             cpu_error_bypass_total: 0,
             cpu_error_bypass_last_lr: None,
-            last_deliberate_trap_bypass: None,
             cpu_error_bypass_lr_count: 0,
             cpu_skipped_instruction_sites: HashMap::new(),
             guest_termination_requested: None,
@@ -1231,7 +1231,6 @@ impl Environment {
             cpu_error_bypass_count: 0,
             cpu_error_bypass_total: 0,
             cpu_error_bypass_last_lr: None,
-            last_deliberate_trap_bypass: None,
             cpu_error_bypass_lr_count: 0,
             cpu_skipped_instruction_sites: HashMap::new(),
             guest_termination_requested: None,
@@ -1303,7 +1302,6 @@ impl Environment {
             cpu_error_bypass_count: 0,
             cpu_error_bypass_total: 0,
             cpu_error_bypass_last_lr: None,
-            last_deliberate_trap_bypass: None,
             cpu_error_bypass_lr_count: 0,
             cpu_skipped_instruction_sites: HashMap::new(),
             guest_termination_requested: None,
@@ -1609,7 +1607,8 @@ impl Environment {
                             start_routine.call_from_host(env, (user_data,));
                         let curr_thread = &mut env.threads[env.current_thread];
                         curr_thread.return_value = Some(return_value);
-                        curr_thread.active = false;
+                        env.exit_if_last_thread();
+                        env.threads[env.current_thread].active = false;
                     });
                 }));
                 if let Err(e) = res {
@@ -2027,7 +2026,10 @@ impl Environment {
                 let stack = self.threads[self.current_thread].stack.take().unwrap();
                 let stack: mem::MutVoidPtr = mem::Ptr::from_bits(*stack.start());
                 log_dbg!("Freeing thread {} stack {:?}", self.current_thread, stack);
-                self.mem.free(stack);
+                // The main stack is a fixed mapping, not a heap allocation.
+                if self.current_thread != 0 {
+                    self.mem.free(stack);
+                }
                 None
             } else {
                 Some(curr_host_context)
@@ -2167,10 +2169,30 @@ impl Environment {
         }
     }
 
+    /// Record explicit thread exit separately from returning from main.
+    pub(crate) fn note_pthread_exit(&mut self, retval: mem::MutVoidPtr) {
+        self.threads[self.current_thread].return_value = Some(retval);
+    }
+
+    /// The last thread ends the process as exit(0), while its coroutine can
+    /// still execute guest atexit handlers. Other threads must remain alive
+    /// when only the main thread calls pthread_exit.
+    fn exit_if_last_thread(&mut self) {
+        if !self.is_guest_termination_requested()
+            && !self
+                .threads
+                .iter()
+                .enumerate()
+                .any(|(id, thread)| id != self.current_thread && thread.active)
+        {
+            crate::libc::stdlib::exit(self, 0);
+        }
+    }
+
     /// Request that active guest execution returns through its host boundary.
     ///
-    /// Linked libc functions use this when an `exit`/`abort` cannot be safely
-    /// unwound. The request is observed by the CPU loop after the host function
+    /// Linked libc functions use this for process termination. The request is
+    /// observed by the CPU loop after the host function
     /// returns, so no guest instruction after a `noreturn` call is executed.
     pub(crate) fn request_guest_termination(&mut self, termination: GuestTermination) {
         self.guest_termination_requested = Some(termination);
@@ -2179,39 +2201,6 @@ impl Environment {
     /// Whether a linked guest termination function has requested session end.
     pub(crate) fn is_guest_termination_requested(&self) -> bool {
         self.guest_termination_requested.is_some()
-    }
-
-    /// Whether the current thread is still inside the call chain in which a
-    /// deliberate guest trap (`udf`/`trap`, i.e. a failed assert, a
-    /// `__builtin_trap`, or a Unity/Mono unhandled-exception abort) was
-    /// bypassed.
-    ///
-    /// The stack grows downwards, so the chain that trapped is still live
-    /// while the stack pointer has not risen back above the value it had at
-    /// the trap. Once it has, the guest genuinely returned past the dead
-    /// frames and a later `exit`/`abort` is unrelated to the trap, so the
-    /// normal compatibility recovery applies again.
-    ///
-    /// Observed case (Turbo Dismount, Unity 4.5.4): managed code throws
-    /// `System.NullReferenceException`, Unity logs it and branches to its
-    /// one-instruction `trap` helper, then calls `exit(1)` from the same
-    /// chain. Recovering that `exit` resumed the engine inside its own
-    /// death path, which immediately dereferenced NULL (SIGSEGV), ran the
-    /// crash reporter and aborted — turning a clean shutdown into a crash
-    /// cascade that hid the original managed exception.
-    pub(crate) fn guest_trap_bypass_still_on_stack(&mut self) -> bool {
-        let Some((thread, trap_sp)) = self.last_deliberate_trap_bypass else {
-            return false;
-        };
-        if thread != self.current_thread {
-            return false;
-        }
-        if self.cpu.regs()[cpu::Cpu::SP] > trap_sp {
-            // The guest unwound past the trapping frame under its own power.
-            self.last_deliberate_trap_bypass = None;
-            return false;
-        }
-        true
     }
 
     /// Remember that Unity's mandatory serialized player archive is unavailable.
@@ -2251,16 +2240,9 @@ impl Environment {
         self.missing_unity_player_archive = Some(path.to_owned());
         log!(
             "Required Unity player archive {:?} is unavailable from the mounted \
-             bundle. A following guest termination will return to the host instead \
-             of resuming a \
-             half-initialized Unity engine.",
+             bundle.",
             path
         );
-    }
-
-    /// The unavailable Unity player archive, if a resource probe found one.
-    pub(crate) fn missing_unity_player_archive(&self) -> Option<&str> {
-        self.missing_unity_player_archive.as_deref()
     }
 
     /// Preserve a deliberate guest-PC redirect across linked-stub dispatch.
@@ -3270,15 +3252,6 @@ impl Environment {
                 // so only the dynamic escalation applies on top of the legacy
                 // branch-to-LR.
                 const UNWIND_AFTER_REPEATS: u32 = 4;
-                if let GuestTrapKind::DeliberateTrap { .. } = trap_kind {
-                    // Remember where this happened. A deliberate trap is the
-                    // guest declaring its own process dead; if it later calls
-                    // `exit`/`abort` without having unwound past this frame,
-                    // splicing execution back into that call chain resumes a
-                    // corpse. See `guest_trap_bypass_still_on_stack`.
-                    let sp = self.cpu.regs()[cpu::Cpu::SP];
-                    self.last_deliberate_trap_bypass = Some((self.current_thread, sp));
-                }
                 // Number of wild-PC bypasses after which "fake return to LR"
                 // is assumed to be the thing keeping the guest stuck.
                 const WILD_PC_UNWIND_AFTER: u32 = 32;

@@ -469,10 +469,7 @@ pub fn pthread_exit(env: &mut Environment, retval: MutVoidPtr) {
     // thread-exit SVC that touchHLE already uses when a pthread start routine
     // returns normally.
     //
-    // Note: environment::Thread::return_value is private to environment.rs.
-    // This patch intentionally does not set it here. If a game later joins a
-    // thread that exited via pthread_exit, we should add a small Environment
-    // setter instead of touching that private field from this module.
+    env.note_pthread_exit(retval);
     let thread_exit = env.dyld.thread_exit_routine();
 
     let regs = env.cpu.regs_mut();

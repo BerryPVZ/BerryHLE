@@ -109,14 +109,6 @@ pub struct State {
     /// the same signal must not re-enter the handler (it would recurse
     /// forever); re-raising it performs the default action instead.
     handling: Vec<i32>,
-    /// Whether a fault-class signal (SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGTRAP)
-    /// has been delivered to a guest handler this session. On real Darwin
-    /// such a signal means the process already crashed; if the guest then
-    /// falls through to `abort()`/`exit()`, validated frame recovery would
-    /// resume it in a broken state (observed as a permanently frozen
-    /// screen in Turbo Dismount), so recovery must refuse and the session
-    /// must end instead.
-    pub(crate) fatal_delivered: bool,
 }
 
 // Guest-visible sizes from Darwin's `sys/signal.h` and `mach/arm/_structs.h`
@@ -313,11 +305,8 @@ pub(crate) enum RaiseOutcome {
 /// The Darwin default action for `signum`, performed with the same
 /// controlled guest-termination machinery that `exit()`/`abort()` use.
 ///
-/// Fatal signals must not kill the emulator process: the guest session
-/// ends through the return-to-host path instead, and recovery to a valid
-/// app frame is attempted first (which is what makes games that
-/// deliberately `raise()` a fatal signal during, say, a DRM check
-/// survive).
+/// Fatal signals end the guest session through the return-to-host boundary.
+/// They cannot be recovered by returning to a guest caller frame.
 fn default_signal_action(env: &mut Environment, signum: i32) {
     let name = signal_name(signum);
     match signum {
@@ -348,7 +337,7 @@ fn default_signal_action(env: &mut Environment, signum: i32) {
                 signum,
                 name
             );
-            crate::libc::stdlib::recover_or_end_guest_termination(
+            crate::libc::stdlib::end_guest_termination(
                 env,
                 &format!("raise({signum}) [signal {name}]"),
                 crate::environment::GuestTermination::Signal(signum),
@@ -409,9 +398,6 @@ pub(crate) fn raise_signal(env: &mut Environment, signum: i32) -> RaiseOutcome {
                 handler,
                 signum
             );
-            if is_fault_signal(signum) {
-                env.libc_state.signal.fatal_delivered = true;
-            }
             env.libc_state.signal.handling.push(signum);
             let func = GuestFunction::from_addr_with_thumb_bit(handler);
             let siginfo_context = if action.flags & SA_SIGINFO != 0 {

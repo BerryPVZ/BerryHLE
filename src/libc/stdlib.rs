@@ -801,76 +801,7 @@ fn unsetenv(env: &mut Environment, name: ConstPtr<u8>) -> i32 {
     }
 }
 
-/// Try to turn a guest-only termination request into a non-local guest return.
-///
-/// `abort` and the `exit` family are marked `noreturn` by their callers, so
-/// allowing their host-function stubs to return normally tends to execute an
-/// unreachable instruction in the guest. The shared C++ recovery helper instead
-/// validates the frame chain and resumes the nearest caller in the main app.
-pub(crate) fn recover_guest_termination(env: &mut Environment, termination: &str) -> bool {
-    if let Some(path) = env.missing_unity_player_archive() {
-        echo!(
-            "Guest {} follows unavailable Unity player archive {:?}; refusing \
-             unsafe frame recovery.",
-            termination,
-            path
-        );
-        return false;
-    }
-
-    if env.guest_trap_bypass_still_on_stack() {
-        // The guest already executed a deliberate trap in this very call
-        // chain (failed assert / __builtin_trap / Unity-Mono unhandled
-        // exception). It has declared itself dead; resuming one of these
-        // frames runs code that its author made unreachable, which in
-        // practice faults almost immediately and buries the real first
-        // error under a SIGSEGV + crash-reporter cascade.
-        echo!(
-            "Guest {} happens inside a call chain that already hit a deliberate \
-             trap instruction; refusing frame recovery and ending the guest \
-             session cleanly. The real failure is the error logged just before \
-             that trap, not this termination.",
-            termination
-        );
-        return false;
-    }
-
-    log!(
-        "Guest {} on emulated thread {}; attempting validated frame recovery.",
-        termination,
-        env.current_thread
-    );
-    env.stack_trace_current();
-
-    if env.libc_state.signal.fatal_delivered {
-        // A fault-class signal was already delivered to a guest handler this
-        // session: the process crashed in the real-Darwin sense. Resuming a
-        // validated app frame from a crash reporter's stack leaves the app
-        // half-alive with no way to recover (observed: Turbo Dismount froze
-        // on a dead frame after SIGSEGV, then its crash reporter aborted).
-        // Release the session instead; benign abort()/exit() calls never
-        // see this.
-        echo!(
-            "Guest {} follows an earlier fatal hardware signal; refusing \
-             frame recovery and ending the guest session.",
-            termination
-        );
-        return false;
-    }
-
-    let Some(continuation) = crate::libc::cxxabi::unwind_to_app_frame(env) else {
-        return false;
-    };
-
-    echo!(
-        "Guest {} was recovered by unwinding to app frame {:#010x}.",
-        termination,
-        continuation.addr_with_thumb_bit()
-    );
-    true
-}
-
-/// End the guest session after recovery could not find a safe continuation.
+/// End the guest process without terminating the host process.
 ///
 /// This only requests a return through the active host boundary; it never exits
 /// or panics the emulator process directly.
@@ -887,44 +818,10 @@ pub(crate) fn end_guest_termination(
     env.request_guest_termination(result);
 }
 
-/// Resume a validated app caller when possible, otherwise end only the guest.
-pub(crate) fn recover_or_end_guest_termination(
-    env: &mut Environment,
-    termination: &str,
-    result: GuestTermination,
-) {
-    if !recover_guest_termination(env, termination) {
-        end_guest_termination(env, termination, result);
-    }
-}
-
-/// Follow the C `exit` contract only when the guest cannot be safely resumed.
-///
-/// In the common compatibility case, a nested library or DRM check calls
-/// `exit`; recovery happens before atexit handlers are drained so that the app
-/// can continue with its process state intact. An unrecoverable `exit` still
-/// runs its handlers, but returns through the emulator's controlled host
-/// boundary rather than ending the emulator process directly.
-fn exit(env: &mut Environment, exit_code: i32) {
+/// Normal process exit runs its registered handlers before ending the session.
+pub(crate) fn exit(env: &mut Environment, exit_code: i32) {
     set_errno(env, 0);
     let termination = format!("exit({exit_code})");
-    if let Some(path) = env.missing_unity_player_archive().map(str::to_owned) {
-        // Unity has already declared engine initialization unrecoverable. Do
-        // not invoke atexit handlers or splice control flow into the caller:
-        // both paths run against partially initialized Unity global state.
-        echo!(
-            "Guest {} follows unavailable Unity player archive {:?}; ending the \
-             guest session without running atexit handlers.",
-            termination,
-            path
-        );
-        end_guest_termination(env, &termination, GuestTermination::Exit(exit_code));
-        return;
-    }
-    if recover_guest_termination(env, &termination) {
-        return;
-    }
-
     // Take the handlers before calling guest code so recursively invoked exit
     // handlers cannot execute the same registrations more than once.
     let handlers = std::mem::take(&mut env.libc_state.stdlib.atexit_handlers);
@@ -933,7 +830,7 @@ fn exit(env: &mut Environment, exit_code: i32) {
         let _: () = func.call_from_host(env, ());
         if env.is_guest_termination_requested() {
             log_dbg!("An atexit handler requested controlled guest termination.");
-            break;
+            return;
         }
     }
 
@@ -945,7 +842,7 @@ fn exit(env: &mut Environment, exit_code: i32) {
 fn immediate_exit(env: &mut Environment, name: &str, exit_code: i32) {
     set_errno(env, 0);
     let termination = format!("{name}({exit_code})");
-    recover_or_end_guest_termination(env, &termination, GuestTermination::Exit(exit_code));
+    end_guest_termination(env, &termination, GuestTermination::Exit(exit_code));
 }
 
 fn _exit(env: &mut Environment, exit_code: i32) {
@@ -961,25 +858,14 @@ fn quick_exit(env: &mut Environment, exit_code: i32) {
 }
 
 fn abort(env: &mut Environment) {
-    // Some games use abort() for recoverable DRM, networking or asset checks.
-    // The same validated recovery path used by exit avoids the old blind frame
-    // walk and, critically, does not terminate the emulator process.
-    //
-    // POSIX defines abort() as "unblock SIGABRT, raise it, and terminate if
-    // that returns". Raising first means an installed SIGABRT handler (crash
-    // reporters, Unity's unhandled-exception shim, ...) actually runs, which
-    // those apps rely on; the statements below then terminate unless the
-    // signal path already did.
+    // A handler may take over without returning (for example via longjmp).
+    // Returning from it, or ignoring SIGABRT, cannot make abort return.
     let outcome = raise_signal(env, SIGABRT);
     if outcome == RaiseOutcome::DefaultActionPerformed || env.is_guest_termination_requested()
     {
         return;
     }
-    recover_or_end_guest_termination(
-        env,
-        "abort()",
-        GuestTermination::Signal(SIGABRT),
-    );
+    end_guest_termination(env, "abort()", GuestTermination::Signal(SIGABRT));
 }
 
 fn bsearch(
@@ -1458,11 +1344,7 @@ fn __assert_rtn(
         file_str,
         line
     );
-    recover_or_end_guest_termination(
-        env,
-        "__assert_rtn()",
-        GuestTermination::Signal(SIGABRT),
-    );
+    abort(env);
 }
 
 fn __assert(env: &mut Environment, expr: ConstPtr<u8>, file: ConstPtr<u8>, line: i32) {
@@ -1474,11 +1356,7 @@ fn __assert(env: &mut Environment, expr: ConstPtr<u8>, file: ConstPtr<u8>, line:
         file_str,
         line
     );
-    recover_or_end_guest_termination(
-        env,
-        "__assert()",
-        GuestTermination::Signal(SIGABRT),
-    );
+    abort(env);
 }
 
 fn __assert_fail(
@@ -1498,11 +1376,7 @@ fn __assert_fail(
         file_str,
         line
     );
-    recover_or_end_guest_termination(
-        env,
-        "__assert_fail()",
-        GuestTermination::Signal(SIGABRT),
-    );
+    abort(env);
 }
 
 fn read_cstr_safe(env: &mut Environment, ptr: ConstPtr<u8>) -> String {
