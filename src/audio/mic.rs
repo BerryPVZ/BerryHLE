@@ -25,7 +25,7 @@
 //! data is simply gone too).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use std::sync::atomic::AtomicU8;
 use std::sync::{Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -85,11 +85,11 @@ static STREAM_AVAILABLE: AtomicBool = AtomicBool::new(false);
 static CONSUMED: AtomicU64 = AtomicU64::new(0);
 
 /// Cached availability probe result (desktop only): 0 unknown, 1 yes, 2 no.
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 static AVAILABILITY: AtomicU8 = AtomicU8::new(0);
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 const AVAIL_YES: u8 = 1;
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 const AVAIL_NO: u8 = 2;
 
 struct SendDevice(*mut openal::alc_types::ALCdevice);
@@ -109,14 +109,19 @@ static BACKEND: Mutex<Backend> = Mutex::new(Backend::None);
 /// Whether the host has a usable microphone.
 ///
 /// On Android this asks the Java side (which also knows whether the
-/// RECORD_AUDIO permission was granted). On other platforms it probes OpenAL
-/// capture once and caches the answer.
+/// RECORD_AUDIO permission was granted). On iOS it asks AVAudioSession, see
+/// [ios_input_available]. On other platforms it probes OpenAL capture once
+/// and caches the answer.
 pub fn has_microphone() -> bool {
     #[cfg(target_os = "android")]
     {
         return crate::android_media::jni_has_microphone();
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "ios")]
+    {
+        return ios_input_available();
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         match AVAILABILITY.load(Ordering::Relaxed) {
             AVAIL_YES => true,
@@ -130,7 +135,47 @@ pub fn has_microphone() -> bool {
     }
 }
 
-#[cfg(not(target_os = "android"))]
+/// `[[AVAudioSession sharedInstance] isInputAvailable]`.
+///
+/// The OpenAL probe can't be used on iOS: opening a capture device makes the
+/// system check microphone access, and it kills an app whose Info.plist has
+/// no NSMicrophoneUsageDescription. Reading this property doesn't touch the
+/// microphone, like the guest's own availability queries on a real device.
+#[cfg(target_os = "ios")]
+fn ios_input_available() -> bool {
+    use std::ffi::{c_char, c_void};
+
+    type Id = *mut c_void;
+    type Sel = *mut c_void;
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> Id;
+        fn sel_registerName(name: *const c_char) -> Sel;
+        fn objc_msgSend();
+    }
+
+    unsafe {
+        // On arm64, objc_msgSend must be called through a pointer of the
+        // method's real type.
+        let send_id: unsafe extern "C" fn(Id, Sel) -> Id =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let send_bool: unsafe extern "C" fn(Id, Sel) -> bool =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+
+        let class = objc_getClass(b"AVAudioSession\0".as_ptr().cast());
+        if class.is_null() {
+            return false;
+        }
+        let shared_instance = sel_registerName(b"sharedInstance\0".as_ptr().cast());
+        let session = send_id(class, shared_instance);
+        if session.is_null() {
+            return false;
+        }
+        let is_input_available = sel_registerName(b"isInputAvailable\0".as_ptr().cast());
+        send_bool(session, is_input_available)
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn probe_openal_capture() -> bool {
     unsafe {
         // Opening a minimal capture device is the only reliable way to ask;
