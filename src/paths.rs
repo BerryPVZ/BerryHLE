@@ -178,7 +178,7 @@ pub fn user_data_base_path() -> Cow<'static, Path> {
 /// `android/app/build.gradle`. The documents provider is registered with
 /// `${applicationId}.provider` as its authority, so this must be kept in sync
 /// with the Gradle file (only the branding suffix is appended separately).
-const ANDROID_APPLICATION_ID: &str = "org.hyperhle.fork";
+const ANDROID_APPLICATION_ID: &str = "org.hyperhle.reborn";
 
 /// The authority of the documents provider that exposes the user data
 /// directory to the system file manager on Android. A build with branding
@@ -208,6 +208,49 @@ fn android_document_uri(document_id: &str) -> String {
     )
 }
 
+fn path_to_file_url(path: &std::path::Path) -> Result<String, String> {
+    // Canonicalize when possible, but don't require the directory to already
+    // exist — the file manager button may be pressed before any app has been
+    // added and the apps directory lazily created. Falling back to an
+    // absolute non-canonical path is better than failing with
+    // "Can't canonicalize".
+    let abs_path = if path.exists() {
+        path.canonicalize()
+            .map_err(|e| format!("Can't canonicalize path {}: {e}", path.display()))?
+    } else {
+        // Build an absolute path without requiring existence.
+        let cur = std::env::current_dir().map_err(|e| format!("Can't get current dir: {e}"))?;
+        let joined = cur.join(path);
+        // Try to canonicalize the parent if it exists, otherwise keep joined.
+        if let Some(parent) = joined.parent().filter(|p| p.exists()) {
+            if let Ok(canonical_parent) = parent.canonicalize() {
+                if let Some(file_name) = joined.file_name() {
+                    canonical_parent.join(file_name)
+                } else {
+                    canonical_parent
+                }
+            } else {
+                joined
+            }
+        } else {
+            joined
+        }
+    };
+    // Ensure the directory exists so file managers have something to show.
+    if !abs_path.exists() {
+        let _ = std::fs::create_dir_all(&abs_path);
+    }
+    let path_str = abs_path
+        .to_str()
+        .ok_or_else(|| "Path is not UTF-8".to_string())?;
+    let path_str = if std::env::consts::OS == "windows" {
+        path_str.strip_prefix("\\\\?\\").unwrap_or(path_str)
+    } else {
+        path_str
+    };
+    Ok(format!("file://{path_str}"))
+}
+
 /// Get a URI that can be used to open a file manager or similar for the path
 /// that [user_data_base_path] represents.
 pub fn url_for_opening_user_data_dir() -> Result<String, String> {
@@ -218,19 +261,7 @@ pub fn url_for_opening_user_data_dir() -> Result<String, String> {
             android_documents_authority()
         ))
     } else {
-        let path = user_data_base_path()
-            .join(".")
-            .canonicalize()
-            .map_err(|e| format!("Can't canonicalize path to user data directory: {e}"))?;
-        let path = path
-            .to_str()
-            .ok_or_else(|| "User data directory path is not UTF-8".to_string())?;
-        let path = if std::env::consts::OS == "windows" {
-            path.strip_prefix("\\\\?\\").unwrap_or(path)
-        } else {
-            path
-        };
-        Ok(format!("file://{path}"))
+        path_to_file_url(&user_data_base_path().join("."))
     }
 }
 
@@ -245,18 +276,7 @@ pub fn url_for_opening_apps_dir() -> Result<String, String> {
         // so the file manager starts where the games are.
         Ok(android_document_uri(&format!("root/{APPS_DIR}")))
     } else {
-        let path = apps_dir
-            .canonicalize()
-            .map_err(|e| format!("Can't canonicalize apps directory: {e}"))?;
-        let path = path
-            .to_str()
-            .ok_or_else(|| "Apps directory path is not UTF-8".to_string())?;
-        let path = if std::env::consts::OS == "windows" {
-            path.strip_prefix("\\\\?\\").unwrap_or(path)
-        } else {
-            path
-        };
-        Ok(format!("file://{path}"))
+        path_to_file_url(&apps_dir)
     }
 }
 

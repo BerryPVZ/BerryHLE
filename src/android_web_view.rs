@@ -419,6 +419,7 @@ mod imp {
         eval_js: *mut c_void,
         stop_loading: *mut c_void,
         open_url: *mut c_void,
+        open_content_uri: *mut c_void,
     }
 
     // SAFETY: the class is held as a global reference, which is valid from
@@ -479,6 +480,7 @@ mod imp {
                 )?,
                 stop_loading: method(jni, class, "stopLoadingWebOverlay", "(I)V")?,
                 open_url: method(jni, class, "openExternalUrl", "(Ljava/lang/String;)I")?,
+                open_content_uri: method(jni, class, "openContentUri", "(Ljava/lang/String;)I")?,
             })
         }
         let Some(jni) = Jni::attach() else {
@@ -649,6 +651,23 @@ mod imp {
         jni.delete_local_ref(url_j);
         ret == 0
     }
+
+    /// Open a content:// URI from our DocumentsProvider in the system file
+    /// manager. Handles vnd.android.document/directory MIME type and grants
+    /// read/write URI permissions. Returns true on success.
+    pub fn open_content_uri(uri: &str) -> bool {
+        let Some(jni) = Jni::attach() else {
+            return false;
+        };
+        let Some(c) = cached() else {
+            return false;
+        };
+        let uri_j = jni.new_jstring(uri);
+        let args = [JValue { l: uri_j }];
+        let ret = jni.call_static_int(c.class, c.open_content_uri, &args);
+        jni.delete_local_ref(uri_j);
+        ret == 0
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -679,6 +698,9 @@ mod imp {
         false
     }
     pub fn open_url_external(_url: &str) -> bool {
+        false
+    }
+    pub fn open_content_uri(_uri: &str) -> bool {
         false
     }
 }

@@ -466,9 +466,11 @@ const CLASSES: ClassExports = objc_classes! {
 
     match paths::url_for_opening_apps_dir() {
         Ok(url) => {
-            // Our `openURL:` implementation is bypassed because it doesn't
-            // allow non-web URLs.
-            let url_res = crate::window::open_url(env, &url);
+            // On Android the file manager needs URI permissions granted
+            // explicitly for our DocumentsProvider. Using the dedicated
+            // file-manager path ensures vnd.android.document/directory MIME
+            // type and FLAG_GRANT_READ/_WRITE_URI_PERMISSION are set.
+            let url_res = crate::window::open_file_manager_url(env, &url);
             if let Err(e) = url_res {
                 echo!("Couldn't open file manager at {:?}: {}", url, e);
             } else {
@@ -493,11 +495,7 @@ fn show_app_picker_gui(
 
     let icon = {
         let bytes: &[u8] = match crate::branding() {
-            "" => include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/icon.png")),
-            "UNOFFICIAL" => include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/res/icon_unofficial.png"
-            )),
+            "" | "UNOFFICIAL" => include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/icon.png")),
             "PREVIEW" => {
                 include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/icon_preview.png"))
             }
@@ -687,7 +685,7 @@ fn app_picker_inner(
         let label: id = msg![env; label initWithFrame:label_frame];
         let text = ns_string::from_rust_string(
             env,
-            format!("{HYPERHLE_FORK_NAME} ({})", crate::COMMIT_HASH),
+            format!("{HYPERHLE_REBORN_NAME} ({})", crate::COMMIT_HASH),
         );
         () = msg![env; label setText:text];
         () = msg![env; label setTextAlignment:UITextAlignmentRight];
@@ -1272,7 +1270,7 @@ fn app_picker_inner(
     (app_path, option_args)
 }
 
-const HYPERHLE_FORK_NAME: &str = "HyperHLE-Fork";
+const HYPERHLE_REBORN_NAME: &str = "HyperHLE-Reborn";
 
 /// Old-iOS home screen layout: a fixed 4×4 icon grid above a row of page dots,
 /// and a translucent dock along the bottom edge.
@@ -3024,7 +3022,7 @@ fn setup_settings(
     let footer = new_label(
         env,
         rect(0.0, y, width, 18.0),
-        &format!("{HYPERHLE_FORK_NAME} ({})", crate::COMMIT_HASH),
+        &format!("{HYPERHLE_REBORN_NAME} ({})", crate::COMMIT_HASH),
         12.0,
         false,
         gray_text,

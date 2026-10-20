@@ -21,7 +21,7 @@ enum CoreKind: String, CaseIterable, Identifiable {
 
     var version: String {
         switch self {
-        case .hyperHLE: return "(HyperHLE-Fork)"
+        case .hyperHLE: return "(HyperHLE-Reborn)"
         case .touchHLE: return "0.2.3"
         }
     }

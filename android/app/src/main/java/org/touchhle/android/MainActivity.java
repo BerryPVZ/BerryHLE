@@ -115,6 +115,23 @@ public class MainActivity extends SDLActivity {
             android.content.Intent i = new android.content.Intent(
                     android.content.Intent.ACTION_VIEW);
             i.setData(android.net.Uri.parse(url));
+            // For content:// URIs from our DocumentsProvider the receiving
+            // file manager needs read/write permission granted explicitly.
+            if (url != null && url.startsWith("content://")) {
+                i.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                        | android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                // Try to give a MIME type so the system can find a handler.
+                // DocumentsProvider directories use vnd.android.document/directory.
+                // Using setDataAndType instead of setData alone helps the
+                // chooser on some OEMs.
+                try {
+                    i.setDataAndType(android.net.Uri.parse(url), "vnd.android.document/directory");
+                    i.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                            | android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                } catch (Throwable ignore) {
+                    i.setData(android.net.Uri.parse(url));
+                }
+            }
             i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
             act.startActivity(i);
         } catch (Throwable t) {
@@ -122,6 +139,51 @@ public class MainActivity extends SDLActivity {
             return -1;
         }
         return 0;
+    }
+
+    // Open a content:// URI from our DocumentsProvider in the system file
+    // manager. This is used for the "File manager" button on Android.
+    // Unlike openExternalUrl it always grants URI permissions and uses a
+    // chooser so the user can pick a file manager if there are multiple.
+    public static int openContentUri(final String uriStr) {
+        android.app.Activity act = mSingleton;
+        if (act == null || uriStr == null || uriStr.isEmpty()) {
+            return -1;
+        }
+        // First try with directory MIME type and grant flags via chooser
+        try {
+            android.net.Uri uri = android.net.Uri.parse(uriStr);
+            android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_VIEW);
+            intent.setDataAndType(uri, "vnd.android.document/directory");
+            intent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    | android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    | android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+            // Also grant via ClipData for Android 5+ chooser handling
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+                intent.setClipData(android.content.ClipData.newRawUri("", uri));
+            }
+            act.startActivity(android.content.Intent.createChooser(intent, "Open with"));
+            return 0;
+        } catch (Throwable t) {
+            Log.w(TAG, "openContentUri with MIME failed for " + uriStr + ", trying fallback", t);
+        }
+        // Fallback: plain VIEW without MIME type
+        try {
+            android.net.Uri uri = android.net.Uri.parse(uriStr);
+            android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_VIEW);
+            intent.setData(uri);
+            intent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    | android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    | android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+                intent.setClipData(android.content.ClipData.newRawUri("", uri));
+            }
+            act.startActivity(intent);
+            return 0;
+        } catch (Throwable t) {
+            Log.e(TAG, "openContentUri failed for " + uriStr, t);
+            return -1;
+        }
     }
 
     // Create a new overlay WebView loading `url` (may be empty to create it

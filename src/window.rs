@@ -2819,11 +2819,39 @@ pub fn open_url(env: &mut Environment, url: &str) -> Result<(), String> {
     // SDL_OpenURL (desktop shell handlers).
     #[cfg(target_os = "android")]
     {
-        if crate::android_web_view::open_url_external(url) {
+        // For content:// URIs from our DocumentsProvider, use the dedicated
+        // file-manager path that grants URI permissions and sets the correct
+        // MIME type (vnd.android.document/directory). The generic browser
+        // path doesn't grant permissions, so the system file manager would be
+        // denied access and the intent would silently fail.
+        if url.starts_with("content://") {
+            if crate::android_web_view::open_content_uri(url) {
+                return Ok(());
+            }
+            // Fall through to try the generic path as well before giving up.
+            if crate::android_web_view::open_url_external(url) {
+                return Ok(());
+            }
+        } else if crate::android_web_view::open_url_external(url) {
             return Ok(());
         }
     }
     env.on_parent_stack_in_coroutine(|_, _| sdl2::url::open_url(url).map_err(|e| e.to_string()))
+}
+
+/// Open a content:// or file:// URI in the system file manager / browser.
+/// On Android this ensures URI permissions are granted for DocumentsProvider
+/// URIs. On other platforms it is identical to `open_url`.
+pub fn open_file_manager_url(env: &mut Environment, url: &str) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        if url.starts_with("content://") {
+            if crate::android_web_view::open_content_uri(url) {
+                return Ok(());
+            }
+        }
+    }
+    open_url(env, url)
 }
 
 /// SDL COMMAND_USER value used to ask MainActivity to open the system file
@@ -2914,7 +2942,21 @@ pub fn show_error_messagebox(window: Option<&Window>, error_message: &str) {
                 // Open data directory (contains log file on android)
                 0 => match crate::paths::url_for_opening_user_data_dir() {
                     Ok(url) => {
-                        if let Err(e) = sdl2::url::open_url(&url).map_err(|e| e.to_string()) {
+                        let open_res = {
+                            #[cfg(target_os = "android")]
+                            {
+                                if url.starts_with("content://") && crate::android_web_view::open_content_uri(&url) {
+                                    Ok(())
+                                } else {
+                                    sdl2::url::open_url(&url).map_err(|e| e.to_string())
+                                }
+                            }
+                            #[cfg(not(target_os = "android"))]
+                            {
+                                sdl2::url::open_url(&url).map_err(|e| e.to_string())
+                            }
+                        };
+                        if let Err(e) = open_res {
                             echo!("Couldn't open file manager at {:?}: {}", url, e);
                         } else {
                             echo!("Opened file manager at {:?}, exiting.", url);

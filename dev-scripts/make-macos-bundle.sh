@@ -13,6 +13,11 @@ if [[ $# == 3 ]]; then
     if [[ "x$BRANDING" == "x" ]]; then
         APP_NAME=touchHLE
         ICON_NAME=icon
+    elif [[ "$BRANDING" == "UNOFFICIAL" ]]; then
+        # UNOFFICIAL now uses the regular icon (no icon_unofficial.png)
+        APP_NAME="touchHLE $BRANDING"
+        ICON_NAME=icon
+        VERSION="$VERSION $BRANDING"
     else
         APP_NAME="touchHLE $BRANDING"
         ICON_NAME="icon_$(echo "$BRANDING" | tr 'A-Z' 'a-z')"
