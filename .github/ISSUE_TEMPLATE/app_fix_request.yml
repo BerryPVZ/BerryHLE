@@ -1,5 +1,5 @@
 name: Request an app fix (IPA + logs)
-description: Request that a specific app/game be fixed in HyperHLE, requires an IPA link, a log file, and a description of the bug/crash
+description: Request that a specific app/game be fixed in HyperHLE, requires an IPA link and a description of the bug/crash, a log file is optional
 labels: ["app fix request"]
 body:
   - type: markdown
@@ -8,10 +8,12 @@ body:
         Use this form to request that a specific app or game be fixed in
         HyperHLE, this is the same request the Telegram bot files on your behalf
 
-        **Three things are required** for a fix to be investigated:
+        **Two things are required** for a fix to be investigated:
         1. A direct **IPA link** (or zipped `.app`) so the app can be downloaded and run
-        2. A **log file** from the run that shows the failure
-        3. A clear **description of the bug/crash**
+        2. A clear **description of the bug/crash**
+
+        A **log file** from the run that shows the failure is optional, but it
+        makes the problem much easier to fix
 
         Please make sure you are testing against the **latest HyperHLE build from
         [Actions](https://github.com/HyperHLE/HyperHLE/actions)** (or the latest
