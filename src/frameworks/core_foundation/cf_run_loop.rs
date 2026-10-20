@@ -14,7 +14,7 @@ use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant}
 use crate::frameworks::core_foundation::cf_allocator::{kCFAllocatorDefault, CFAllocatorRef};
 use crate::frameworks::core_foundation::time::CFTimeInterval;
 use crate::frameworks::core_foundation::{CFIndex, CFRelease, CFRetain, CFTypeRef};
-use crate::frameworks::foundation::ns_run_loop::run_run_loop_single_iteration;
+use crate::frameworks::foundation::ns_run_loop;
 use crate::frameworks::foundation::ns_string;
 use crate::mem::{ConstPtr, GuestISize, MutPtr, MutVoidPtr, SafeRead};
 use crate::objc::{id, msg, msg_class, nil, objc_classes, ClassExports, HostObject};
@@ -86,12 +86,6 @@ pub struct CFRunLoopSourceHostObject {
 }
 impl HostObject for CFRunLoopSourceHostObject {}
 
-// CFRunLoopRunResult
-const kCFRunLoopRunFinished: i32 = 1;
-const kCFRunLoopRunStopped: i32 = 2;
-const kCFRunLoopRunTimedOut: i32 = 3;
-const kCFRunLoopRunHandledSource: i32 = 4;
-
 // CFRunLoopActivity flags
 type CFRunLoopActivity = u32;
 const kCFRunLoopEntry: CFRunLoopActivity = 1 << 0;
@@ -115,22 +109,6 @@ pub const CONSTANTS: ConstantExports = &[
         HostConstant::NSString(kCFRunLoopDefaultMode),
     ),
 ];
-
-// MARK: - Helpers
-
-fn is_known_mode(_env: &mut Environment, mode: CFRunLoopMode) -> bool {
-    // Accept ALL non-nil modes. iOS apps frequently use custom run loop modes
-    // (UITrackingRunLoopMode, GSEventReceiveRunLoopMode, etc.) which are all
-    // valid. Since our run loop implementation doesn't actually partition
-    // sources/timers by mode, every mode is effectively equivalent to the
-    // default mode — but rejecting unknown modes caused Astro Shark and other
-    // Unity-based games to spin-loop with "unknown mode, skipping" flooding
-    // the log.
-    if mode.is_null() {
-        return false;
-    }
-    true
-}
 
 // MARK: - Retain / Release
 
@@ -158,10 +136,11 @@ pub fn CFRunLoopGetMain(env: &mut Environment) -> CFRunLoopRef {
     msg_class![env; NSRunLoop mainRunLoop]
 }
 
-fn CFRunLoopCopyCurrentMode(env: &mut Environment, _rl: CFRunLoopRef) -> CFRunLoopMode {
-    // We only support the default mode.
-    let s = ns_string::from_rust_string(env, kCFRunLoopDefaultMode.to_string());
-    crate::objc::autorelease(env, s)
+fn CFRunLoopCopyCurrentMode(env: &mut Environment, rl: CFRunLoopRef) -> CFRunLoopMode {
+    match ns_run_loop::current_mode(env, rl) {
+        Some(mode) => ns_string::from_rust_string(env, mode),
+        None => nil,
+    }
 }
 
 fn CFRunLoopCopyAllModes(env: &mut Environment, _rl: CFRunLoopRef) -> CFTypeRef {
@@ -172,12 +151,17 @@ fn CFRunLoopCopyAllModes(env: &mut Environment, _rl: CFRunLoopRef) -> CFTypeRef 
 }
 
 fn CFRunLoopContainsSource(
-    _env: &mut Environment,
-    _rl: CFRunLoopRef,
-    _source: CFRunLoopSourceRef,
-    _mode: CFRunLoopMode,
+    env: &mut Environment,
+    rl: CFRunLoopRef,
+    source: CFRunLoopSourceRef,
+    mode: CFRunLoopMode,
 ) -> bool {
-    false
+    let mode = ns_string::to_rust_string(env, mode).to_string();
+    ns_run_loop::contains_in_mode(env, rl, source, &mode)
+}
+
+fn CFRunLoopAddCommonMode(env: &mut Environment, rl: CFRunLoopRef, mode: CFRunLoopMode) {
+    ns_run_loop::add_common_mode(env, rl, mode);
 }
 
 fn CFRunLoopContainsObserver(
@@ -213,38 +197,29 @@ fn CFRunLoopRunInMode(
     env: &mut Environment,
     mode: CFRunLoopMode,
     seconds: CFTimeInterval,
-    _return_after_source_handled: bool,
+    return_after_source_handled: bool,
 ) -> i32 {
-    // touchHLE's run loop is mode-agnostic: NSRunLoop stores its timers and
-    // sources in a single global list and `addTimer:forMode:` ignores the mode
-    // entirely. Engines like Unity drive their main loop through a private
-    // run-loop mode, so bailing out for any non-default mode used to make every
-    // such call a no-op. That both spammed the log and, more importantly,
-    // starved the run loop: CATransactions never committed, UIKit events and
-    // timers never fired, and scene/asset-load completion handlers scheduled on
-    // the run loop never ran (e.g. My Talking Tom never rendering its room
-    // background, only the clear colour). Treat an unknown mode the same as the
-    // default mode instead of skipping.
-    if !is_known_mode(env, mode) {
-        log_dbg!("CFRunLoopRunInMode: unknown mode, treating as default mode");
-    }
     let current = CFRunLoopGetCurrent(env);
-    if seconds == 0.0 {
-        run_run_loop_single_iteration(env, current);
-    } else {
-        let limit: id = msg_class![env; NSDate dateWithTimeIntervalSinceNow:seconds];
-        let _: () = msg![env; current runUntilDate:limit];
-    }
-    kCFRunLoopRunFinished
+    let now = env
+        .guest_clock
+        .system_time()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    ns_run_loop::run_in_mode(
+        env,
+        current,
+        mode,
+        Some(now + seconds.max(0.0)),
+        return_after_source_handled,
+    ) as i32
 }
 
 fn CFRunLoopStop(env: &mut Environment, rl: CFRunLoopRef) {
     if rl.is_null() {
         return;
     }
-    env.objc
-        .borrow_mut::<crate::frameworks::foundation::ns_run_loop::NSRunLoopHostObject>(rl)
-        .stopped = true;
+    ns_run_loop::stop(env, rl);
 }
 
 fn CFRunLoopWakeUp(_env: &mut Environment, _rl: CFRunLoopRef) {
@@ -262,8 +237,11 @@ fn CFRunLoopAddSource(
     if rl.is_null() || source.is_null() {
         return;
     }
-    if !is_known_mode(env, mode) {
-        log_dbg!("CFRunLoopAddSource: ignoring unknown mode");
+    // Custom modes are valid registration names; nil is not a mode.
+    if mode.is_null() {
+        return;
+    }
+    if !ns_run_loop::register_mode(env, rl, source, mode) {
         return;
     }
     let already_contains = env
@@ -271,14 +249,13 @@ fn CFRunLoopAddSource(
         .borrow::<crate::frameworks::foundation::ns_run_loop::NSRunLoopHostObject>(rl)
         .sources
         .contains(&source);
-    if already_contains {
-        return;
+    if !already_contains {
+        CFRetain(env, source);
+        env.objc
+            .borrow_mut::<ns_run_loop::NSRunLoopHostObject>(rl)
+            .sources
+            .push(source);
     }
-    CFRetain(env, source);
-    env.objc
-        .borrow_mut::<crate::frameworks::foundation::ns_run_loop::NSRunLoopHostObject>(rl)
-        .sources
-        .push(source);
     let schedule = env
         .objc
         .borrow::<CFRunLoopSourceHostObject>(source)
@@ -298,23 +275,27 @@ fn CFRunLoopRemoveSource(
     if rl.is_null() || source.is_null() {
         return;
     }
-    let pos = env
-        .objc
-        .borrow::<crate::frameworks::foundation::ns_run_loop::NSRunLoopHostObject>(rl)
-        .sources
-        .iter()
-        .position(|&s| s == source);
-    let Some(pos) = pos else { return };
-    env.objc
-        .borrow_mut::<crate::frameworks::foundation::ns_run_loop::NSRunLoopHostObject>(rl)
-        .sources
-        .remove(pos);
-    let cancel = env.objc.borrow::<CFRunLoopSourceHostObject>(source).cancel;
-    let info = env.objc.borrow::<CFRunLoopSourceHostObject>(source).info;
+    let mode_name = ns_string::to_rust_string(env, mode).to_string();
+    if !ns_run_loop::registered_in_mode(env, rl, source, &mode_name) {
+        return;
+    }
+    let last = ns_run_loop::unregister_mode(env, rl, source, mode);
+    let (cancel, info) = {
+        let state = env.objc.borrow::<CFRunLoopSourceHostObject>(source);
+        (state.cancel, state.info)
+    };
+    if last {
+        env.objc
+            .borrow_mut::<ns_run_loop::NSRunLoopHostObject>(rl)
+            .sources
+            .retain(|s| *s != source);
+    }
     if !cancel.to_ptr().is_null() {
         let _: () = cancel.call_from_host(env, (info, rl, mode));
     }
-    CFRelease(env, source);
+    if last {
+        CFRelease(env, source);
+    }
 }
 
 fn CFRunLoopSourceCreate(
@@ -641,6 +622,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFRunLoopContainsTimer(_, _, _)),
     // Running
     export_c_func!(CFRunLoopRun()),
+    export_c_func!(CFRunLoopAddCommonMode(_, _)),
     export_c_func!(CFRunLoopRunInMode(_, _, _)),
     export_c_func!(CFRunLoopStop(_)),
     export_c_func!(CFRunLoopWakeUp(_)),

@@ -276,17 +276,6 @@ fn path_after_app_bundle_component(path: &str) -> Option<&str> {
     None
 }
 
-/// Unreal's IPhoneTOC records cooked assets under `../UDKGame/`,
-/// while iOS mounts them at the app bundle root.
-fn strip_udk_game_bundle_prefix(path: &str) -> Option<String> {
-    let normalized = path.replace('\\', "/");
-    let path = normalized.strip_prefix("./").unwrap_or(&normalized);
-    let relative = path.strip_prefix("../")?;
-    let (root, contents) = relative.split_once('/').unwrap_or((relative, ""));
-    root.eq_ignore_ascii_case("UDKGame")
-        .then(|| contents.to_string())
-}
-
 /// Resolve an existing file path as iPhone OS would see it.
 ///
 /// Bundle files live on a case-insensitive volume on the devices this emulator
@@ -320,17 +309,18 @@ pub(crate) fn resolve_existing_guest_path(env: &Environment, path: &str) -> Opti
         // redirect arbitrary absolute filesystem paths.
         path_after_app_bundle_component(path)
     } else {
-        Some(path.trim_start_matches("./"))
+        // Relative paths are resolved against the working directory
+        // only. Looking them up in the bundle too would find bundle files
+        // from any directory.
+        None
     }?;
-    let relative_path =
-        strip_udk_game_bundle_prefix(relative_path).unwrap_or_else(|| relative_path.to_string());
 
     let data_relative_path = relative_path
         .split_once('/')
         .and_then(|(component, remainder)| {
             component.eq_ignore_ascii_case("Data").then_some(remainder)
         })
-        .unwrap_or(relative_path.as_str());
+        .unwrap_or(relative_path);
     let mut candidates = vec![
         format!("{bundle_root}/{relative_path}"),
         format!("{bundle_root}/Data/{data_relative_path}"),
@@ -1930,7 +1920,7 @@ fn release_range_from_locks(locks: &mut Vec<LockRange>, release: &LockRange) {
 
 #[cfg(test)]
 mod tests {
-    use super::{path_after_app_bundle_component, strip_udk_game_bundle_prefix};
+    use super::path_after_app_bundle_component;
 
     #[test]
     fn finds_case_insensitive_complete_app_bundle_components() {
@@ -1948,22 +1938,6 @@ mod tests {
             path_after_app_bundle_component(
                 "/var/mobile/Applications/old-id/Granny.app.backup/Data/data.unity3d"
             ),
-            None
-        );
-    }
-
-    #[test]
-    fn maps_unreal_cooked_paths_from_project_root_to_bundle_root() {
-        assert_eq!(
-            strip_udk_game_bundle_prefix("../UDKGame/CookedIPhone/Core.xxx").as_deref(),
-            Some("CookedIPhone/Core.xxx")
-        );
-        assert_eq!(
-            strip_udk_game_bundle_prefix(r"..\udkgame\CookedIPhone\Core.xxx").as_deref(),
-            Some("CookedIPhone/Core.xxx")
-        );
-        assert_eq!(
-            strip_udk_game_bundle_prefix("../OtherGame/CookedIPhone/Core.xxx"),
             None
         );
     }

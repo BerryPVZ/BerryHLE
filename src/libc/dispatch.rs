@@ -16,6 +16,7 @@ use crate::dyld::{
     export_c_func, export_c_func_aliased, ConstantExports, FunctionExports, HostConstant,
 };
 use crate::frameworks::foundation::ns_dictionary::dict_from_keys_and_objects;
+use crate::frameworks::foundation::ns_run_loop::{self, NSRunLoopCommonModes};
 use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::libc::semaphore::{host_create_semaphore, host_destroy_semaphore, sem_t};
 use crate::mem::{ConstVoidPtr, MutPtr, MutVoidPtr, Ptr};
@@ -388,6 +389,51 @@ pub(super) fn dispatch_after_delay_secs(when: u64) -> f64 {
     secs.clamp(0.0, 60.0)
 }
 
+// Main-queue timers only make work ready. Delivery is an input source,
+// so runMode returns after the callback, just as for queued selectors.
+fn schedule_after(
+    env: &mut Environment,
+    delay: f64,
+    queue: dispatch_queue_t,
+    dict: id,
+    fire: &str,
+    enqueue: &str,
+) {
+    let main = queue.to_bits() == MAIN_QUEUE_PTR;
+    let selector = env
+        .objc
+        .lookup_selector(if main { enqueue } else { fire })
+        .unwrap();
+    let cls: Class = env
+        .objc
+        .get_known_class("_touchHLE_DispatchAfter", &mut env.mem);
+    if main {
+        let timer: id = msg_class![env; NSTimer timerWithTimeInterval:delay
+            target:cls selector:selector userInfo:dict repeats:false];
+        let run_loop: id = msg_class![env; NSRunLoop mainRunLoop];
+        let mode = get_static_str(env, NSRunLoopCommonModes);
+        let _: () = msg![env; run_loop addTimer:timer forMode:mode];
+    } else {
+        // Preserve the existing fallback for queues not implemented here.
+        let _: id = msg_class![env; NSTimer scheduledTimerWithTimeInterval:delay
+            target:cls selector:selector userInfo:dict repeats:false];
+    }
+}
+
+fn enqueue_after(env: &mut Environment, target: id, timer: id, selector: &str) {
+    let run_loop: id = msg_class![env; NSRunLoop mainRunLoop];
+    let selector = env.objc.lookup_selector(selector).unwrap();
+    ns_run_loop::add_perform_request(
+        env,
+        run_loop,
+        target,
+        selector,
+        timer,
+        false,
+        crate::objc::nil,
+    );
+}
+
 /// `dispatch_after(when, queue, block)`
 ///
 /// Crucially this must be *asynchronous*: the block has to run on a later run
@@ -403,7 +449,7 @@ pub(super) fn dispatch_after_delay_secs(when: u64) -> f64 {
 fn dispatch_after(
     env: &mut Environment,
     when: u64, // dispatch_time_t
-    _queue: dispatch_queue_t,
+    queue: dispatch_queue_t,
     block: dispatch_block_t,
 ) {
     if block.is_null() {
@@ -417,24 +463,20 @@ fn dispatch_after(
     let num: id = msg_class![env; NSNumber numberWithUnsignedInt:(block.to_bits())];
     let key: id = get_static_str(env, "_touchHLE_dispatch_after_block");
     let dict: id = dict_from_keys_and_objects(env, &[(key, num)]);
-    let sel = env
-        .objc
-        .lookup_selector("_touchHLE_dispatchAfterFireBlock:")
-        .unwrap();
-    let cls: Class = env.objc.get_known_class("_touchHLE_DispatchAfter", &mut env.mem);
-    let _: id = msg_class![env;
-        NSTimer scheduledTimerWithTimeInterval:delay
-                                       target:cls
-                                     selector:sel
-                                     userInfo:dict
-                                      repeats:false
-    ];
+    schedule_after(
+        env,
+        delay,
+        queue,
+        dict,
+        "_touchHLE_dispatchAfterFireBlock:",
+        "_touchHLE_dispatchAfterEnqueueBlock:",
+    );
 }
 
 fn dispatch_after_f(
     env: &mut Environment,
     when: u64,
-    _queue: dispatch_queue_t,
+    queue: dispatch_queue_t,
     context: MutVoidPtr,
     work: GuestFunction,
 ) {
@@ -448,18 +490,14 @@ fn dispatch_after_f(
     let ctx_key: id = get_static_str(env, "_touchHLE_dispatch_after_ctx");
     let work_key: id = get_static_str(env, "_touchHLE_dispatch_after_work");
     let dict: id = dict_from_keys_and_objects(env, &[(ctx_key, ctx_num), (work_key, work_num)]);
-    let sel = env
-        .objc
-        .lookup_selector("_touchHLE_dispatchAfterFireFunc:")
-        .unwrap();
-    let cls: Class = env.objc.get_known_class("_touchHLE_DispatchAfter", &mut env.mem);
-    let _: id = msg_class![env;
-        NSTimer scheduledTimerWithTimeInterval:delay
-                                       target:cls
-                                     selector:sel
-                                     userInfo:dict
-                                      repeats:false
-    ];
+    schedule_after(
+        env,
+        delay,
+        queue,
+        dict,
+        "_touchHLE_dispatchAfterFireFunc:",
+        "_touchHLE_dispatchAfterEnqueueFunc:",
+    );
 }
 
 /// Host-only helper class that owns the NSTimer callbacks used to implement
@@ -468,6 +506,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 (env, this, _cmd);
 
 @implementation _touchHLE_DispatchAfter: NSObject
+
++ (())_touchHLE_dispatchAfterEnqueueBlock:(id)timer {
+    enqueue_after(env, this, timer, "_touchHLE_dispatchAfterFireBlock:");
+}
+
++ (())_touchHLE_dispatchAfterEnqueueFunc:(id)timer {
+    enqueue_after(env, this, timer, "_touchHLE_dispatchAfterFireFunc:");
+}
 
 + (())_touchHLE_dispatchAfterFireBlock:(id)timer {
     let dict: id = msg![env; timer userInfo];
