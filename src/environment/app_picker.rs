@@ -495,11 +495,7 @@ fn show_app_picker_gui(
 
     let icon = {
         let bytes: &[u8] = match crate::branding() {
-            "" => include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/icon.png")),
-            "UNOFFICIAL" => include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/res/icon_unofficial.png"
-            )),
+            "" | "UNOFFICIAL" => include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/icon.png")),
             "PREVIEW" => {
                 include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/icon_preview.png"))
             }
