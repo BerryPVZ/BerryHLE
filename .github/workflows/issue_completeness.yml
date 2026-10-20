@@ -1,8 +1,8 @@
 name: Close incomplete issues
 
-# Closes new issues that are missing a log, an IPA link or a description of the
-# bug, and reopens them when an edit adds what was missing. The check itself
-# lives in .github/scripts/issue-completeness.js.
+# Closes new issues that are missing an IPA link or a description of the bug,
+# and reopens them when an edit adds what was missing. A log is optional. The
+# check itself lives in .github/scripts/issue-completeness.js.
 
 on:
   issues:

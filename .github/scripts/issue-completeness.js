@@ -1,5 +1,5 @@
-// Closes issues that are missing a log, an IPA link or a description of the
-// bug, and reopens them once an edit adds what was missing.
+// Closes issues that are missing an IPA link or a description of the bug, and
+// reopens them once an edit adds what was missing. A log is optional.
 //
 // Used by .github/workflows/issue_completeness.yml through
 // actions/github-script. checkIssue() is pure so it can be tested locally:
@@ -14,7 +14,6 @@ const MAINTAINERS = ['OWNER', 'MEMBER', 'COLLABORATOR'];
 // Headings used by the issue forms in .github/ISSUE_TEMPLATE and by the
 // Telegram bot (telegram_bot/bot/request.py).
 const IPA_HEADING = /ipa link/i;
-const LOG_HEADING = /\blog\b/i;
 const DESCRIPTION_HEADING =
   /describe the bug|what is the problem|bug \/ crash|describe the feature or issue/i;
 // The general form is for emulator features, which have no app to attach.
@@ -23,10 +22,6 @@ const FEATURE_HEADING = /describe the feature or issue/i;
 const URL = /https?:\/\/[^\s<>`"'\]]+/gi;
 const STORE_URL = /^https?:\/\/(apps|itunes)\.apple\.com\//i;
 const IPA_URL = /\.ipa\b/i;
-// Log files dragged into the form, or log lines pasted anywhere.
-const LOG_ATTACHMENT =
-  /https:\/\/github\.com\/user-attachments\/files\/\d+\/[^\s)]*\.(txt|log)\b/i;
-const LOG_TEXT = /touchHLE(::|\s+UNOFFICIAL|\s+v\d)/;
 
 function sections(body) {
   const out = [];
@@ -74,7 +69,6 @@ function checkIssue(body) {
   const parts = sections(body);
   const find = (re) => parts.filter((s) => re.test(s.heading));
   const ipaParts = find(IPA_HEADING);
-  const logParts = find(LOG_HEADING);
   const descParts = find(DESCRIPTION_HEADING);
   const isFeature = find(FEATURE_HEADING).length > 0;
 
@@ -103,23 +97,9 @@ function checkIssue(body) {
     ipa = telegramIpa || urls(body).some((u) => IPA_URL.test(u));
   }
 
-  let log = LOG_ATTACHMENT.test(body) || LOG_TEXT.test(body);
-  if (!log) {
-    log = logParts.some((s) => {
-      const text = answer(s.text);
-      const links = urls(text);
-      // A link to the IPA pasted into the log field is not a log.
-      if (links.length > 0) return links.some((u) => !IPA_URL.test(u));
-      return hasWords(text, 20);
-    });
-  }
-
   const missing = [];
   if (!description) missing.push('a description of the bug');
-  if (!isFeature) {
-    if (!ipa) missing.push('a direct IPA link');
-    if (!log) missing.push('a log');
-  }
+  if (!isFeature && !ipa) missing.push('a direct IPA link');
   return { missing };
 }
 
@@ -130,7 +110,7 @@ Hi @${author}, this issue has been closed automatically because it is missing:
 
 ${list}
 
-Every bug report or fix request needs a description of the bug, a direct link to the IPA (not an App Store page) and the log from the run that failed. Please **edit this issue** to add what is missing and it will be reopened automatically.`;
+Every bug report or fix request needs a description of the bug and a direct link to the IPA (not an App Store page). A log from the run that failed is optional but makes the problem much easier to fix. Please **edit this issue** to add what is missing and it will be reopened automatically.`;
 }
 
 async function run({ github, context, core }) {

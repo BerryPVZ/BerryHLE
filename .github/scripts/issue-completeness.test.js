@@ -47,16 +47,20 @@ test('complete fix request passes', () => {
   );
 });
 
-test('App Store link and placeholder log are not enough', () => {
+test('App Store link is not enough', () => {
   const body = fixForm({
     ipa: 'https://apps.apple.com/ph/app/trigger-fist/id531184261',
     bug: BUG,
-    log: '...',
+    log: LOG,
   });
-  assert.deepStrictEqual(checkIssue(body).missing, [
-    'a direct IPA link',
-    'a log',
-  ]);
+  assert.deepStrictEqual(checkIssue(body).missing, ['a direct IPA link']);
+});
+
+test('the log is optional', () => {
+  for (const log of ['', '...', '_No response_', IPA]) {
+    const body = fixForm({ ipa: IPA, bug: BUG, log });
+    assert.deepStrictEqual(checkIssue(body).missing, [], log);
+  }
 });
 
 test('empty answers are missing', () => {
@@ -64,32 +68,21 @@ test('empty answers are missing', () => {
   assert.deepStrictEqual(checkIssue(body).missing, [
     'a description of the bug',
     'a direct IPA link',
-    'a log',
   ]);
 });
 
-test('IPA link pasted into the log field is not a log', () => {
+test('IPA links with parentheses count', () => {
   const ipa =
     'https://archive.org/download/x/BackStab-(com.gameloft.BackStab)-1.0.0.ipa';
-  const body = fixForm({ ipa, bug: BUG, log: ipa });
-  assert.deepStrictEqual(checkIssue(body).missing, ['a log']);
-});
-
-test('linked or attached logs count', () => {
-  for (const log of [
-    '[touchHLE_log.txt](https://github.com/user-attachments/files/33634357/touchHLE_log.txt)',
-    "Here's the log: https://www.dropbox.com/scl/fi/abc/touchHLE_log.txt?dl=0",
-  ]) {
-    const body = fixForm({ ipa: IPA, bug: BUG, log });
-    assert.deepStrictEqual(checkIssue(body).missing, [], log);
-  }
+  const body = fixForm({ ipa: `[BackStab](${ipa})`, bug: BUG, log: '' });
+  assert.deepStrictEqual(checkIssue(body).missing, []);
 });
 
 test('deprecated form with only the checkbox is missing everything', () => {
   const body = `### By submitting this issue, I certify that…
 
 - [x] I understand this form is deprecated and I should use the “Request a fix for a specific game / app” form.`;
-  assert.strictEqual(checkIssue(body).missing.length, 3);
+  assert.strictEqual(checkIssue(body).missing.length, 2);
 });
 
 test('old game fix form without an IPA field is missing the IPA', () => {
@@ -129,8 +122,8 @@ test('free-form body is checked as a whole', () => {
 ${IPA}
 touchHLE::frameworks: something went wrong`;
   assert.deepStrictEqual(checkIssue(body).missing, []);
-  assert.strictEqual(checkIssue('').missing.length, 3);
-  assert.strictEqual(checkIssue(null).missing.length, 3);
+  assert.strictEqual(checkIssue('').missing.length, 2);
+  assert.strictEqual(checkIssue(null).missing.length, 2);
 });
 
 test('Telegram bot issues', () => {
@@ -164,7 +157,7 @@ _Filed via the HyperHLE Telegram fix bot._`;
   assert.deepStrictEqual(checkIssue(attached).missing, []);
 
   const noLog = body.replace(/<details>[\s\S]*<\/details>/, '_none provided_');
-  assert.deepStrictEqual(checkIssue(noLog).missing, ['a log']);
+  assert.deepStrictEqual(checkIssue(noLog).missing, []);
 });
 
 // A fake Octokit that records the calls run() makes.

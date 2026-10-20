@@ -66,8 +66,7 @@ body:
       label: Log output
       description: |
         On Android, this is the log.txt file. On Windows or macOS, it's visible
-        in the Terminal/Command Prompt/PowerShell. Issues without a log are
-        closed automatically.
+        in the Terminal/Command Prompt/PowerShell.
       render: 'text'
     validations:
       required: true
