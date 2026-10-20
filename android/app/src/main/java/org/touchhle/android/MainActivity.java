@@ -88,8 +88,9 @@ public class MainActivity extends SDLActivity {
     // to notify the emulated app that a page finished loading in a real
     // WebView overlay. Payload packs (overlay id, action) into one long.
 
-    // Request code for the system file picker started by this activity.
+    // Request codes for system document pickers started by this activity.
     private static final int REQUEST_ADD_IPA = 1;
+    private static final int REQUEST_OPEN_APPS_FOLDER = 2;
 
     // =====================================================================
     // Real WebView overlay support (called from Rust via JNI; see
@@ -157,16 +158,29 @@ public class MainActivity extends SDLActivity {
         // is installed. EXTRA_INITIAL_URI asks Android 8+ to start in the
         // touchHLE apps directory.
         try {
-            android.net.Uri uri = android.net.Uri.parse(uriStr);
-            android.content.Intent intent = new android.content.Intent(
+            final android.net.Uri uri = android.net.Uri.parse(uriStr);
+            final android.content.Intent intent = new android.content.Intent(
                     android.content.Intent.ACTION_OPEN_DOCUMENT_TREE);
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
                 intent.putExtra(android.provider.DocumentsContract.EXTRA_INITIAL_URI, uri);
             }
-            act.startActivity(intent);
+            // ACTION_OPEN_DOCUMENT_TREE is an activity-for-result contract.
+            // Start it on the UI thread and use startActivityForResult rather
+            // than a fire-and-forget startActivity; some Android versions do
+            // not present the picker reliably without the result contract.
+            act.runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        act.startActivityForResult(intent, REQUEST_OPEN_APPS_FOLDER);
+                    } catch (Throwable t) {
+                        Log.e(TAG, "Couldn't launch apps folder picker for " + uri, t);
+                    }
+                }
+            });
             return 0;
         } catch (Throwable t) {
-            Log.e(TAG, "openContentUri tree picker failed for " + uriStr, t);
+            Log.e(TAG, "openContentUri tree picker setup failed for " + uriStr, t);
             return -1;
         }
     }
