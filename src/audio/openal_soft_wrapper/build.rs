@@ -79,6 +79,13 @@ fn main() {
         }
         build.out_dir(out_dir);
 
+        // OpenAL Soft's headers reference `uint8_t` without including
+        // <cstdint>, and newer libstdc++/GCC no longer expose it transitively.
+        // Force the include so the vendored sources build on current distros.
+        if !os.eq_ignore_ascii_case("windows") {
+            build.cxxflag("-include cstdint");
+        }
+
         build.define("LIBTYPE", "STATIC");
 
         // Don't build extras, we don't need them and they can encounter issues

@@ -281,6 +281,12 @@ jobs:
     - name: Generate local.properties file  
       run: echo 'sdk.dir='$ANDROID_SDK_ROOT > android/local.properties  
 
+    - name: Set up JDK 17  
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '17'
+
     - name: Build for Android  
       run: cd android && ../gradle/gradle-8.11.1/bin/gradle assembleRelease && mv app/build/outputs/apk/release/HyperHLE-Reborn-release.apk ../HyperHLE-Reborn.apk  
       env:  
