@@ -1057,7 +1057,7 @@ fn app_picker_inner(
                 main_run_loop,
                 delegate,
                 settings.main_view,
-                app_frame.size.width,
+                app_frame.size,
                 true,
             );
         } else if std::mem::take(&mut host_obj.settings_hide) {
@@ -1066,7 +1066,7 @@ fn app_picker_inner(
                 main_run_loop,
                 delegate,
                 settings.main_view,
-                app_frame.size.width,
+                app_frame.size,
                 false,
             );
         } else if std::mem::take(&mut host_obj.scale_hack_default) {
@@ -1858,10 +1858,39 @@ fn run_lock_screen(
     let thumb_width = (track_width * 0.245).clamp(76.0, 100.0);
     let label_x = thumb_width + 24.0;
     let label_width = (track_width - label_x - 12.0).max(0.0);
-    let slide_color = ui_color(env, 1.0, 1.0, 1.0, 0.58);
-    let slide_text = new_label(env, rect(label_x, 0.0, label_width, 62.0), "slide to unlock", 25.0, false, slide_color);
-    () = msg![env; slide_text setTextAlignment:UITextAlignmentCenter];
-    () = msg![env; track addSubview:slide_text];
+    // Render one label per glyph. The custom renderer does not reliably clip
+    // duplicate full-string labels, so animating individual glyph alpha gives
+    // a clean left-to-right sheen without any overprinted text.
+    let shimmer_text = "slide to unlock";
+    let font: id = msg_class![env; UIFont systemFontOfSize:(25.0 as CGFloat)];
+    let whole_text = ns_string::from_rust_string(env, shimmer_text.to_string());
+    let whole_size: CGSize = msg![env; whole_text sizeWithFont:font];
+    release(env, whole_text);
+    let mut shimmer_letters = Vec::new();
+    let mut prefix = String::new();
+    let mut prefix_width = 0.0 as CGFloat;
+    let text_start = label_x + (label_width - whole_size.width) * 0.5;
+    for glyph in shimmer_text.chars() {
+        prefix.push(glyph);
+        let prefix_string = ns_string::from_rust_string(env, prefix.clone());
+        let size: CGSize = msg![env; prefix_string sizeWithFont:font];
+        release(env, prefix_string);
+        let glyph_width = (size.width - prefix_width).max(1.0);
+        let glyph_text = glyph.to_string();
+        let color = ui_color(env, 1.0, 1.0, 1.0, 0.86);
+        let letter = new_label(
+            env,
+            rect(text_start + prefix_width, 0.0, glyph_width + 0.5, 62.0),
+            &glyph_text,
+            25.0,
+            false,
+            color,
+        );
+        () = msg![env; letter setTextAlignment:UITextAlignmentCenter];
+        () = msg![env; track addSubview:letter];
+        shimmer_letters.push(letter);
+        prefix_width = size.width;
+    }
     // The classic iOS thumb is a wide silver pill, not a square tile.
     // Keep its proportion tied to the track so it scales with device width.
     let thumb_height = 54.0;
@@ -1936,10 +1965,12 @@ fn run_lock_screen(
             env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate).lock_slider_progress = progress;
         }
         let elapsed = started.elapsed().as_secs_f64();
-        // Keep the phrase as one UILabel: a gentle light pulse avoids the
-        // doubled/striped glyph artifacts caused by clipped duplicate labels.
-        let shimmer = (0.5 + 0.5 * (elapsed * std::f64::consts::TAU / 2.8).sin()) as CGFloat;
-        () = msg![env; slide_text setAlpha:(0.62 + shimmer * 0.20)];
+        let sweep = (elapsed % 2.4) / 2.4 * (shimmer_letters.len() as f64 + 4.0) - 2.0;
+        for (index, &letter) in shimmer_letters.iter().enumerate() {
+            let distance = (index as f64 - sweep).abs();
+            let glow = (1.0 - distance / 2.2).clamp(0.0, 1.0) as CGFloat;
+            () = msg![env; letter setAlpha:(0.58 + glow * 0.42)];
+        }
         let mut knob_frame: CGRect = msg![env; knob frame];
         let travel = (track_width - thumb_width - 8.0).max(0.0);
         knob_frame.origin.x = 4.0 + travel * progress as CGFloat;
@@ -2779,20 +2810,27 @@ fn slide_settings_screen(
     run_loop: id,
     delegate: id,
     settings_view: id,
-    _width: CGFloat,
+    screen_size: CGSize,
     open: bool,
 ) {
-    const START_SCALE: CGFloat = 0.86;
+    const START_SCALE: CGFloat = 0.88;
+    const START_Y_FRACTION: CGFloat = 0.10;
     if open {
-        let initial_transform = CGAffineTransform::make_scale(START_SCALE, START_SCALE);
+        let initial_transform = CGAffineTransform::make_scale(START_SCALE, START_SCALE)
+            .concat(CGAffineTransform::make_translation(0.0, screen_size.height * START_Y_FRACTION));
         () = msg![env; settings_view setTransform:initial_transform];
         () = msg![env; settings_view setAlpha:(0.0 as CGFloat)];
         () = msg![env; settings_view setHidden:false];
     }
     animate_for(env, run_loop, delegate, SETTINGS_SLIDE_DURATION, |env, t| {
-        let progress = if open { ease_in_out_cubic(t) as CGFloat } else { (1.0 - ease_in_out_cubic(t)) as CGFloat };
+        // Open upward out of the dock with a gentle zoom; closing retraces the
+        // same path, rather than simply fading/scaling in place.
+        let eased = ease_out_cubic(t) as CGFloat;
+        let progress = if open { eased } else { 1.0 - eased };
         let scale = START_SCALE + (1.0 - START_SCALE) * progress;
-        let transform = CGAffineTransform::make_scale(scale, scale);
+        let translate_y = screen_size.height * START_Y_FRACTION * (1.0 - progress);
+        let transform = CGAffineTransform::make_scale(scale, scale)
+            .concat(CGAffineTransform::make_translation(0.0, translate_y));
         () = msg![env; settings_view setTransform:transform];
         () = msg![env; settings_view setAlpha:progress];
     });
