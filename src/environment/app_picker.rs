@@ -1857,9 +1857,12 @@ fn run_lock_screen(
         let strip = new_view(env, rect(2.0, 2.0 + band as CGFloat * 1.4, size.width - 46.0, 2.0), highlight);
         () = msg![env; track addSubview:strip];
     }
+    let track_width = size.width - 42.0;
+    let thumb_width = (track_width * 0.245).clamp(76.0, 100.0);
+    let label_x = thumb_width + 24.0;
+    let label_width = (track_width - label_x - 12.0).max(0.0);
     let slide_color = ui_color(env, 1.0, 1.0, 1.0, 0.58);
-    let label_width = size.width - 130.0;
-    let slide_text = new_label(env, rect(72.0, 0.0, label_width, 62.0), "slide to unlock", 25.0, false, slide_color);
+    let slide_text = new_label(env, rect(label_x, 0.0, label_width, 62.0), "slide to unlock", 25.0, false, slide_color);
     () = msg![env; slide_text setTextAlignment:UITextAlignmentCenter];
     () = msg![env; track addSubview:slide_text];
     // Bright duplicate glyphs, clipped into soft narrow bands, sweep across
@@ -1877,41 +1880,39 @@ fn run_lock_screen(
         text_glints.push((clip, glint, index));
     }
 
-    let knob_shadow_color = ui_color(env, 0.0, 0.0, 0.0, 0.55);
-    let knob_shadow = new_view(env, rect(5.0, 6.0, 54.0, 54.0), knob_shadow_color);
-    let knob_shadow_layer: id = msg![env; knob_shadow layer];
-    () = msg![env; knob_shadow_layer setCornerRadius:(15.0 as CGFloat)];
-    () = msg![env; track addSubview:knob_shadow];
-    let knob_color = ui_color(env, 0.91, 0.92, 0.94, 1.0);
-    let knob = new_view(env, rect(4.0, 4.0, 54.0, 54.0), knob_color);
-    let knob_layer: id = msg![env; knob layer];
-    () = msg![env; knob_layer setCornerRadius:(14.0 as CGFloat)];
-    () = msg![env; knob setClipsToBounds:true];
-    let knob_edge = ui_color(env, 1.0, 1.0, 1.0, 0.78);
-    let knob_edge_cg: id = msg![env; knob_edge CGColor];
-    () = msg![env; knob_layer setBorderColor:knob_edge_cg];
-    () = msg![env; knob_layer setBorderWidth:(1.0 as CGFloat)];
-    // One restrained inset glint keeps the thumb glossy without child layers
-    // painting square corners over its rounded silhouette.
-    let knob_glint_color = ui_color(env, 1.0, 1.0, 1.0, 0.48);
-    let knob_glint = new_view(env, rect(5.0, 3.0, 44.0, 1.5), knob_glint_color);
-    () = msg![env; knob addSubview:knob_glint];
+    // The classic iOS thumb is a wide silver pill, not a square tile.
+    // Keep its proportion tied to the track so it scales with device width.
+    let thumb_height = 54.0;
+    let thumb_image = make_lock_thumb_image(env);
+    let knob: id = msg_class![env; UIImageView alloc];
+    let knob: id = msg![env; knob initWithImage:thumb_image];
+    () = msg![env; knob setFrame:(rect(4.0, 4.0, thumb_width, thumb_height))];
     () = msg![env; track addSubview:knob];
     let arrow_image = make_lock_arrow_image(env);
     let arrow_view: id = msg_class![env; UIImageView alloc];
     let arrow_view: id = msg![env; arrow_view initWithImage:arrow_image];
-    () = msg![env; arrow_view setFrame:(rect(4.0, 9.0, 46.0, 36.0))];
+    let arrow_width = 52.0;
+    let arrow_height = 40.0;
+    () = msg![env; arrow_view setFrame:(rect(
+        (thumb_width - arrow_width) * 0.5,
+        (thumb_height - arrow_height) * 0.5,
+        arrow_width,
+        arrow_height,
+    ))];
     () = msg![env; knob addSubview:arrow_view];
 
     // A nearly transparent UISlider is the actual touch surface. Its value
     // drives the visible thumb continuously, so the arrow follows the finger
     // instead of only reacting after a swipe has already ended.
     let slider: id = msg_class![env; UISlider alloc];
-    let track_width = size.width - 42.0;
+    // Align UISlider's touch-value endpoints with the centers of the wide
+    // custom thumb so the visual knob stays directly under the finger.
+    let slider_start = 4.0 + thumb_width * 0.5 - 11.5;
+    let slider_width = track_width - slider_start * 2.0;
     let slider: id = msg![env; slider initWithFrame:(rect(
-        19.5,
+        slider_start,
         0.0,
-        track_width - 39.0,
+        slider_width,
         62.0,
     ))];
     () = msg![env; slider setValue:0.0f32];
@@ -1957,13 +1958,13 @@ fn run_lock_screen(
         let shimmer_start = -56.0 + shimmer_phase as CGFloat * (label_width + 56.0);
         for &(clip, glint, index) in &text_glints {
             let offset = shimmer_start + index as CGFloat * 7.0;
-            () = msg![env; clip setFrame:(rect(72.0 + offset, 0.0, 8.0, 62.0))];
+            () = msg![env; clip setFrame:(rect(label_x + offset, 0.0, 8.0, 62.0))];
             // Offset each clipped copy back by its own band position so every
             // slice stays pixel-aligned with the base glyphs (no ghosting).
             () = msg![env; glint setFrame:(rect(-offset - index as CGFloat * 7.0, 0.0, label_width, 62.0))];
         }
         let mut knob_frame: CGRect = msg![env; knob frame];
-        let travel = (track_width - 62.0).max(0.0);
+        let travel = (track_width - thumb_width - 8.0).max(0.0);
         knob_frame.origin.x = 4.0 + travel * progress as CGFloat;
         () = msg![env; knob setFrame:knob_frame];
         if clock_updated.elapsed() >= Duration::from_secs(1) {
@@ -1999,6 +2000,15 @@ fn run_lock_screen(
     for &dot in page_dots {
         () = msg![env; dot setHidden:false];
     }
+}
+
+fn make_lock_thumb_image(env: &mut Environment) -> id {
+    let bytes: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/lock_thumb.png"));
+    let image = Image::from_bytes(bytes).unwrap();
+    let cg_image = cg_image::from_image(env, image);
+    let ui_image: id = msg_class![env; UIImage imageWithCGImage:cg_image];
+    release(env, cg_image);
+    ui_image
 }
 
 fn make_lock_arrow_image(env: &mut Environment) -> id {
