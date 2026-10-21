@@ -1849,14 +1849,11 @@ fn run_lock_screen(
     () = msg![env; track_layer setBorderColor:track_edge_cg];
     () = msg![env; track_layer setBorderWidth:(1.0 as CGFloat)];
     () = msg![env; lock addSubview:track];
-    // Feathered top reflections give the dark inset capsule its gloss.
-    for band in 0..16 {
-        let t = band as CGFloat / 15.0;
-        let alpha = 0.22 * (1.0 - t).powi(2);
-        let highlight = ui_color(env, 1.0, 1.0, 1.0, alpha);
-        let strip = new_view(env, rect(2.0, 2.0 + band as CGFloat * 1.4, size.width - 46.0, 2.0), highlight);
-        () = msg![env; track addSubview:strip];
-    }
+    // A single restrained top glint keeps the capsule glossy without visible
+    // striping on renderers that do not composite translucent bands smoothly.
+    let track_glint_color = ui_color(env, 1.0, 1.0, 1.0, 0.11);
+    let track_glint = new_view(env, rect(14.0, 2.0, size.width - 70.0, 1.0), track_glint_color);
+    () = msg![env; track addSubview:track_glint];
     let track_width = size.width - 42.0;
     let thumb_width = (track_width * 0.245).clamp(76.0, 100.0);
     let label_x = thumb_width + 24.0;
@@ -1865,21 +1862,6 @@ fn run_lock_screen(
     let slide_text = new_label(env, rect(label_x, 0.0, label_width, 62.0), "slide to unlock", 25.0, false, slide_color);
     () = msg![env; slide_text setTextAlignment:UITextAlignmentCenter];
     () = msg![env; track addSubview:slide_text];
-    // Bright duplicate glyphs, clipped into soft narrow bands, sweep across
-    // the lettering to create a real iOS-style text sheen without a hard bar.
-    let mut text_glints = Vec::new();
-    let glint_strengths = [0.05, 0.10, 0.18, 0.28, 0.38, 0.28, 0.18, 0.10, 0.05];
-    for (index, strength) in glint_strengths.iter().enumerate() {
-        let clip = new_view(env, rect(72.0, 0.0, 8.0, 62.0), clear);
-        () = msg![env; clip setClipsToBounds:true];
-        let bright = ui_color(env, 1.0, 1.0, 1.0, *strength);
-        let glint = new_label(env, rect(0.0, 0.0, label_width, 62.0), "slide to unlock", 25.0, false, bright);
-        () = msg![env; glint setTextAlignment:UITextAlignmentCenter];
-        () = msg![env; clip addSubview:glint];
-        () = msg![env; track addSubview:clip];
-        text_glints.push((clip, glint, index));
-    }
-
     // The classic iOS thumb is a wide silver pill, not a square tile.
     // Keep its proportion tied to the track so it scales with device width.
     let thumb_height = 54.0;
@@ -1954,15 +1936,10 @@ fn run_lock_screen(
             env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate).lock_slider_progress = progress;
         }
         let elapsed = started.elapsed().as_secs_f64();
-        let shimmer_phase = (elapsed % 2.2) / 2.2;
-        let shimmer_start = -56.0 + shimmer_phase as CGFloat * (label_width + 56.0);
-        for &(clip, glint, index) in &text_glints {
-            let offset = shimmer_start + index as CGFloat * 7.0;
-            () = msg![env; clip setFrame:(rect(label_x + offset, 0.0, 8.0, 62.0))];
-            // Offset each clipped copy back by its own band position so every
-            // slice stays pixel-aligned with the base glyphs (no ghosting).
-            () = msg![env; glint setFrame:(rect(-offset - index as CGFloat * 7.0, 0.0, label_width, 62.0))];
-        }
+        // Keep the phrase as one UILabel: a gentle light pulse avoids the
+        // doubled/striped glyph artifacts caused by clipped duplicate labels.
+        let shimmer = (0.5 + 0.5 * (elapsed * std::f64::consts::TAU / 2.8).sin()) as CGFloat;
+        () = msg![env; slide_text setAlpha:(0.62 + shimmer * 0.20)];
         let mut knob_frame: CGRect = msg![env; knob frame];
         let travel = (track_width - thumb_width - 8.0).max(0.0);
         knob_frame.origin.x = 4.0 + travel * progress as CGFloat;
