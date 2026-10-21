@@ -1827,32 +1827,77 @@ fn run_lock_screen(
         () = msg![env; shade addSubview:strip];
     }
     () = msg![env; lock addSubview:shade];
-    let track_color = ui_color(env, 0.015, 0.02, 0.035, 0.62);
-    let track = new_view(env, rect(20.0, bottom + 13.0, size.width - 40.0, 62.0), track_color);
+    // Raised metal bezel around the black glass slider, like the inset 3D
+    // capsule on the reference iPhone OS lock screen.
+    let bezel_color = ui_color(env, 0.25, 0.26, 0.28, 1.0);
+    let bezel = new_view(env, rect(17.0, bottom + 10.0, size.width - 34.0, 68.0), bezel_color);
+    let bezel_layer: id = msg![env; bezel layer];
+    () = msg![env; bezel_layer setCornerRadius:(20.0 as CGFloat)];
+    let bezel_edge = ui_color(env, 0.62, 0.64, 0.67, 1.0);
+    let bezel_edge_cg: id = msg![env; bezel_edge CGColor];
+    () = msg![env; bezel_layer setBorderColor:bezel_edge_cg];
+    () = msg![env; bezel_layer setBorderWidth:(1.5 as CGFloat)];
+    () = msg![env; lock addSubview:bezel];
+
+    let track_color = ui_color(env, 0.008, 0.012, 0.02, 0.90);
+    let track = new_view(env, rect(21.0, bottom + 13.0, size.width - 42.0, 62.0), track_color);
     let track_layer: id = msg![env; track layer];
     () = msg![env; track_layer setCornerRadius:(18.0 as CGFloat)];
     () = msg![env; track setClipsToBounds:true];
+    let track_edge = ui_color(env, 0.0, 0.0, 0.0, 0.85);
+    let track_edge_cg: id = msg![env; track_edge CGColor];
+    () = msg![env; track_layer setBorderColor:track_edge_cg];
+    () = msg![env; track_layer setBorderWidth:(1.0 as CGFloat)];
     () = msg![env; lock addSubview:track];
-    // Many very thin translucent bands form a soft glass highlight instead of
-    // the hard-edged half-track reflection that looked like a second bar.
+    // Feathered top reflections give the dark inset capsule its gloss.
     for band in 0..16 {
         let t = band as CGFloat / 15.0;
-        let alpha = 0.16 * (1.0 - t);
+        let alpha = 0.22 * (1.0 - t).powi(2);
         let highlight = ui_color(env, 1.0, 1.0, 1.0, alpha);
-        let strip = new_view(env, rect(1.0, 1.0 + band as CGFloat * 2.0, size.width - 42.0, 2.5), highlight);
+        let strip = new_view(env, rect(2.0, 2.0 + band as CGFloat * 1.4, size.width - 46.0, 2.0), highlight);
         () = msg![env; track addSubview:strip];
     }
-    let edge_color = ui_color(env, 1.0, 1.0, 1.0, 0.26);
-    let track_edge = new_view(env, rect(1.0, 1.0, size.width - 42.0, 1.0), edge_color);
-    () = msg![env; track addSubview:track_edge];
-    let slide_color = ui_color(env, 1.0, 1.0, 1.0, 0.72);
-    let slide_text = new_label(env, rect(72.0, 0.0, size.width - 130.0, 62.0), "slide to unlock", 25.0, false, slide_color);
+    let slide_color = ui_color(env, 1.0, 1.0, 1.0, 0.58);
+    let label_width = size.width - 130.0;
+    let slide_text = new_label(env, rect(72.0, 0.0, label_width, 62.0), "slide to unlock", 25.0, false, slide_color);
     () = msg![env; slide_text setTextAlignment:UITextAlignmentCenter];
     () = msg![env; track addSubview:slide_text];
-    let knob_color = ui_color(env, 0.96, 0.96, 0.97, 1.0);
+    // Bright duplicate glyphs, clipped into soft narrow bands, sweep across
+    // the lettering to create a real iOS-style text sheen without a hard bar.
+    let mut text_glints = Vec::new();
+    let glint_strengths = [0.10, 0.18, 0.30, 0.48, 0.62, 0.48, 0.30, 0.18, 0.10];
+    for (index, strength) in glint_strengths.iter().enumerate() {
+        let clip = new_view(env, rect(72.0, 0.0, 8.0, 62.0), clear);
+        () = msg![env; clip setClipsToBounds:true];
+        let bright = ui_color(env, 1.0, 1.0, 1.0, *strength);
+        let glint = new_label(env, rect(0.0, 0.0, label_width, 62.0), "slide to unlock", 25.0, false, bright);
+        () = msg![env; glint setTextAlignment:UITextAlignmentCenter];
+        () = msg![env; clip addSubview:glint];
+        () = msg![env; track addSubview:clip];
+        text_glints.push((clip, glint, index));
+    }
+
+    let knob_shadow_color = ui_color(env, 0.0, 0.0, 0.0, 0.55);
+    let knob_shadow = new_view(env, rect(5.0, 6.0, 54.0, 54.0), knob_shadow_color);
+    let knob_shadow_layer: id = msg![env; knob_shadow layer];
+    () = msg![env; knob_shadow_layer setCornerRadius:(15.0 as CGFloat)];
+    () = msg![env; track addSubview:knob_shadow];
+    let knob_color = ui_color(env, 0.82, 0.83, 0.85, 1.0);
     let knob = new_view(env, rect(4.0, 4.0, 54.0, 54.0), knob_color);
     let knob_layer: id = msg![env; knob layer];
     () = msg![env; knob_layer setCornerRadius:(14.0 as CGFloat)];
+    () = msg![env; knob setClipsToBounds:true];
+    let knob_edge = ui_color(env, 1.0, 1.0, 1.0, 0.78);
+    let knob_edge_cg: id = msg![env; knob_edge CGColor];
+    () = msg![env; knob_layer setBorderColor:knob_edge_cg];
+    () = msg![env; knob_layer setBorderWidth:(1.0 as CGFloat)];
+    for band in 0..18 {
+        let t = band as CGFloat / 17.0;
+        let shade = 0.98 - 0.24 * t;
+        let gloss = ui_color(env, shade, shade, shade, 1.0);
+        let strip = new_view(env, rect(1.0, band as CGFloat * 3.0, 52.0, 3.0), gloss);
+        () = msg![env; knob addSubview:strip];
+    }
     () = msg![env; track addSubview:knob];
     let arrow_image = make_lock_arrow_image(env);
     let arrow_view: id = msg_class![env; UIImageView alloc];
@@ -1864,7 +1909,13 @@ fn run_lock_screen(
     // drives the visible thumb continuously, so the arrow follows the finger
     // instead of only reacting after a swipe has already ended.
     let slider: id = msg_class![env; UISlider alloc];
-    let slider: id = msg![env; slider initWithFrame:(rect(0.0, 0.0, size.width - 40.0, 62.0))];
+    let track_width = size.width - 42.0;
+    let slider: id = msg![env; slider initWithFrame:(rect(
+        19.5,
+        0.0,
+        track_width - 39.0,
+        62.0,
+    ))];
     () = msg![env; slider setValue:0.0f32];
     // Keep the control itself fully hit-testable, but hide its stock blue/gray
     // track and thumb so only our custom glass slider is visible.
@@ -1904,13 +1955,15 @@ fn run_lock_screen(
             env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate).lock_slider_progress = progress;
         }
         let elapsed = started.elapsed().as_secs_f64();
-        let phase = (elapsed * std::f64::consts::TAU / 2.4).sin();
-        // Slow text breathing is the idle iOS-style hint; while dragging, the
-        // thumb tracks the actual UISlider value frame-by-frame.
-        let text_alpha = (0.64 + (phase + 1.0) * 0.14) as CGFloat;
-        () = msg![env; slide_text setAlpha:text_alpha];
+        let shimmer_phase = (elapsed % 2.2) / 2.2;
+        let shimmer_start = -56.0 + shimmer_phase as CGFloat * (label_width + 56.0);
+        for &(clip, glint, index) in &text_glints {
+            let offset = shimmer_start + index as CGFloat * 7.0;
+            () = msg![env; clip setFrame:(rect(72.0 + offset, 0.0, 8.0, 62.0))];
+            () = msg![env; glint setFrame:(rect(-offset, 0.0, label_width, 62.0))];
+        }
         let mut knob_frame: CGRect = msg![env; knob frame];
-        let travel = (size.width - 40.0 - 62.0).max(0.0);
+        let travel = (track_width - 62.0).max(0.0);
         knob_frame.origin.x = 4.0 + travel * progress as CGFloat;
         () = msg![env; knob setFrame:knob_frame];
         if clock_updated.elapsed() >= Duration::from_secs(1) {
