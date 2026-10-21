@@ -2267,7 +2267,7 @@ fn make_dock(
         .clamp(2.0, 18.0);
     let first_x = (dock_width - (DOCK_ICON_SIZE * count + gap * (count - 1.0))) / 2.0;
 
-    let plus_image = make_add_ipa_app_icon(env);
+    let plus_image = make_icon_from_text(env, "+", 50.0, -6.0, (0.25, 0.25, 0.25, 1.0));
     let settings_image = make_settings_app_icon(env);
     let recent_placeholder = make_icon_from_text(env, "↻", 34.0, 0.0, (0.25, 0.25, 0.25, 1.0));
     let browse_image = make_browse_app_icon(env);
@@ -2801,11 +2801,11 @@ fn slide_settings_screen(
     if !open { () = msg![env; settings_view setHidden:true]; }
 }
 
-/// Loads a bundled home-screen icon and applies the same rounded mask used by
-/// installed apps. The selected artwork already has its iOS-style gloss.
+/// Loads a flat monochrome dock icon, applying the same rounded mask and
+/// subtle gloss as the original gray picker icons.
 fn make_dock_asset_icon(env: &mut Environment, bytes: &[u8]) -> id {
     let mut image = Image::from_bytes(bytes).unwrap();
-    image.round_icon_corners(/* add_sheen: */ false);
+    image.round_icon_corners(/* add_sheen: */ true);
     let cg_image = cg_image::from_image(env, image);
     let ui_image: id = msg_class![env; UIImage imageWithCGImage:cg_image];
     release(env, cg_image);
@@ -2814,11 +2814,6 @@ fn make_dock_asset_icon(env: &mut Environment, bytes: &[u8]) -> id {
 
 fn make_settings_app_icon(env: &mut Environment) -> id {
     let bytes: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/settings_icon.png"));
-    make_dock_asset_icon(env, bytes)
-}
-
-fn make_add_ipa_app_icon(env: &mut Environment) -> id {
-    let bytes: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/add_ipa_icon.png"));
     make_dock_asset_icon(env, bytes)
 }
 
