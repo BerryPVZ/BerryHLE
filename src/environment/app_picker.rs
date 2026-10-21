@@ -325,6 +325,7 @@ struct AppPickerDelegateHostObject {
     /// Set when the horizontal swipe recognizers fire (old-iOS page change).
     swipe_left: bool,
     swipe_right: bool,
+    lock_screen_unlocked: bool,
 }
 impl HostObject for AppPickerDelegateHostObject {}
 
@@ -477,6 +478,9 @@ const CLASSES: ClassExports = objc_classes! {
 }
 - (())swipeRight {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).swipe_right = true;
+}
+- (())unlockLockScreen {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).lock_screen_unlocked = true;
 }
 - (())openRecentApp {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).recent_app_tapped = true;
@@ -811,6 +815,17 @@ fn app_picker_inner(
     chrome_views.extend(page_dots.iter().copied());
 
     let main_run_loop: id = msg_class![env; NSRunLoop mainRunLoop];
+    run_lock_screen(
+        env,
+        main_run_loop,
+        delegate,
+        main_view,
+        app_frame.size,
+        icon_grid_stuff.as_ref(),
+        dock,
+        version_label,
+        &page_dots,
+    );
     if let Some(ref grid) = icon_grid_stuff {
         play_home_screen_unlock_animation(
             env,
@@ -1731,6 +1746,146 @@ fn update_icon_grid(
     }
 }
 
+
+/// Construct and display the iPhone OS 4 lock screen over the picker wallpaper.
+/// A rightward swipe dismisses the lock screen; a pulsing label recreates the
+/// animated “slide to unlock” treatment.
+fn run_lock_screen(
+    env: &mut Environment,
+    run_loop: id,
+    delegate: id,
+    parent: id,
+    size: CGSize,
+    grid: Option<&IconGridStuff>,
+    dock: id,
+    version_label: id,
+    page_dots: &[id],
+) {
+    if let Some(grid) = grid {
+        for container in &grid.containers {
+            () = msg![env; container.view setHidden:true];
+        }
+    }
+    () = msg![env; dock setHidden:true];
+    () = msg![env; version_label setHidden:true];
+    for &dot in page_dots {
+        () = msg![env; dot setHidden:true];
+    }
+    let clear = msg_class![env; UIColor clearColor];
+    let lock = new_view(env, rect(0.0, 0.0, size.width, size.height), clear);
+    let top_color = ui_color(env, 0.0, 0.0, 0.0, 0.30);
+    let top = new_view(env, rect(0.0, 0.0, size.width, 135.0), top_color);
+    () = msg![env; lock addSubview:top];
+    let white: id = msg_class![env; UIColor whiteColor];
+    let clock = new_label(env, rect(0.0, 12.0, size.width, 82.0), &lock_screen_time_string(), 68.0, false, white);
+    () = msg![env; clock setTextAlignment:UITextAlignmentCenter];
+    let shadow = ui_color(env, 0.0, 0.0, 0.0, 0.7);
+    () = msg![env; clock setShadowColor:shadow];
+    () = msg![env; clock setShadowOffset:(CGSize { width: 0.0, height: 2.0 })];
+    () = msg![env; lock addSubview:clock];
+    let date = new_label(env, rect(8.0, 91.0, size.width - 16.0, 32.0), &lock_screen_date_string(), 22.0, false, white);
+    () = msg![env; date setTextAlignment:UITextAlignmentCenter];
+    () = msg![env; date setShadowColor:shadow];
+    () = msg![env; date setShadowOffset:(CGSize { width: 0.0, height: 1.0 })];
+    () = msg![env; lock addSubview:date];
+
+    let bottom = size.height - 116.0;
+    let shade_color = ui_color(env, 0.0, 0.0, 0.0, 0.28);
+    let shade = new_view(env, rect(0.0, bottom - 20.0, size.width, 136.0), shade_color);
+    () = msg![env; lock addSubview:shade];
+    let track_color = ui_color(env, 0.0, 0.0, 0.0, 0.73);
+    let track = new_view(env, rect(20.0, bottom + 13.0, size.width - 40.0, 62.0), track_color);
+    let track_layer: id = msg![env; track layer];
+    () = msg![env; track_layer setCornerRadius:(18.0 as CGFloat)];
+    () = msg![env; lock addSubview:track];
+    let edge_color = ui_color(env, 1.0, 1.0, 1.0, 0.16);
+    let track_edge = new_view(env, rect(1.0, 1.0, size.width - 42.0, 1.0), edge_color);
+    () = msg![env; track addSubview:track_edge];
+    let slide_color = ui_color(env, 1.0, 1.0, 1.0, 0.64);
+    let slide_text = new_label(env, rect(72.0, 0.0, size.width - 130.0, 62.0), "slide to unlock", 25.0, false, slide_color);
+    () = msg![env; slide_text setTextAlignment:UITextAlignmentCenter];
+    () = msg![env; track addSubview:slide_text];
+    let knob_color = ui_color(env, 0.94, 0.94, 0.95, 1.0);
+    let knob = new_view(env, rect(4.0, 4.0, 54.0, 54.0), knob_color);
+    let knob_layer: id = msg![env; knob layer];
+    () = msg![env; knob_layer setCornerRadius:(14.0 as CGFloat)];
+    () = msg![env; track addSubview:knob];
+    let arrow_color = ui_color(env, 0.35, 0.35, 0.36, 1.0);
+    let arrow = new_label(env, rect(2.0, 0.0, 50.0, 54.0), "➜", 34.0, true, arrow_color);
+    () = msg![env; arrow setTextAlignment:UITextAlignmentCenter];
+    () = msg![env; knob addSubview:arrow];
+
+    let swipe_selector = env.objc.lookup_selector("unlockLockScreen").unwrap();
+    let swipe: id = msg_class![env; UISwipeGestureRecognizer alloc];
+    let swipe: id = msg![env; swipe initWithTarget:delegate action:swipe_selector];
+    () = msg![env; swipe setDirection:UISwipeGestureRecognizerDirectionRight];
+    () = msg![env; lock addGestureRecognizer:swipe];
+    () = msg![env; parent addSubview:lock];
+
+    let started = Instant::now();
+    let mut clock_updated = Instant::now();
+    loop {
+        run_run_loop_single_iteration(env, run_loop);
+        let unlocked = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate).lock_screen_unlocked;
+        if unlocked { break; }
+        let phase = (started.elapsed().as_secs_f64() * 2.4).sin();
+        () = msg![env; slide_text setAlpha:((0.66 + phase.abs() * 0.28) as CGFloat)];
+        let mut knob_frame: CGRect = msg![env; knob frame];
+        knob_frame.origin.x = 4.0 + phase.max(0.0) as CGFloat * 5.0;
+        () = msg![env; knob setFrame:knob_frame];
+        if clock_updated.elapsed() >= Duration::from_secs(1) {
+            clock_updated = Instant::now();
+            let text = ns_string::from_rust_string(env, lock_screen_time_string());
+            () = msg![env; clock setText:text];
+            release(env, text);
+        }
+    }
+    {
+        let mut host = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
+        host.lock_screen_unlocked = false;
+        host.swipe_right = false;
+        host.swipe_left = false;
+    }
+    animate_for(env, run_loop, delegate, Duration::from_millis(480), |env, t| {
+        let p = ease_in_out_cubic(t) as CGFloat;
+        let mut frame: CGRect = msg![env; lock frame];
+        frame.origin.y = -size.height * p;
+        () = msg![env; lock setFrame:frame];
+    });
+    () = msg![env; lock setHidden:true];
+    if let Some(grid) = grid {
+        () = msg![env; grid.containers[grid.visible].view setHidden:false];
+    }
+    () = msg![env; dock setHidden:false];
+    () = msg![env; version_label setHidden:false];
+    for &dot in page_dots {
+        () = msg![env; dot setHidden:false];
+    }
+}
+
+#[cfg(unix)]
+fn lock_screen_calendar_parts() -> (i32, i32, i32, i32, i32, i32) {
+    unsafe {
+        let mut now: libc::time_t = 0;
+        libc::time(&mut now);
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&now, &mut tm).is_null() { return (14, 50, 3, 0, 21, 2026); }
+        (tm.tm_hour, tm.tm_min, tm.tm_wday, tm.tm_mon, tm.tm_mday, tm.tm_year + 1900)
+    }
+}
+#[cfg(not(unix))]
+fn lock_screen_calendar_parts() -> (i32, i32, i32, i32, i32, i32) { (14, 50, 3, 0, 21, 2026) }
+fn lock_screen_time_string() -> String {
+    let (hour, minute, ..) = lock_screen_calendar_parts();
+    format!("{:02}:{:02}", hour, minute)
+}
+fn lock_screen_date_string() -> String {
+    let (_, _, weekday, month, day, _) = lock_screen_calendar_parts();
+    let weekdays = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    let months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+    format!("{}, {} {}", weekdays[weekday.clamp(0, 6) as usize], months[month.clamp(0, 11) as usize], day)
+}
+
 /// Builds a fake old-iOS status bar: signal bars, carrier, clock and battery.
 /// Returns the bar itself, the clock label and the battery charge bar, which
 /// the event loop updates.
@@ -1877,10 +2032,7 @@ fn status_bar_time_string() -> String {
         }
         tm
     };
-    let hour = tm.tm_hour.rem_euclid(12);
-    let hour = if hour == 0 { 12 } else { hour };
-    let suffix = if tm.tm_hour < 12 { "AM" } else { "PM" };
-    format!("{}:{:02} {}", hour, tm.tm_min, suffix)
+    format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
 }
 
 #[cfg(not(unix))]
@@ -1953,10 +2105,6 @@ fn rebuild_page_dots(
 const DOCK_ICON_SIZE: CGFloat = 60.0;
 const DOCK_ICON_TOP: CGFloat = 5.0;
 const DOCK_LABEL_HEIGHT: CGFloat = 12.0;
-/// The dock shortcuts sit close together in the middle of the dock instead of
-/// being spread out to the screen edges.
-const DOCK_MIN_GAP: CGFloat = 14.0;
-const DOCK_MAX_GAP: CGFloat = 26.0;
 
 /// Builds the old-iOS dock at the bottom of the home screen. The shortcuts
 /// live outside the paged grid, so they stay in place while pages slide.
@@ -1968,41 +2116,34 @@ fn make_dock(
     recent_app: Option<(&str, id)>,
 ) -> id {
     let width = screen_size.width;
-    let top = screen_size.height - APP_PICKER_DOCK_HEIGHT;
-    let background = ui_color(env, 1.0, 1.0, 1.0, 0.15);
-    let dock = new_view(
-        env,
-        rect(0.0, top, width, APP_PICKER_DOCK_HEIGHT),
-        background,
-    );
-    let hairline_color = ui_color(env, 1.0, 1.0, 1.0, 0.35);
-    let hairline = new_view(env, rect(0.0, 0.0, width, 1.0), hairline_color);
+    let dock_inset = 6.0;
+    let dock_width = width - dock_inset * 2.0;
+    let top = screen_size.height - APP_PICKER_DOCK_HEIGHT + 2.0;
+    let background = ui_color(env, 0.035, 0.045, 0.065, 0.62);
+    let dock = new_view(env, rect(dock_inset, top, dock_width, APP_PICKER_DOCK_HEIGHT - 4.0), background);
+    let dock_layer: id = msg![env; dock layer];
+    () = msg![env; dock_layer setCornerRadius:(12.0 as CGFloat)];
+    let hairline_color = ui_color(env, 1.0, 1.0, 1.0, 0.38);
+    let hairline = new_view(env, rect(12.0, 0.0, dock_width - 24.0, 1.0), hairline_color);
     () = msg![env; dock addSubview:hairline];
 
-    let count: CGFloat = 3.0;
-    let side_inset: CGFloat = 10.0;
-    let gap = ((width - side_inset * 2.0 - DOCK_ICON_SIZE * count) / (count - 1.0))
-        .clamp(DOCK_MIN_GAP, DOCK_MAX_GAP);
-    let first_x = (width - (DOCK_ICON_SIZE * count + gap * (count - 1.0))) / 2.0;
+    let count: CGFloat = 4.0;
+    let side_inset: CGFloat = 8.0;
+    let gap = ((dock_width - side_inset * 2.0 - DOCK_ICON_SIZE * count) / (count - 1.0))
+        .clamp(2.0, 18.0);
+    let first_x = (dock_width - (DOCK_ICON_SIZE * count + gap * (count - 1.0))) / 2.0;
 
     let plus_image = make_icon_from_text(env, "+", 50.0, -6.0, (0.25, 0.25, 0.25, 1.0));
     let settings_image = make_settings_app_icon(env);
     let recent_placeholder = make_icon_from_text(env, "↻", 34.0, 0.0, (0.25, 0.25, 0.25, 1.0));
-
+    let browse_image = make_icon_from_text(env, "A", 38.0, 0.0, (0.12, 0.32, 0.78, 1.0));
+    let step = DOCK_ICON_SIZE + gap;
+    make_dock_item(env, delegate, dock, first_x, plus_image, "Add .ipa", "addIpa");
     make_dock_item(
         env,
         delegate,
         dock,
-        first_x,
-        plus_image,
-        "Add .ipa",
-        "addIpa",
-    );
-    make_dock_item(
-        env,
-        delegate,
-        dock,
-        first_x + DOCK_ICON_SIZE + gap,
+        first_x + step,
         settings_image,
         "Settings",
         "settingsShow",
@@ -2014,11 +2155,12 @@ fn make_dock(
         env,
         delegate,
         dock,
-        first_x + 2.0 * (DOCK_ICON_SIZE + gap),
+        first_x + step * 2.0,
         recent_image,
         recent_label,
         "openRecentApp",
     );
+    make_dock_item(env, delegate, dock, first_x + step * 3.0, browse_image, "Browse", "addIpa");
     () = msg![env; main_view addSubview:dock];
     dock
 }
@@ -2173,7 +2315,7 @@ const APP_LAUNCH_BLACK_HOLD_DURATION: Duration = Duration::from_millis(250);
 /// Side length of the app icon at the centre of the launch animation.
 const APP_LAUNCH_ICON_SIZE: CGFloat = 120.0;
 /// Duration of the settings screen slide (iOS-style push from the right).
-const SETTINGS_SLIDE_DURATION: Duration = Duration::from_millis(350);
+const SETTINGS_SLIDE_DURATION: Duration = Duration::from_millis(560);
 /// How long an app icon must be held down before its delete dialog opens.
 const APP_LONG_PRESS_DURATION: Duration = Duration::from_millis(500);
 
@@ -2497,26 +2639,30 @@ fn slide_to_page(
     grid.visible = back;
 }
 
-/// Slides the settings screen in from the right (`open`) or back out again.
+/// Scales the Settings screen in and out from the centre, like an iOS app.
 fn slide_settings_screen(
     env: &mut Environment,
     run_loop: id,
     delegate: id,
     settings_view: id,
-    width: CGFloat,
+    _width: CGFloat,
     open: bool,
 ) {
+    const START_SCALE: CGFloat = 0.86;
     if open {
+        () = msg![env; settings_view setTransform:CGAffineTransform::make_scale(START_SCALE, START_SCALE)];
+        () = msg![env; settings_view setAlpha:(0.0 as CGFloat)];
         () = msg![env; settings_view setHidden:false];
     }
     animate_for(env, run_loop, delegate, SETTINGS_SLIDE_DURATION, |env, t| {
-        let p = ease_out_cubic(t);
-        let progress = if open { p } else { 1.0 - p };
-        set_view_x(env, settings_view, (width as f64 * (1.0 - progress)) as CGFloat);
+        let progress = if open { ease_in_out_cubic(t) as CGFloat } else { (1.0 - ease_in_out_cubic(t)) as CGFloat };
+        let scale = START_SCALE + (1.0 - START_SCALE) * progress;
+        () = msg![env; settings_view setTransform:CGAffineTransform::make_scale(scale, scale)];
+        () = msg![env; settings_view setAlpha:progress];
     });
-    if !open {
-        () = msg![env; settings_view setHidden:true];
-    }
+    () = msg![env; settings_view setTransform:CGAffineTransformIdentity];
+    () = msg![env; settings_view setAlpha:(1.0 as CGFloat)];
+    if !open { () = msg![env; settings_view setHidden:true]; }
 }
 
 /// Builds the iOS-style "Settings" app icon (grey gear, gloss and rounded
@@ -2747,7 +2893,7 @@ fn setup_settings(
     // so scrolled content must not be able to show up in that strip.
     let status_offset = app_frame.origin.y;
 
-    let grouped_bg = ui_color(env, 0.937, 0.937, 0.957, 1.0);
+    let grouped_bg = ui_color(env, 0.79, 0.82, 0.85, 1.0);
     let settings_view = new_view(
         env,
         rect(0.0, -status_offset, width, height + status_offset),
@@ -2755,22 +2901,33 @@ fn setup_settings(
     );
     () = msg![env; settings_view setHidden:true];
     () = msg![env; super_view addSubview:settings_view];
+    let stripe = ui_color(env, 0.55, 0.58, 0.62, 0.10);
+    let mut stripe_x: CGFloat = 2.0;
+    while stripe_x < width {
+        let stripe_view = new_view(env, rect(stripe_x, 0.0, 1.0, height + status_offset), stripe);
+        () = msg![env; settings_view addSubview:stripe_view];
+        stripe_x += 5.0;
+    }
 
     let clear: id = msg_class![env; UIColor clearColor];
     let black: id = msg_class![env; UIColor blackColor];
     let white: id = msg_class![env; UIColor whiteColor];
     let gray_text = ui_color(env, 0.43, 0.43, 0.45, 1.0);
-    let blue = ui_color(env, 0.0, 0.478, 1.0, 1.0);
-
     // Navigation bar with the title and a "Done" button.
-    let nav_bar_bg = ui_color(env, 0.97, 0.97, 0.98, 1.0);
+    let nav_bar_bg = ui_color(env, 0.20, 0.34, 0.52, 1.0);
     let nav_bar = new_view(
         env,
         rect(0.0, 0.0, width, SETTINGS_NAV_BAR_HEIGHT + status_offset),
         nav_bar_bg,
     );
     () = msg![env; settings_view addSubview:nav_bar];
-    let nav_separator_color = ui_color(env, 0.78, 0.78, 0.8, 1.0);
+    let nav_height = SETTINGS_NAV_BAR_HEIGHT + status_offset;
+    for (band, color) in [(0.0, (0.42, 0.57, 0.75)), (0.22, (0.32, 0.47, 0.66)), (0.45, (0.24, 0.38, 0.57))] {
+        let band_color = ui_color(env, color.0, color.1, color.2, 1.0);
+        let highlight = new_view(env, rect(0.0, nav_height * band, width, nav_height * 0.24), band_color);
+        () = msg![env; nav_bar addSubview:highlight];
+    }
+    let nav_separator_color = ui_color(env, 0.12, 0.22, 0.36, 1.0);
     let nav_separator = new_view(
         env,
         rect(0.0, SETTINGS_NAV_BAR_HEIGHT + status_offset - 1.0, width, 1.0),
@@ -2778,7 +2935,7 @@ fn setup_settings(
     );
     () = msg![env; settings_view addSubview:nav_separator];
 
-    let title_color = ui_color(env, 0.1, 0.1, 0.1, 1.0);
+    let title_color = ui_color(env, 1.0, 1.0, 1.0, 1.0);
     let title = new_label(
         env,
         rect(60.0, status_offset, width - 120.0, SETTINGS_NAV_BAR_HEIGHT),
@@ -2796,7 +2953,7 @@ fn setup_settings(
     () = msg![env; done setTitle:done_text forState:UIControlStateNormal];
     // FIXME: manually calling layoutSubviews shouldn't be needed?
     () = msg![env; done layoutSubviews];
-    () = msg![env; done setTitleColor:blue forState:UIControlStateNormal];
+    () = msg![env; done setTitleColor:white forState:UIControlStateNormal];
     let done_label: id = msg![env; done titleLabel];
     let done_font: id = msg_class![env; UIFont boldSystemFontOfSize:(17.0 as CGFloat)];
     () = msg![env; done_label setFont:done_font];
@@ -2922,6 +3079,11 @@ fn setup_settings(
         y += SETTINGS_HEADER_HEIGHT;
 
         let group_height: CGFloat = rows.iter().map(settings_row_height).sum();
+        let outline_color = ui_color(env, 0.66, 0.67, 0.69, 1.0);
+        let outline = new_view(env, rect(SETTINGS_GROUP_INSET - 1.0, y - 1.0, inner_width + 2.0, group_height + 2.0), outline_color);
+        let outline_layer: id = msg![env; outline layer];
+        () = msg![env; outline_layer setCornerRadius:(11.0 as CGFloat)];
+        () = msg![env; scroll addSubview:outline];
         let group = new_view(
             env,
             rect(SETTINGS_GROUP_INSET, y, inner_width, group_height),
@@ -3214,12 +3376,10 @@ fn update_dropdown_menu(
         }
         let tag: NSInteger = msg![env; item tag];
         let is_selected = selected.is_some_and(|v| v as NSInteger == tag);
-        let color: id = if is_selected {
-            msg_class![env; UIColor magentaColor]
-        } else {
-            msg_class![env; UIColor darkGrayColor]
-        };
+        let color = if is_selected { ui_color(env, 0.08, 0.40, 0.78, 1.0) } else { ui_color(env, 1.0, 1.0, 1.0, 1.0) };
+        let text_color: id = if is_selected { msg_class![env; UIColor whiteColor] } else { msg_class![env; UIColor blackColor] };
         () = msg![env; item setBackgroundColor:color];
+        () = msg![env; item setTitleColor:text_color forState:UIControlStateNormal];
     }
 
     // Position the scrollbar thumb proportionally to the scroll offset.
