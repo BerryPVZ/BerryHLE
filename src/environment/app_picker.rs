@@ -3940,10 +3940,11 @@ fn make_delete_dialog(
         separator_color,
     );
     () = msg![env; panel addSubview:separator];
+    let separator_glint_color = ui_color(env, 1.0, 1.0, 1.0, 0.65);
     let separator_glint = new_view(
         env,
         rect(10.0, button_y + 1.0, DELETE_DIALOG_WIDTH - 20.0, 1.0),
-        ui_color(env, 1.0, 1.0, 1.0, 0.65),
+        separator_glint_color,
     );
     () = msg![env; panel addSubview:separator_glint];
 
