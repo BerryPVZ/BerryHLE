@@ -822,6 +822,7 @@ fn app_picker_inner(
         main_view,
         app_frame.size,
         icon_grid_stuff.as_ref(),
+        status_bar,
         dock,
         version_label,
         &page_dots,
@@ -1757,6 +1758,7 @@ fn run_lock_screen(
     parent: id,
     size: CGSize,
     grid: Option<&IconGridStuff>,
+    status_bar: Option<id>,
     dock: id,
     version_label: id,
     page_dots: &[id],
@@ -1772,11 +1774,27 @@ fn run_lock_screen(
     for &dot in page_dots {
         () = msg![env; dot setHidden:true];
     }
-    let clear = msg_class![env; UIColor clearColor];
+    let clear: id = msg_class![env; UIColor clearColor];
     let lock = new_view(env, rect(0.0, 0.0, size.width, size.height), clear);
-    let top_color = ui_color(env, 0.0, 0.0, 0.0, 0.30);
-    let top = new_view(env, rect(0.0, 0.0, size.width, 135.0), top_color);
+    if let Some(bar) = status_bar {
+        let status_glass = ui_color(env, 0.02, 0.025, 0.04, 0.36);
+        () = msg![env; bar setBackgroundColor:status_glass];
+    }
+
+    // Layered translucent bands give the clock panel the soft glass gradient
+    // of the iOS 4 lock screen while keeping the wallpaper visible beneath it.
+    let top = new_view(env, rect(0.0, 0.0, size.width, 138.0), clear);
+    for band in 0..12 {
+        let y = band as CGFloat * 11.5;
+        let alpha = 0.30 - band as CGFloat * 0.014;
+        let tint = ui_color(env, 0.025, 0.035, 0.06, alpha);
+        let strip = new_view(env, rect(0.0, y, size.width, 12.0), tint);
+        () = msg![env; top addSubview:strip];
+    }
     () = msg![env; lock addSubview:top];
+    let header_edge_color = ui_color(env, 1.0, 1.0, 1.0, 0.18);
+    let header_edge = new_view(env, rect(0.0, 137.0, size.width, 1.0), header_edge_color);
+    () = msg![env; lock addSubview:header_edge];
     let white: id = msg_class![env; UIColor whiteColor];
     let clock = new_label(env, rect(0.0, 12.0, size.width, 82.0), &lock_screen_time_string(), 68.0, false, white);
     () = msg![env; clock setTextAlignment:UITextAlignmentCenter];
@@ -1791,36 +1809,57 @@ fn run_lock_screen(
     () = msg![env; lock addSubview:date];
 
     let bottom = size.height - 116.0;
-    let shade_color = ui_color(env, 0.0, 0.0, 0.0, 0.28);
-    let shade = new_view(env, rect(0.0, bottom - 20.0, size.width, 136.0), shade_color);
+    let shade = new_view(env, rect(0.0, bottom - 24.0, size.width, 140.0), clear);
+    for band in 0..12 {
+        let y = band as CGFloat * (140.0 / 12.0);
+        let alpha = 0.035 + band as CGFloat * 0.018;
+        let tint = ui_color(env, 0.015, 0.02, 0.035, alpha);
+        let strip = new_view(env, rect(0.0, y, size.width, 12.0), tint);
+        () = msg![env; shade addSubview:strip];
+    }
     () = msg![env; lock addSubview:shade];
-    let track_color = ui_color(env, 0.0, 0.0, 0.0, 0.73);
+    let track_color = ui_color(env, 0.015, 0.02, 0.035, 0.62);
     let track = new_view(env, rect(20.0, bottom + 13.0, size.width - 40.0, 62.0), track_color);
     let track_layer: id = msg![env; track layer];
     () = msg![env; track_layer setCornerRadius:(18.0 as CGFloat)];
+    () = msg![env; track setClipsToBounds:true];
     () = msg![env; lock addSubview:track];
-    let edge_color = ui_color(env, 1.0, 1.0, 1.0, 0.16);
+    // A translucent upper reflection plus a fine inner edge creates the glass
+    // capsule; the darker bottom half supplies depth without blacking out art.
+    let sheen_color = ui_color(env, 1.0, 1.0, 1.0, 0.14);
+    let sheen = new_view(env, rect(3.0, 2.0, size.width - 46.0, 20.0), sheen_color);
+    let sheen_layer: id = msg![env; sheen layer];
+    () = msg![env; sheen_layer setCornerRadius:(14.0 as CGFloat)];
+    () = msg![env; track addSubview:sheen];
+    let edge_color = ui_color(env, 1.0, 1.0, 1.0, 0.26);
     let track_edge = new_view(env, rect(1.0, 1.0, size.width - 42.0, 1.0), edge_color);
     () = msg![env; track addSubview:track_edge];
     let slide_color = ui_color(env, 1.0, 1.0, 1.0, 0.64);
     let slide_text = new_label(env, rect(72.0, 0.0, size.width - 130.0, 62.0), "slide to unlock", 25.0, false, slide_color);
     () = msg![env; slide_text setTextAlignment:UITextAlignmentCenter];
     () = msg![env; track addSubview:slide_text];
-    let knob_color = ui_color(env, 0.94, 0.94, 0.95, 1.0);
-    let knob = new_view(env, rect(4.0, 4.0, 54.0, 54.0), knob_color);
+    let knob_color = ui_color(env, 0.96, 0.96, 0.97, 1.0);
+    let knob: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+    () = msg![env; knob setFrame:(rect(4.0, 4.0, 54.0, 54.0))];
+    () = msg![env; knob setBackgroundColor:knob_color];
     let knob_layer: id = msg![env; knob layer];
     () = msg![env; knob_layer setCornerRadius:(14.0 as CGFloat)];
+    let unlock_selector = env.objc.lookup_selector("unlockLockScreen").unwrap();
+    () = msg![env; knob addTarget:delegate
+                            action:unlock_selector
+                  forControlEvents:UIControlEventTouchUpInside];
     () = msg![env; track addSubview:knob];
+    // Use the basic right-arrow glyph available in the bundled Helvetica-like
+    // fonts; the heavy Unicode arrow previously rendered as an empty square.
     let arrow_color = ui_color(env, 0.35, 0.35, 0.36, 1.0);
-    let arrow = new_label(env, rect(2.0, 0.0, 50.0, 54.0), "➜", 34.0, true, arrow_color);
+    let arrow = new_label(env, rect(2.0, 0.0, 50.0, 54.0), "→", 38.0, true, arrow_color);
     () = msg![env; arrow setTextAlignment:UITextAlignmentCenter];
     () = msg![env; knob addSubview:arrow];
 
-    let swipe_selector = env.objc.lookup_selector("unlockLockScreen").unwrap();
     let swipe: id = msg_class![env; UISwipeGestureRecognizer alloc];
-    let swipe: id = msg![env; swipe initWithTarget:delegate action:swipe_selector];
+    let swipe: id = msg![env; swipe initWithTarget:delegate action:unlock_selector];
     () = msg![env; swipe setDirection:UISwipeGestureRecognizerDirectionRight];
-    () = msg![env; lock addGestureRecognizer:swipe];
+    () = msg![env; track addGestureRecognizer:swipe];
     () = msg![env; parent addSubview:lock];
 
     let started = Instant::now();
@@ -1854,6 +1893,9 @@ fn run_lock_screen(
         () = msg![env; lock setFrame:frame];
     });
     () = msg![env; lock setHidden:true];
+    if let Some(bar) = status_bar {
+        () = msg![env; bar setBackgroundColor:clear];
+    }
     if let Some(grid) = grid {
         let active_container = grid.containers[grid.visible].view;
         () = msg![env; active_container setHidden:false];
