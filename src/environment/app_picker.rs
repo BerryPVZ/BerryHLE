@@ -2180,7 +2180,7 @@ fn make_dock(
     let plus_image = make_add_ipa_app_icon(env);
     let settings_image = make_settings_app_icon(env);
     let recent_placeholder = make_icon_from_text(env, "↻", 34.0, 0.0, (0.25, 0.25, 0.25, 1.0));
-    let browse_image = make_add_ipa_app_icon(env);
+    let browse_image = make_browse_app_icon(env);
     let step = DOCK_ICON_SIZE + gap;
     make_dock_item(env, delegate, dock, first_x, plus_image, "Add .ipa", "addIpa");
     make_dock_item(
@@ -2729,6 +2729,11 @@ fn make_settings_app_icon(env: &mut Environment) -> id {
 
 fn make_add_ipa_app_icon(env: &mut Environment) -> id {
     let bytes: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/add_ipa_icon.png"));
+    make_dock_asset_icon(env, bytes)
+}
+
+fn make_browse_app_icon(env: &mut Environment) -> id {
+    let bytes: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/browse_icon.png"));
     make_dock_asset_icon(env, bytes)
 }
 
