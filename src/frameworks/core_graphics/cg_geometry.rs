@@ -17,17 +17,14 @@ use crate::mem::SafeRead;
 use crate::objc::{id, msg, msg_class, nil};
 use crate::Environment;
 
-/// The `FromStr` impls below implement `CGPointFromString` and friends, which
-/// ignore whitespace: `"{{0,0},{64,32}}"` (the usual form in sprite sheet
-/// plists) and `"{ 1, 2 }"` parse just like `NSStringFromCGRect`'s
-/// `"{{0, 0}, {64, 32}}"`.
-fn strip_whitespace(s: &str) -> String {
-    s.chars().filter(|c| !c.is_whitespace()).collect()
-}
-
 fn parse_tuple(s: &str) -> Result<(f32, f32), ()> {
+    // TexturePacker/Cocos2D plists commonly omit spaces after commas.
+    // Whitespace is formatting, not part of the geometry's syntax.
     let (a, b) = s.split_once(',').ok_or(())?;
-    Ok((a.parse().map_err(|_| ())?, b.parse().map_err(|_| ())?))
+    Ok((
+        a.trim().parse().map_err(|_| ())?,
+        b.trim().parse().map_err(|_| ())?,
+    ))
 }
 
 // =========================================================================
@@ -58,8 +55,12 @@ impl GuestArg for CGPoint {
 impl std::str::FromStr for CGPoint {
     type Err = ();
     fn from_str(s: &str) -> Result<CGPoint, ()> {
-        let s = strip_whitespace(s);
-        let s = s.strip_prefix('{').ok_or(())?.strip_suffix('}').ok_or(())?;
+        let s = s
+            .trim()
+            .strip_prefix('{')
+            .ok_or(())?
+            .strip_suffix('}')
+            .ok_or(())?;
         let (x, y) = parse_tuple(s)?;
         Ok(CGPoint { x, y })
     }
@@ -136,8 +137,12 @@ impl GuestArg for CGSize {
 impl std::str::FromStr for CGSize {
     type Err = ();
     fn from_str(s: &str) -> Result<CGSize, ()> {
-        let s = strip_whitespace(s);
-        let s = s.strip_prefix('{').ok_or(())?.strip_suffix('}').ok_or(())?;
+        let s = s
+            .trim()
+            .strip_prefix('{')
+            .ok_or(())?
+            .strip_suffix('}')
+            .ok_or(())?;
         let (w, h) = parse_tuple(s)?;
         Ok(CGSize {
             width: w,
@@ -220,18 +225,21 @@ impl GuestArg for CGRect {
 impl std::str::FromStr for CGRect {
     type Err = ();
     fn from_str(s: &str) -> Result<CGRect, ()> {
-        let s = strip_whitespace(s);
         let s = s
-            .strip_prefix("{{")
+            .trim()
+            .strip_prefix('{')
             .ok_or(())?
-            .strip_suffix("}}")
+            .strip_suffix('}')
             .ok_or(())?;
-        let (a, b) = s.split_once("},{").ok_or(())?;
-        let (x, y) = parse_tuple(a)?;
-        let (width, height) = parse_tuple(b)?;
+        // Split after the origin tuple, then let CGPoint/CGSize validate
+        // both pairs. Accept compact and spaced forms without accepting
+        // missing braces, extra components, or trailing data.
+        let end = s.find('}').ok_or(())?;
+        let (origin, size) = s.split_at(end + 1);
+        let size = size.trim_start().strip_prefix(',').ok_or(())?;
         Ok(CGRect {
-            origin: CGPoint { x, y },
-            size: CGSize { width, height },
+            origin: origin.parse()?,
+            size: size.parse()?,
         })
     }
 }
@@ -936,5 +944,78 @@ mod tests {
 
         assert_eq!("{1;2}".parse::<CGPoint>(), Err(()));
         assert_eq!("{{1,2},{3}}".parse::<CGRect>(), Err(()));
+    }
+}
+
+#[cfg(test)]
+mod geometry_string_tests {
+    use super::{CGPoint, CGRect, CGSize};
+
+    #[test]
+    fn parses_texturepacker_frames_without_spaces() {
+        // Break the Cookie: Sports 1.1, SpriteAtlas and GameMenuAtlas.
+        for (text, x, y, width, height) in [
+            ("{{698,636},{22,31}}", 698.0, 636.0, 22.0, 31.0),
+            ("{{456,347},{70,57}}", 456.0, 347.0, 70.0, 57.0),
+            ("{{411,234},{104,100}}", 411.0, 234.0, 104.0, 100.0),
+        ] {
+            assert_eq!(
+                text.parse::<CGRect>(),
+                Ok(CGRect {
+                    origin: CGPoint { x, y },
+                    size: CGSize { width, height },
+                })
+            );
+        }
+        assert_eq!("{-1,0}".parse::<CGPoint>(), Ok(CGPoint { x: -1.0, y: 0.0 }));
+        assert_eq!(
+            "{1024,2048}".parse::<CGSize>(),
+            Ok(CGSize {
+                width: 1024.0,
+                height: 2048.0
+            })
+        );
+    }
+
+    #[test]
+    fn geometry_whitespace_and_display_round_trip() {
+        let rect = CGRect {
+            origin: CGPoint { x: -1.5, y: 2.0 },
+            size: CGSize {
+                width: 30.0,
+                height: 40.0,
+            },
+        };
+        for text in [
+            "{{-1.5, 2}, {30, 40}}",
+            " { { -1.5 , 2 } , { 30 , 40 } } ",
+            "{{-1.5,2}, {30,40}}",
+            "{{-1.5, 2},{30, 40}}",
+            "{{-1.5,2},{3e1,4e1}}",
+        ] {
+            assert_eq!(text.parse::<CGRect>(), Ok(rect));
+        }
+        assert_eq!(rect.to_string().parse::<CGRect>(), Ok(rect));
+        assert_eq!(rect.origin.to_string().parse::<CGPoint>(), Ok(rect.origin));
+        assert_eq!(rect.size.to_string().parse::<CGSize>(), Ok(rect.size));
+    }
+
+    #[test]
+    fn malformed_geometry_remains_invalid() {
+        for text in ["", "1,2", "{1}", "{1,2,3}", "{a,2}", "{1,}", "{1,2}junk"] {
+            assert!(text.parse::<CGPoint>().is_err(), "{text}");
+            assert!(text.parse::<CGSize>().is_err(), "{text}");
+        }
+        for text in [
+            "",
+            "{1,2,3,4}",
+            "{{1,2}{3,4}}",
+            "{{1,2},{3}}",
+            "{{1,2},{3,4},5}",
+            "{{1,2},{3,4}}junk",
+            "{{1,2},{3,4}",
+        ] {
+            assert!(text.parse::<CGRect>().is_err(), "{text}");
+        }
     }
 }

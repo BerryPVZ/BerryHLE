@@ -384,3 +384,14 @@ com.ea.simsmedieval.bv: --ios-es2-direct-present
 # Retina screen. On the 320x480 iPhone 3GS every label and icon is twice too
 # big for its row, so the title and text overflow. Emulate a Retina iPhone.
 com.anarchyent.mcwikipaid: --device-family=iphone-4
+# Break the Cookie: Sports (Kobold2D config.lua uses CCDirector rotation).
+# Its Info.plist advertises portrait too, despite landscape-only gameplay.
+# Read back the portrait drawable and apply device rotation once.
+hu.BV.BTC-Olympic: --landscape-left --present-mode=readback
+
+# Break the Cookie Free uses the same CCDirector drawable and startup checks.
+hu.BV.BreakTheCookieFree: --landscape-left --present-mode=readback
+
+# Food Fight mixes NIB-based UIKit menus with a MashEAGLView. Keep the
+# compositor active while the game's GL renderer is idle on menu screens.
+com.tomatoflix.foodfight: --force-composition

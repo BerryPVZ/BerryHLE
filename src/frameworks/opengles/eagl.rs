@@ -1292,7 +1292,7 @@ pub const CLASSES: ClassExports = objc_classes! {
                 env.current_thread,
             );
             match maybe_gles {
-                Some(mut gles) => Some(unsafe { read_renderbuffer(gles.as_mut(), renderbuffer, pixels_vec) }),
+                Some(mut gles) => unsafe { read_renderbuffer(gles.as_mut(), renderbuffer, pixels_vec) },
                 None => {
                     log!(
                         "[EAGLContext presentRenderbuffer:{:#x}] lost GL \
@@ -1402,7 +1402,15 @@ fn dump_readback_ppm(pixels: &[u8], width: u32, height: u32) {
 unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLuint, drawable: id) {
     // PERF: recycle the layer's previous pixel buffer instead of allocating
     // (and page-faulting in) a fresh multi-megabyte Vec every frame.
-    let pixels_vec = get_pixels_vec_for_presenting(env, drawable);
+    let full_frame = matches!(
+        env.bundle.bundle_identifier(),
+        "hu.BV.BTC-Olympic" | "hu.BV.BreakTheCookieFree"
+    ) && !env.options.force_composition;
+    let pixels_vec = if full_frame {
+        std::mem::take(&mut env.framework_state.opengles.fullscreen_readback_pixels)
+    } else {
+        get_pixels_vec_for_presenting(env, drawable)
+    };
     let read_result = {
         let maybe_gles = super::sync_context(
             &mut env.framework_state.opengles,
@@ -1411,7 +1419,7 @@ unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLu
             env.current_thread,
         );
         match maybe_gles {
-            Some(mut gles) => Some(read_renderbuffer(gles.as_mut(), renderbuffer, pixels_vec)),
+            Some(mut gles) => read_renderbuffer(gles.as_mut(), renderbuffer, pixels_vec),
             None => None,
         }
     };
@@ -1420,11 +1428,92 @@ unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLu
         return;
     };
     dump_readback_ppm(&pixels, width, height);
+    if full_frame {
+        present_full_frame_readback(env, &pixels, width, height);
+        env.framework_state.opengles.fullscreen_readback_pixels = pixels;
+        return;
+    }
     present_pixels(env, drawable, pixels, width, height);
     let force_composition = env.options.force_composition;
     env.options.force_composition = true;
     crate::frameworks::core_animation::recomposite_if_necessary(env, true);
     env.options.force_composition = force_composition;
+}
+
+/// Present raw framebuffer pixels in the separate internal context. Unlike
+/// layer composition this applies exactly one display rotation, without
+/// UIKit frame clipping, and never changes the guest's sprite GL state.
+unsafe fn present_full_frame_readback(
+    env: &mut Environment,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+) {
+    let window = env.window.as_mut().unwrap();
+    let viewport = window.viewport();
+    let rotation = window.rotation_matrix();
+    let cursor = window.virtual_cursor_visible_at();
+    let mut texture = env.framework_state.opengles.fullscreen_readback_texture;
+    let mut gles = window.make_internal_gl_ctx_current();
+    gles.ActiveTexture(gles11::TEXTURE0);
+    gles.ClientActiveTexture(gles11::TEXTURE0);
+    if texture == 0 {
+        log!("Break the Cookie: presenting full {}x{} framebuffer with one device rotation in the internal GL context.", width, height);
+        gles.GenTextures(1, &mut texture);
+    }
+    gles.BindTexture(gles11::TEXTURE_2D, texture);
+    for (pname, param) in [
+        (gles11::TEXTURE_MIN_FILTER, gles11::LINEAR),
+        (gles11::TEXTURE_MAG_FILTER, gles11::LINEAR),
+        (gles11::TEXTURE_WRAP_S, gles11::CLAMP_TO_EDGE),
+        (gles11::TEXTURE_WRAP_T, gles11::CLAMP_TO_EDGE),
+    ] {
+        gles.TexParameteri(gles11::TEXTURE_2D, pname, param as GLint);
+    }
+    gles.PixelStorei(gles11::UNPACK_ALIGNMENT, 1);
+    gles.TexImage2D(
+        gles11::TEXTURE_2D,
+        0,
+        gles11::RGBA as GLint,
+        width as GLsizei,
+        height as GLsizei,
+        0,
+        gles11::RGBA,
+        gles11::UNSIGNED_BYTE,
+        pixels.as_ptr().cast(),
+    );
+    gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, 0);
+    for cap in [
+        gles11::BLEND,
+        gles11::DEPTH_TEST,
+        gles11::STENCIL_TEST,
+        gles11::SCISSOR_TEST,
+        gles11::CULL_FACE,
+        gles11::LIGHTING,
+        gles11::FOG,
+        gles11::ALPHA_TEST,
+    ] {
+        gles.Disable(cap);
+    }
+    gles.DisableClientState(gles11::COLOR_ARRAY);
+    gles.DisableClientState(gles11::NORMAL_ARRAY);
+    gles.BindBuffer(gles11::ARRAY_BUFFER, 0);
+    gles.BindBuffer(gles11::ELEMENT_ARRAY_BUFFER, 0);
+    gles.Color4f(1.0, 1.0, 1.0, 1.0);
+    gles.ColorMask(gles11::TRUE, gles11::TRUE, gles11::TRUE, gles11::TRUE);
+    gles.TexEnvi(
+        gles11::TEXTURE_ENV,
+        gles11::TEXTURE_ENV_MODE,
+        gles11::REPLACE as GLint,
+    );
+    for mode in [gles11::PROJECTION, gles11::MODELVIEW, gles11::TEXTURE] {
+        gles.MatrixMode(mode);
+        gles.LoadIdentity();
+    }
+    present_frame(gles.as_mut(), viewport, rotation, cursor);
+    drop(gles);
+    window.swap_window();
+    env.framework_state.opengles.fullscreen_readback_texture = texture;
 }
 
 /// Implement framerate limiting.
@@ -1597,8 +1686,12 @@ unsafe fn get_renderbuffer_size(gles: &mut dyn GLES) -> (GLsizei, GLsizei) {
 /// The returned values are the [Vec], the width and height.
 ///
 /// The provided context must be current.
-unsafe fn read_renderbuffer(gles: &mut dyn GLES, renderbuffer: GLuint, mut pixel_buffer: Vec<u8>) -> (Vec<u8>, u32, u32) {
+unsafe fn read_renderbuffer(gles: &mut dyn GLES, renderbuffer: GLuint, mut pixel_buffer: Vec<u8>) -> Option<(Vec<u8>, u32, u32)> {
+    let old_renderbuffer = get_int(gles, gles11::RENDERBUFFER_BINDING_OES) as GLuint;
+    gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, renderbuffer);
     let (width, height) = get_renderbuffer_size(gles);
+    gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, old_renderbuffer);
+    if width <= 0 || height <= 0 { return None; }
     let width_u32: u32 = width.try_into().unwrap();
     let height_u32: u32 = height.try_into().unwrap();
 
@@ -1611,7 +1704,14 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, renderbuffer: GLuint, mut pixel
     // a different or incomplete FBO bound, in which case using it would be
     // just as wrong as the old unconditional temporary-FBO path.
     let old_framebuffer: GLuint = get_int(gles, gles11::FRAMEBUFFER_BINDING_OES) as _;
-    let (attached_renderbuffer, framebuffer_status) = if old_framebuffer != 0 {
+    // FRAMEBUFFER_BINDING aliases DRAW, but ReadPixels uses READ. Save both
+    // before a temporary FRAMEBUFFER bind can overwrite the resolve source.
+    let old_read_framebuffer = if gles.has_separate_framebuffer_bindings() {
+        Some(get_int(gles, crate::gles::gles30_raw::READ_FRAMEBUFFER_BINDING) as GLuint)
+    } else {
+        None
+    };
+    let (attached_renderbuffer, attachment_type, framebuffer_status) = if old_framebuffer != 0 {
         let mut attached = 0;
         gles.GetFramebufferAttachmentParameterivOES(
             gles11::FRAMEBUFFER_OES,
@@ -1619,15 +1719,19 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, renderbuffer: GLuint, mut pixel
             gles11::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME_OES,
             &mut attached,
         );
+        let mut object_type = 0;
+        gles.GetFramebufferAttachmentParameterivOES(gles11::FRAMEBUFFER_OES, gles11::COLOR_ATTACHMENT0_OES, gles11::FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE_OES, &mut object_type);
         (
             attached as GLuint,
+            object_type as GLenum,
             gles.CheckFramebufferStatusOES(gles11::FRAMEBUFFER_OES),
         )
     } else {
-        (0, gles11::FRAMEBUFFER_COMPLETE_OES)
+        (0, 0, gles11::FRAMEBUFFER_COMPLETE_OES)
     };
     let use_bound_framebuffer = old_framebuffer != 0
         && attached_renderbuffer == renderbuffer
+        && attachment_type == gles11::RENDERBUFFER_OES
         && framebuffer_status == gles11::FRAMEBUFFER_COMPLETE_OES;
     let mut src_framebuffer: GLuint = 0;
     if !use_bound_framebuffer {
@@ -1646,6 +1750,17 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, renderbuffer: GLuint, mut pixel
         );
     }
 
+    if gles.CheckFramebufferStatusOES(gles11::FRAMEBUFFER_OES) != gles11::FRAMEBUFFER_COMPLETE_OES {
+        if !use_bound_framebuffer {
+            gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, old_framebuffer);
+            gles.DeleteFramebuffersOES(1, &src_framebuffer);
+        }
+        if let Some(read) = old_read_framebuffer {
+            gles.BindFramebufferOES(crate::gles::gles30_raw::READ_FRAMEBUFFER, read);
+        }
+        return None;
+    }
+
     // On tile-based GPUs (Mali, Adreno, PowerVR) the per-tile color buffer
     // isn't guaranteed to be resolved to the renderbuffer's main memory
     // until the driver decides to flush. glReadPixels is supposed to imply
@@ -1654,14 +1769,33 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, renderbuffer: GLuint, mut pixel
     // tile resolve here while the application's FBO is still bound.
     gles.Finish();
 
+    if old_read_framebuffer.is_some() && use_bound_framebuffer {
+        gles.BindFramebufferOES(crate::gles::gles30_raw::READ_FRAMEBUFFER, old_framebuffer);
+    }
+
     // Read the pixels
     let size = (width_u32 as usize)
         .checked_mul(height_u32 as usize)
         .unwrap()
         .checked_mul(4)
         .unwrap();
-    pixel_buffer.clear();
-    pixel_buffer.reserve_exact(size);
+    // ReadPixels leaves the destination untouched on error. Never expose spare
+    // Vec capacity as pixels: that displays heap garbage and is undefined Rust.
+    prepare_readback_buffer(&mut pixel_buffer, size);
+    let old_pack_alignment = get_int(gles, gles11::PACK_ALIGNMENT);
+    gles.PixelStorei(gles11::PACK_ALIGNMENT, 1);
+    // A prior guest command can leave GL_INVALID_ENUM pending. It does not
+    // mean ReadPixels failed: establish an error boundary for this operation.
+    for _ in 0..16 {
+        let pending_error = gles.GetError();
+        if pending_error == gles11::NO_ERROR {
+            break;
+        }
+        log_dbg!(
+            "EAGL readback: clearing earlier GL error {:#x}",
+            pending_error
+        );
+    }
     let before = Instant::now();
     gles.ReadPixels(
         0,
@@ -1678,14 +1812,27 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, renderbuffer: GLuint, mut pixel
         height,
         Instant::now().saturating_duration_since(before)
     );
-    pixel_buffer.set_len(size);
+    let read_error = gles.GetError();
+    gles.PixelStorei(gles11::PACK_ALIGNMENT, old_pack_alignment);
 
     if !use_bound_framebuffer {
         gles.DeleteFramebuffersOES(1, &src_framebuffer);
         gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, old_framebuffer);
     }
 
-    (pixel_buffer, width_u32, height_u32)
+    if let Some(read) = old_read_framebuffer {
+        gles.BindFramebufferOES(crate::gles::gles30_raw::READ_FRAMEBUFFER, read);
+    }
+
+    if read_error != gles11::NO_ERROR {
+        log!(
+            "EAGL readback failed with GL error {:#x}; skipping frame",
+            read_error
+        );
+        None
+    } else {
+        Some((pixel_buffer, width_u32, height_u32))
+    }
 }
 
 /// Shader-based variant of the renderbuffer presenter, used when the
@@ -2651,8 +2798,10 @@ unsafe fn present_renderbuffer(
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        if matches!(n, 600 | 1200 | 1700) {
-            let (px, w, h) = read_renderbuffer(gles, renderbuffer, Vec::new());
+        if let Some((px, w, h)) = matches!(n, 600 | 1200 | 1700)
+            .then(|| read_renderbuffer(gles, renderbuffer, Vec::new()))
+            .flatten()
+        {
             let mut out = format!("P6\n{} {}\n255\n", w, h).into_bytes();
             for c in px.chunks_exact(4) {
                 out.extend_from_slice(&[c[0], c[1], c[2]]);
@@ -3480,8 +3629,10 @@ unsafe fn present_renderbuffer(
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
         log_once!("DUMP-RB: present_renderbuffer reached, dumping enabled");
-        if matches!(n, 600 | 1200 | 1700) {
-            let (px, w, h) = read_renderbuffer(gles, renderbuffer, Vec::new());
+        if let Some((px, w, h)) = matches!(n, 600 | 1200 | 1700)
+            .then(|| read_renderbuffer(gles, renderbuffer, Vec::new()))
+            .flatten()
+        {
             let mut out = format!("P6\n{} {}\n255\n", w, h).into_bytes();
             for c in px.chunks_exact(4) {
                 out.extend_from_slice(&[c[0], c[1], c[2]]);
@@ -3806,4 +3957,206 @@ fn attach_orphaned_eagl_view_to_root(env: &mut Environment, drawable: id) -> boo
         }
     }
     false
+}
+
+fn prepare_readback_buffer(buffer: &mut Vec<u8>, size: usize) {
+    buffer.clear();
+    buffer.resize(size, 0);
+}
+#[cfg(test)]
+mod readback_buffer_tests {
+    use super::prepare_readback_buffer;
+    #[test]
+    fn failed_copy_cannot_expose_recycled_or_uninitialized_pixels() {
+        let mut buffer = vec![0xa5; 128];
+        prepare_readback_buffer(&mut buffer, 64);
+        assert_eq!(buffer, vec![0; 64]);
+        prepare_readback_buffer(&mut buffer, 256);
+        assert_eq!(buffer, vec![0; 256]);
+    }
+}
+
+#[cfg(test)]
+mod framebuffer_readback_tests {
+    use super::*;
+    struct Framebuffers {
+        draw: GLuint,
+        read: GLuint,
+        renderbuffer: GLuint,
+        pack: GLint,
+        separate: bool,
+        incomplete: bool,
+        error: GLenum,
+    }
+    impl GLES for Framebuffers {
+        fn has_separate_framebuffer_bindings(&self) -> bool {
+            self.separate
+        }
+        unsafe fn GetIntegerv(&mut self, pname: GLenum, out: *mut GLint) {
+            *out = match pname {
+                gles11::FRAMEBUFFER_BINDING_OES => self.draw as _,
+                crate::gles::gles30_raw::READ_FRAMEBUFFER_BINDING => {
+                    assert!(self.separate);
+                    self.read as _
+                }
+                gles11::RENDERBUFFER_BINDING_OES => self.renderbuffer as _,
+                gles11::PACK_ALIGNMENT => self.pack,
+                _ => panic!("unexpected query {pname:x}"),
+            };
+        }
+        unsafe fn BindFramebufferOES(&mut self, target: GLenum, value: GLuint) {
+            if target == crate::gles::gles30_raw::READ_FRAMEBUFFER {
+                assert!(self.separate);
+                self.read = value;
+            } else {
+                assert_eq!(target, gles11::FRAMEBUFFER_OES);
+                self.draw = value;
+                self.read = value;
+            }
+        }
+        unsafe fn BindRenderbufferOES(&mut self, _: GLenum, value: GLuint) {
+            self.renderbuffer = value;
+        }
+        unsafe fn GetRenderbufferParameterivOES(
+            &mut self,
+            _: GLenum,
+            pname: GLenum,
+            out: *mut GLint,
+        ) {
+            assert_eq!(self.renderbuffer, 42);
+            *out = match pname {
+                gles11::RENDERBUFFER_WIDTH_OES => 2,
+                gles11::RENDERBUFFER_HEIGHT_OES => 1,
+                _ => panic!("unexpected renderbuffer query"),
+            };
+        }
+        unsafe fn GetFramebufferAttachmentParameterivOES(
+            &mut self,
+            _: GLenum,
+            _: GLenum,
+            pname: GLenum,
+            out: *mut GLint,
+        ) {
+            *out = match pname {
+                gles11::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME_OES => {
+                    if self.draw == 7 {
+                        42
+                    } else {
+                        99
+                    }
+                }
+                gles11::FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE_OES => gles11::RENDERBUFFER_OES as _,
+                _ => panic!("unexpected attachment query"),
+            };
+        }
+        unsafe fn CheckFramebufferStatusOES(&mut self, _: GLenum) -> GLenum {
+            if self.incomplete && self.draw == 10 {
+                0x8cd6
+            } else {
+                gles11::FRAMEBUFFER_COMPLETE_OES
+            }
+        }
+        unsafe fn GenFramebuffersOES(&mut self, _: GLsizei, out: *mut GLuint) {
+            *out = 10;
+        }
+        unsafe fn DeleteFramebuffersOES(&mut self, _: GLsizei, _: *const GLuint) {}
+        unsafe fn FramebufferRenderbufferOES(
+            &mut self,
+            _: GLenum,
+            _: GLenum,
+            _: GLenum,
+            rb: GLuint,
+        ) {
+            assert_eq!(rb, 42);
+            assert_eq!(self.draw, 10);
+        }
+        unsafe fn Finish(&mut self) {}
+        unsafe fn PixelStorei(&mut self, pname: GLenum, value: GLint) {
+            assert_eq!(pname, gles11::PACK_ALIGNMENT);
+            self.pack = value;
+        }
+        unsafe fn ReadPixels(
+            &mut self,
+            _: GLint,
+            _: GLint,
+            w: GLsizei,
+            h: GLsizei,
+            _: GLenum,
+            _: GLenum,
+            pixels: *mut std::ffi::c_void,
+        ) {
+            if self.read != 7 && self.read != 10 {
+                self.error = 0x506;
+                return;
+            }
+            std::ptr::write_bytes(pixels.cast::<u8>(), 0x5a, (w * h * 4) as usize);
+        }
+        unsafe fn GetError(&mut self) -> GLenum {
+            std::mem::take(&mut self.error)
+        }
+    }
+    #[test]
+    fn reads_resolved_target_and_restores_both_bindings() {
+        for draw in [7, 3] {
+            let mut gl = Framebuffers {
+                draw,
+                read: 9,
+                renderbuffer: 8,
+                pack: 8,
+                separate: true,
+                incomplete: false,
+                error: 0,
+            };
+            let (pixels, w, h) = unsafe { read_renderbuffer(&mut gl, 42, vec![0xaa; 8]) }.unwrap();
+            assert_eq!((pixels, w, h), (vec![0x5a; 8], 2, 1));
+            assert_eq!(
+                (gl.draw, gl.read, gl.renderbuffer, gl.pack),
+                (draw, 9, 8, 8)
+            );
+        }
+    }
+    #[test]
+    fn stale_guest_error_does_not_discard_valid_readback() {
+        let mut gl = Framebuffers {
+            draw: 7,
+            read: 7,
+            renderbuffer: 8,
+            pack: 4,
+            separate: false,
+            incomplete: false,
+            error: gles11::INVALID_ENUM,
+        };
+        let (pixels, width, height) =
+            unsafe { read_renderbuffer(&mut gl, 42, Vec::new()) }.unwrap();
+        assert_eq!((pixels, width, height), (vec![0x5a; 8], 2, 1));
+        assert_eq!((gl.draw, gl.read, gl.pack), (7, 7, 4));
+    }
+    #[test]
+    fn incomplete_fallback_restores_both_bindings() {
+        let mut gl = Framebuffers {
+            draw: 3,
+            read: 9,
+            renderbuffer: 8,
+            pack: 4,
+            separate: true,
+            incomplete: true,
+            error: 0,
+        };
+        assert!(unsafe { read_renderbuffer(&mut gl, 42, Vec::new()) }.is_none());
+        assert_eq!((gl.draw, gl.read, gl.renderbuffer), (3, 9, 8));
+    }
+    #[test]
+    fn native_es1_does_not_query_split_bindings() {
+        let mut gl = Framebuffers {
+            draw: 7,
+            read: 7,
+            renderbuffer: 8,
+            pack: 4,
+            separate: false,
+            incomplete: false,
+            error: 0,
+        };
+        assert!(unsafe { read_renderbuffer(&mut gl, 42, Vec::new()) }.is_some());
+        assert_eq!((gl.draw, gl.read, gl.pack), (7, 7, 4));
+    }
 }

@@ -5,7 +5,7 @@
  */
 //! The `NSValue` class cluster, including `NSNumber`.
 
-use super::ns_string::{from_rust_ordering, from_rust_string};
+use super::ns_string::{self, from_rust_ordering, from_rust_string};
 use super::{
     _nib_archive_decoder, ns_keyed_unarchiver, NSComparisonResult, NSOrderedSame, NSRange,
     NSUInteger,
@@ -229,6 +229,13 @@ fn decode_struct_value(
         // value round-trips exactly through `-getValue:`, matching the real
         // runtime instead of silently corrupting it to "pointer bits".
         let bytes = env.mem.get_bytes_fallible(value, size as u32)?.to_vec();
+        Some(NSValueHostObject::RawStruct {
+            encoding: enc.to_owned(),
+            bytes,
+        })
+    } else if matches!(enc.as_bytes().first(), Some(b'{' | b'(' | b'[')) {
+        let (_, size, _) = super::parse_objc_type(env, type_ptr.cast());
+        let bytes = env.mem.get_bytes_fallible(value, size)?.to_vec();
         Some(NSValueHostObject::RawStruct {
             encoding: enc.to_owned(),
             bytes,
@@ -482,6 +489,40 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 // MARK: - Additional NSValue accessors
+
+// Keyed archives store common geometry values as a tagged string. Sprite
+// catalogues use these for atlas rectangles, offsets and original sizes.
+- (id)initWithCoder:(id)coder {
+    let key = ns_string::get_static_str(env, "NS.special");
+    let kind: NSInteger = msg![env; coder decodeIntegerForKey:key];
+    let host = match kind {
+        1 => {
+            let key = ns_string::get_static_str(env, "NS.pointval");
+            let value: CGPoint = msg![env; coder decodeCGPointForKey:key];
+            NSValueHostObject::CGPoint(value)
+        }
+        2 => {
+            let key = ns_string::get_static_str(env, "NS.sizeval");
+            let value: CGSize = msg![env; coder decodeCGSizeForKey:key];
+            NSValueHostObject::CGSize(value)
+        }
+        3 => {
+            let key = ns_string::get_static_str(env, "NS.rectval");
+            let value: CGRect = msg![env; coder decodeCGRectForKey:key];
+            NSValueHostObject::CGRect(value)
+        }
+        _ => {
+            log!("NSValue initWithCoder: unsupported NS.special {}", kind);
+            release(env, this);
+            return nil;
+        }
+    };
+    let class = env.objc.get_known_class("NSValue", &mut env.mem);
+    let value = env.objc.alloc_object(class, Box::new(host), &mut env.mem);
+    release(env, this);
+    value
+}
+
 
 - (id)nonretainedObjectValue {
     // Reverse of valueWithNonretainedObject — recover the id from bits.

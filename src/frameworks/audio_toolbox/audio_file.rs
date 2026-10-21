@@ -883,6 +883,12 @@ fn read_packets(
         return paramErr;
     }
 
+    // Food Fight's AudioPlayback callback checks OSStatus before the packet
+    // count and only rewinds on a successful zero-packet read. Preserve the
+    // real short-read counts, but use its expected EOF convention.
+    let soft_eof = audiofile_soft_eof_enabled()
+        || env.bundle.bundle_identifier() == "com.tomatoflix.foodfight";
+
     let host_object = match State::get(&mut env.framework_state)
         .audio_files
         .get_mut(&in_audio_file)
@@ -1079,7 +1085,7 @@ fn read_packets(
         }
     }
 
-    if short_read && audiofile_soft_eof_enabled() {
+    if short_read && soft_eof {
         // Do NOT pretend EOF produced a full buffer. That can make games loop
         // forever because they think audio data still exists.
         //
@@ -1093,7 +1099,7 @@ fn read_packets(
         env.mem.write(io_num_packets, packets_read);
 
         log!(
-            "AudioFileReadPackets: TOUCHHLE_AUDIOFILE_SOFT_EOF=1,              softened EOF short read ({} < {} bytes), reporting {} packet(s) without eofErr",
+            "AudioFileReadPackets: compatibility EOF short read ({} < {} bytes), reporting {} packet(s) without eofErr",
             bytes_read,
             bytes_to_read,
             packets_read

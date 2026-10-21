@@ -47,6 +47,8 @@ pub(crate) struct CALayerHostObject {
     pub(crate) metal_drawable_size: CGSize,
     pub(crate) metal_framebuffer_only: bool,
     delegate: id,
+    /// Retained model for a detached presentation snapshot; nil for model layers.
+    presentation_model: id,
     pub(super) sublayers: Vec<id>,
     superlayer: id,
     pub(super) bounds: CGRect,
@@ -69,6 +71,7 @@ pub(crate) struct CALayerHostObject {
     pub(super) sublayer_transform: CATransform3D,
     pub(super) hidden: bool,
     pub(super) opaque: bool,
+    pub(super) masks_to_bounds: bool,
     pub(super) opacity: f32,
     pub(super) background_color: Option<CGColorHostObject>,
     /// CGImageRef for pattern backgrounds (set via colorWithPatternImage:)
@@ -388,6 +391,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         },
         metal_framebuffer_only: false,
         delegate: nil,
+        presentation_model: nil,
         sublayers: Vec::new(),
         superlayer: nil,
         bounds: CGRect {
@@ -402,6 +406,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         sublayer_transform: CATransform3DIdentity,
         hidden: false,
         opaque: false,
+        masks_to_bounds: false,
         opacity: 1.0,
         background_color: None,
         background_pattern_cg_image: nil,
@@ -447,6 +452,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let &mut CALayerHostObject {
         drawable_properties,
         contents,
+        presentation_model,
         superlayer,
         cg_context,
         mask,
@@ -455,6 +461,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     } = env.objc.borrow_mut(this);
     let sublayers = std::mem::take(sublayers);
 
+    if presentation_model != nil { release(env, presentation_model); }
     if drawable_properties != nil { release(env, drawable_properties); }
     if contents != nil { release(env, contents); }
     if mask != nil { release(env, mask); }
@@ -501,23 +508,36 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)superlayer { env.objc.borrow::<CALayerHostObject>(this).superlayer }
 
-// https://developer.apple.com/documentation/quartzcore/calayer/1410744-presentationlayer
-// Apple returns a copy of the layer holding the values that are currently
-// "in flight" (i.e. the state as displayed on screen mid-animation), or nil if
-// the layer has not yet been committed for rendering. touchHLE has no separate
-// presentation-layer tree — the model layer doubles as the render/presentation
-// layer (see core_animation::composition) — so the correct approximation is to
-// return the layer itself rather than nil. Games query this (e.g. to read
-// `[[layer presentationLayer] position]` for hit-testing during a move
-// animation), and returning nil would make them dereference a null object.
-- (id)presentationLayer { this }
+// Snapshot the same interpolated geometry used by the compositor. Returning
+// the model here makes moving objects hit-test and collect at their destination.
+- (id)presentationLayer {
+    if env.objc.borrow::<CALayerHostObject>(this).presentation_model != nil {
+        return this;
+    }
+    let mut snapshot = super::animation::State::sample_presentation_layer(env, this);
+    snapshot.presentation_model = this;
+    snapshot.superlayer = nil;
+    snapshot.sublayers.clear();
+    snapshot.animations.clear();
+    snapshot.anonymous_animations.clear();
+    snapshot.cg_context = None;
+    snapshot.presented_pixels = None;
+    snapshot.gles_texture = None;
+    snapshot.background_pattern_gles_texture = None;
+    snapshot.use_implicit_animations = false;
+    retain(env, this);
+    for object in [snapshot.contents, snapshot.drawable_properties, snapshot.mask] {
+        if object != nil { retain(env, object); }
+    }
+    let class = env.objc.get_known_class("CALayer", &mut env.mem);
+    let layer = env.objc.alloc_object(class, Box::new(snapshot), &mut env.mem);
+    autorelease(env, layer)
+}
 
-// https://developer.apple.com/documentation/quartzcore/calayer/1410631-modellayer
-// When sent to a presentation layer this returns the underlying model layer;
-// when sent to a model layer it returns the layer itself. Since our model
-// layer is its own presentation layer, returning `this` is correct in both
-// cases.
-- (id)modelLayer { this }
+- (id)modelLayer {
+    let model = env.objc.borrow::<CALayerHostObject>(this).presentation_model;
+    if model == nil { this } else { model }
+}
 
 - (())addSublayer:(id)layer {
     if layer == nil { return; }
@@ -611,6 +631,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 }
 
+- (bool)masksToBounds { env.objc.borrow::<CALayerHostObject>(this).masks_to_bounds }
+- (())setMasksToBounds:(bool)clips {
+    env.objc.borrow_mut::<CALayerHostObject>(this).masks_to_bounds = clips;
+}
+
 - (CGRect)bounds { env.objc.borrow::<CALayerHostObject>(this).bounds }
 - (())setBounds:(CGRect)bounds {
     let host_object = env.objc.borrow_mut::<CALayerHostObject>(this);
@@ -699,20 +724,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     })
 }
 - (())setFrame:(CGRect)frame {
-    let CALayerHostObject { anchor_point, affine_transform, .. } = env.objc.borrow_mut(this);
-    let inverse_transform = CGAffineTransform::make_translation(
-        -frame.size.width * anchor_point.x,
-        -frame.size.height * anchor_point.y,
-    ).concat(*affine_transform).invert();
-    let transformed_size = inverse_transform.apply_to_rect(CGRect {
-        origin: CGPoint { x: 0.0, y: 0.0 },
-        size: frame.size
-    }).size;
-    let transformed_offset = inverse_transform.apply_to_point(CGPoint { x: 0.0, y: 0.0 });
-    let new_position = CGPoint {
-        x: frame.origin.x + transformed_offset.x,
-        y: frame.origin.y + transformed_offset.y,
-    };
+    let CALayerHostObject { anchor_point, affine_transform, bounds, .. } = env.objc.borrow(this);
+    let bounds_origin = bounds.origin;
+    let (transformed_size, new_position) = geometry_for_frame(frame, *anchor_point, *affine_transform);
     // The inverse-transform round-trip above accumulates floating-point
     // error, so a frame whose origin/size are whole numbers can come back
     // as e.g. 320.000031 instead of 320.0. Real iOS reports clean integer
@@ -728,7 +742,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     };
     () = msg![env; this setPosition:new_position];
     let new_bounds = CGRect {
-        origin: CGPoint { x: 0.0, y: 0.0 },
+        origin: bounds_origin,
         size: CGSize {
             width: snap_near_integer(transformed_size.width),
             height: snap_near_integer(transformed_size.height),
@@ -1041,6 +1055,30 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())addAnimation:(id)anim forKey:(id)key {
+    if key == nil && env.objc.borrow::<CALayerHostObject>(this).anonymous_animations.contains(&anim) {
+        return;
+    }
+    // Keep the incoming object alive even when replacing itself under a key.
+    retain(env, anim);
+    super::ca_animation::reset_playback(env, anim);
+    if !super::ca_animation::is_implicit(env, anim) {
+        let path: id = msg![env; anim keyPath];
+        if path != nil {
+            let path = to_rust_string(env, path).into_owned();
+            let attached: Vec<(String, id)> = env.objc
+                .borrow::<CALayerHostObject>(this).animations.iter()
+                .map(|(key, animation)| (key.clone(), *animation)).collect();
+            for (key, animation) in attached {
+                if super::ca_animation::is_implicit(env, animation) {
+                    let other_path: id = msg![env; animation keyPath];
+                    if to_rust_string(env, other_path) == path {
+                        env.objc.borrow_mut::<CALayerHostObject>(this).animations.remove(&key);
+                        release(env, animation);
+                    }
+                }
+            }
+        }
+    }
     let duration: CFTimeInterval = msg![env; anim duration];
     if duration == 0.0 {
         let duration: CFTimeInterval = msg_class![env; CATransaction animationDuration];
@@ -1072,6 +1110,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
         retain(env, anim);
     }
+    release(env, anim);
 }
 
 - (())removeAnimationForKey:(id)key {
@@ -1373,6 +1412,7 @@ fn add_default_implied_basic_animation(
     let animation = msg_class![env; CABasicAnimation animationWithKeyPath:key_path];
     () = msg![env; animation setFromValue: from_value];
     () = msg![env; animation setToValue: to_value];
+    super::ca_animation::mark_implicit(env, animation);
     ca_transaction::State::add_animation(env, layer, animation);
 }
 
@@ -1381,4 +1421,41 @@ pub fn set_use_implicit_animations(env: &mut Environment, layer: id, enable: boo
     env.objc
         .borrow_mut::<CALayerHostObject>(layer)
         .use_implicit_animations = enable;
+}
+
+
+/// Recover local bounds from the axis-aligned frame, then place the transformed
+/// anchor-relative rectangle at the requested origin. Inverting the frame's
+/// origin directly gives the wrong position for a rotated layer.
+fn geometry_for_frame(frame: CGRect, anchor: CGPoint, transform: CGAffineTransform) -> (CGSize, CGPoint) {
+    let (a, b, c, d) = (transform.a.abs(), transform.b.abs(), transform.c.abs(), transform.d.abs());
+    let determinant = a * d - b * c;
+    let fallback = transform.invert().apply_to_rect(CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: frame.size }).size;
+    let size = if determinant.abs() > 0.000001 {
+        let width = (frame.size.width * d - frame.size.height * c) / determinant;
+        let height = (frame.size.height * a - frame.size.width * b) / determinant;
+        if width.is_finite() && height.is_finite() && width >= 0.0 && height >= 0.0 { CGSize { width, height } } else { fallback }
+    } else { fallback };
+    let extent = transform.apply_to_rect(CGRect { origin: CGPoint { x: -size.width * anchor.x, y: -size.height * anchor.y }, size });
+    (size, CGPoint { x: frame.origin.x - extent.origin.x, y: frame.origin.y - extent.origin.y })
+}
+
+#[cfg(test)]
+mod frame_geometry_tests {
+    use super::*;
+    #[test]
+    fn rotated_frames_round_trip_with_noncentral_anchors() {
+        for angle in [0.0, std::f32::consts::FRAC_PI_2, -std::f32::consts::FRAC_PI_2, std::f32::consts::PI] {
+            for anchor in [CGPoint { x: 0.5, y: 0.5 }, CGPoint { x: 0.0, y: 1.0 }] {
+                let transform = CGAffineTransform::make_rotation(angle);
+                let frame = CGRect { origin: CGPoint { x: 17.0, y: 23.0 }, size: CGSize { width: 480.0, height: 320.0 } };
+                let (size, position) = geometry_for_frame(frame, anchor, transform);
+                let actual = transform.apply_to_rect(CGRect { origin: CGPoint { x: -size.width * anchor.x, y: -size.height * anchor.y }, size });
+                assert!((actual.origin.x + position.x - frame.origin.x).abs() < 0.001);
+                assert!((actual.origin.y + position.y - frame.origin.y).abs() < 0.001);
+                assert!((actual.size.width - frame.size.width).abs() < 0.001);
+                assert!((actual.size.height - frame.size.height).abs() < 0.001);
+            }
+        }
+    }
 }

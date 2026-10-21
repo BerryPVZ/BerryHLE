@@ -3,7 +3,10 @@
  */
 
 use crate::dyld::{export_c_func, FunctionExports};
-use crate::frameworks::core_graphics::cg_context::CGContextDrawImage;
+use crate::frameworks::core_graphics::cg_context::{
+    CGContextDrawImage, CGContextRef, CGContextRestoreGState, CGContextSaveGState,
+    CGContextScaleCTM, CGContextTranslateCTM,
+};
 use crate::frameworks::core_graphics::cg_image::{
     self, CGImageGetHeight, CGImageGetWidth, CGImageRef, CGImageRelease, CGImageRetain,
 };
@@ -21,7 +24,46 @@ use crate::objc::{
 use crate::Environment;
 use std::collections::HashMap;
 
+// UIImage uses UIKit's downward image axis; CGContextDrawImage uses Quartz's
+// upward axis. Reflect only this draw, preserving the caller's transform.
+fn draw_ui_image(env: &mut Environment, context: CGContextRef, rect: CGRect, image: CGImageRef) {
+    CGContextSaveGState(env, context);
+    CGContextTranslateCTM(
+        env,
+        context,
+        rect.origin.x,
+        rect.origin.y + rect.size.height,
+    );
+    CGContextScaleCTM(env, context, 1.0, -1.0);
+    CGContextDrawImage(
+        env,
+        context,
+        CGRect {
+            origin: CGPoint::default(),
+            size: rect.size,
+        },
+        image,
+    );
+    CGContextRestoreGState(env, context);
+}
+
 const CACHE_SIZE: usize = 60;
+
+fn image_resource_candidates(name: &str) -> (Vec<String>, String) {
+    let extension = name.rfind('.').filter(|&dot| !name[dot..].contains('/'));
+    let (stem, extension) = match extension {
+        Some(dot) => (&name[..dot], &name[dot + 1..]),
+        None => (name, "png"),
+    };
+    (vec![
+        stem.to_owned(),
+        format!("{stem}~iphone"),
+        format!("{stem}@2x~iphone"),
+        format!("{stem}@3x~iphone"),
+        format!("{stem}@2x"),
+        format!("{stem}@3x"),
+    ], extension.to_owned())
+}
 
 #[derive(Default)]
 pub struct State {
@@ -97,21 +139,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     if path == nil {
         // Split "foo.png" into stem "foo" and extension "png"; a name with no
         // extension implies "png" like UIKit does.
-        let (stem, ext) = match name_str.rfind('.') {
-            Some(dot) => (
-                name_str[..dot].to_string(),
-                name_str[dot + 1..].to_string(),
-            ),
-            None => (name_str.clone(), "png".to_string()),
-        };
+        let (candidates, ext) = image_resource_candidates(&name_str);
         let ext_ns = ns_string::from_rust_string(env, ext);
-        for candidate in [
-            format!("{}~iphone", stem),
-            format!("{}@2x~iphone", stem),
-            format!("{}@3x~iphone", stem),
-            format!("{}@2x", stem),
-            format!("{}@3x", stem),
-        ] {
+        for candidate in candidates {
             let candidate = ns_string::from_rust_string(env, candidate);
             path = msg![env; bundle pathForResource:candidate ofType:ext_ns];
             release(env, candidate);
@@ -204,9 +234,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)initWithContentsOfFile:(id)path { // NSString*
+    // A failed load must return nil: callers may then try bundled artwork
+    // after checking for a downloaded replacement (for example Food Fight).
     if path == nil {
-        env.objc.borrow_mut::<UIImageHostObject>(this).cg_image = get_dummy_cg_image(env);
-        return this;
+        release(env, this);
+        return nil;
     }
     let path_str = ns_string::to_rust_string(env, path);
     let bytes = env.fs.read(GuestPath::new(&path_str));
@@ -227,12 +259,12 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
     }
     let Ok(bytes) = bytes else {
-        env.objc.borrow_mut::<UIImageHostObject>(this).cg_image = get_dummy_cg_image(env);
-        return this;
+        release(env, this);
+        return nil;
     };
     let Ok(image) = Image::from_bytes(&bytes) else {
-        env.objc.borrow_mut::<UIImageHostObject>(this).cg_image = get_dummy_cg_image(env);
-        return this;
+        release(env, this);
+        return nil;
     };
 
     // Infer the scale factor from the Retina filename suffix so that
@@ -345,7 +377,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             height: CGImageGetHeight(env, image) as CGFloat / scale,
         }
     };
-    CGContextDrawImage(env, context, rect, image);
+    draw_ui_image(env, context, rect, image);
 }
 
 - (())drawInRect:(CGRect)rect {
@@ -359,7 +391,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let image = env.objc.borrow::<UIImageHostObject>(this).cg_image;
     // Drawing a nil image is a no-op, not a crash.
     if image == nil { return; }
-    CGContextDrawImage(env, context, rect, image);
+    draw_ui_image(env, context, rect, image);
 }
 
 // `blendMode` and `alpha` arguments are accepted and validated, but applying
@@ -373,7 +405,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let image = env.objc.borrow::<UIImageHostObject>(this).cg_image;
     // Drawing a nil image is a no-op, not a crash.
     if image == nil { return; }
-    CGContextDrawImage(env, context, rect, image);
+    draw_ui_image(env, context, rect, image);
 }
 
 - (())drawAtPoint:(CGPoint)point blendMode:(i32)_blend_mode alpha:(CGFloat)_alpha {
@@ -390,7 +422,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             height: CGImageGetHeight(env, image) as CGFloat / scale,
         }
     };
-    CGContextDrawImage(env, context, rect, image);
+    draw_ui_image(env, context, rect, image);
 }
 
 // Apple: "Draws the image, tiled, in a rectangle." The receiver's CGImage is
@@ -645,3 +677,28 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(UIImageJPEGRepresentation(_, _)),
     export_c_func!(UIImageWriteToSavedPhotosAlbum(_, _, _, _)),
 ];
+
+#[cfg(test)]
+mod resource_tests {
+    use super::image_resource_candidates;
+
+    #[test]
+    fn globbert_plain_png_names_precede_retina_fallbacks() {
+        for name in ["R&S_00015", "R&S_Ident_00023", "4_HEADPHONES_H37)225_389-216"] {
+            let (candidates, extension) = image_resource_candidates(name);
+            assert_eq!(format!("{}.{}", candidates[0], extension), format!("{name}.png"));
+            assert!(candidates.contains(&format!("{name}@2x")));
+            assert!(candidates.contains(&format!("{name}@3x")));
+        }
+    }
+
+    #[test]
+    fn suffixes_precede_extensions_and_directory_dots_are_preserved() {
+        let (candidates, extension) = image_resource_candidates("news-close.png");
+        assert_eq!(extension, "png");
+        assert!(candidates.contains(&"news-close@2x".to_owned()));
+        let (candidates, extension) = image_resource_candidates("art.v1/headphones");
+        assert_eq!(candidates[0], "art.v1/headphones");
+        assert_eq!(extension, "png");
+    }
+}

@@ -32,10 +32,19 @@ use crate::Environment;
 
 #[derive(Default)]
 pub struct State {
+    sample_only: bool,
     started_animations: Vec<id>,
     finished_animations: Vec<(id, id, bool, bool, Option<String>)>,
 }
 impl State {
+    pub fn sample_presentation_layer(env: &mut Environment, layer: id) -> CALayerHostObject {
+        Self {
+            sample_only: true,
+            ..Self::default()
+        }
+        .create_presentation_layer(env, layer)
+    }
+
     pub fn create_presentation_layer(
         &mut self,
         env: &mut Environment,
@@ -61,6 +70,11 @@ impl State {
             Iterator::chain(named_animations.iter(), anonymous_animations.iter())
         {
             let animation = *animation;
+            // Some placeholder animation classes do not yet inherit the
+            // CAAnimation host state. Do not fabricate playback state for them.
+            if !super::ca_animation::has_animation_state(env, animation) {
+                continue;
+            }
 
             let fill_mode: CAMediaTimingFillMode = msg![env; animation fillMode];
             let fill_mode = to_rust_string(env, fill_mode);
@@ -68,19 +82,24 @@ impl State {
             // TODO: Convert to local time
             let current_time = CACurrentMediaTime(env);
             let begin_time: CFTimeInterval = msg![env; animation beginTime];
-            let start_time = get_animation_start_time(env, animation);
+            let start_time = *get_animation_start_time(env, animation);
 
             if current_time >= begin_time {
-                if start_time.is_none() {
+                if start_time.is_none() && !self.sample_only {
                     // Animation started but isn't marked as such
-                    start_time.replace(current_time);
+                    get_animation_start_time(env, animation).replace(current_time);
+                    retain(env, animation);
                     self.started_animations.push(animation);
                 }
             } else if fill_mode != kCAFillModeBackwards && fill_mode != kCAFillModeBoth {
                 continue;
             }
 
-            let effective_begin_time = start_time.unwrap_or(begin_time);
+            let effective_begin_time = start_time.unwrap_or(if begin_time == 0.0 {
+                current_time
+            } else {
+                begin_time
+            });
 
             if let Some(key) = key {
                 log_dbg!(
@@ -124,7 +143,7 @@ impl State {
                 as f32)
                 .min(effective_repeat_count);
 
-            let mut progress = current_repeat.fract();
+            let mut progress = cycle_progress(current_repeat, effective_repeat_count);
 
             let autoreverses: bool = msg![env; animation autoreverses];
             if autoreverses {
@@ -142,13 +161,20 @@ impl State {
 
             if current_repeat >= effective_repeat_count {
                 let removed_on_completion: bool = msg![env; animation isRemovedOnCompletion];
-                self.finished_animations.push((
-                    layer,
-                    animation,
-                    true,
-                    removed_on_completion,
-                    key.to_owned(),
-                ));
+                if !self.sample_only && super::ca_animation::mark_completion_reported(env, animation)
+                {
+                    // Delegates may remove/release this animation, or another
+                    // layer scheduled later in this completion batch.
+                    retain(env, layer);
+                    retain(env, animation);
+                    self.finished_animations.push((
+                        layer,
+                        animation,
+                        true,
+                        removed_on_completion,
+                        key.to_owned(),
+                    ));
+                }
                 if fill_mode != kCAFillModeForwards && fill_mode != kCAFillModeBoth {
                     continue;
                 }
@@ -300,29 +326,39 @@ impl State {
                     () = msg![env; delegate animationDidStart: animation];
                 }
             }
+            release(env, animation);
         }
 
-        for (layer, ..) in &self.finished_animations {
-            retain(env, *layer);
-        }
         for (layer, animation, finished, removed_on_completion, key) in self.finished_animations {
-            let delegate = msg![env; animation delegate];
-            if delegate != nil {
-                let responds: bool = msg![env; delegate respondsToSelector: did_stop_sel];
-                if responds {
-                    () = msg![env; delegate animationDidStop: animation finished: finished];
+            let attached = {
+                let host = env.objc.borrow::<CALayerHostObject>(layer);
+                match &key {
+                    Some(key) => host.animations.get(key) == Some(&animation),
+                    None => host.anonymous_animations.contains(&animation),
+                }
+            };
+            if attached {
+                // Detach before invoking guest code: a completion can install
+                // its next animation under the same key. Never delete that
+                // replacement after the callback, or revisit the old one.
+                if removed_on_completion {
+                    if let Some(key) = key {
+                        let key = from_rust_string(env, key);
+                        () = msg![env; layer removeAnimationForKey: key];
+                        release(env, key);
+                    } else {
+                        remove_anonymous_animation(env, layer, animation);
+                    }
+                }
+                let delegate = msg![env; animation delegate];
+                if delegate != nil {
+                    let responds: bool = msg![env; delegate respondsToSelector: did_stop_sel];
+                    if responds {
+                        () = msg![env; delegate animationDidStop: animation finished: finished];
+                    }
                 }
             }
-
-            if removed_on_completion {
-                if let Some(key) = key {
-                    let key = from_rust_string(env, key);
-                    () = msg![env; layer removeAnimationForKey: key];
-                } else {
-                    remove_anonymous_animation(env, layer, animation);
-                }
-            }
-
+            release(env, animation);
             release(env, layer);
         }
     }
@@ -415,5 +451,33 @@ fn id_as_option(value: id) -> Option<id> {
         None
     } else {
         Some(value)
+    }
+}
+
+/// A completed integral repeat ends at its destination, not at fract() == 0.
+fn cycle_progress(current_repeat: f32, repeat_count: f32) -> f32 {
+    if current_repeat >= repeat_count && current_repeat.fract() == 0.0 {
+        1.0
+    } else {
+        current_repeat.fract()
+    }
+}
+
+#[cfg(test)]
+mod coin_animation_tests {
+    use super::cycle_progress;
+
+    #[test]
+    fn completed_motion_does_not_jump_back_to_its_start() {
+        assert_eq!(cycle_progress(0.5, 1.0), 0.5);
+        assert_eq!(cycle_progress(1.0, 1.0), 1.0);
+        assert_eq!(cycle_progress(2.0, 2.0), 1.0);
+        assert_eq!(cycle_progress(1.5, 1.5), 0.5);
+    }
+
+    #[test]
+    fn an_unfinished_loop_still_wraps() {
+        assert_eq!(cycle_progress(1.0, 2.0), 0.0);
+        assert_eq!(cycle_progress(2.0, f32::INFINITY), 0.0);
     }
 }

@@ -380,7 +380,7 @@ fn fread(
     with_file_lock(env, file_ptr, |env| {
         crate::audio::music_bypass::note_stdio_activity(file_ptr.to_bits());
 
-        if item_size == 0 {
+        if item_size == 0 || n_items == 0 {
             return 0;
         }
 
@@ -397,6 +397,7 @@ fn fread(
                 return 0;
             }
         };
+        let FILE { fd } = env.mem.read(file_ptr);
         let FILEHostObject {
             ref mut pushbacks, ..
         } = env
@@ -414,8 +415,12 @@ fn fread(
                 .copy_from_slice(&pushbacks[offset..]);
             pushbacks.truncate(offset);
 
+            // ungetc rewinds the descriptor; consuming pushback must undo it.
+            if posix_io::lseek(env, fd, to_copy.into(), SEEK_CUR) < 0 {
+                log_dbg!("fread: pushback seek failed on fd {:?}", fd);
+            }
             if total_size == to_copy {
-                return total_size;
+                return to_copy / item_size;
             }
             total_size -= to_copy;
             let ptr: MutPtr<u8> = buffer.cast();
@@ -424,7 +429,6 @@ fn fread(
         } else {
             0
         };
-        let FILE { fd } = env.mem.read(file_ptr);
         // Real stdio `fread` keeps issuing read(2) calls until it has satisfied the
         // full request, hit end-of-file, or hit an error, and it sets the stream's
         // EOF indicator when a read returns 0 before the request is filled. A

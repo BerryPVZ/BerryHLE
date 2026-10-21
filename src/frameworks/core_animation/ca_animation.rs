@@ -116,6 +116,8 @@ struct CAAnimationHostObject {
     duration: CFTimeInterval,
     fill_mode: &'static str,
     started_at: Option<CFTimeInterval>,
+    completion_reported: bool,
+    implicit: bool,
 }
 impl HostObject for CAAnimationHostObject {}
 impl Default for CAAnimationHostObject {
@@ -130,6 +132,8 @@ impl Default for CAAnimationHostObject {
             duration: Default::default(),
             fill_mode: kCAFillModeRemoved,
             started_at: None,
+            completion_reported: false,
+            implicit: false,
         }
     }
 }
@@ -369,7 +373,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         release(env, timing_function);
     }
 
-    env.objc.dealloc_object(this, &mut env.mem)
+    // NSObject clears custom KVC tags before this address can be reused.
+    msg_super![env; this dealloc]
 }
 
 @end
@@ -710,4 +715,35 @@ pub fn get_animation_start_time(
         .objc
         .borrow_mut::<CAAnimationHostObject>(animation)
         .started_at
+}
+
+/// Each attachment may deliver completion only once, including animations
+/// retained on their layer with removedOnCompletion = false.
+pub fn mark_completion_reported(env: &mut Environment, animation: id) -> bool {
+    let host = env.objc.borrow_mut::<CAAnimationHostObject>(animation);
+    !std::mem::replace(&mut host.completion_reported, true)
+}
+
+pub fn reset_playback(env: &mut Environment, animation: id) {
+    if !has_animation_state(env, animation) {
+        return;
+    }
+    let host = env.objc.borrow_mut::<CAAnimationHostObject>(animation);
+    host.started_at = None;
+    host.completion_reported = false;
+}
+
+pub fn has_animation_state(env: &mut Environment, animation: id) -> bool {
+    let class = crate::objc::ObjC::read_isa(animation, &env.mem);
+    let base = env.objc.get_known_class("CAAnimation", &mut env.mem);
+    env.objc.class_is_subclass_of(class, base)
+}
+
+pub fn mark_implicit(env: &mut Environment, animation: id) {
+    env.objc.borrow_mut::<CAAnimationHostObject>(animation).implicit = true;
+}
+
+pub fn is_implicit(env: &mut Environment, animation: id) -> bool {
+    has_animation_state(env, animation)
+        && env.objc.borrow::<CAAnimationHostObject>(animation).implicit
 }

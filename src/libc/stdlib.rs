@@ -23,6 +23,7 @@ pub mod qsort;
 
 #[derive(Default)]
 pub struct State {
+    dladdr_names: std::collections::HashMap<usize, ConstPtr<u8>>,
     rand: u32,
     random: u32,
     arc4random: u32,
@@ -1363,9 +1364,73 @@ fn system(env: &mut Environment, cmd: ConstPtr<u8>) -> i32 {
     }
 }
 
-fn dladdr(_env: &mut Environment, _addr: ConstVoidPtr, _info: MutVoidPtr) -> i32 {
-    // FakeDladdr
-    0
+fn dladdr(env: &mut Environment, addr: ConstVoidPtr, info: MutVoidPtr) -> i32 {
+    if info.is_null() {
+        return 0;
+    }
+    let address = addr.to_bits() & !1;
+    let Some(index) = env
+        .bins
+        .iter()
+        .position(|bin| (bin.text_base..bin.last_segment_end).contains(&address))
+    else {
+        return 0;
+    };
+    let base = env.bins[index].text_base;
+    let name = if let Some(&name) = env.libc_state.stdlib.dladdr_names.get(&index) {
+        name
+    } else {
+        let name = env.bins[index].name.clone();
+        let ptr = env.mem.alloc(name.len() as u32 + 1).cast::<u8>();
+        env.mem
+            .bytes_at_mut(ptr, name.len() as u32)
+            .copy_from_slice(name.as_bytes());
+        env.mem.write(ptr + name.len() as u32, 0u8);
+        env.libc_state
+            .stdlib
+            .dladdr_names
+            .insert(index, ptr.cast_const());
+        ptr.cast_const()
+    };
+    // BTC's GameManager init inspects the in-memory encryption command.
+    // A decrypted dump clears cryptid, unlike the running device image.
+    // Restore that metadata for these apps only, after the loader has accepted
+    // the decrypted executable. No code or on-disk game data is changed.
+    if index == 0
+        && matches!(
+            env.bundle.bundle_identifier(),
+            "hu.BV.BTC-Olympic" | "hu.BV.BreakTheCookieFree"
+        )
+    {
+        let header = ConstPtr::<u32>::from_bits(base);
+        let ncmds = env.mem.read(header + 4);
+        let sizeofcmds: u32 = env.mem.read(header + 5);
+        let mut offset = 28u32;
+        for _ in 0..ncmds {
+            if offset + 8 > 28 + sizeofcmds {
+                break;
+            }
+            let command = ConstPtr::<u32>::from_bits(base + offset);
+            let cmd: u32 = env.mem.read(command);
+            let size: u32 = env.mem.read(command + 1);
+            if size < 8 || size > 28 + sizeofcmds - offset {
+                break;
+            }
+            if cmd == 0x21 && size >= 20 {
+                env.mem.write((command + 4).cast_mut(), 1u32);
+                break;
+            }
+            offset += size;
+        }
+    }
+    // Dl_info: filename, image base, nearest symbol name, symbol address.
+    // Image-only resolution is valid when symbol information is unavailable.
+    let fields = info.cast::<u32>();
+    env.mem.write(fields, name.to_bits());
+    env.mem.write(fields + 1, base);
+    env.mem.write(fields + 2, 0u32);
+    env.mem.write(fields + 3, 0u32);
+    1
 }
 
 fn kqueue(_env: &mut Environment) -> i32 {
@@ -1931,34 +1996,28 @@ fn flistxattr(
 // MARK: - zlib supplemental
 // ===========================================================================
 
-/// `int inflateReset2(z_streamp strm, int windowBits)`
-///
-/// Per the [zlib manual](https://www.zlib.net/manual.html): "This function is
-/// equivalent to inflateEnd followed by inflateInit2, but does not free and
-/// reallocate the internal decompression state. The stream will keep attributes
-/// that may have been set by inflateInit2." It was added in zlib 1.2.3.4.
-///
-/// The bundled libz.1.2.3.dylib does not export this symbol, so apps that link
-/// against a newer SDK (e.g. Flappy Bird built for iOS 7) fail at lazy-bind
-/// time. We provide a minimal host implementation that calls through to the
-/// guest's `inflateReset` (same as calling inflateReset on the stream — window
-/// bits are stored in the stream structure anyway from the initial inflateInit2
-/// call).
-///
-/// Return value: Z_OK (0) on success.
-fn inflateReset2(_env: &mut Environment, _strm: MutVoidPtr, _window_bits: i32) -> i32 {
-    // Z_OK = 0. We cannot easily call back into the guest's inflateReset
-    // from host code without the full z_stream layout. However, the most
-    // common pattern is that inflateReset2 is called right after inflateInit2
-    // (which already set window bits) or before any actual inflate call.
-    // Returning Z_OK lets the app proceed — the stream state was already
-    // initialized by the guest's inflateInit2 which IS in the old libz.
-    log_dbg!(
-        "inflateReset2(strm={:?}, windowBits={}) -> Z_OK (stubbed)",
-        _strm,
-        _window_bits
-    );
-    0 // Z_OK
+/// Compatibility with modern libpng's windowBits=0 (read window from header).
+/// The bundled zlib 1.2.3 predates that convention; a 32 KiB window can decode
+/// all valid zlib streams. Other window modes pass through unchanged.
+fn inflateInit2_(env: &mut Environment, stream: MutVoidPtr, bits: i32,
+                 version: ConstPtr<u8>, size: i32) -> i32 {
+    let Some(addr) = env.bins.iter().find_map(|b| b.external_symbols.get("_inflateInit2_")).copied() else {
+        return -2;
+    };
+    let bits = if bits == 0 { 15 } else { bits };
+    GuestFunction::from_addr_with_thumb_bit(addr).call_from_host(env, (stream, bits, version, size))
+}
+
+/// Reinitialize the old guest decompressor rather than reporting a fake reset.
+fn inflateReset2(env: &mut Environment, stream: MutVoidPtr, bits: i32) -> i32 {
+    if stream.is_null() { return -2; }
+    let end = env.bins.iter().find_map(|b| b.external_symbols.get("_inflateEnd")).copied();
+    let version = env.bins.iter().find_map(|b| b.external_symbols.get("_zlibVersion")).copied();
+    let (Some(end), Some(version)) = (end, version) else { return -2; };
+    let result: i32 = GuestFunction::from_addr_with_thumb_bit(end).call_from_host(env, (stream,));
+    if result != 0 { return result; }
+    let version: ConstPtr<u8> = GuestFunction::from_addr_with_thumb_bit(version).call_from_host(env, ());
+    inflateInit2_(env, stream, bits, version, 56)
 }
 
 /// `int getloadavg(double loadavg[], int nelem)`
@@ -2077,6 +2136,7 @@ pub const FUNCTIONS: FunctionExports = &[
     // bundled libz.1.2.3.dylib doesn't have it. Some apps (Flappy Bird)
     // import it.
     export_c_func!(inflateReset2(_, _)),
+    export_c_func!(inflateInit2_(_, _, _, _)),
 ];
 
 pub fn atof_inner(

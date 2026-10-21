@@ -88,6 +88,15 @@ fn main() {
 
         build.define("LIBTYPE", "STATIC");
 
+        if os.eq_ignore_ascii_case("windows") {
+            // Rust uses the release DLL CRT even in debug builds. Do not let
+            // CMake's Debug defaults pull in the separate debug CRT.
+            build.define("CMAKE_POLICY_DEFAULT_CMP0091", "NEW");
+            build.define("CMAKE_MSVC_RUNTIME_LIBRARY", "MultiThreadedDLL");
+            build.define("CMAKE_C_FLAGS_DEBUG", "/MD /Zi /Ob0 /Od");
+            build.define("CMAKE_CXX_FLAGS_DEBUG", "/MD /Zi /Ob0 /Od");
+        }
+
         // Don't build extras, we don't need them and they can encounter issues
         // when cross-compiling.
         build.define("ALSOFT_UTILS", "OFF");

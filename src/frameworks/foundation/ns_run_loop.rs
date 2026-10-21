@@ -698,6 +698,7 @@ fn run_loop_body(
             handled |= delivered;
             limit_sleep_time(&mut sleep_until, next_due);
 
+            uikit::ui_view::layout_pending_views(env);
             let force_video_composition = media_player::has_active_video(env);
             let next_due = core_animation::recomposite_if_necessary(env, force_video_composition);
             limit_sleep_time(&mut sleep_until, next_due);

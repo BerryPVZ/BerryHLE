@@ -661,6 +661,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - Hit testing
 
 - (id)hitTest:(CGPoint)point withEvent:(id)event {
+    // Food Fight uses disabled buttons as artwork for its custom menu
+    // hit areas and for unused dialog choices. Let hit testing continue
+    // to the enabled choice or the parent view instead of swallowing taps.
+    if env.bundle.bundle_identifier() == "com.tomatoflix.foodfight"
+        && !msg![env; this isEnabled]
+    {
+        return nil;
+    }
     if msg![env; this pointInside:point withEvent:event] { this } else { nil }
 }
 

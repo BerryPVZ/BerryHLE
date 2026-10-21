@@ -189,6 +189,7 @@ fn stale_cancel_and_release(env: &mut Environment, finger_id: FingerId, touch: i
         let stale_set: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
         () = msg![env; stale_set addObject:touch];
         let cancel_event = ui_event::new_event(env, stale_set);
+        super::ui_gesture_recognizer::touches_cancelled(env, stale_view, stale_set, cancel_event);
         () = msg![env; stale_view touchesCancelled:stale_set withEvent:cancel_event];
         release(env, cancel_event);
         release(env, stale_set);
@@ -1035,6 +1036,11 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             );
         }
 
+        if crate::env_flag_cached!("TOUCHHLE_TRACE_TOUCHES") {
+            let class = msg![env; view class];
+            log!("Touch target {} {:?} at {:?}", env.objc.get_class_name(class), view, location_in_window);
+        }
+
         let is_multi_touch_enabled: bool = msg![env; view isMultipleTouchEnabled];
         if !is_multi_touch_enabled
             && !touchhle_cocos_should_allow_multitouch(env, view)
@@ -1115,7 +1121,7 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     for (view, v_set) in view_touches {
         let _: () = msg![env;
             view touchesBegan:v_set withEvent:event];
-        super::ui_gesture_recognizer::touches_began(env, view, v_set);
+        super::ui_gesture_recognizer::touches_began(env, view, v_set, event);
         touchhle_send_cocos_touch_aliases_to_chain(env, view, "began", v_set, event);
         let count: NSUInteger = msg![env; v_set count];
         log_touch_delivery("TOUCH-DIAG", &TOUCH_BEGAN_DIAGNOSTICS, count as usize);
@@ -1199,7 +1205,7 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     let event = ui_event::new_event(env, all_touches_set);
     autorelease(env, event);
     for (view, v_set) in view_touches {
-        super::ui_gesture_recognizer::touches_moved(env, view, v_set);
+        super::ui_gesture_recognizer::touches_moved(env, view, v_set, event);
         let deliver = touches_for_view_delivery(env, v_set);
         let count: NSUInteger = msg![env; deliver count];
         if count != 0 {
@@ -1367,7 +1373,7 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     let event = ui_event::new_event(env, all_touches_set);
     autorelease(env, event);
     for (view, v_set) in view_touches {
-        super::ui_gesture_recognizer::touches_ended(env, view, v_set);
+        super::ui_gesture_recognizer::touches_ended(env, view, v_set, event);
         let deliver = touches_for_view_delivery(env, v_set);
         let count: NSUInteger = msg![env; deliver count];
         if count != 0 {

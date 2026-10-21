@@ -3003,24 +3003,19 @@ pub fn objc_copyImageNames(
     env: &mut crate::Environment,
     out_count: crate::mem::MutPtr<u32>,
 ) -> crate::mem::MutPtr<ConstPtr<u8>> {
-    use crate::mem::Ptr;
-    let names: Vec<String> = env.bins.iter().map(|bin| bin.name.clone()).collect();
-    let count = names.len() as u32;
-    if !out_count.is_null() {
-        env.mem.write(out_count, count);
+    let images: Vec<u32> = env.bins.iter().enumerate()
+        .filter(|(_, bin)| bin.sections.iter().any(|s| s.name.starts_with("__objc_")))
+        .map(|(index, _)| index as u32).collect();
+    let count = images.len() as u32;
+    if !out_count.is_null() { env.mem.write(out_count, count); }
+    if count == 0 { return crate::mem::Ptr::null(); }
+    let result = env.mem.alloc((count + 1) * 4).cast();
+    for (index, image) in images.into_iter().enumerate() {
+        let name = crate::libc::mach_o::_dyld_get_image_name(env, image);
+        env.mem.write(result + index as u32, name);
     }
-    if count == 0 {
-        return Ptr::null();
-    }
-    let array: crate::mem::MutPtr<ConstPtr<u8>> = env
-        .mem
-        .alloc(count * guest_size_of::<ConstPtr<u8>>())
-        .cast();
-    for (index, name) in names.iter().enumerate() {
-        let name_ptr = env.mem.alloc_and_write_cstr(name.as_bytes());
-        env.mem.write(array + index as u32, name_ptr.cast_const());
-    }
-    array
+    env.mem.write(result + count, ConstPtr::<u8>::null());
+    result
 }
 
 /// `void *object_getIndexedIvars(id obj)` — returns a pointer to the

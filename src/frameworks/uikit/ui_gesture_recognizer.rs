@@ -158,6 +158,25 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (UIGestureRecognizerState)state {
     env.objc.borrow::<UIGestureRecognizerHostObject>(this).state
 }
+- (())setState:(UIGestureRecognizerState)state {
+    if !(0..=5).contains(&state) { return; }
+    let previous = env.objc.borrow::<UIGestureRecognizerHostObject>(this).state;
+    if state == previous && state != 2 { return; }
+    if state == 1 && !delegate_allows_begin(env, this) {
+        env.objc.borrow_mut::<UIGestureRecognizerHostObject>(this).state = UIGestureRecognizerStateFailed;
+        return;
+    }
+    env.objc.borrow_mut::<UIGestureRecognizerHostObject>(this).state = state;
+    if matches!(state, 1..=4) {
+        send_action(env, this);
+    }
+}
+- (())reset { }
+// Subclasses implement these hooks; calling super is permitted.
+- (())touchesBegan:(id)_touches withEvent:(id)_event { }
+- (())touchesMoved:(id)_touches withEvent:(id)_event { }
+- (())touchesEnded:(id)_touches withEvent:(id)_event { }
+- (())touchesCancelled:(id)_touches withEvent:(id)_event { }
 - (bool)isEnabled { env.objc.borrow::<UIGestureRecognizerHostObject>(this).enabled }
 - (())setEnabled:(bool)enabled {
     if !enabled { cancel_long_press(env, this); }
@@ -342,7 +361,7 @@ fn delegate_allows_begin(env: &mut Environment, recognizer: id) -> bool {
     }
 }
 
-pub(super) fn touches_began(env: &mut Environment, view: id, touches: id) {
+pub(super) fn touches_began(env: &mut Environment, view: id, touches: id, event: id) {
     if view == nil {
         return;
     }
@@ -364,6 +383,11 @@ pub(super) fn touches_began(env: &mut Environment, view: id, touches: id) {
         if !enabled || !delegate_allows_touch(env, recognizer, touch) {
             continue;
         }
+        let generic = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).kind == GestureKind::Generic;
+        if generic {
+            // UIKit resets a completed custom recognizer before the next sequence.
+            () = msg![env; recognizer reset];
+        }
         let location: CGPoint = msg![env; touch locationInView:recognizer_view];
         let host = env
             .objc
@@ -372,11 +396,14 @@ pub(super) fn touches_began(env: &mut Environment, view: id, touches: id) {
         host.current_location = location;
         host.state = UIGestureRecognizerStatePossible;
         host.tracking = true;
+        if generic {
+            () = msg![env; recognizer touchesBegan:touches withEvent:event];
+        }
     }
     for recognizer in recognizers { release(env, recognizer); }
 }
 
-pub(super) fn touches_moved(env: &mut Environment, view: id, touches: id) {
+pub(super) fn touches_moved(env: &mut Environment, view: id, touches: id, event: id) {
     if view == nil {
         return;
     }
@@ -400,12 +427,15 @@ pub(super) fn touches_moved(env: &mut Environment, view: id, touches: id) {
             env.objc
                 .borrow_mut::<UIGestureRecognizerHostObject>(recognizer)
                 .current_location = location;
+            if env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).kind == GestureKind::Generic {
+                () = msg![env; recognizer touchesMoved:touches withEvent:event];
+            }
         }
     }
     for recognizer in recognizers { release(env, recognizer); }
 }
 
-pub(super) fn touches_ended(env: &mut Environment, view: id, touches: id) {
+pub(super) fn touches_ended(env: &mut Environment, view: id, touches: id, event: id) {
     if view == nil {
         return;
     }
@@ -434,6 +464,11 @@ pub(super) fn touches_ended(env: &mut Environment, view: id, touches: id) {
                 .borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
             host.current_location = location;
             host.tracking = false;
+        }
+
+        if env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).kind == GestureKind::Generic {
+            () = msg![env; recognizer touchesEnded:touches withEvent:event];
+            continue;
         }
 
         let recognized = {
@@ -481,6 +516,25 @@ pub(super) fn touches_ended(env: &mut Environment, view: id, touches: id) {
             env.objc
                 .borrow_mut::<UIGestureRecognizerHostObject>(recognizer)
                 .state = UIGestureRecognizerStateFailed;
+        }
+    }
+    for recognizer in recognizers { release(env, recognizer); }
+}
+
+pub(super) fn touches_cancelled(env: &mut Environment, view: id, touches: id, event: id) {
+    let recognizers = recognizers_in_chain(env, view);
+    for &recognizer in &recognizers { retain(env, recognizer); }
+    for &recognizer in &recognizers {
+        let host = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer);
+        if host.kind == GestureKind::LongPress {
+            cancel_long_press(env, recognizer);
+        } else if host.tracking {
+            let generic = host.kind == GestureKind::Generic;
+            env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer).tracking = false;
+            if generic {
+                () = msg![env; recognizer touchesCancelled:touches withEvent:event];
+            }
+            env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer).state = UIGestureRecognizerStateFailed;
         }
     }
     for recognizer in recognizers { release(env, recognizer); }

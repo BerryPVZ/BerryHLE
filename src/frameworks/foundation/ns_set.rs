@@ -13,7 +13,7 @@ use crate::abi::{CallFromHost, DotDotDot, GuestFunction};
 use crate::environment::Environment;
 use crate::mem::{ConstPtr, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::{
-    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
+    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, Class, ClassExports, HostObject,
     NSZonePtr, SEL,
 };
 
@@ -116,9 +116,39 @@ pub const CLASSES: ClassExports = objc_classes! {
     autorelease(env, new)
 }
 
+// Both concrete set classes share the keyed archive's NS.objects array.
+- (id)initWithCoder:(id)coder {
+    let class: Class = msg![env; coder class];
+    let keyed: Class = msg_class![env; NSKeyedUnarchiver class];
+    let nib: Class = msg_class![env; _touchHLE_NIBArchiveDecoder class];
+    let objects = if env.objc.class_is_subclass_of(class, keyed) {
+        super::ns_keyed_unarchiver::decode_current_array(env, coder)
+    } else if env.objc.class_is_subclass_of(class, nib) {
+        super::_nib_archive_decoder::decode_current_array(env, coder)
+    } else {
+        let key = super::ns_string::get_static_str(env, "NS.objects");
+        let array: id = msg![env; coder decodeObjectForKey:key];
+        return msg![env; this initWithArray:array];
+    };
+    let mut dict = DictionaryHostObject::default();
+    let null: id = msg_class![env; NSNull null];
+    for object in objects {
+        dict.insert(env, object, null, false);
+        release(env, object); // decode_current_array retained each member.
+    }
+    let mut old = std::mem::replace(&mut env.objc.borrow_mut::<SetHostObject>(this).dict, dict);
+    old.release(env);
+    this
+}
+
 // NSCopying implementation
 - (id)copyWithZone:(NSZonePtr)_zone {
     retain(env, this)
+}
+
+- (id)mutableCopyWithZone:(NSZonePtr)_zone {
+    let copy: id = msg_class![env; NSMutableSet alloc];
+    msg![env; copy initWithSet:this]
 }
 
 - (bool)containsObject:(id)object {
@@ -195,6 +225,15 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
     }
     true
+}
+
+- (id)setByAddingObject:(id)object {
+    let mut dict = set_from_set(env, this, false);
+    let null: id = msg_class![env; NSNull null];
+    dict.insert(env, object, null, false);
+    let new: id = msg_class![env; NSSet alloc];
+    env.objc.borrow_mut::<SetHostObject>(new).dict = dict;
+    autorelease(env, new)
 }
 
 // Apple: "Returns a new set containing the objects of the receiving set and
@@ -357,12 +396,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // NSCopying implementation
 // NSMutableSet's -copyWithZone: must produce an immutable NSSet that
-// snapshots the receiver. We materialise the elements via -allObjects
-// (which is implemented for our private subclass) and reuse the
-// +[NSSet setWithArray:] code path to build a fresh immutable set.
+// snapshots the receiver. Both copy methods return an owned (+1) object
+// and retain the original elements without copying the elements themselves.
 - (id)copyWithZone:(NSZonePtr)_zone {
-    let objects: id = msg![env; this allObjects];
-    msg_class![env; NSSet setWithArray:objects]
+    let copy: id = msg_class![env; NSSet alloc];
+    msg![env; copy initWithSet:this]
 }
 
 @end
@@ -490,15 +528,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
 
-// NSCopying implementation
-- (id)copyWithZone:(NSZonePtr)_zone {
-    retain(env, this)
-}
-
-// NSCopying implementation
-- (id)mutableCopyWithZone:(NSZonePtr)_zone {
-    retain(env, this)
-}
+// Inherit independent, owned copies from NSMutableSet/NSSet. Returning
+// self here lets mutations of a copy change the original. Cocos's touch
+// dispatcher removes swallowed touches from a mutable copy; aliasing it
+// loses the active touches needed to deliver movement and release events.
 
 - (id)initWithCapacity:(NSUInteger)_numItems {
     // We ignore the requested capacity as Rust's internal data structures
@@ -796,9 +829,12 @@ fn set_union(env: &mut Environment, set: id, other: id) -> DictionaryHostObject 
         return dict;
     }
     let null: id = msg_class![env; NSNull null];
-    let count: NSUInteger = msg![env; other count];
-    for i in 0..count {
-        let object: id = msg![env; other objectAtIndex:i];
+    let enumerator: id = msg![env; other objectEnumerator];
+    loop {
+        let object: id = msg![env; enumerator nextObject];
+        if object == nil {
+            break;
+        }
         dict.insert(env, object, null, /* copy_key: */ false);
     }
     dict

@@ -39,6 +39,7 @@ use crate::mem::{
 use crate::objc::msg;
 use crate::Environment;
 use std::collections::{HashMap, VecDeque};
+use std::rc::Rc;
 
 #[derive(Default)]
 pub struct State {
@@ -105,6 +106,8 @@ struct AudioQueueHostObject {
         MutVoidPtr,
     )>,
     is_running_handler: bool,
+    /// Identifies this queue even if a callback disposes and reuses its address.
+    identity: Rc<()>,
     is_input: bool,
     /// Whether this input queue currently holds a reference on the shared
     /// host capture stream ([mic::start]/[mic::stop]). Pause keeps it; stop
@@ -337,6 +340,7 @@ pub fn AudioQueueNewOutput(
         aq_is_running_user_data: None,
         property_listeners: Vec::new(),
         is_running_handler: false,
+        identity: Rc::new(()),
         is_input: false,
         input_capture_ref: false,
         input_delay: 0,
@@ -1905,6 +1909,37 @@ pub fn decode_buffer_from_bytes(
     }
 }
 
+/// A stopped OpenAL source marks even newly queued buffers as processed.
+/// Drain the completed buffers before rewinding, so a refill cannot discard
+/// fresh audio or repeatedly drive the guest's EOF path without playing it.
+fn prepare_source_for_refill(context: &OpenAL, source: ALuint, queued: ALint) -> bool {
+    unsafe {
+        let mut source_state = 0;
+        context.GetSourcei(source, al::AL_SOURCE_STATE, &mut source_state);
+        if source_state == al::AL_STOPPED {
+            if queued != 0 {
+                return false;
+            }
+            context.SourceRewind(source);
+        }
+    }
+    true
+}
+
+/// AudioQueueStart is idempotent, but alSourcePlay restarts playing audio.
+/// After an underrun, the handler must return completed buffers first.
+fn start_source_if_needed(context: &OpenAL, source: ALuint) {
+    unsafe {
+        let mut source_state = 0;
+        let mut processed = 0;
+        context.GetSourcei(source, al::AL_SOURCE_STATE, &mut source_state);
+        context.GetSourcei(source, al::AL_BUFFERS_PROCESSED, &mut processed);
+        if source_state == al::AL_PAUSED || (source_state != al::AL_PLAYING && processed == 0) {
+            context.SourcePlay(source);
+        }
+    }
+}
+
 fn prime_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
     let (state, context) =
         State::get_with_context(&mut env.framework_state, &mut env.openal_manager);
@@ -1998,6 +2033,9 @@ fn prime_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
 
         unsafe {
             context.GetSourcei(al_source, al::AL_BUFFERS_QUEUED, &mut al_buffers_queued);
+            if !prepare_source_for_refill(&context, al_source, al_buffers_queued) {
+                break;
+            }
             context.GetSourcei(
                 al_source,
                 al::AL_BUFFERS_PROCESSED,
@@ -2482,56 +2520,82 @@ pub fn handle_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
 
     host_object.is_running_handler = true;
 
-    let mut buffers_to_reuse = Vec::new();
+    let identity = host_object.identity.clone();
+    // Bound the work to buffers already completed at entry. A callback may
+    // refill, reset, or dispose the queue, and must not keep the run loop here
+    // indefinitely by producing more completed buffers while it runs.
+    let mut callback_budget = 0;
+    unsafe {
+        context.GetSourcei(al_source, al::AL_BUFFERS_PROCESSED, &mut callback_budget);
+        assert_eq!(context.GetError(), 0);
+    }
 
-    unqueue_buffers(al_source, &context, |al_buffer| {
-        host_object.al_unused_buffers.push(al_buffer);
-        // OpenAL is reporting one buffer as processed, so the queue should
-        // be non-empty. If the host and OpenAL views ever desync (e.g.
-        // through an unexpected reset), just stop pulling from the empty
-        // queue instead of panicking on `.unwrap()`.
-        if let Some(buffer_ref) = host_object.buffer_queue.pop_front() {
-            buffers_to_reuse.push(buffer_ref);
-        } else {
+    for _ in 0..callback_budget {
+        let (state, context) =
+            State::get_with_context(&mut env.framework_state, &mut env.openal_manager);
+        let Some(host) = state.audio_queues.get_mut(&in_aq) else {
+            return;
+        };
+        if !Rc::ptr_eq(&identity, &host.identity) {
+            return;
+        }
+        let Some(source) = host.al_source else {
+            break;
+        };
+        let mut processed = 0;
+        unsafe {
+            context.GetSourcei(source, al::AL_BUFFERS_PROCESSED, &mut processed);
+            assert_eq!(context.GetError(), 0);
+        }
+        if processed == 0 {
+            break;
+        }
+        // Return only this buffer to the guest. Keeping the other completed
+        // buffers queued prevents the callback from freeing them before their
+        // turn (Food Fight replaces its buffers when it reaches EOF).
+        let mut al_buffer = 0;
+        unsafe {
+            context.SourceUnqueueBuffers(source, 1, &mut al_buffer);
+            assert_eq!(context.GetError(), 0);
+        }
+        host.al_unused_buffers.push(al_buffer);
+        let Some(buffer_ref) = host.buffer_queue.pop_front() else {
             log!(
-                "Warning: handle_audio_queue({:?}): OpenAL reported a processed \
-                 buffer but the guest buffer_queue is empty; skipping.",
+                "Warning: processed buffer missing from audio queue {:?}",
                 in_aq
             );
-        }
-    });
-
-    let &mut AudioQueueHostObject {
-        callback_proc,
-        callback_user_data,
-        is_running,
-        ..
-    } = host_object;
-
-    for buffer_ref in buffers_to_reuse.drain(..) {
-        log_dbg!(
-            "Recyling buffer {:?} for queue {:?}. Calling callback {:?} with user data {:?}.",
-            buffer_ref,
-            in_aq,
-            callback_proc,
-            callback_user_data
-        );
-
+            break;
+        };
+        let callback_proc = host.callback_proc;
+        let callback_user_data = host.callback_user_data;
         let () = callback_proc.call_from_host(env, (callback_user_data, in_aq, buffer_ref));
+    }
+
+    let Some(host) = State::get(&mut env.framework_state)
+        .audio_queues
+        .get(&in_aq)
+    else {
+        return;
+    };
+    if !Rc::ptr_eq(&identity, &host.identity) {
+        return;
     }
 
     prime_audio_queue(env, in_aq);
 
-    // The guest callback we just invoked above is allowed to call
-    // AudioQueueDispose on `in_aq`. If it did, the queue is gone and there
-    // is nothing left to do here.
-    if State::get(&mut env.framework_state)
+    // A refill callback can stop, pause, dispose, or replace this queue's
+    // source. Never restart from the state captured before that callback.
+    let Some(host) = State::get(&mut env.framework_state)
         .audio_queues
-        .get(&in_aq)
-        .is_none()
-    {
+        .get_mut(&in_aq)
+    else {
         return;
-    }
+    };
+    let is_running = host.is_running;
+    let Some(al_source) = host.al_source else {
+        host.is_running_handler = false;
+        return;
+    };
 
     let context = env
         .framework_state
@@ -2544,7 +2608,13 @@ pub fn handle_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
 
             context.GetSourcei(al_source, al::AL_SOURCE_STATE, &mut al_source_state);
             assert!(context.GetError() == 0);
-            if al_source_state == al::AL_STOPPED {
+            let mut queued = 0;
+            let mut processed = 0;
+            context.GetSourcei(al_source, al::AL_BUFFERS_QUEUED, &mut queued);
+            context.GetSourcei(al_source, al::AL_BUFFERS_PROCESSED, &mut processed);
+            // Restart only an underrun with fresh audio. Replaying processed
+            // buffers repeats the tail when a track is draining.
+            if matches!(al_source_state, al::AL_STOPPED | al::AL_INITIAL) && queued > processed {
                 context.SourcePlay(al_source);
                 log_dbg!("Restarted OpenAL source for queue {:?}", in_aq);
             }
@@ -2572,7 +2642,9 @@ pub fn handle_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
     let state = State::get(&mut env.framework_state);
 
     if let Some(host_object) = state.audio_queues.get_mut(&in_aq) {
-        host_object.is_running_handler = false;
+        if Rc::ptr_eq(&identity, &host_object.identity) {
+            host_object.is_running_handler = false;
+        }
     }
 }
 
@@ -2693,6 +2765,7 @@ pub fn AudioQueueStart(
         return kAudioQueueErr_InvalidProperty;
     };
 
+    let was_running = host_object.is_running == AudioQueueIsRunning::Running;
     if is_supported_audio_format(&host_object.format) {
         let Some(al_source) = host_object.al_source else {
             // prime_audio_queue should have created the OpenAL source, but
@@ -2706,7 +2779,7 @@ pub fn AudioQueueStart(
             return kAudioQueueErr_InvalidProperty;
         };
         host_object.is_running = AudioQueueIsRunning::Running;
-        unsafe { context.SourcePlay(al_source) };
+        start_source_if_needed(&context, al_source);
         assert!(unsafe { context.GetError() } == 0);
     } else {
         log!(
@@ -2716,7 +2789,9 @@ pub fn AudioQueueStart(
         return kAudioQueueErr_InvalidProperty;
     }
 
-    notify_aq_is_running(env, in_aq);
+    if !was_running {
+        notify_aq_is_running(env, in_aq);
+    }
 
     0 // success
 }
@@ -3062,6 +3137,7 @@ pub fn AudioQueueNewInput(
         aq_is_running_user_data: None,
         property_listeners: Vec::new(),
         is_running_handler: false,
+        identity: Rc::new(()),
         is_input: true,
         input_capture_ref: false,
         input_delay: 0,
@@ -3113,13 +3189,76 @@ pub const FUNCTIONS: FunctionExports = &[
 
 #[cfg(test)]
 mod tests {
-    use super::downmix_i16_to_mono;
-    use super::{
-        input_bytes_per_packet, input_packet_capacity, is_supported_input_format,
-        AudioQueueBuffer, AudioStreamBasicDescription, Ptr, kAudioFormatAppleIMA4,
-        kAudioFormatFlagIsFloat, kAudioFormatFlagIsPacked, kAudioFormatLinearPCM,
-        kAudioFormatMPEG4AAC,
-    };
+    use super::*;
+
+    #[test]
+    fn openal_restart_preserves_audio_and_recovers_after_underrun() {
+        const AL_SAMPLE_OFFSET: ALenum = 0x1025; // OpenAL 1.1
+        let mut manager = OpenALManager::new().unwrap();
+        let mut al_context = al::OpenALContext::new(&mut manager).unwrap();
+        let context = al_context.make_current(&mut manager);
+        unsafe {
+            let mut source = 0;
+            let mut buffers = [0; 2];
+            context.GenSources(1, &mut source);
+            context.GenBuffers(2, buffers.as_mut_ptr());
+            // Long enough that the null backend cannot finish during checks.
+            let samples = vec![0i16; 44100 * 10];
+            for buffer in buffers {
+                context.BufferData(
+                    buffer,
+                    al::AL_FORMAT_MONO16,
+                    samples.as_ptr().cast(),
+                    (samples.len() * 2) as _,
+                    44100,
+                );
+            }
+            context.SourceQueueBuffers(source, 2, buffers.as_ptr());
+            start_source_if_needed(&context, source);
+            context.Sourcei(source, AL_SAMPLE_OFFSET, 10000);
+            start_source_if_needed(&context, source);
+            let mut offset = 0;
+            context.GetSourcei(source, AL_SAMPLE_OFFSET, &mut offset);
+            assert!(offset >= 10000, "starting twice rewound playing audio");
+
+            context.SourcePause(source);
+            context.Sourcei(source, AL_SAMPLE_OFFSET, samples.len() as i32 + 10000);
+            let mut processed = 0;
+            context.GetSourcei(source, al::AL_BUFFERS_PROCESSED, &mut processed);
+            assert_eq!(processed, 1);
+            start_source_if_needed(&context, source);
+            let mut resumed_state = 0;
+            context.GetSourcei(source, al::AL_SOURCE_STATE, &mut resumed_state);
+            assert_eq!(resumed_state, al::AL_PLAYING);
+            context.GetSourcei(source, AL_SAMPLE_OFFSET, &mut offset);
+            assert!(offset >= samples.len() as i32 + 10000);
+
+            // Stop deterministically reproduces the backend state of an
+            // underrun without relying on a timing-sensitive sleep.
+            context.SourceStop(source);
+            assert!(!prepare_source_for_refill(&context, source, 2));
+            start_source_if_needed(&context, source);
+            let mut state = 0;
+            context.GetSourcei(source, al::AL_SOURCE_STATE, &mut state);
+            assert_eq!(state, al::AL_STOPPED, "replayed processed buffers");
+            let mut returned = [0; 2];
+            context.SourceUnqueueBuffers(source, 2, returned.as_mut_ptr());
+            assert_eq!(returned, buffers);
+            assert!(prepare_source_for_refill(&context, source, 0));
+            context.SourceQueueBuffers(source, 2, buffers.as_ptr());
+            let mut processed = -1;
+            context.GetSourcei(source, al::AL_BUFFERS_PROCESSED, &mut processed);
+            assert_eq!(processed, 0, "fresh audio was marked processed");
+            start_source_if_needed(&context, source);
+            context.GetSourcei(source, al::AL_SOURCE_STATE, &mut state);
+            assert_eq!(state, al::AL_PLAYING);
+            context.SourceStop(source);
+            context.SourceUnqueueBuffers(source, 2, returned.as_mut_ptr());
+            context.DeleteSources(1, &source);
+            context.DeleteBuffers(2, buffers.as_ptr());
+            assert_eq!(context.GetError(), 0);
+        }
+    }
 
     #[test]
     fn downmix_averages_each_interleaved_frame() {

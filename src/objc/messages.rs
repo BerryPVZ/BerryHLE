@@ -464,6 +464,52 @@ fn objc_msgSend_inner(
         }
     }
 
+    // PetsWar 1.0 uses an MPEG-4 Part 2 CG.mp4 intro, which our H.264
+    // movie decoder cannot display. Continue through its existing deferred
+    // gameStart: path, waiting for asynchronous image preloading if needed.
+    if super2.is_none()
+        && env.bundle.bundle_identifier() == "com.iphogame.petswar"
+        && env.objc.get_class_name(orig_class) == "MTLoadingLayer"
+        && selector.as_str(&env.mem) == "playMovieAtURL:"
+    {
+        let start = env.objc.lookup_selector("gameStart:");
+        let loaded = env.objc.object_lookup_ivar(&env.mem, receiver, &"index".to_owned());
+        let total = env.objc.object_lookup_ivar(&env.mem, receiver, &"count".to_owned());
+        let new_game = env.objc.object_lookup_ivar(&env.mem, receiver, &"gameNew_".to_owned());
+        if let (Some(start), Some(loaded), Some(total), Some(new_game)) =
+            (start, loaded, total, new_game)
+        {
+            if env.objc.object_has_method(&env.mem, receiver, start) {
+                let loaded: u32 = env.mem.read(loaded.cast());
+                let total: u32 = env.mem.read(total.cast());
+                if loaded >= total {
+                    let saved = *env.cpu.regs();
+                    () = super::msg![env; receiver schedule:start];
+                    env.cpu.regs_mut().copy_from_slice(&saved);
+                } else {
+                    // imageLoaded: schedules gameStart: when index == count,
+                    // provided this intro-only flag is clear.
+                    env.mem.write(new_game.cast::<u8>(), 0);
+                }
+                log!("PetsWar: skipped unsupported intro; continuing after image preload");
+                return;
+            }
+        }
+    }
+
+    if super2.is_none() && super::runtime_hooks::intercept(env, orig_class, selector) {
+        return;
+    }
+
+    if super2.is_none() && super::btc_content::intercept(env, orig_class, selector) {
+        return;
+    }
+    let btc_token = if super2.is_none() {
+        super::btc_content::before(env, receiver, orig_class, selector)
+    } else {
+        None
+    };
+
     // ULTRAHLE_MINIONJUMP_TAP_BRIDGE_BEGIN
     // Minion Jump / SheepEscape: map Cocos2D GrowButton/GrowStarButton objects
     // to their real target+selector callbacks. This is app-gated so Potato and
@@ -824,6 +870,8 @@ Type mismatch when sending message {} to {:?}!
                         guest_imp.call_without_pushing_stack_frame(env)
                     }
                 }
+
+                super::btc_content::after(env, btc_token);
 
                 // ULTRAHLE_MINIONJUMP_TAP_POSTCALL_BEGIN
                 if ultrahle_minionjump_active && ultrahle_minionjump_factory_should_map {
@@ -2486,12 +2534,13 @@ pub(super) fn objc_msgSendSuper2(
 #[allow(non_snake_case)]
 pub(super) fn objc_msgSendSuper2_stret(
     env: &mut Environment,
+    _stret: MutVoidPtr,
     super_ptr: ConstPtr<objc_super>,
     selector: SEL,
 ) {
     let objc_super { receiver, class } = env.mem.read(super_ptr);
-    // Rewrite first argument to match the normal ABI.
-    crate::abi::write_next_arg(&mut 0, env.cpu.regs_mut(), &mut env.mem, receiver);
+    // Preserve r0 (the return buffer); replace the super pointer in r1.
+    crate::abi::write_next_arg(&mut 1, env.cpu.regs_mut(), &mut env.mem, receiver);
     objc_msgSend_inner(
         env,
         receiver,
@@ -2742,14 +2791,8 @@ where
     // Provide type info for dynamic type checking.
     env.objc.message_type_info = Some(<(R, P) as MsgSendSuperSignature>::WithoutSuper::type_info());
     if R::SIZE_IN_MEM.is_some() {
-        // Struct returns (stret) for super-calls aren't implemented yet.
-        // Log this clearly and fall through to the non-stret path so the
-        // host process keeps running and the caller will simply observe
-        // the default-constructed return value via to_regs/to_mem below.
-        log!(
-            "Warning: msg_send_super2: struct-return (stret) super-call is not implemented; falling back to non-stret dispatch. Result may be unreliable.",
-        );
-        (objc_msgSendSuper2 as fn(&mut Environment, ConstPtr<objc_super>, SEL))
+        (objc_msgSendSuper2_stret
+            as fn(&mut Environment, MutVoidPtr, ConstPtr<objc_super>, SEL))
             .call_from_host(env, args)
     } else {
         (objc_msgSendSuper2 as fn(&mut Environment, ConstPtr<objc_super>, SEL))

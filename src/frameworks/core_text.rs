@@ -34,17 +34,12 @@
 //!   `CTStringAttributes.h` (Apple SDK).
 
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant, HostDylib};
-use crate::font::{Font, TextAlignment, WrapMode};
+use crate::font::{Font, WrapMode};
 use rusttype::GlyphId;
 use crate::frameworks::core_foundation::{cf_array::CFArrayRef, cf_type::CFTypeRef, CFIndex, CFRange};
 use crate::frameworks::core_foundation::cf_attributed_string::CFAttributedStringRef;
 use crate::frameworks::core_graphics::cg_affine_transform::CGAffineTransform;
-use crate::frameworks::core_graphics::cg_bitmap_context::{
-    CGBitmapContextDrawer, CGBitmapContextGetHeight,
-};
-use crate::frameworks::core_graphics::cg_context::{
-    CGContextConcatCTM, CGContextGetCTM, CGContextRestoreGState, CGContextSaveGState,
-};
+use crate::frameworks::core_graphics::cg_bitmap_context::CGBitmapContextDrawer;
 use crate::frameworks::core_graphics::cg_font::{
     cg_font_with_font, data_provider_font, CGFontCreateWithFontName, CGFontRef, CGGlyph,
 };
@@ -137,18 +132,24 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @implementation _touchHLE_CTFontDescriptor: NSObject
 - (())dealloc {
+    let attrs = env.objc.borrow::<CTFontDescriptorHostObject>(this).attrs;
+    release(env, attrs);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 @end
 
 @implementation _touchHLE_CTFont: NSObject
 - (())dealloc {
+    let font = env.objc.borrow::<CTFontHostObject>(this).font;
+    release(env, font);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 @end
 
 @implementation _touchHLE_CTTypesetter: NSObject
 - (())dealloc {
+    let attr_string = env.objc.borrow::<CTTypesetterHostObject>(this).attr_string;
+    release(env, attr_string);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 @end
@@ -170,12 +171,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @implementation _touchHLE_CTFramesetter: NSObject
 - (())dealloc {
+    let attr_string = env.objc.borrow::<CTFramesetterHostObject>(this).attr_string;
+    release(env, attr_string);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 @end
 
 @implementation _touchHLE_CTFrame: NSObject
 - (())dealloc {
+    let line = env.objc.borrow::<CTFrameHostObject>(this).line;
+    release(env, line);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 @end
@@ -584,7 +589,7 @@ fn CTLineGetTypographicBounds(
     ascent: MutPtr<CGFloat>,
     descent: MutPtr<CGFloat>,
     leading: MutPtr<CGFloat>,
-) -> CGFloat {
+) -> f64 {
     if line.is_null() {
         return 0.0;
     }
@@ -606,7 +611,7 @@ fn CTLineGetTypographicBounds(
     if !leading.is_null() {
         env.mem.write(leading, leading_val);
     }
-    width
+    f64::from(width)
 }
 
 fn CTLineGetImageBounds(env: &mut Environment, line: CTLineRef, _context: id) -> CGRect {
@@ -641,37 +646,17 @@ fn CTLineDraw(env: &mut Environment, line: CTLineRef, context: id) {
     let size: CGFloat = msg![env; font pointSize];
     let text_str = to_rust_string(env, text).into_owned();
     let font_obj = font_for_text(env, font, &text_str).unwrap_or_else(Font::sans_regular);
-    let needs_y_flip = CGContextGetCTM(env, context).d > 0.0;
-    if needs_y_flip {
-        let height = CGBitmapContextGetHeight(env, context) as CGFloat;
-        CGContextSaveGState(env, context);
-        CGContextConcatCTM(
-            env,
-            context,
-            CGAffineTransform {
-                a: 1.0,
-                b: 0.0,
-                c: 0.0,
-                d: -1.0,
-                tx: 0.0,
-                ty: height,
-            },
-        );
-    }
+    let (matrix, position) =
+        crate::frameworks::core_graphics::cg_context::text_matrix_and_position(env, context);
     let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
     let fill_color = drawer.rgb_fill_color();
-    font_obj.draw(
+    font_obj.draw_text_baseline(
         size,
         &text_str,
-        (0.0, 0.0),
-        None,
-        TextAlignment::Left,
+        (position.x, position.y),
+        matrix,
         |glyph| draw_font_glyph(&mut drawer, glyph, fill_color, None, None),
     );
-    drop(drawer);
-    if needs_y_flip {
-        CGContextRestoreGState(env, context);
-    }
 }
 
 /// `CFIndex CTLineGetGlyphCount(CTLineRef line)`

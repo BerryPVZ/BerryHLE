@@ -105,6 +105,8 @@ pub struct Options {
     /// Disable the Cheat Engine-style memory trainer overlay. The trainer
     /// is off by default; opt in with `--trainer`.
     pub trainer_disabled: bool,
+    /// Enable app-specific Objective-C return overrides from Quick Options.
+    pub runtime_hooks_enabled: bool,
     pub initial_orientation: DeviceOrientation,
     /// iOS version reported to guest applications. `None` uses the latest compatibility version.
     pub ios_version: Option<(i32, i32, i32)>,
@@ -288,6 +290,7 @@ impl Default for Options {
             fullscreen: false,
             preserve_aspect_ratio: false,
             trainer_disabled: true,
+            runtime_hooks_enabled: false,
             device_family: None,
             auto_device_family: false,
             host_screen_size: None,
@@ -690,6 +693,10 @@ impl Options {
             self.zero_stack_after_guest_to_host_call = Some(value.parse().map_err(|_| {
                 "Invalid value for --zero-stack-after-guest-to-host-call=".to_string()
             })?);
+        } else if arg == "--flex" {
+            self.runtime_hooks_enabled = true;
+        } else if arg == "--no-flex" {
+            self.runtime_hooks_enabled = false;
         } else if arg == "--no-trainer" {
             self.trainer_disabled = true;
         } else if arg == "--trainer" {

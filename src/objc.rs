@@ -25,11 +25,13 @@ use crate::dyld::{
 use crate::fastmap::{FxHashMap, FxHashSet};
 use crate::MutexId;
 
+mod btc_content;
 mod classes;
 mod messages;
 mod methods;
 mod objects;
 mod properties;
+pub(crate) mod runtime_hooks;
 mod selectors;
 mod synchronization;
 pub(crate) mod type_encoding;
@@ -101,6 +103,9 @@ pub type NSZonePtr = crate::mem::MutVoidPtr;
 
 /// Main type holding Objective-C runtime state.
 pub struct ObjC {
+    /// Nesting depth of BTC Sports classic background menu construction.
+    btc_classic_menu_depth: u32,
+
     /// Known selectors (interned method name strings).
     selectors: FxHashMap<String, SEL>,
 
@@ -218,6 +223,7 @@ pub struct ObjC {
 impl ObjC {
     pub fn new() -> ObjC {
         ObjC {
+            btc_classic_menu_depth: 0,
             selectors: FxHashMap::default(),
             objects: FxHashMap::default(),
             classes: FxHashMap::default(),
@@ -383,7 +389,7 @@ const CONSTANTS: ConstantExports = &[
 const FUNCTIONS: FunctionExports = &[
     export_c_func!(objc_msgSend(_, _)),
     export_c_func!(objc_msgSend_stret(_, _, _)),
-    export_c_func!(objc_msgSendSuper2_stret(_, _)),
+    export_c_func!(objc_msgSendSuper2_stret(_, _, _)),
     export_c_func!(objc_msgSendSuper2(_, _)),
     export_c_func!(objc_getProperty(_, _, _, _)),
     export_c_func!(objc_setProperty(_, _, _, _, _, _)),

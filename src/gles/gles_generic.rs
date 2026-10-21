@@ -476,6 +476,11 @@ pub trait GLES {
             "unknown GLES profile"
         }
     }
+
+    /// Whether the host exposes independently bindable read/draw framebuffers.
+    fn has_separate_framebuffer_bindings(&self) -> bool {
+        false
+    }
     /// Forward the guest's `glDiscardFramebufferEXT` call to the host driver.
     ///
     /// `GL_EXT_discard_framebuffer` is a bandwidth hint: the app promises not
