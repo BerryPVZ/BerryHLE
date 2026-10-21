@@ -17,6 +17,62 @@ pub const UIGestureRecognizerStatePossible: UIGestureRecognizerState = 0;
 pub const UIGestureRecognizerStateRecognized: UIGestureRecognizerState = 3;
 pub const UIGestureRecognizerStateFailed: UIGestureRecognizerState = 5;
 
+#[derive(Default)]
+pub struct State {
+    actions: ActionBatch,
+}
+
+/// Actions run after all recognizers and views process the current input.
+/// Running them from setState: lets a later recognizer's cleanup undo a
+/// hold that an earlier recognizer has just started (Globbert's squish).
+#[derive(Default)]
+struct ActionBatch {
+    depth: usize,
+    pending: Vec<id>,
+}
+
+impl ActionBatch {
+    fn begin(&mut self) {
+        self.depth += 1;
+    }
+
+    /// None means immediate delivery; Some says whether a retain is needed.
+    fn defer(&mut self, recognizer: id) -> Option<bool> {
+        if self.depth == 0 {
+            return None;
+        }
+        let inserted = !self.pending.contains(&recognizer);
+        if inserted {
+            self.pending.push(recognizer);
+        }
+        Some(inserted)
+    }
+
+    fn finish(&mut self) -> Vec<id> {
+        self.depth -= 1;
+        if self.depth == 0 {
+            std::mem::take(&mut self.pending)
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+pub(super) fn begin_touch_dispatch(env: &mut Environment) {
+    env.framework_state.uikit.ui_gesture_recognizer.actions.begin();
+}
+
+pub(super) fn finish_touch_dispatch(env: &mut Environment) {
+    let pending = env.framework_state.uikit.ui_gesture_recognizer.actions.finish();
+    for recognizer in pending {
+        let host = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer);
+        if host.enabled && matches!(host.state, 1..=4) {
+            send_action(env, recognizer);
+        }
+        release(env, recognizer);
+    }
+}
+
 pub type UISwipeGestureRecognizerDirection = NSUInteger;
 pub const UISwipeGestureRecognizerDirectionRight: UISwipeGestureRecognizerDirection = 1 << 0;
 pub const UISwipeGestureRecognizerDirectionLeft: UISwipeGestureRecognizerDirection = 1 << 1;
@@ -60,6 +116,21 @@ pub(super) struct UIGestureRecognizerHostObject {
 impl HostObject for UIGestureRecognizerHostObject {}
 
 impl UIGestureRecognizerHostObject {
+    fn track_custom_touch(&mut self, touch: id, point: CGPoint) {
+        if !self.tracking {
+            self.initial_location = point;
+            self.state = UIGestureRecognizerStatePossible;
+        }
+        self.current_location = point;
+        self.active_touches.insert(touch, (point, point));
+        self.tracking = true;
+    }
+
+    fn end_custom_touch(&mut self, touch: id) {
+        self.active_touches.remove(&touch);
+        self.tracking = !self.active_touches.is_empty();
+    }
+
     fn new(kind: GestureKind) -> Self {
         Self {
             target: nil,
@@ -103,6 +174,10 @@ fn init_with_target(env: &mut Environment, this: id, target: id, action: SEL) ->
 }
 
 fn send_action(env: &mut Environment, recognizer: id) {
+    if let Some(inserted) = env.framework_state.uikit.ui_gesture_recognizer.actions.defer(recognizer) {
+        if inserted { retain(env, recognizer); }
+        return;
+    }
     let (target, action) = {
         let host = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer);
         (host.target, host.action)
@@ -384,20 +459,39 @@ pub(super) fn touches_began(env: &mut Environment, view: id, touches: id, event:
             continue;
         }
         let generic = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).kind == GestureKind::Generic;
-        if generic {
-            // UIKit resets a completed custom recognizer before the next sequence.
-            () = msg![env; recognizer reset];
+        let new_sequence = !env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).tracking;
+        if generic && new_sequence {
+            let state = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).state;
+            // Do not call guest reset on a fresh recognizer or another finger
+            // in a live sequence: reset can explicitly stop the app's hold.
+            if state != UIGestureRecognizerStatePossible {
+                () = msg![env; recognizer reset];
+            }
         }
         let location: CGPoint = msg![env; touch locationInView:recognizer_view];
+        if generic {
+            let array: id = msg![env; touches allObjects];
+            let count: NSUInteger = msg![env; array count];
+            for i in 0..count {
+                let touch: id = msg![env; array objectAtIndex:i];
+                let point: CGPoint = msg![env; touch locationInView:recognizer_view];
+                env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer)
+                    .track_custom_touch(touch, point);
+            }
+        }
         let host = env
             .objc
             .borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
-        host.initial_location = location;
+        if !generic || new_sequence {
+            host.initial_location = location;
+            host.state = UIGestureRecognizerStatePossible;
+        }
         host.current_location = location;
-        host.state = UIGestureRecognizerStatePossible;
         host.tracking = true;
         if generic {
-            () = msg![env; recognizer touchesBegan:touches withEvent:event];
+            if matches!(host.state, 0..=2) {
+                () = msg![env; recognizer touchesBegan:touches withEvent:event];
+            }
         }
     }
     for recognizer in recognizers { release(env, recognizer); }
@@ -428,7 +522,10 @@ pub(super) fn touches_moved(env: &mut Environment, view: id, touches: id, event:
                 .borrow_mut::<UIGestureRecognizerHostObject>(recognizer)
                 .current_location = location;
             if env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).kind == GestureKind::Generic {
-                () = msg![env; recognizer touchesMoved:touches withEvent:event];
+                let state = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).state;
+                if matches!(state, 0..=2) {
+                    () = msg![env; recognizer touchesMoved:touches withEvent:event];
+                }
             }
         }
     }
@@ -463,11 +560,23 @@ pub(super) fn touches_ended(env: &mut Environment, view: id, touches: id, event:
                 .objc
                 .borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
             host.current_location = location;
-            host.tracking = false;
+            if host.kind != GestureKind::Generic {
+                host.tracking = false;
+            }
         }
 
         if env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).kind == GestureKind::Generic {
-            () = msg![env; recognizer touchesEnded:touches withEvent:event];
+            let state = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).state;
+            if matches!(state, 0..=2) {
+                () = msg![env; recognizer touchesEnded:touches withEvent:event];
+            }
+            let array: id = msg![env; touches allObjects];
+            let count: NSUInteger = msg![env; array count];
+            for i in 0..count {
+                let touch: id = msg![env; array objectAtIndex:i];
+                env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer)
+                    .end_custom_touch(touch);
+            }
             continue;
         }
 
@@ -531,6 +640,7 @@ pub(super) fn touches_cancelled(env: &mut Environment, view: id, touches: id, ev
         } else if host.tracking {
             let generic = host.kind == GestureKind::Generic;
             env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer).tracking = false;
+            env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer).active_touches.clear();
             if generic {
                 () = msg![env; recognizer touchesCancelled:touches withEvent:event];
             }
@@ -687,5 +797,66 @@ mod long_press_tests {
         assert!(h.press_timer == nil);
         assert!(movement_allowed(CGPoint { x: 0.0, y: 0.0 }, CGPoint { x: 6.0, y: 8.0 }, h.allowable_movement));
         assert!(!movement_allowed(CGPoint { x: 0.0, y: 0.0 }, CGPoint { x: 6.0, y: 8.1 }, h.allowable_movement));
+    }
+}
+
+#[cfg(test)]
+mod hold_tests {
+    use super::*;
+
+    #[test]
+    fn sibling_cleanup_finishes_before_globbert_starts_holding() {
+        let squish = id::from_bits(1);
+        let mut batch = ActionBatch::default();
+        batch.begin();
+        // SQ1 enters Began. Its action must wait while SQ3/SQ5 reject the
+        // same press and invoke their delegate's squishStopped callback.
+        assert_eq!(batch.defer(squish), Some(true));
+        let mut holding = false;
+        assert!(!holding);
+        for recognizer in batch.finish() {
+            assert_eq!(recognizer, squish);
+            holding = true;
+        }
+        assert!(holding);
+        // An input pass with no release must not schedule another action.
+        batch.begin();
+        assert!(batch.finish().is_empty());
+        assert!(holding);
+    }
+
+    #[test]
+    fn another_finger_does_not_reset_or_end_a_live_custom_hold() {
+        let first = id::from_bits(1);
+        let second = id::from_bits(2);
+        let start = CGPoint { x: 10.0, y: 20.0 };
+        let mut host = UIGestureRecognizerHostObject::new(GestureKind::Generic);
+        host.track_custom_touch(first, start);
+        host.state = 1; // Began, while the first finger remains down.
+        host.track_custom_touch(second, CGPoint { x: 30.0, y: 40.0 });
+        assert_eq!(host.state, 1);
+        assert_eq!(host.initial_location, start);
+        host.end_custom_touch(second);
+        assert!(host.tracking);
+        assert_eq!(host.state, 1);
+        host.end_custom_touch(first);
+        assert!(!host.tracking);
+        assert!(host.active_touches.is_empty());
+        host.track_custom_touch(second, start);
+        assert_eq!(host.state, UIGestureRecognizerStatePossible);
+    }
+
+    #[test]
+    fn nested_input_coalesces_actions_until_the_outer_event_finishes() {
+        let recognizer = id::from_bits(1);
+        let mut batch = ActionBatch::default();
+        assert_eq!(batch.defer(recognizer), None);
+        batch.begin();
+        assert_eq!(batch.defer(recognizer), Some(true));
+        batch.begin();
+        assert_eq!(batch.defer(recognizer), Some(false));
+        assert!(batch.finish().is_empty());
+        assert_eq!(batch.finish(), vec![recognizer]);
+        assert_eq!(batch.defer(recognizer), None);
     }
 }

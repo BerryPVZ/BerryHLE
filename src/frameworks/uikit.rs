@@ -1023,6 +1023,7 @@ pub struct State {
     ui_font: ui_font::State,
     ui_geometry: ui_geometry::State,
     ui_graphics: ui_graphics::State,
+    ui_gesture_recognizer: ui_gesture_recognizer::State,
     ui_image: ui_image::State,
     ui_keyboard: ui_keyboard::State,
     ui_launch_delegate: ui_launch_delegate::State,

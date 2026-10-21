@@ -63,7 +63,7 @@ layer/layout fixes are shared with that path.
 
 ## Validation
 
-All 411 library unit tests pass with `ALSOFT_DRIVERS=null`. The Windows debug
+All 414 library unit tests pass with `ALSOFT_DRIVERS=null`. The Windows debug
 executable builds, and `--help` exits successfully. The normal audio backend
 caused a post-test shutdown abort in this session; the null backend exits
 cleanly. Android compilation and SDK-dependent guest TestApp tests were not
@@ -76,3 +76,25 @@ starts Globbert, then stops at its first window-dependent call, as expected.
 Consequently the graphics and drag behavior require an in-game check on a
 normal desktop session. The user's IPA and log are diagnostic input and are
 not included in the source archive or patch.
+
+## Globbert sustained holds
+
+Globbert's SQ1/SQ3/SQ5 recognizers call a shared `squishStopped` delegate
+callback when rejecting a press. Sending the recognized sibling's target
+action synchronously from `setState:` started its hold before that cleanup,
+so the same input event could immediately stop it again. Target actions are
+now retained, coalesced and dispatched after the complete input event,
+including all sibling recognizers and views. Failed or disabled recognizers
+do not deliver queued actions.
+
+Fresh recognizers are no longer reset before their first touch, and adding
+another finger to a live custom sequence preserves its state and initial
+position. Each custom recognizer tracks its active touches until release or
+cancellation; failed recognizers do not receive later move/end callbacks.
+Stationary touches no longer expire after ten seconds when another finger
+arrives on a single-touch view. Explicit release, cancellation and replacement
+of the same physical finger still terminate the old touch.
+
+Three regressions cover sibling cleanup before hold start, preserving a live
+sequence until its last touch ends, and nested/coalesced action dispatch.
+Visual gameplay verification retains the limitation described above.

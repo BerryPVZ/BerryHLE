@@ -55,10 +55,6 @@ fn log_touch_delivery(marker: &str, counter: &AtomicUsize, count: usize) {
     }
 }
 
-/// A touch with no event for this long is no longer part of a live gesture;
-/// its Up/Cancel was lost. Used to reclaim stale touches safely.
-const STALE_TOUCH_SECONDS: f64 = 10.0;
-
 pub type UITouchPhase = NSInteger;
 pub const UITouchPhaseBegan: UITouchPhase = 0;
 pub const UITouchPhaseMoved: UITouchPhase = 1;
@@ -586,6 +582,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 };
 
 pub fn handle_event(env: &mut Environment, event: Event) {
+    super::ui_gesture_recognizer::begin_touch_dispatch(env);
     let touch_ids: Vec<id> = env
         .framework_state
         .uikit
@@ -611,6 +608,7 @@ pub fn handle_event(env: &mut Environment, event: Event) {
             );
         }
     }
+    super::ui_gesture_recognizer::finish_touch_dispatch(env);
 }
 
 fn touchhle_cocos_touch_aliases_enabled(env: &mut Environment, view: id) -> bool {
@@ -1052,53 +1050,26 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             // first finger turned into a ghost (no more Moved/Ended, and the
             // view was never told it ended). Unity-style input state machines
             // then stalled and later swipes were randomly ignored.
-            let active: Vec<(FingerId, id)> = env
+            // A stationary finger can remain down indefinitely. Silence
+            // is not evidence that its release was lost; drop the newcomer.
+            log_dbg!("Second finger on single-touch view; dropping the new touch.");
+            let new_finger = env
                 .framework_state
                 .uikit
                 .ui_touch
                 .current_touches
                 .iter()
-                .map(|(&fid, &t)| (fid, t))
-                .collect();
-            let stale: Vec<(FingerId, id)> = active
-                .into_iter()
-                .filter(|&(_, t)| {
-                    touch_ivars(env, t, |v| {
-                        v.view == view
-                            && t != touch
-                            && (timestamp - v.timestamp) > STALE_TOUCH_SECONDS
-                    })
-                })
-                .collect();
-            if !stale.is_empty() {
-                // Very old touches cannot be part of a live gesture; their
-                // Up/Cancel was lost long ago. Cancel them visibly, then let
-                // the newcomer through.
-                for (fid, t) in stale {
-                    stale_cancel_and_release(env, fid, t, "stale on single-touch view");
-                }
-            } else {
-                // A live second finger on a single-touch view: like real iOS,
-                // keep the tracked touch intact and drop the newcomer.
-                log_dbg!("Second finger on single-touch view; dropping the new touch.");
-                let new_finger = env
-                    .framework_state
+                .find(|(_, &v)| v == touch)
+                .map(|(&k, _)| k);
+            if let Some(new_finger) = new_finger {
+                env.framework_state
                     .uikit
                     .ui_touch
                     .current_touches
-                    .iter()
-                    .find(|(_, &v)| v == touch)
-                    .map(|(&k, _)| k);
-                if let Some(new_finger) = new_finger {
-                    env.framework_state
-                        .uikit
-                        .ui_touch
-                        .current_touches
-                        .remove(&new_finger);
-                }
-                release(env, touch);
-                continue;
+                    .remove(&new_finger);
             }
+            release(env, touch);
+            continue;
         }
 
         if let Entry::Vacant(e) = view_touches.entry(view) {
