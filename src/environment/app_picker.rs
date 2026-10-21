@@ -1827,25 +1827,31 @@ fn run_lock_screen(
     () = msg![env; track_layer setCornerRadius:(18.0 as CGFloat)];
     () = msg![env; track setClipsToBounds:true];
     () = msg![env; lock addSubview:track];
-    // A translucent upper reflection plus a fine inner edge creates the glass
-    // capsule; the darker bottom half supplies depth without blacking out art.
-    let sheen_color = ui_color(env, 1.0, 1.0, 1.0, 0.14);
-    let sheen = new_view(env, rect(3.0, 2.0, size.width - 46.0, 20.0), sheen_color);
-    let sheen_layer: id = msg![env; sheen layer];
-    () = msg![env; sheen_layer setCornerRadius:(14.0 as CGFloat)];
-    () = msg![env; track addSubview:sheen];
+    // Many very thin translucent bands form a soft glass highlight instead of
+    // the hard-edged half-track reflection that looked like a second bar.
+    for band in 0..16 {
+        let t = band as CGFloat / 15.0;
+        let alpha = 0.16 * (1.0 - t);
+        let highlight = ui_color(env, 1.0, 1.0, 1.0, alpha);
+        let strip = new_view(env, rect(1.0, 1.0 + band as CGFloat * 2.0, size.width - 42.0, 2.5), highlight);
+        () = msg![env; track addSubview:strip];
+    }
     let edge_color = ui_color(env, 1.0, 1.0, 1.0, 0.26);
     let track_edge = new_view(env, rect(1.0, 1.0, size.width - 42.0, 1.0), edge_color);
     () = msg![env; track addSubview:track_edge];
-    let slide_color = ui_color(env, 1.0, 1.0, 1.0, 0.64);
+    let slide_color = ui_color(env, 1.0, 1.0, 1.0, 0.72);
     let slide_text = new_label(env, rect(72.0, 0.0, size.width - 130.0, 62.0), "slide to unlock", 25.0, false, slide_color);
     () = msg![env; slide_text setTextAlignment:UITextAlignmentCenter];
     () = msg![env; track addSubview:slide_text];
-    let shimmer_color = ui_color(env, 1.0, 1.0, 1.0, 0.22);
-    let shimmer = new_view(env, rect(-48.0, 7.0, 38.0, 48.0), shimmer_color);
-    let shimmer_layer: id = msg![env; shimmer layer];
-    () = msg![env; shimmer_layer setCornerRadius:(10.0 as CGFloat)];
-    () = msg![env; track addSubview:shimmer];
+    // A feathered shimmer made of thin strips glides under the lettering.
+    let mut shimmer_bands = Vec::new();
+    for band in 0..12 {
+        let distance = (band as CGFloat - 5.5).abs() / 5.5;
+        let tint = ui_color(env, 1.0, 1.0, 1.0, 0.20 * (1.0 - distance));
+        let strip = new_view(env, rect(-100.0 + band as CGFloat * 3.0, 6.0, 3.2, 50.0), tint);
+        () = msg![env; track addSubview:strip];
+        shimmer_bands.push(strip);
+    }
     let knob_color = ui_color(env, 0.96, 0.96, 0.97, 1.0);
     let knob: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
     () = msg![env; knob setFrame:(rect(4.0, 4.0, 54.0, 54.0))];
@@ -1876,15 +1882,18 @@ fn run_lock_screen(
         let unlocked = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate).lock_screen_unlocked;
         if unlocked { break; }
         let elapsed = started.elapsed().as_secs_f64();
-        let phase = (elapsed * 2.4).sin();
-        () = msg![env; slide_text setAlpha:((0.42 + (phase + 1.0) * 0.29) as CGFloat)];
+        let phase = (elapsed * std::f64::consts::TAU / 2.0).sin();
+        () = msg![env; slide_text setAlpha:((0.48 + (phase + 1.0) * 0.25) as CGFloat)];
         let mut knob_frame: CGRect = msg![env; knob frame];
-        knob_frame.origin.x = 4.0 + ((phase + 1.0) * 0.5) as CGFloat * 12.0;
+        knob_frame.origin.x = 4.0 + ((phase + 1.0) * 0.5) as CGFloat * 8.0;
         () = msg![env; knob setFrame:knob_frame];
-        let shimmer_phase = (elapsed % 1.6) / 1.6;
-        let mut shimmer_frame: CGRect = msg![env; shimmer frame];
-        shimmer_frame.origin.x = -42.0 + shimmer_phase as CGFloat * (size.width - 12.0);
-        () = msg![env; shimmer setFrame:shimmer_frame];
+        let shimmer_phase = (elapsed % 1.8) / 1.8;
+        let shimmer_start = -44.0 + shimmer_phase as CGFloat * (size.width - 32.0);
+        for (index, &band) in shimmer_bands.iter().enumerate() {
+            let mut frame: CGRect = msg![env; band frame];
+            frame.origin.x = shimmer_start + index as CGFloat * 3.0;
+            () = msg![env; band setFrame:frame];
+        }
         if clock_updated.elapsed() >= Duration::from_secs(1) {
             clock_updated = Instant::now();
             let text = ns_string::from_rust_string(env, lock_screen_time_string());
