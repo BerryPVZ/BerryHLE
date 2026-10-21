@@ -1784,11 +1784,13 @@ fn run_lock_screen(
     // Layered translucent bands give the clock panel the soft glass gradient
     // of the iOS 4 lock screen while keeping the wallpaper visible beneath it.
     let top = new_view(env, rect(0.0, 0.0, size.width, 138.0), clear);
-    for band in 0..12 {
-        let y = band as CGFloat * 11.5;
-        let alpha = 0.30 - band as CGFloat * 0.014;
-        let tint = ui_color(env, 0.025, 0.035, 0.06, alpha);
-        let strip = new_view(env, rect(0.0, y, size.width, 12.0), tint);
+    const GLASS_STEPS: usize = 48;
+    for band in 0..GLASS_STEPS {
+        let t = band as CGFloat / (GLASS_STEPS - 1) as CGFloat;
+        let y = 138.0 * t;
+        let band_height = 138.0 / GLASS_STEPS as CGFloat + 0.5;
+        let tint = ui_color(env, 0.025, 0.035, 0.06, 0.30 - 0.18 * t);
+        let strip = new_view(env, rect(0.0, y, size.width, band_height), tint);
         () = msg![env; top addSubview:strip];
     }
     () = msg![env; lock addSubview:top];
@@ -1810,11 +1812,12 @@ fn run_lock_screen(
 
     let bottom = size.height - 116.0;
     let shade = new_view(env, rect(0.0, bottom - 24.0, size.width, 140.0), clear);
-    for band in 0..12 {
-        let y = band as CGFloat * (140.0 / 12.0);
-        let alpha = 0.035 + band as CGFloat * 0.018;
-        let tint = ui_color(env, 0.015, 0.02, 0.035, alpha);
-        let strip = new_view(env, rect(0.0, y, size.width, 12.0), tint);
+    for band in 0..GLASS_STEPS {
+        let t = band as CGFloat / (GLASS_STEPS - 1) as CGFloat;
+        let y = 140.0 * t;
+        let band_height = 140.0 / GLASS_STEPS as CGFloat + 0.5;
+        let tint = ui_color(env, 0.015, 0.02, 0.035, 0.035 + 0.20 * t);
+        let strip = new_view(env, rect(0.0, y, size.width, band_height), tint);
         () = msg![env; shade addSubview:strip];
     }
     () = msg![env; lock addSubview:shade];
@@ -1838,6 +1841,11 @@ fn run_lock_screen(
     let slide_text = new_label(env, rect(72.0, 0.0, size.width - 130.0, 62.0), "slide to unlock", 25.0, false, slide_color);
     () = msg![env; slide_text setTextAlignment:UITextAlignmentCenter];
     () = msg![env; track addSubview:slide_text];
+    let shimmer_color = ui_color(env, 1.0, 1.0, 1.0, 0.22);
+    let shimmer = new_view(env, rect(-48.0, 7.0, 38.0, 48.0), shimmer_color);
+    let shimmer_layer: id = msg![env; shimmer layer];
+    () = msg![env; shimmer_layer setCornerRadius:(10.0 as CGFloat)];
+    () = msg![env; track addSubview:shimmer];
     let knob_color = ui_color(env, 0.96, 0.96, 0.97, 1.0);
     let knob: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
     () = msg![env; knob setFrame:(rect(4.0, 4.0, 54.0, 54.0))];
@@ -1849,12 +1857,11 @@ fn run_lock_screen(
                             action:unlock_selector
                   forControlEvents:UIControlEventTouchUpInside];
     () = msg![env; track addSubview:knob];
-    // Use the basic right-arrow glyph available in the bundled Helvetica-like
-    // fonts; the heavy Unicode arrow previously rendered as an empty square.
-    let arrow_color = ui_color(env, 0.35, 0.35, 0.36, 1.0);
-    let arrow = new_label(env, rect(2.0, 0.0, 50.0, 54.0), "→", 38.0, true, arrow_color);
-    () = msg![env; arrow setTextAlignment:UITextAlignmentCenter];
-    () = msg![env; knob addSubview:arrow];
+    let arrow_image = make_lock_arrow_image(env);
+    let arrow_view: id = msg_class![env; UIImageView alloc];
+    let arrow_view: id = msg![env; arrow_view initWithImage:arrow_image];
+    () = msg![env; arrow_view setFrame:(rect(4.0, 9.0, 46.0, 36.0))];
+    () = msg![env; knob addSubview:arrow_view];
 
     let swipe: id = msg_class![env; UISwipeGestureRecognizer alloc];
     let swipe: id = msg![env; swipe initWithTarget:delegate action:unlock_selector];
@@ -1868,11 +1875,16 @@ fn run_lock_screen(
         run_run_loop_single_iteration(env, run_loop);
         let unlocked = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate).lock_screen_unlocked;
         if unlocked { break; }
-        let phase = (started.elapsed().as_secs_f64() * 2.4).sin();
-        () = msg![env; slide_text setAlpha:((0.66 + phase.abs() * 0.28) as CGFloat)];
+        let elapsed = started.elapsed().as_secs_f64();
+        let phase = (elapsed * 2.4).sin();
+        () = msg![env; slide_text setAlpha:((0.42 + (phase + 1.0) * 0.29) as CGFloat)];
         let mut knob_frame: CGRect = msg![env; knob frame];
-        knob_frame.origin.x = 4.0 + phase.max(0.0) as CGFloat * 5.0;
+        knob_frame.origin.x = 4.0 + ((phase + 1.0) * 0.5) as CGFloat * 12.0;
         () = msg![env; knob setFrame:knob_frame];
+        let shimmer_phase = (elapsed % 1.6) / 1.6;
+        let mut shimmer_frame: CGRect = msg![env; shimmer frame];
+        shimmer_frame.origin.x = -42.0 + shimmer_phase as CGFloat * (size.width - 12.0);
+        () = msg![env; shimmer setFrame:shimmer_frame];
         if clock_updated.elapsed() >= Duration::from_secs(1) {
             clock_updated = Instant::now();
             let text = ns_string::from_rust_string(env, lock_screen_time_string());
@@ -1905,6 +1917,15 @@ fn run_lock_screen(
     for &dot in page_dots {
         () = msg![env; dot setHidden:false];
     }
+}
+
+fn make_lock_arrow_image(env: &mut Environment) -> id {
+    let bytes: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/lock_arrow.png"));
+    let image = Image::from_bytes(bytes).unwrap();
+    let cg_image = cg_image::from_image(env, image);
+    let ui_image: id = msg_class![env; UIImage imageWithCGImage:cg_image];
+    release(env, cg_image);
+    ui_image
 }
 
 #[cfg(unix)]
@@ -2978,10 +2999,20 @@ fn setup_settings(
     );
     () = msg![env; settings_view addSubview:nav_bar];
     let nav_height = SETTINGS_NAV_BAR_HEIGHT + status_offset;
-    for (band, color) in [(0.0, (0.42, 0.57, 0.75)), (0.22, (0.32, 0.47, 0.66)), (0.45, (0.24, 0.38, 0.57))] {
-        let band_color = ui_color(env, color.0, color.1, color.2, 1.0);
-        let highlight = new_view(env, rect(0.0, nav_height * band, width, nav_height * 0.24), band_color);
-        () = msg![env; nav_bar addSubview:highlight];
+    const NAV_GRADIENT_STEPS: usize = 48;
+    for step in 0..NAV_GRADIENT_STEPS {
+        let t = step as CGFloat / (NAV_GRADIENT_STEPS - 1) as CGFloat;
+        let y = nav_height * t;
+        let band_height = nav_height / NAV_GRADIENT_STEPS as CGFloat + 0.5;
+        let color = ui_color(
+            env,
+            0.39 - 0.18 * t,
+            0.56 - 0.25 * t,
+            0.75 - 0.23 * t,
+            1.0,
+        );
+        let band = new_view(env, rect(0.0, y, width, band_height), color);
+        () = msg![env; nav_bar addSubview:band];
     }
     let nav_separator_color = ui_color(env, 0.12, 0.22, 0.36, 1.0);
     let nav_separator = new_view(
