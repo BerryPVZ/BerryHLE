@@ -829,6 +829,7 @@ fn app_picker_inner(
         app_frame.size,
         icon_grid_stuff.as_ref(),
         status_bar,
+        status_time_label,
         dock,
         version_label,
         &page_dots,
@@ -1765,6 +1766,7 @@ fn run_lock_screen(
     size: CGSize,
     grid: Option<&IconGridStuff>,
     status_bar: Option<id>,
+    status_time_label: Option<id>,
     dock: id,
     version_label: id,
     page_dots: &[id],
@@ -1977,8 +1979,13 @@ fn run_lock_screen(
         () = msg![env; knob setFrame:knob_frame];
         if clock_updated.elapsed() >= Duration::from_secs(1) {
             clock_updated = Instant::now();
+            // Keep both clocks on the same timestamp while the lock screen is
+            // modal; the outer picker event loop is paused until unlock.
             let text = ns_string::from_rust_string(env, lock_screen_time_string());
             () = msg![env; clock setText:text];
+            if let Some(status_time_label) = status_time_label {
+                () = msg![env; status_time_label setText:text];
+            }
             release(env, text);
         }
     }
@@ -2320,12 +2327,12 @@ fn make_dock(
         env,
         delegate,
         dock,
-        first_x + step * 2.0,
+        first_x + step * 3.0,
         recent_image,
         recent_label,
         "openRecentApp",
     );
-    make_dock_item(env, delegate, dock, first_x + step * 3.0, browse_image, "Browse", "addIpa");
+    make_dock_item(env, delegate, dock, first_x + step * 2.0, browse_image, "Browse", "addIpa");
     () = msg![env; main_view addSubview:dock];
     dock
 }
