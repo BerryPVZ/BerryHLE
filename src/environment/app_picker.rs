@@ -1865,7 +1865,7 @@ fn run_lock_screen(
     // Bright duplicate glyphs, clipped into soft narrow bands, sweep across
     // the lettering to create a real iOS-style text sheen without a hard bar.
     let mut text_glints = Vec::new();
-    let glint_strengths = [0.10, 0.18, 0.30, 0.48, 0.62, 0.48, 0.30, 0.18, 0.10];
+    let glint_strengths = [0.05, 0.10, 0.18, 0.28, 0.38, 0.28, 0.18, 0.10, 0.05];
     for (index, strength) in glint_strengths.iter().enumerate() {
         let clip = new_view(env, rect(72.0, 0.0, 8.0, 62.0), clear);
         () = msg![env; clip setClipsToBounds:true];
@@ -1882,7 +1882,7 @@ fn run_lock_screen(
     let knob_shadow_layer: id = msg![env; knob_shadow layer];
     () = msg![env; knob_shadow_layer setCornerRadius:(15.0 as CGFloat)];
     () = msg![env; track addSubview:knob_shadow];
-    let knob_color = ui_color(env, 0.82, 0.83, 0.85, 1.0);
+    let knob_color = ui_color(env, 0.91, 0.92, 0.94, 1.0);
     let knob = new_view(env, rect(4.0, 4.0, 54.0, 54.0), knob_color);
     let knob_layer: id = msg![env; knob layer];
     () = msg![env; knob_layer setCornerRadius:(14.0 as CGFloat)];
@@ -1891,13 +1891,11 @@ fn run_lock_screen(
     let knob_edge_cg: id = msg![env; knob_edge CGColor];
     () = msg![env; knob_layer setBorderColor:knob_edge_cg];
     () = msg![env; knob_layer setBorderWidth:(1.0 as CGFloat)];
-    for band in 0..18 {
-        let t = band as CGFloat / 17.0;
-        let shade = 0.98 - 0.24 * t;
-        let gloss = ui_color(env, shade, shade, shade, 1.0);
-        let strip = new_view(env, rect(1.0, band as CGFloat * 3.0, 52.0, 3.0), gloss);
-        () = msg![env; knob addSubview:strip];
-    }
+    // One restrained inset glint keeps the thumb glossy without child layers
+    // painting square corners over its rounded silhouette.
+    let knob_glint_color = ui_color(env, 1.0, 1.0, 1.0, 0.48);
+    let knob_glint = new_view(env, rect(5.0, 3.0, 44.0, 1.5), knob_glint_color);
+    () = msg![env; knob addSubview:knob_glint];
     () = msg![env; track addSubview:knob];
     let arrow_image = make_lock_arrow_image(env);
     let arrow_view: id = msg_class![env; UIImageView alloc];
@@ -1960,7 +1958,9 @@ fn run_lock_screen(
         for &(clip, glint, index) in &text_glints {
             let offset = shimmer_start + index as CGFloat * 7.0;
             () = msg![env; clip setFrame:(rect(72.0 + offset, 0.0, 8.0, 62.0))];
-            () = msg![env; glint setFrame:(rect(-offset, 0.0, label_width, 62.0))];
+            // Offset each clipped copy back by its own band position so every
+            // slice stays pixel-aligned with the base glyphs (no ghosting).
+            () = msg![env; glint setFrame:(rect(-offset - index as CGFloat * 7.0, 0.0, label_width, 62.0))];
         }
         let mut knob_frame: CGRect = msg![env; knob frame];
         let travel = (track_width - 62.0).max(0.0);
