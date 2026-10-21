@@ -707,6 +707,13 @@ fn unarchive_key(env: &mut Environment, unarchiver: id, key: Uid) -> id {
 
             let new_object: id = msg![env; class alloc];
             let new_object: id = msg![env; new_object initWithCoder:unarchiver];
+            // Custom views can replace a placeholder with a nested nib's
+            // populated view. Cache and notify the delegate about that result.
+            let replacement: id = msg![env; new_object awakeAfterUsingCoder:unarchiver];
+            if replacement != new_object {
+                retain(env, replacement);
+            }
+            let new_object = replacement;
 
             let host_obj = borrow_host_obj(env, unarchiver); // reborrow
             host_obj.current_key = old_current_key;

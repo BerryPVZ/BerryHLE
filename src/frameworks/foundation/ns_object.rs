@@ -966,6 +966,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 }
 
+- (id)awakeAfterUsingCoder:(id)_coder {
+    this
+}
+
 - (())awakeFromNib {
 }
 

@@ -509,6 +509,13 @@ fn unarchive_obj(env: &mut Environment, unarchiver: id, idx: u32) -> id {
 
     let new_object: id = msg![env; class alloc];
     let new_object: id = msg![env; new_object initWithCoder:unarchiver];
+    // Honor replacement objects before subsequent outlet connections resolve
+    // this archive index (e.g. Charlie the Steak's nested custom views).
+    let replacement: id = msg![env; new_object awakeAfterUsingCoder:unarchiver];
+    if replacement != new_object {
+        retain(env, replacement);
+    }
+    let new_object = replacement;
 
     let host_obj = borrow_host_obj(env, unarchiver); // reborrow
     host_obj.current_object_idx = old_current_idx;

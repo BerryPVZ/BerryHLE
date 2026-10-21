@@ -221,6 +221,16 @@ pub const CLASSES: ClassExports = objc_classes! {
     init_with_target(env, this, target, action)
 }
 
+- (id)initWithCoder:(id)_coder {
+    // The allocation selected the concrete recognizer kind. Preserve its
+    // defaults; nib event/outlet connections supply its target and view.
+    this
+}
+
+- (())addTarget:(id)target action:(SEL)action {
+    init_with_target(env, this, target, action);
+}
+
 - (id)delegate { env.objc.borrow::<UIGestureRecognizerHostObject>(this).delegate }
 - (())setDelegate:(id)delegate {
     env.objc.borrow_mut::<UIGestureRecognizerHostObject>(this).delegate = delegate;

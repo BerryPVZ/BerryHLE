@@ -175,13 +175,21 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     let top_level_objects = if let Ok(unarchiver) = load_nib_file(env, this, GuestPathBuf::from(nib_path)) {
         let top_level_objects_key = get_static_str(env, "UINibTopLevelObjectsKey");
-        let objects = msg![env; unarchiver decodeObjectForKey:top_level_objects_key];
+        let decoded: id = msg![env; unarchiver decodeObjectForKey:top_level_objects_key];
+        // First Responder proxies decode to nil. They are archive placeholders,
+        // not top-level instances: a nil slot stops guest fast enumeration
+        // before it reaches the real view (Charlie's nested nib loaders).
+        let objects: id = msg_class![env; NSMutableArray new];
+        let count: NSUInteger = msg![env; decoded count];
+        for i in 0..count {
+            let object: id = msg![env; decoded objectAtIndex:i];
+            if object != nil {
+                () = msg![env; objects addObject:object];
+            }
+        }
 
         // Удерживаем объекты ДО удаления анрайхиватора, иначе они могут
         // вычиститься
-        if objects != nil {
-            retain(env, objects);
-        }
         release(env, unarchiver);
 
         if objects != nil {
@@ -388,7 +396,13 @@ pub const CLASSES: ClassExports = objc_classes! {
             selector,
             event_mask,
         );
-        () = msg![env; source addTarget:destination action:action forControlEvents:event_mask];
+        let class: Class = msg![env; source class];
+        let gesture_class = env.objc.get_known_class("UIGestureRecognizer", &mut env.mem);
+        if env.objc.class_is_subclass_of(class, gesture_class) {
+            () = msg![env; source addTarget:destination action:action];
+        } else {
+            () = msg![env; source addTarget:destination action:action forControlEvents:event_mask];
+        }
     } else {
         log!(
             "Warning: UIRuntimeEventConnection skipping connect — source={:?} destination={:?} label={:?}",
@@ -473,16 +487,16 @@ pub const CLASSES: ClassExports = objc_classes! {
     // Try to get the existing array for this key
     let existing_array: id = msg![env; source valueForKey:label];
 
+    // Collection getters can return immutable snapshots (gestureRecognizers
+    // does). Assign the appended collection through its setter so the owning
+    // view actually attaches each recognizer and sets its view back-pointer.
+    let new_array: id = msg_class![env; NSMutableArray new];
     if existing_array != nil {
-        // Array already exists, just add the destination to it
-        () = msg![env; existing_array addObject:destination];
-    } else {
-        // Create a new NSMutableArray, add the destination, and set it
-        let new_array: id = msg_class![env; NSMutableArray new];
-        () = msg![env; new_array addObject:destination];
-        () = msg![env; source setValue:new_array forKey:label];
-        release(env, new_array);
+        () = msg![env; new_array addObjectsFromArray:existing_array];
     }
+    () = msg![env; new_array addObject:destination];
+    () = msg![env; source setValue:new_array forKey:label];
+    release(env, new_array);
 }
 
 - (())dealloc {
