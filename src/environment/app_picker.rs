@@ -1763,7 +1763,8 @@ fn run_lock_screen(
 ) {
     if let Some(grid) = grid {
         for container in &grid.containers {
-            () = msg![env; container.view setHidden:true];
+            let container_view = container.view;
+            () = msg![env; container_view setHidden:true];
         }
     }
     () = msg![env; dock setHidden:true];
@@ -1854,7 +1855,8 @@ fn run_lock_screen(
     });
     () = msg![env; lock setHidden:true];
     if let Some(grid) = grid {
-        () = msg![env; grid.containers[grid.visible].view setHidden:false];
+        let active_container = grid.containers[grid.visible].view;
+        () = msg![env; active_container setHidden:false];
     }
     () = msg![env; dock setHidden:false];
     () = msg![env; version_label setHidden:false];
@@ -2650,14 +2652,16 @@ fn slide_settings_screen(
 ) {
     const START_SCALE: CGFloat = 0.86;
     if open {
-        () = msg![env; settings_view setTransform:CGAffineTransform::make_scale(START_SCALE, START_SCALE)];
+        let initial_transform = CGAffineTransform::make_scale(START_SCALE, START_SCALE);
+        () = msg![env; settings_view setTransform:initial_transform];
         () = msg![env; settings_view setAlpha:(0.0 as CGFloat)];
         () = msg![env; settings_view setHidden:false];
     }
     animate_for(env, run_loop, delegate, SETTINGS_SLIDE_DURATION, |env, t| {
         let progress = if open { ease_in_out_cubic(t) as CGFloat } else { (1.0 - ease_in_out_cubic(t)) as CGFloat };
         let scale = START_SCALE + (1.0 - START_SCALE) * progress;
-        () = msg![env; settings_view setTransform:CGAffineTransform::make_scale(scale, scale)];
+        let transform = CGAffineTransform::make_scale(scale, scale);
+        () = msg![env; settings_view setTransform:transform];
         () = msg![env; settings_view setAlpha:progress];
     });
     () = msg![env; settings_view setTransform:CGAffineTransformIdentity];
