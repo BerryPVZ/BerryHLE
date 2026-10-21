@@ -18,6 +18,12 @@
 - (NSUInteger)count;
 - (id)member:(id)object;
 @end
+@interface NSData (FoundationBase64Tests)
++ (id)dataWithBytes:(const void *)bytes length:(NSUInteger)length;
+- (id)base64EncodedDataWithOptions:(NSUInteger)options;
+- (NSUInteger)length;
+- (const void *)bytes;
+@end
 #endif
 #include <string.h>
 
@@ -88,3 +94,34 @@ int test_NSHashTable_copy_empty(void) {
   return result;
 }
 
+int test_NSData_base64_data(void) {
+  static const struct {
+    const unsigned char *input;
+    unsigned length;
+    const char *encoded;
+  } cases[] = {
+      {(const unsigned char *)"", 0, ""},
+      {(const unsigned char *)"f", 1, "Zg=="},
+      {(const unsigned char *)"fo", 2, "Zm8="},
+      {(const unsigned char *)"foo", 3, "Zm9v"},
+      {(const unsigned char *)"foobar", 6, "Zm9vYmFy"},
+      {(const unsigned char *)"\000\377\020", 3, "AP8Q"},
+  };
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  int result = 0;
+  unsigned i;
+  for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    NSAutoreleasePool *inner = [[NSAutoreleasePool alloc] init];
+    NSData *source = [NSData dataWithBytes:cases[i].input length:cases[i].length];
+    NSData *encoded = [[source base64EncodedDataWithOptions:0] retain];
+    [inner drain];
+    unsigned length = (unsigned)strlen(cases[i].encoded);
+    if (encoded == nil || [encoded length] != length ||
+        (length && memcmp([encoded bytes], cases[i].encoded, length) != 0))
+      result = -(int)(i + 1);
+    [encoded release];
+    if (result) break;
+  }
+  [pool drain];
+  return result;
+}
