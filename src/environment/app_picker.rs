@@ -1057,7 +1057,7 @@ fn app_picker_inner(
                 main_run_loop,
                 delegate,
                 settings.main_view,
-                app_frame.size,
+                app_frame.size.width,
                 true,
             );
         } else if std::mem::take(&mut host_obj.settings_hide) {
@@ -1066,7 +1066,7 @@ fn app_picker_inner(
                 main_run_loop,
                 delegate,
                 settings.main_view,
-                app_frame.size,
+                app_frame.size.width,
                 false,
             );
         } else if std::mem::take(&mut host_obj.scale_hack_default) {
@@ -2480,7 +2480,7 @@ const APP_LAUNCH_BLACK_HOLD_DURATION: Duration = Duration::from_millis(250);
 /// Side length of the app icon at the centre of the launch animation.
 const APP_LAUNCH_ICON_SIZE: CGFloat = 120.0;
 /// Duration of the settings screen slide (iOS-style push from the right).
-const SETTINGS_SLIDE_DURATION: Duration = Duration::from_millis(560);
+const SETTINGS_SLIDE_DURATION: Duration = Duration::from_millis(760);
 /// How long an app icon must be held down before its delete dialog opens.
 const APP_LONG_PRESS_DURATION: Duration = Duration::from_millis(500);
 
@@ -2810,27 +2810,23 @@ fn slide_settings_screen(
     run_loop: id,
     delegate: id,
     settings_view: id,
-    screen_size: CGSize,
+    _width: CGFloat,
     open: bool,
 ) {
-    const START_SCALE: CGFloat = 0.88;
-    const START_Y_FRACTION: CGFloat = 0.10;
+    const START_SCALE: CGFloat = 0.86;
     if open {
-        let initial_transform = CGAffineTransform::make_scale(START_SCALE, START_SCALE)
-            .concat(CGAffineTransform::make_translation(0.0, screen_size.height * START_Y_FRACTION));
+        // iOS-style zoom from the center of the screen, without movement from
+        // the dock or any other direction.
+        let initial_transform = CGAffineTransform::make_scale(START_SCALE, START_SCALE);
         () = msg![env; settings_view setTransform:initial_transform];
         () = msg![env; settings_view setAlpha:(0.0 as CGFloat)];
         () = msg![env; settings_view setHidden:false];
     }
     animate_for(env, run_loop, delegate, SETTINGS_SLIDE_DURATION, |env, t| {
-        // Open upward out of the dock with a gentle zoom; closing retraces the
-        // same path, rather than simply fading/scaling in place.
-        let eased = ease_out_cubic(t) as CGFloat;
+        let eased = ease_in_out_cubic(t) as CGFloat;
         let progress = if open { eased } else { 1.0 - eased };
         let scale = START_SCALE + (1.0 - START_SCALE) * progress;
-        let translate_y = screen_size.height * START_Y_FRACTION * (1.0 - progress);
-        let transform = CGAffineTransform::make_scale(scale, scale)
-            .concat(CGAffineTransform::make_translation(0.0, translate_y));
+        let transform = CGAffineTransform::make_scale(scale, scale);
         () = msg![env; settings_view setTransform:transform];
         () = msg![env; settings_view setAlpha:progress];
     });
