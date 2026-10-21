@@ -4100,7 +4100,7 @@ impl Environment {
                         }
                     }
                     ThreadBlock::KeymgrLock(key) => {
-                        if self.libc_state.keymgr.processwide_ptr_is_unlocked(key) {
+                        if self.libc_state.keymgr_processwide_ptr_is_unlocked(key) {
                             self.threads[thread_id].blocked_by = ThreadBlock::NotBlocked;
                             return thread_id;
                         }
