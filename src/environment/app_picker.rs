@@ -3817,6 +3817,18 @@ struct DeleteDialog {
     title: id,
 }
 
+/// Adds a pre-rendered old-iOS bevel/gradient image to an alert surface.
+fn add_delete_artwork(env: &mut Environment, parent: id, frame: CGRect, bytes: &[u8]) {
+    let image = Image::from_bytes(bytes).unwrap();
+    let cg_image = cg_image::from_image(env, image);
+    let ui_image: id = msg_class![env; UIImage imageWithCGImage:cg_image];
+    release(env, cg_image);
+    let view: id = msg_class![env; UIImageView alloc];
+    let view: id = msg![env; view initWithImage:ui_image];
+    () = msg![env; view setFrame:frame];
+    () = msg![env; parent addSubview:view];
+}
+
 /// Builds one button of an alert box.
 fn make_alert_button(
     env: &mut Environment,
@@ -3829,6 +3841,8 @@ fn make_alert_button(
 ) -> id {
     let button: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
     () = msg![env; button setFrame:frame];
+    let clear: id = msg_class![env; UIColor clearColor];
+    () = msg![env; button setBackgroundColor:clear];
     let text = ns_string::from_rust_string(env, title.to_string());
     () = msg![env; button setTitle:text forState:UIControlStateNormal];
     release(env, text);
@@ -3849,9 +3863,9 @@ fn make_alert_button(
     button
 }
 
-/// Builds the delete dialog in the style of an old iOS alert: a white rounded
-/// box over a dimmed screen, with a title, a message, and Cancel and Delete
-/// buttons. It is hidden until [show_delete_dialog].
+/// Builds the delete dialog in a classic pre-iOS-7 style: a beveled silver
+/// alert panel, glossy blue/red action buttons, and a dimmed screen. It is
+/// hidden until [show_delete_dialog].
 fn make_delete_dialog(
     env: &mut Environment,
     delegate: id,
@@ -3875,10 +3889,13 @@ fn make_delete_dialog(
         DELETE_DIALOG_WIDTH,
         DELETE_DIALOG_HEIGHT,
     );
-    let white: id = msg_class![env; UIColor whiteColor];
-    let panel = new_view(env, panel_frame, white);
+    let clear: id = msg_class![env; UIColor clearColor];
+    let panel = new_view(env, panel_frame, clear);
     let panel_layer: id = msg![env; panel layer];
-    () = msg![env; panel_layer setCornerRadius:(10.0 as CGFloat)];
+    () = msg![env; panel_layer setCornerRadius:(12.0 as CGFloat)];
+    () = msg![env; panel setClipsToBounds:true];
+    let panel_bytes: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/delete_alert_panel.png"));
+    add_delete_artwork(env, panel, rect(0.0, 0.0, DELETE_DIALOG_WIDTH, DELETE_DIALOG_HEIGHT), panel_bytes);
     () = msg![env; panel setHidden:true];
     () = msg![env; main_view addSubview:panel];
 
@@ -3908,30 +3925,39 @@ fn make_delete_dialog(
     () = msg![env; message setNumberOfLines:3];
     () = msg![env; panel addSubview:message];
 
-    let separator_color = ui_color(env, 0.78, 0.78, 0.8, 1.0);
+    let separator_color = ui_color(env, 0.42, 0.45, 0.49, 0.72);
     let button_y = DELETE_DIALOG_HEIGHT - DELETE_DIALOG_BUTTON_HEIGHT;
-    let half = DELETE_DIALOG_WIDTH / 2.0;
     let separator = new_view(
         env,
-        rect(0.0, button_y, DELETE_DIALOG_WIDTH, 1.0),
+        rect(10.0, button_y, DELETE_DIALOG_WIDTH - 20.0, 1.0),
         separator_color,
     );
     () = msg![env; panel addSubview:separator];
-    let v_separator = new_view(
+    let separator_glint = new_view(
         env,
-        rect(half, button_y, 1.0, DELETE_DIALOG_BUTTON_HEIGHT),
-        separator_color,
+        rect(10.0, button_y + 1.0, DELETE_DIALOG_WIDTH - 20.0, 1.0),
+        ui_color(env, 1.0, 1.0, 1.0, 0.65),
     );
-    () = msg![env; panel addSubview:v_separator];
+    () = msg![env; panel addSubview:separator_glint];
 
-    let blue = ui_color(env, 0.0, 0.478, 1.0, 1.0);
-    let red = ui_color(env, 0.85, 0.12, 0.12, 1.0);
+    let button_margin = 12.0;
+    let button_gap = 8.0;
+    let button_width = (DELETE_DIALOG_WIDTH - button_margin * 2.0 - button_gap) / 2.0;
+    let button_height = 34.0;
+    let button_frame_y = button_y + 5.0;
+    let cancel_frame = rect(button_margin, button_frame_y, button_width, button_height);
+    let delete_frame = rect(button_margin + button_width + button_gap, button_frame_y, button_width, button_height);
+    let blue_bytes: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/delete_button_blue.png"));
+    let red_bytes: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/delete_button_red.png"));
+    add_delete_artwork(env, panel, cancel_frame, blue_bytes);
+    add_delete_artwork(env, panel, delete_frame, red_bytes);
+    let white: id = msg_class![env; UIColor whiteColor];
     let cancel = make_alert_button(
         env,
         delegate,
-        rect(0.0, button_y, half, DELETE_DIALOG_BUTTON_HEIGHT),
+        cancel_frame,
         "Cancel",
-        blue,
+        white,
         false,
         "deleteCancel",
     );
@@ -3939,9 +3965,9 @@ fn make_delete_dialog(
     let delete = make_alert_button(
         env,
         delegate,
-        rect(half, button_y, half, DELETE_DIALOG_BUTTON_HEIGHT),
+        delete_frame,
         "Delete",
-        red,
+        white,
         true,
         "deleteConfirm",
     );
