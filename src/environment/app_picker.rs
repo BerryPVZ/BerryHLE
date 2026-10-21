@@ -326,6 +326,7 @@ struct AppPickerDelegateHostObject {
     swipe_left: bool,
     swipe_right: bool,
     lock_screen_unlocked: bool,
+    lock_slider_progress: f32,
 }
 impl HostObject for AppPickerDelegateHostObject {}
 
@@ -479,8 +480,13 @@ const CLASSES: ClassExports = objc_classes! {
 - (())swipeRight {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).swipe_right = true;
 }
-- (())unlockLockScreen {
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).lock_screen_unlocked = true;
+- (())lockSliderChanged:(id)sender {
+    let progress: f32 = msg![env; sender value]; // UISlider*
+    let mut host = env.objc.borrow_mut::<AppPickerDelegateHostObject>(this);
+    host.lock_slider_progress = progress;
+    if progress >= 0.96 {
+        host.lock_screen_unlocked = true;
+    }
 }
 - (())openRecentApp {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).recent_app_tapped = true;
@@ -1843,25 +1849,10 @@ fn run_lock_screen(
     let slide_text = new_label(env, rect(72.0, 0.0, size.width - 130.0, 62.0), "slide to unlock", 25.0, false, slide_color);
     () = msg![env; slide_text setTextAlignment:UITextAlignmentCenter];
     () = msg![env; track addSubview:slide_text];
-    // A feathered shimmer made of thin strips glides under the lettering.
-    let mut shimmer_bands = Vec::new();
-    for band in 0..12 {
-        let distance = (band as CGFloat - 5.5).abs() / 5.5;
-        let tint = ui_color(env, 1.0, 1.0, 1.0, 0.20 * (1.0 - distance));
-        let strip = new_view(env, rect(-100.0 + band as CGFloat * 3.0, 6.0, 3.2, 50.0), tint);
-        () = msg![env; track addSubview:strip];
-        shimmer_bands.push(strip);
-    }
     let knob_color = ui_color(env, 0.96, 0.96, 0.97, 1.0);
-    let knob: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
-    () = msg![env; knob setFrame:(rect(4.0, 4.0, 54.0, 54.0))];
-    () = msg![env; knob setBackgroundColor:knob_color];
+    let knob = new_view(env, rect(4.0, 4.0, 54.0, 54.0), knob_color);
     let knob_layer: id = msg![env; knob layer];
     () = msg![env; knob_layer setCornerRadius:(14.0 as CGFloat)];
-    let unlock_selector = env.objc.lookup_selector("unlockLockScreen").unwrap();
-    () = msg![env; knob addTarget:delegate
-                            action:unlock_selector
-                  forControlEvents:UIControlEventTouchUpInside];
     () = msg![env; track addSubview:knob];
     let arrow_image = make_lock_arrow_image(env);
     let arrow_view: id = msg_class![env; UIImageView alloc];
@@ -1869,31 +1860,59 @@ fn run_lock_screen(
     () = msg![env; arrow_view setFrame:(rect(4.0, 9.0, 46.0, 36.0))];
     () = msg![env; knob addSubview:arrow_view];
 
-    let swipe: id = msg_class![env; UISwipeGestureRecognizer alloc];
-    let swipe: id = msg![env; swipe initWithTarget:delegate action:unlock_selector];
-    () = msg![env; swipe setDirection:UISwipeGestureRecognizerDirectionRight];
-    () = msg![env; track addGestureRecognizer:swipe];
+    // A nearly transparent UISlider is the actual touch surface. Its value
+    // drives the visible thumb continuously, so the arrow follows the finger
+    // instead of only reacting after a swipe has already ended.
+    let slider: id = msg_class![env; UISlider alloc];
+    let slider: id = msg![env; slider initWithFrame:(rect(0.0, 0.0, size.width - 40.0, 62.0))];
+    () = msg![env; slider setValue:0.0f32];
+    // Keep the control itself fully hit-testable, but hide its stock blue/gray
+    // track and thumb so only our custom glass slider is visible.
+    let slider_parts: id = msg![env; slider subviews];
+    let slider_part_count: usize = msg![env; slider_parts count];
+    for index in 0..slider_part_count {
+        let part: id = msg![env; slider_parts objectAtIndex:(index as usize)];
+        () = msg![env; part setAlpha:(0.0 as CGFloat)];
+    }
+    let slider_selector = env.objc.lookup_selector("lockSliderChanged:").unwrap();
+    () = msg![env; slider addTarget:delegate
+                              action:slider_selector
+                    forControlEvents:UIControlEventValueChanged];
+    () = msg![env; track addSubview:slider];
     () = msg![env; parent addSubview:lock];
 
+    {
+        let mut host = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
+        host.lock_screen_unlocked = false;
+        host.lock_slider_progress = 0.0;
+    }
     let started = Instant::now();
     let mut clock_updated = Instant::now();
     loop {
         run_run_loop_single_iteration(env, run_loop);
-        let unlocked = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate).lock_screen_unlocked;
+        let (unlocked, mut progress) = {
+            let host = env.objc.borrow::<AppPickerDelegateHostObject>(delegate);
+            (host.lock_screen_unlocked, host.lock_slider_progress)
+        };
         if unlocked { break; }
-        let elapsed = started.elapsed().as_secs_f64();
-        let phase = (elapsed * std::f64::consts::TAU / 2.0).sin();
-        () = msg![env; slide_text setAlpha:((0.48 + (phase + 1.0) * 0.25) as CGFloat)];
-        let mut knob_frame: CGRect = msg![env; knob frame];
-        knob_frame.origin.x = 4.0 + ((phase + 1.0) * 0.5) as CGFloat * 8.0;
-        () = msg![env; knob setFrame:knob_frame];
-        let shimmer_phase = (elapsed % 1.8) / 1.8;
-        let shimmer_start = -44.0 + shimmer_phase as CGFloat * (size.width - 32.0);
-        for (index, &band) in shimmer_bands.iter().enumerate() {
-            let mut frame: CGRect = msg![env; band frame];
-            frame.origin.x = shimmer_start + index as CGFloat * 3.0;
-            () = msg![env; band setFrame:frame];
+        let tracking: bool = msg![env; slider tracking];
+        if !tracking && progress > 0.0 {
+            // A partial swipe eases back to the start; a completed one is
+            // handled above by the unlock transition.
+            progress = (progress - 0.055).max(0.0);
+            () = msg![env; slider setValue:progress];
+            env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate).lock_slider_progress = progress;
         }
+        let elapsed = started.elapsed().as_secs_f64();
+        let phase = (elapsed * std::f64::consts::TAU / 2.4).sin();
+        // Slow text breathing is the idle iOS-style hint; while dragging, the
+        // thumb tracks the actual UISlider value frame-by-frame.
+        let text_alpha = (0.64 + (phase + 1.0) * 0.14) as CGFloat;
+        () = msg![env; slide_text setAlpha:text_alpha];
+        let mut knob_frame: CGRect = msg![env; knob frame];
+        let travel = (size.width - 40.0 - 62.0).max(0.0);
+        knob_frame.origin.x = 4.0 + travel * progress as CGFloat;
+        () = msg![env; knob setFrame:knob_frame];
         if clock_updated.elapsed() >= Duration::from_secs(1) {
             clock_updated = Instant::now();
             let text = ns_string::from_rust_string(env, lock_screen_time_string());
@@ -1904,6 +1923,7 @@ fn run_lock_screen(
     {
         let mut host = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
         host.lock_screen_unlocked = false;
+        host.lock_slider_progress = 0.0;
         host.swipe_right = false;
         host.swipe_left = false;
     }
