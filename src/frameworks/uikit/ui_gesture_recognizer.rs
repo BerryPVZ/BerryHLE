@@ -23,8 +23,7 @@ pub struct State {
 }
 
 /// Actions run after all recognizers and views process the current input.
-/// Running them from setState: lets a later recognizer's cleanup undo a
-/// hold that an earlier recognizer has just started (Globbert's squish).
+/// Coalescing notifications avoids duplicate actions within one input pass.
 #[derive(Default)]
 struct ActionBatch {
     depth: usize,
@@ -522,9 +521,17 @@ pub(super) fn touches_moved(env: &mut Environment, view: id, touches: id, event:
                 .borrow_mut::<UIGestureRecognizerHostObject>(recognizer)
                 .current_location = location;
             if env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).kind == GestureKind::Generic {
-                let state = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).state;
-                if matches!(state, 0..=2) {
+                let state_before_move = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).state;
+                if matches!(state_before_move, 0..=2) {
                     () = msg![env; recognizer touchesMoved:touches withEvent:event];
+                    // A continuous recognizer must keep delivering updates
+                    // after it begins, even when its guest movement hook is
+                    // empty (Globbert's SQ1/SQ3/SQ5 recognizers). Otherwise
+                    // the target sees only the initial squish position.
+                    let state = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).state;
+                    if matches!(state_before_move, 1 | 2) && matches!(state, 1 | 2) {
+                        () = msg![env; recognizer setState:2];
+                    }
                 }
             }
         }
@@ -805,12 +812,11 @@ mod hold_tests {
     use super::*;
 
     #[test]
-    fn sibling_cleanup_finishes_before_globbert_starts_holding() {
+    fn continuous_action_waits_until_touch_dispatch_finishes() {
         let squish = id::from_bits(1);
         let mut batch = ActionBatch::default();
         batch.begin();
-        // SQ1 enters Began. Its action must wait while SQ3/SQ5 reject the
-        // same press and invoke their delegate's squishStopped callback.
+        // Entering Began queues one action until the input pass finishes.
         assert_eq!(batch.defer(squish), Some(true));
         let mut holding = false;
         assert!(!holding);

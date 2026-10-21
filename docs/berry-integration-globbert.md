@@ -69,32 +69,38 @@ caused a post-test shutdown abort in this session; the null backend exits
 cleanly. Android compilation and SDK-dependent guest TestApp tests were not
 run.
 
-Graphical Globbert verification is blocked by this session: both the newly
-built executable and the user's existing downloaded executable exit with
-`0xc0000409` immediately before window creation. Headless launch loads and
-starts Globbert, then stops at its first window-dependent call, as expected.
-Consequently the graphics and drag behavior require an in-game check on a
-normal desktop session. The user's IPA and log are diagnostic input and are
-not included in the source archive or patch.
+## Globbert body drag follow-up
 
-## Globbert sustained holds
+The first hold follow-up did not resolve the reported body behavior. Its
+sibling-cleanup explanation was speculative: runtime inspection shows each
+squish recognizer attached to a separate view. A controlled guest run shows
+that `isSquishing` stays true until release, but the old code leaves the
+squish frame stuck at its initial value when the pointer moves.
 
-Globbert's SQ1/SQ3/SQ5 recognizers call a shared `squishStopped` delegate
-callback when rejecting a press. Sending the recognized sibling's target
-action synchronously from `setState:` started its hold before that cleanup,
-so the same input event could immediately stop it again. Target actions are
-now retained, coalesced and dispatched after the complete input event,
-including all sibling recognizers and views. Failed or disabled recognizers
-do not deliver queued actions.
+Globbert's SQ1/SQ3/SQ5 custom recognizers enter Began on touch down and have
+empty movement hooks. After an active custom recognizer processes a move,
+UIKit now advances it to Changed and schedules its target action. Possible,
+ended, cancelled and failed recognizers are not promoted. Actions remain
+coalesced per input event, including when a subclass explicitly sets Changed.
+This lets Globbert use the latest drag position and keep the resulting
+squish until its own release callback runs.
 
-Fresh recognizers are no longer reset before their first touch, and adding
-another finger to a live custom sequence preserves its state and initial
-position. Each custom recognizer tracks its active touches until release or
-cancellation; failed recognizers do not receive later move/end callbacks.
-Stationary touches no longer expire after ten seconds when another finger
-arrives on a single-touch view. Explicit release, cancellation and replacement
-of the same physical finger still terminate the old touch.
+The previous follow-up's active-touch tracking, deferred actions and removal
+of the stationary-touch timeout remain in place. The new change does not
+inject releases, repeat actions on a timer or alter the guest application.
 
-Three regressions cover sibling cleanup before hold start, preserving a live
-sequence until its last touch ends, and nested/coalesced action dispatch.
-Visual gameplay verification retains the limitation described above.
+A temporary, opt-in diagnostic fixture runs the original Globbert guest code
+with scripted down/move/hold/up events. It initializes the game view and
+interaction flags to isolate the squish behavior from the welcome sequence.
+Baseline SQ1 frames: 1 -> 1 -> 1. Corrected SQ1 frames: 1 -> 4 -> 6; frame 6
+and isSquishing=true persist during a two-second stationary hold, and the
+release sets isSquishing=false. Temporary instrumentation is excluded from
+the delivered executable. This is a controlled guest test, not a manual
+visual gameplay test. The user's IPA is not included in any deliverable.
+
+The exposed-view fixture also passed SQ3 (frames 3 -> 5 -> 6), SQ5
+(frames 1 -> 3 -> 5), and a repeated SQ1 press. All four runs hit the intended
+body view through normal hit testing, remained active during the stationary
+hold, and stopped on Up. Exposing each view bypasses the overlapping tap
+button during fixture setup; normal gameplay screen transitions still need
+a user check.
