@@ -2135,10 +2135,10 @@ fn make_dock(
         .clamp(2.0, 18.0);
     let first_x = (dock_width - (DOCK_ICON_SIZE * count + gap * (count - 1.0))) / 2.0;
 
-    let plus_image = make_icon_from_text(env, "+", 50.0, -6.0, (0.25, 0.25, 0.25, 1.0));
+    let plus_image = make_add_ipa_app_icon(env);
     let settings_image = make_settings_app_icon(env);
     let recent_placeholder = make_icon_from_text(env, "↻", 34.0, 0.0, (0.25, 0.25, 0.25, 1.0));
-    let browse_image = make_icon_from_text(env, "A", 38.0, 0.0, (0.12, 0.32, 0.78, 1.0));
+    let browse_image = make_add_ipa_app_icon(env);
     let step = DOCK_ICON_SIZE + gap;
     make_dock_item(env, delegate, dock, first_x, plus_image, "Add .ipa", "addIpa");
     make_dock_item(
@@ -2669,20 +2669,25 @@ fn slide_settings_screen(
     if !open { () = msg![env; settings_view setHidden:true]; }
 }
 
-/// Builds the iOS-style "Settings" app icon (grey gear, gloss and rounded
-/// corners, like the bundled app icons).
-fn make_settings_app_icon(env: &mut Environment) -> id {
-    let bytes: &[u8] = include_bytes!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/res/settings_icon.png"
-    ));
+/// Loads a bundled home-screen icon and applies the same rounded mask used by
+/// installed apps. The selected artwork already has its iOS-style gloss.
+fn make_dock_asset_icon(env: &mut Environment, bytes: &[u8]) -> id {
     let mut image = Image::from_bytes(bytes).unwrap();
-    // Same resolution-aware corner radius and gloss as `Bundle::load_icon()`.
-    image.round_icon_corners(/* add_sheen: */ true);
+    image.round_icon_corners(/* add_sheen: */ false);
     let cg_image = cg_image::from_image(env, image);
     let ui_image: id = msg_class![env; UIImage imageWithCGImage:cg_image];
     release(env, cg_image);
     ui_image
+}
+
+fn make_settings_app_icon(env: &mut Environment) -> id {
+    let bytes: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/settings_icon.png"));
+    make_dock_asset_icon(env, bytes)
+}
+
+fn make_add_ipa_app_icon(env: &mut Environment) -> id {
+    let bytes: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/add_ipa_icon.png"));
+    make_dock_asset_icon(env, bytes)
 }
 
 /// Blue for the selected segment, light grey for the others (iOS style).
