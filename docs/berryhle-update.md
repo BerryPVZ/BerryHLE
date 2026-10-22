@@ -47,7 +47,11 @@ The merged upstream AudioUnit connection fix applies generally, including
 com.popcap.ios.chs.PvZiPad (1017.0.0, PvZ-iPad_ZH). It tracks hand-made mixer
 connections, starts upstream voices, pumps output-unit render notifications,
 uses the documented notification flag values and propagates per-bus gain and
-playback rate. No English-only bundle check is involved. The supplied Chinese
+playback rate. No English-only bundle check is involved.
+Audio Unit render/input model and properties:
+https://developer.apple.com/library/archive/documentation/MusicAudio/Conceptual/AudioUnitProgrammingGuide/TheAudioUnit/TheAudioUnit.html
+Render notification timing:
+https://developer.apple.com/documentation/audiotoolbox/audiounitaddrendernotify(_:_:_:) The supplied Chinese
 IPA was tested with its own scratch copy of saved data.
 
 ## Validation

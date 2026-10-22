@@ -1083,6 +1083,9 @@ mod intersection_tests {
     }
     #[test]
     fn point_projectiles_intersect_enemy_extents() {
+        // Apple/Swift Foundation uses closed extents and non-null intersections:
+        // https://github.com/swiftlang/swift-corelibs-foundation/blob/main/Sources/Foundation/NSGeometry.swift
+        // Apple API: https://developer.apple.com/documentation/coregraphics/cgrectintersectsrect(_:_:)
         let enemy = r(240.0, 73.0, 36.0, 61.0);
         let point = r(258.0, 99.5, 0.0, 0.0);
         assert_eq!(rect_intersection(enemy, point), point);

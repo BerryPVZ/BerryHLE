@@ -2768,6 +2768,9 @@ mod connection_lifecycle_tests {
 
     #[test]
     fn a_late_voice_feeds_running_output_through_a_dormant_mixer() {
+        // Output pulls audio through connected units/input callbacks:
+        // https://developer.apple.com/library/archive/documentation/MusicAudio/Conceptual/AudioUnitProgrammingGuide/TheAudioUnit/TheAudioUnit.html
+        // The live callback installation order is also reproduced by PvZ HD.
         let voice = AudioUnit::from_bits(0x100);
         let mixer = AudioUnit::from_bits(0x200);
         let output = AudioUnit::from_bits(0x300);
