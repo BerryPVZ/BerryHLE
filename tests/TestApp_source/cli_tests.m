@@ -336,6 +336,10 @@ static int check_selector_background(BOOL wait) {
     pthread_mutex_lock(&selector_mutex);
     done = selector_worker_done;
     pthread_mutex_unlock(&selector_mutex);
+    // Unless a thread blocks or yields, touchHLE switches guest threads only
+    // after an instruction batch, so this loop could use up the deadline
+    // before the worker finishes.
+    sched_yield();
   } while ((!done || selector_order != 3) &&
            [deadline timeIntervalSinceNow] > 0);
   // On failure leave the probe alive for the pending request; the harness
