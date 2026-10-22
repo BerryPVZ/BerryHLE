@@ -23,6 +23,8 @@ Quality and performance:
 
 Compatibility:
 
+- Native GLES 2.0 now enables `GL_OES_texture_3D` for shaders that use `sampler3D` when the host advertises the extension. This fixes Unity's built-in dither-mask shader failing to compile on Mesa and compatible drivers.
+
 - Fruit Ninja 1.8.0 no longer crashes when its menu music loops, and no longer draws its game into a portrait strip of the landscape screen. An `AudioQueue` AAC buffer holding a single ADTS frame couldn't be decoded, and the empty stand-in was queued in the wrong OpenAL format, which panicked. AAC queues now decode frame by frame with a decoder that persists across buffers, and a buffer that still can't be decoded is queued as silence in the source's format. Views now follow their autoresizing masks when their superview is resized, as on iOS, so the game's EAGLView fills its autorotated root view.
 - Plants vs. Zombies HD plays its sound effects again. Its engine wires its voices to RemoteIO by hand with `kAudioUnitProperty_MakeConnection` and connects each voice from a post-render notify. Connections are now tracked, units that feed a running output unit are rendered, render notifies run for output units without a callback of their own, the `kAudioUnitRenderAction_PreRender`/`PostRender` flags have their real values (they were 1 and 2 instead of 4 and 8), and the 3D mixer's per-voice gain and playback rate are applied.
 - Charlie, the Steak gets past its splash screen. `objc_retainBlock` now copies stack blocks to the heap like `_Block_copy`, instead of keeping a pointer to a stack frame that is gone by the time the block runs.
