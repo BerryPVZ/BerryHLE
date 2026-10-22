@@ -2122,9 +2122,8 @@ impl Dyld {
         let function_ptr: MutPtr<u32> = function_ptr.cast();
         mem.write(function_ptr + 0, encode_a32_svc(svc));
         mem.write(function_ptr + 1, encode_a32_ret());
-        // Crash diagnostics: map stub addresses to symbols so a FATAL SIGNAL
-        // report with `last guest PC` identifies the aborting host function.
-        log!("host fn stub {} at {:#x}", symbol, function_ptr.to_bits());
+        // Keep address-to-symbol mappings available when dyld debugging is enabled.
+        log_dbg!("host fn stub {} at {:#x}", symbol, function_ptr.to_bits());
         GuestFunction::from_addr_with_thumb_bit(function_ptr.to_bits())
     }
 

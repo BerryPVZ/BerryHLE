@@ -295,7 +295,8 @@ class DynarmicWrapper {
       page_table;
 
 public:
-  DynarmicWrapper(void *direct_memory_access_ptr, size_t null_page_count) {
+  DynarmicWrapper(void *direct_memory_access_ptr, size_t null_page_count,
+                  bool fastmem_enabled) {
     Dynarmic::A32::UserConfig user_config;
     user_config.callbacks = &env;
     for (size_t cp = 0; cp < 16; ++cp) {
@@ -346,6 +347,10 @@ public:
       }
       user_config.page_table = &page_table;
       user_config.absolute_offset_page_table = true;
+      if (fastmem_enabled) {
+        user_config.fastmem_pointer =
+            reinterpret_cast<std::uintptr_t>(direct_memory_access_ptr);
+      }
     }
     cpu = std::make_unique<Dynarmic::A32::Jit>(user_config);
     env.cpu = cpu.get();
@@ -414,8 +419,10 @@ public:
 extern "C" {
 
 DynarmicWrapper *touchHLE_DynarmicWrapper_new(void *direct_memory_access_ptr,
-                                              size_t null_page_count) {
-  return new DynarmicWrapper(direct_memory_access_ptr, null_page_count);
+                                              size_t null_page_count,
+                                              bool fastmem_enabled) {
+  return new DynarmicWrapper(direct_memory_access_ptr, null_page_count,
+                             fastmem_enabled);
 }
 void touchHLE_DynarmicWrapper_delete(DynarmicWrapper *cpu) { delete cpu; }
 

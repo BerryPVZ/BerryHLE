@@ -5,6 +5,35 @@
  */
 //! Cross-platform memory management wrappers using the host's system calls.
 
+/// Protects a guest memory segment from host reads and writes.
+///
+/// # Safety
+/// `address` must point to a mapped region at least `size` bytes long. Both
+/// `address` and `size` must be aligned to the host page size.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(super) unsafe fn protect_guest_null_segment(
+    address: *mut core::ffi::c_void,
+    size: usize,
+) -> std::io::Result<()> {
+    let host_page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if host_page_size <= 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let host_page_size = host_page_size as usize;
+    if address as usize % host_page_size != 0 || size == 0 || size % host_page_size != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("null segment must be aligned to the {host_page_size}-byte host page size"),
+        ));
+    }
+
+    if unsafe { libc::mprotect(address, size, libc::PROT_NONE) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// Cross-platform memory allocation using the host's system calls.
 /// Returns an address aligned to the guest's 4KB page boundaries.
 ///
