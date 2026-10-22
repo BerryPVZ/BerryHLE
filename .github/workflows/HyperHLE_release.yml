@@ -403,9 +403,16 @@ jobs:
           archive: false
 
   build-win:
-    runs-on: windows-2022  
+    # Like build-ios, this waits for check-hyperhle-release only to learn the
+    # version a release build will be tagged with (for the installer), and
+    # runs regardless.
+    needs: [check-hyperhle-release]
+    if: ${{ !cancelled() }}
+    runs-on: windows-2022
+    env:
+      HYPERHLE_VERSION: ${{ needs.check-hyperhle-release.outputs.should_release == 'true' && needs.check-hyperhle-release.outputs.version || '' }}
 
-    steps:  
+    steps:
     - name: Checkout touchHLE
       uses: actions/checkout@main
       with:
@@ -442,9 +449,42 @@ jobs:
       run: cd dev-scripts && ./make-windows-bundle.sh ../target/release/touchHLE.exe && mv touchHLE_windows_bundle/ ..  
       
     - uses: actions/upload-artifact@main
-      with:  
-        name: HyperHLE_Windows_x86_64  
+      with:
+        name: HyperHLE_Windows_x86_64
         path: touchHLE_windows_bundle/
+
+    - name: Build installer
+      # Inno Setup 6 ships with the windows-2022 runner image; install it only
+      # if the image ever stops including it. PowerShell rather than bash, as
+      # MSYS would rewrite ISCC's /D and /O arguments into paths.
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+        if (-not (Test-Path $iscc)) {
+          choco install innosetup -y --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        }
+        if ($env:HYPERHLE_VERSION) {
+          $version = $env:HYPERHLE_VERSION
+        } else {
+          $version = (cargo run --quiet --package touchHLE_version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        }
+        if ($version -notmatch '(\d+)\.(\d+)\.(\d+)') {
+          throw "Can't get a numeric version from '$version'"
+        }
+        $numeric = $Matches[0]
+        & $iscc "/DAppVersion=$version" "/DAppNumericVersion=$numeric" `
+          "/DBundleDir=..\touchHLE_windows_bundle" "/DOutputDir=.." `
+          dev-scripts\hyperhle-installer.iss
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    # Uploaded as-is rather than wrapped in a zip.
+    - uses: actions/upload-artifact@main
+      with:
+        path: HyperHLE_Windows_x86_64_Setup.exe
+        archive: false
 
   check-hyperhle-release:
     runs-on: ubuntu-latest
@@ -503,6 +543,11 @@ jobs:
         with:
           name: HyperHLE_Windows_x86_64
           path: artifacts/windows
+      - name: Download Windows installer
+        uses: actions/download-artifact@main
+        with:
+          name: HyperHLE_Windows_x86_64_Setup.exe
+          path: artifacts/windows-installer
       - name: Download Linux artifact
         uses: actions/download-artifact@main
         with:
@@ -547,5 +592,6 @@ jobs:
           body_path: release/RELEASE_NOTES.md
           files: |
             release/HyperHLE_*.zip
+            release/HyperHLE_Windows_x86_64_Setup.exe
             release/HyperHLE-iOS-*.ipa
           fail_on_unmatched_files: true
