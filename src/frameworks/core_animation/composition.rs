@@ -200,9 +200,18 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     let ui_scale: u32 = env.options.ui_scale.get();
     let fb_width = screen_bounds.size.width as u32 * scale_hack * ui_scale;
     let fb_height = screen_bounds.size.height as u32 * scale_hack * ui_scale;
+    // An app that draws in landscape screen coordinates needs the same fixed
+    // presentation rotation through composition as through the EAGL presenter.
+    let rotation = match env.options.present_rotate {
+        Some(0) => Matrix::<2>::identity(),
+        Some(90) => Matrix::z_rotation(std::f32::consts::FRAC_PI_2),
+        Some(180) => Matrix::z_rotation(std::f32::consts::PI),
+        Some(270) => Matrix::z_rotation(-std::f32::consts::FRAC_PI_2),
+        _ => env.window().rotation_matrix(),
+    };
     let present_frame_args = (
         env.window().viewport(),
-        env.window().rotation_matrix(),
+        rotation,
         env.window().virtual_cursor_visible_at(),
     );
     let host_framebuffer = env.window().host_framebuffer();

@@ -196,7 +196,7 @@ pub struct Options {
     /// scheduler and are written to tolerate a spurious wake. Enable it only
     /// per-app, via the default options file.
     pub mach_semaphore_spurious_wake_ms: Option<u64>,
-    /// Override the EAGL present rotation with a fixed clockwise angle in
+    /// Override the EAGL and compositor presentation rotation with a fixed clockwise angle in
     /// degrees (0, 90, 180 or 270), replacing the orientation-derived rotation
     /// and the iPad autorotation compensation. Some apps (e.g. the universal
     /// iPhone+iPad binary of Minecraft: Story Mode, com.telltalegames.MC100)
@@ -204,6 +204,8 @@ pub struct Options {
     /// rotation turns the picture sideways; `--present-rotate=0` presents it
     /// as-is. `None` keeps the automatic behaviour.
     pub present_rotate: Option<u32>,
+    /// Report landscape UIScreen geometry for apps that draw in display coordinates.
+    pub landscape_uiscreen_bounds: bool,
     /// Use UIKit's actual autorotation transform when deciding whether to add
     /// EAGL's 180-degree presentation compensation. Off by default to retain
     /// the legacy iPad/non-portrait heuristic; opt in with `--rotation-fix`.
@@ -339,6 +341,7 @@ impl Default for Options {
             prefer_gles2_context: false,
             mach_semaphore_spurious_wake_ms: None,
             present_rotate: None,
+            landscape_uiscreen_bounds: false,
             rotation_fix: false,
             force_gles1_context: std::env::var("TOUCHHLE_FORCE_GLES1_CONTEXT")
                 .map(|value| {
@@ -626,9 +629,9 @@ impl Options {
             // bounds. Apps that lay their render target out directly from
             // UIScreen.bounds without applying the interface-orientation
             // rotation (e.g. Minecraft: Story Mode) otherwise render a portrait
-            // frame that gets stretched into the landscape window. The GLES
-            // layer reads this via the env var, so set it here.
-            std::env::set_var("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS", "1");
+            // frame that gets stretched into the landscape window. Keep this
+            // in app options: the picker may have already queried UIScreen.
+            self.landscape_uiscreen_bounds = true;
         } else if let Some(value) = arg.strip_prefix("--present-rotate=") {
             let deg: u32 = value
                 .parse()
@@ -790,6 +793,15 @@ fn parse_dump_options(options: &str) -> Result<DumpingOptions, String> {
 #[cfg(test)]
 mod option_parsing_tests {
     use super::*;
+
+    #[test]
+    fn landscape_screen_option_is_local_to_the_selected_app() {
+        let mut picker_options = Options::default();
+        assert!(!picker_options.landscape_uiscreen_bounds);
+        assert!(picker_options.parse_argument("--landscape-uiscreen-bounds").unwrap());
+        assert!(picker_options.landscape_uiscreen_bounds);
+        assert!(!Options::default().landscape_uiscreen_bounds);
+    }
 
     #[test]
     fn globbert_debug_option_is_scoped_and_opt_in() {

@@ -305,6 +305,13 @@ fn touchhle_cocos_should_force_landscape_view(env: &mut Environment, view: id) -
     }
 
     let class_name = touchhle_cocos_view_class_name(env, view);
+    // This Unity player swaps UIScreen's dimensions itself. When its UIKit
+    // screens use landscape bounds, keep the game surface in that same space.
+    if env.bundle.bundle_identifier() == "com.tayasui.mrpoofree"
+        && env.options.landscape_uiscreen_bounds && class_name == "EAGLView"
+    {
+        return true;
+    }
     if !touchhle_cocos_is_gl_or_game_view_name(&class_name) && class_name != "UIWindow" {
         return false;
     }
@@ -1684,7 +1691,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())setBounds:(CGRect)bounds {
     let mut bounds = touchhle_cocos_sanitize_rect(bounds);
 
-    if crate::env_flag_cached!("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS") {
+    if crate::env_flag_cached!("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS")
+        || (env.bundle.bundle_identifier() == "com.tayasui.mrpoofree" && env.options.landscape_uiscreen_bounds)
+    {
         let view_class: Class = msg![env; this class];
         let class_name = env.objc.get_class_name(view_class).to_owned();
         if class_name == "UIWindow" || class_name.contains("EAGLView") {
@@ -1692,7 +1701,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             let h = bounds.size.height.round() as i32;
             if (w == 320 && (h == 460 || h == 480)) || (w == 0 && h == 0) {
                 log!(
-                    "TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS=1: coercing setBounds for {} {:?} from {:?} to 480x320",
+                    "Landscape view bounds: coercing setBounds for {} {:?} from {:?} to 480x320",
                     class_name,
                     this,
                     bounds

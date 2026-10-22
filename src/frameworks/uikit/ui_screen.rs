@@ -40,7 +40,8 @@ fn screen_size_for_current_orientation(env: &mut crate::Environment) -> (u32, u3
     // — the app kept rendering at the device's native point size.
     let portrait_size = env.window().screen_size();
     let orientation = env.window().current_rotation();
-    let landscape_bounds = crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS");
+    let landscape_bounds = env.options.landscape_uiscreen_bounds
+        || crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS");
     screen_size_for_orientation(portrait_size, orientation, landscape_bounds)
 }
 
@@ -197,9 +198,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (CGRect)bounds {
     let (width, height) = screen_size_for_current_orientation(env);
-    if crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS") {
-        log!(
-            "TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS=1: UIScreen bounds reporting {}x{}",
+    if env.options.landscape_uiscreen_bounds {
+        log_dbg!(
+            "Landscape UIScreen bounds reporting {}x{}",
             width,
             height
         );

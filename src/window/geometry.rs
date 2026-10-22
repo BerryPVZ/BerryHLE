@@ -5,6 +5,38 @@
  */
 //! Coordinate conversions shared by window presentation and input.
 
+/// Convert display-aligned normalized input to the app's screen coordinates.
+pub(super) fn normalized_to_screen((x, y): (f32, f32), (width, height): (u32, u32)) -> (f32, f32) {
+    (
+        ((x + 0.5) * width as f32)
+            .clamp(0.0, width.saturating_sub(1) as f32)
+            .round(),
+        ((y + 0.5) * height as f32)
+            .clamp(0.0, height.saturating_sub(1) as f32)
+            .round(),
+    )
+}
+
+#[cfg(test)]
+mod landscape_input_tests {
+    use super::*;
+    #[test]
+    fn landscape_input_matches_display_and_clamps_letterbox_edges() {
+        let viewport = (100, 50, 960, 640);
+        for (input, expected) in [
+            ((580.0, 370.0), (240.0, 160.0)),
+            ((100.0, 50.0), (0.0, 0.0)),
+            ((1060.0, 690.0), (479.0, 319.0)),
+            ((0.0, 370.0), (0.0, 160.0)),
+        ] {
+            assert_eq!(
+                normalized_to_screen(normalize_viewport_coords(input, viewport), (480, 320)),
+                expected
+            );
+        }
+    }
+}
+
 /// Convert SDL window coordinates to drawable pixels. Query both sizes from
 /// the same window; their ratio can change when moving between displays.
 pub(super) fn window_to_drawable(
