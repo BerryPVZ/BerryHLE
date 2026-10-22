@@ -494,7 +494,7 @@ fn substitute_classes(
         }
     }
 
-    log!(
+    log_dbg!(
         "Note: substituting fake class for {} to improve compatibility",
         name
     );
@@ -965,7 +965,7 @@ impl ObjC {
                     (host.name.clone(), host.superclass)
                 };
                 let superclass_name = self.borrow::<ClassHostObject>(superclass).name.clone();
-                log!(
+                log_dbg!(
                     "Class {} need ivar reconciliation with superclass {}!",
                     name,
                     superclass_name
