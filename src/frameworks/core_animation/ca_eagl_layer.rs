@@ -696,13 +696,14 @@ mod layer_rotation_tests {
 
     #[test]
     fn snaps_quarter_turn_float_noise() {
+        let quarter = std::f32::consts::FRAC_PI_2;
+        // Autorotation leaves a little noise in the transform, so the
+        // accumulated angle lands just beside a quarter turn.
+        assert_eq!(snap_to_quarter_turn(quarter + 1e-6), quarter);
+        assert_eq!(snap_to_quarter_turn(-quarter - 1e-6), -quarter);
         assert_eq!(
-            snap_to_quarter_turn(1.0f32.atan2(-4.371139e-8)),
-            std::f32::consts::FRAC_PI_2,
-        );
-        assert_eq!(
-            snap_to_quarter_turn((-4.371139e-8f32).atan2(-1.0)),
-            -std::f32::consts::FRAC_PI_2,
+            snap_to_quarter_turn(std::f32::consts::PI + 1e-6),
+            std::f32::consts::PI
         );
         assert_eq!(snap_to_quarter_turn(0.0), 0.0);
         // A rotation that is not a quarter turn is passed through untouched.
