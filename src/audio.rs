@@ -107,6 +107,7 @@ impl Clone for AudioFile {
     fn clone(&self) -> Self {
         let inner = match self.inner {
             AudioFileInner::Mp3(ref mp3) => AudioFileInner::Mp3(mp3.clone()),
+            AudioFileInner::Symphonia(ref pcm) => AudioFileInner::Symphonia(pcm.clone()),
             _ => Self::parse_inner(self.raw_data.as_ref().clone()).unwrap(),
         };
         AudioFile {
@@ -195,6 +196,22 @@ impl AudioFile {
             AudioFileInner::Symphonia(pcm) => Some((pcm.bytes, pcm.sample_rate, pcm.channels)),
             _ => None,
         }
+    }
+
+    /// Decode packet-based formats for Extended Audio File Services, leaving
+    /// the original compressed packets available to Audio File Services.
+    pub fn decoded_packet_file(&self) -> Result<Option<Self>, ()> {
+        let packets = match &self.inner {
+            AudioFileInner::Aac(packets) | AudioFileInner::Mp3(packets) => packets,
+            _ => return Ok(None),
+        };
+        let pcm = symphonia_formats::decode_symphonia_to_pcm(Cursor::new(
+            packets.packet_bytes.clone(),
+        ))?;
+        Ok(Some(Self {
+            raw_data: self.raw_data.clone(),
+            inner: AudioFileInner::Symphonia(pcm),
+        }))
     }
 
     // Extracted parse_inner to fix E0599 and removed duplicate read_from_vec
@@ -1195,5 +1212,54 @@ fn alaw_to_linear_wav(a_val: u8) -> i16 {
         t as i16
     } else {
         -(t as i16)
+    }
+}
+
+#[cfg(test)]
+mod compressed_pcm_tests {
+    use super::*;
+
+    #[test]
+    fn aac_caf_decodes_without_changing_packet_access() {
+        check_caf(
+            include_bytes!("../tests/fixtures/sine-440hz-mono-aac.caf"),
+            1,
+        );
+        check_caf(
+            include_bytes!("../tests/fixtures/sine-660hz-stereo-aac.caf"),
+            2,
+        );
+    }
+
+    fn check_caf(bytes: &[u8], channels: u32) {
+        let file = AudioFile::read_from_vec(bytes.to_vec()).unwrap();
+        assert!(matches!(
+            file.audio_description().format,
+            AudioFormat::Mpeg4Aac
+        ));
+        assert_eq!(file.packet_size_fixed(), 0);
+        let mut decoded = file.decoded_packet_file().unwrap().unwrap();
+        let desc = decoded.audio_description();
+        assert!(matches!(desc.format, AudioFormat::LinearPcm { .. }));
+        assert_eq!(desc.sample_rate, 44100.0);
+        assert_eq!(desc.channels_per_frame, channels);
+        assert_eq!(desc.bytes_per_packet, channels * 2);
+        assert!(decoded.byte_count() >= 4410 * 2);
+        let mut pcm = vec![0; decoded.byte_count() as usize];
+        assert_eq!(decoded.read_bytes(0, &mut pcm), Ok(pcm.len()));
+        assert!(pcm
+            .chunks_exact(2)
+            .any(|s| i16::from_le_bytes([s[0], s[1]]).abs() > 100));
+        let mut tail = [0; 64];
+        assert_eq!(decoded.read_bytes(pcm.len() as u64, &mut tail), Ok(0));
+        assert_eq!(decoded.read_bytes(32, &mut tail), Ok(64));
+        assert_eq!(tail, pcm[32..96]);
+        let mut clone = decoded.clone();
+        assert_eq!(clone.read_bytes(32, &mut tail), Ok(64));
+        assert_eq!(tail, pcm[32..96]);
+        assert!(matches!(
+            file.audio_description().format,
+            AudioFormat::Mpeg4Aac
+        ));
     }
 }

@@ -44,6 +44,7 @@ use symphonia::core::packet::PacketRef;
 use symphonia::core::units::{Duration, Timestamp};
 
 /// PCM data decoded from a miscellaneous format file.
+#[derive(Clone)]
 pub struct SymphoniaDecodedToPcm {
     /// 16-bit little-endian PCM samples, grouped in frames (one sample per
     /// channel in each frame).

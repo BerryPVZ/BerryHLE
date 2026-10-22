@@ -703,6 +703,14 @@ fn objc_msgSend_inner(
 
             let missing_selector_name = selector.as_str(&env.mem).to_owned();
 
+            if super2.is_none()
+                && crate::frameworks::foundation::ns_invocation::try_forward_message(
+                    env, receiver, selector,
+                )
+            {
+                return;
+            }
+
             if try_cocos_missing_selector_compat(
                 env,
                 receiver,

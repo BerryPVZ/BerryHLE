@@ -340,7 +340,24 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
                 host.opacity,
             )
         };
-        let transform_kind = classify_fullscreen_layer_transform(affine_transform, orientation);
+        let transform_kind = classify_fullscreen_layer_transform(affine_transform, orientation)
+            .or_else(|| {
+                // Buddyman draws a landscape buffer and manually rotates its
+                // layer opposite to UIKit autorotation. Its zero-rotation
+                // presentation profile can display that buffer directly.
+                if env.bundle.bundle_identifier() != "com.crazylion.buddyman.tm.kick2"
+                    || env.options.present_rotate != Some(0)
+                {
+                    return None;
+                }
+                use crate::window::DeviceOrientation;
+                let inverse = match orientation {
+                    DeviceOrientation::LandscapeLeft => DeviceOrientation::LandscapeRight,
+                    DeviceOrientation::LandscapeRight => DeviceOrientation::LandscapeLeft,
+                    _ => return None,
+                };
+                classify_fullscreen_layer_transform(affine_transform, inverse)
+            });
         let layer_to_screen = superlayer_to_layer_transform.concat(parent_to_screen);
         let layer_frame = layer_to_screen.apply_to_rect(CGRect {
             origin: layer_bounds.origin,
@@ -374,7 +391,7 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
         {
             if crate::env_flag_cached!("TOUCHHLE_TRACE_PRESENT") {
                 log!(
-                    "FULLSCREEN-DIAG layer {:?} rejected: frame={:?} screen={:?} frame_match={} bounds_origin={:?} anchor={:?} hidden={} opacity={} transform_kind={:?} transform_usable={}",
+                    "FULLSCREEN-DIAG layer {:?} rejected: frame={:?} screen={:?} frame_match={} bounds_origin={:?} anchor={:?} hidden={} opacity={} transform_kind={:?} transform_usable={} affine={:?}",
                     layer,
                     layer_frame,
                     screen_bounds,
@@ -384,7 +401,8 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
                     hidden,
                     opacity,
                     transform_kind,
-                    transform_is_usable
+                    transform_is_usable,
+                    affine_transform
                 );
             }
             return nil;

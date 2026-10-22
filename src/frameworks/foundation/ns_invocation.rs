@@ -56,6 +56,98 @@ struct NSInvocationHostObject {
 }
 impl HostObject for NSInvocationHostObject {}
 
+/// Enter Objective-C's full forwarding path for a receiver that implements it.
+/// Save arguments before calling into the guest: those calls overwrite the CPU
+/// registers holding the original message, including soft-float arguments.
+pub(crate) fn try_forward_message(
+    env: &mut crate::Environment,
+    receiver: id,
+    selector: SEL,
+) -> bool {
+    let Some(forward) = env.objc.lookup_selector("forwardInvocation:") else {
+        return false;
+    };
+    if !env.objc.object_has_method(&env.mem, receiver, forward) {
+        return false;
+    }
+    let saved = *env.cpu.regs();
+    let signature: id = msg![env; receiver methodSignatureForSelector:selector];
+    if signature == nil {
+        env.cpu.regs_mut().copy_from_slice(&saved);
+        return false;
+    }
+    let return_type = env
+        .objc
+        .borrow::<NSMethodSignatureHostObject>(signature)
+        .return_type
+        .clone();
+    if return_type
+        .trim_start_matches(['r', 'n', 'N', 'o', 'O', 'R', 'V'])
+        .starts_with(['{', '(', '['])
+    {
+        env.cpu.regs_mut().copy_from_slice(&saved);
+        return false;
+    }
+    let invocation: id = msg_class![env; NSInvocation invocationWithMethodSignature:signature];
+    let sizes = env
+        .objc
+        .borrow::<NSInvocationHostObject>(invocation)
+        .argument_sizes
+        .clone();
+    if sizes.len() < 2 || sizes.len() > 128 || sizes.iter().any(|&s| s > 65536) {
+        env.cpu.regs_mut().copy_from_slice(&saved);
+        return false;
+    }
+    let arguments = capture_message_arguments(&sizes, &saved, |word| {
+        env.mem.read(crate::mem::ConstPtr::<u32>::from_bits(
+            saved[Cpu::SP] + word as u32 * 4,
+        ))
+    });
+    () = msg![env; invocation setTarget:receiver];
+    () = msg![env; invocation setSelector:selector];
+    for (index, bytes) in arguments.iter().enumerate().skip(2) {
+        let buffer = env.mem.alloc(bytes.len() as u32);
+        env.mem
+            .bytes_at_mut(buffer.cast(), bytes.len() as u32)
+            .copy_from_slice(bytes);
+        () = msg![env; invocation setArgument:buffer atIndex:(index as NSInteger)];
+        env.mem.free(buffer);
+    }
+    () = msg![env; receiver forwardInvocation:invocation];
+    let result = env
+        .objc
+        .borrow::<NSInvocationHostObject>(invocation)
+        .return_value;
+    env.cpu.regs_mut().copy_from_slice(&saved);
+    env.cpu.regs_mut()[..2].copy_from_slice(&result);
+    true
+}
+
+fn capture_message_arguments(
+    sizes: &[u32],
+    registers: &[u32; 16],
+    mut stack_word: impl FnMut(usize) -> u32,
+) -> Vec<Vec<u8>> {
+    let mut word = 0;
+    sizes
+        .iter()
+        .map(|&size| {
+            let mut bytes = Vec::with_capacity(size as usize);
+            for _ in 0..size.div_ceil(4) {
+                let value = if word < 4 {
+                    registers[word]
+                } else {
+                    stack_word(word - 4)
+                };
+                bytes.extend_from_slice(&value.to_le_bytes());
+                word += 1;
+            }
+            bytes.truncate(size as usize);
+            bytes
+        })
+        .collect()
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -667,7 +759,18 @@ fn argument_words(encoding: &str, bytes: &[u8]) -> Vec<u32> {
 
 #[cfg(test)]
 mod argument_tests {
-    use super::argument_words;
+    use super::{argument_words, capture_message_arguments};
+    #[test]
+    fn captures_forwarded_audio_arguments_across_registers_and_stack() {
+        let mut regs = [0u32; 16];
+        regs[..4].copy_from_slice(&[0x1234, 0x5678, 0x9000, 1.0f32.to_bits()]);
+        let stack = [0.9f32.to_bits(), (-0.25f32).to_bits()];
+        let captured = capture_message_arguments(&[4,4,4,4,4,4], &regs, |i| stack[i]);
+        assert_eq!(captured[2], 0x9000u32.to_le_bytes());
+        assert_eq!(captured[3], 1.0f32.to_le_bytes());
+        assert_eq!(captured[4], 0.9f32.to_le_bytes());
+        assert_eq!(captured[5], (-0.25f32).to_le_bytes());
+    }
     #[test]
     fn preserves_wide_and_aggregate_arguments() {
         assert_eq!(

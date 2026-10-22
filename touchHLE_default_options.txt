@@ -397,3 +397,7 @@ hu.BV.BreakTheCookieFree: --landscape-left --present-mode=readback
 # Food Fight mixes NIB-based UIKit menus with a MashEAGLView. Keep the
 # compositor active while the game's GL renderer is idle on menu screens.
 com.tomatoflix.foodfight: --force-composition
+
+# Buddyman Kick 2 draws a landscape buffer and manually rotates its GL layer.
+# Display the native buffer directly instead of copying it through the CPU.
+com.crazylion.buddyman.tm.kick2: --device-family=iphone --landscape-right --present-rotate=0

@@ -43,6 +43,8 @@ impl State {
 pub struct ExtAudioFileHostObject {
     /// The underlying audio file (can be Real or Dummy).
     pub audio_file: AudioFileHostObject,
+    /// Decoded PCM used for reads; preserve the original file format metadata.
+    decoded_audio_file: Option<AudioFileHostObject>,
     /// Client format requested via `kExtAudioFileProperty_ClientDataFormat`.
     /// `None` means "use the file's native format" (no conversion).
     pub client_format: Option<AudioStreamBasicDescription>,
@@ -116,8 +118,19 @@ fn register_ext_audio_file(
     wrapped_id: Option<AudioFileID>,
     out_ext_audio_file: MutPtr<ExtAudioFileRef>,
 ) -> OSStatus {
+    let decoded_audio_file = match &audio_file {
+        AudioFileHostObject::Real(file) => match file.decoded_packet_file() {
+            Ok(file) => file.map(AudioFileHostObject::Real),
+            Err(()) => {
+                log!("ExtAudioFile: compressed audio decoding failed");
+                return kExtAudioFileError_InvalidDataFormat;
+            }
+        },
+        _ => None,
+    };
     let host_object = ExtAudioFileHostObject {
         audio_file,
+        decoded_audio_file,
         client_format: None,
         frame_position: 0,
         wrapped_audio_file_id: wrapped_id,
@@ -346,7 +359,11 @@ pub fn ExtAudioFileGetProperty(
             env.mem.write(out_property_data.cast(), desc);
         }
         kExtAudioFileProperty_FileLengthFrames => {
-            let total_frames: i64 = match &host_object.audio_file {
+            let total_frames: i64 = match host_object
+                .decoded_audio_file
+                .as_ref()
+                .unwrap_or(&host_object.audio_file)
+            {
                 AudioFileHostObject::Real(af) => {
                     let desc = af.audio_description();
                     if desc.bytes_per_packet != 0 {
@@ -495,8 +512,13 @@ pub fn ExtAudioFileRead(
         return kExtAudioFileError_InvalidOperationOrder;
     };
 
+    let audio_file = host
+        .decoded_audio_file
+        .as_mut()
+        .unwrap_or(&mut host.audio_file);
+
     // Extract format info safely from real or dummy files
-    let (frames_per_packet, packet_size) = match &host.audio_file {
+    let (frames_per_packet, packet_size) = match &*audio_file {
         AudioFileHostObject::Real(af) => (
             af.audio_description().frames_per_packet,
             af.packet_size_fixed(),
@@ -520,7 +542,7 @@ pub fn ExtAudioFileRead(
     // that differs from the file's native format (sample rate, channel
     // count, bit depth, int/float), read native frames and convert them
     // instead of returning raw file bytes.
-    let native_asbd = build_asbd(&host.audio_file);
+    let native_asbd = build_asbd(audio_file);
     let native_shape = pcm_shape_from_asbd(&native_asbd);
     let client_shape = host.client_format.and_then(|f| pcm_shape_from_asbd(&f));
     let needs_conversion = match (&native_shape, &client_shape) {
@@ -546,7 +568,7 @@ pub fn ExtAudioFileRead(
         // Read native PCM into a host-side staging buffer.
         let starting_byte = host.frame_position * native_bpf;
         let mut staging = vec![0u8; native_bytes_needed as usize];
-        let bytes_read = match &mut host.audio_file {
+        let bytes_read = match &mut *audio_file {
             AudioFileHostObject::Real(af) => {
                 af.read_bytes(starting_byte, &mut staging).unwrap_or(0)
             }
@@ -624,7 +646,7 @@ pub fn ExtAudioFileRead(
     let buffer_slice = env.mem.bytes_at_mut(out_buffer.cast(), bytes_to_read); // ИСПРАВЛЕНИЕ: Убран 'as usize', так как функция ожидает u32
 
     // Read logic directly without using error-prone map ID transmutes
-    let bytes_read = match &mut host.audio_file {
+    let bytes_read = match &mut *audio_file {
         AudioFileHostObject::Real(af) => af.read_bytes(starting_byte, buffer_slice).unwrap_or(0),
         AudioFileHostObject::Dummy { byte_count, .. } => {
             for b in buffer_slice.iter_mut() {
