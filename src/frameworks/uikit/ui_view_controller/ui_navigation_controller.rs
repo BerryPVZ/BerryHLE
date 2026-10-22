@@ -101,6 +101,18 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; this init]
 }
 
+- (())loadView {
+    // Navigation controllers own a container view. Applying UIViewController's
+    // implicit class-name nib search here can instantiate another navigation
+    // controller from the same archive while its stack is being decoded.
+    let screen: id = msg_class![env; UIScreen mainScreen];
+    let bounds: CGRect = msg![env; screen bounds];
+    let view: id = msg_class![env; UIView alloc];
+    let view: id = msg![env; view initWithFrame:bounds];
+    () = msg![env; this setView:view];
+    release(env, view);
+}
+
 // =========================================================================
 // MARK: - Delegate
 // =========================================================================

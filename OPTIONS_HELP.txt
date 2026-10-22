@@ -532,4 +532,3 @@ Other options:
 
     --no-globbert-debug
         Disable Globbert's debug overlay.
-

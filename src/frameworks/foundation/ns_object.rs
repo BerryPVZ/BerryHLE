@@ -30,14 +30,11 @@ use self::kvc_helpers::{
     send_numeric_kvc_setter, send_nsvalue_kvc_setter,
 };
 
-// Хранилище для отмененных таймеров (target, имя селектора в виде строки)
-//
 // These side-channel stores are guarded by mutexes rather than being
 // `static mut`: re-entrant access (e.g. a `release` triggering `dealloc`
 // while iterating) was previously undefined behaviour. Locks must never be
 // held across a `msg!`/`msg_send` call, since guest code can re-enter these
 // same accessors.
-pub static CANCELLED_PERFORMS: Mutex<Vec<(u32, Option<String>)>> = Mutex::new(Vec::new());
 
 // Хранилище для динамических свойств KVC (когда NIB устанавливает кастомные IBOutlet на базовые классы)
 pub static DYNAMIC_KVC_STORAGE: Mutex<Vec<(u32, String, u32)>> = Mutex::new(Vec::new());
@@ -394,21 +391,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; this description]
 }
 
-+ (())cancelPreviousPerformRequestsWithTarget:(id)target
-                                     selector:(SEL)selector
-                                       object:(id)_object {
-    let sel_str = selector.as_str(&env.mem).to_string();
-    CANCELLED_PERFORMS
-        .lock()
-        .unwrap()
-        .push((target.to_bits(), Some(sel_str)));
++ (())cancelPreviousPerformRequestsWithTarget:(id)target selector:(SEL)selector object:(id)object {
+    let run_loop: id = msg_class![env; NSRunLoop currentRunLoop];
+    ns_run_loop::cancel_delayed_performs(env, run_loop, target, Some(selector), object);
 }
 
 + (())cancelPreviousPerformRequestsWithTarget:(id)target {
-    CANCELLED_PERFORMS
-        .lock()
-        .unwrap()
-        .push((target.to_bits(), None));
+    let run_loop: id = msg_class![env; NSRunLoop currentRunLoop];
+    ns_run_loop::cancel_delayed_performs(env, run_loop, target, None, nil);
 }
 
 - (id)init {
@@ -809,7 +799,7 @@ pub const CLASSES: ClassExports = objc_classes! {
                              userInfo:dict
                               repeats:false
     ];
-    let run_loop: id = msg_class![env; NSRunLoop mainRunLoop];
+    let run_loop: id = msg_class![env; NSRunLoop currentRunLoop];
     let mode: id = get_static_str(env, NSDefaultRunLoopMode);
     () = msg![env; run_loop addTimer:timer forMode:mode];
 }
@@ -937,31 +927,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     let arg_key: id = get_static_str(env, "arg");
     let arg: id = msg![env; dict objectForKey:arg_key];
-    let target_bits = this.to_bits();
-    let mut cancelled = false;
-
-    {
-        let mut cancelled_performs = CANCELLED_PERFORMS.lock().unwrap();
-        if let Some(pos) = cancelled_performs
-            .iter()
-            .position(|x| x.0 == target_bits && x.1.as_deref() == Some(sel_str.as_str()))
-        {
-            cancelled_performs.remove(pos);
-            cancelled = true;
-        } else if cancelled_performs
-            .iter()
-            .any(|x| x.0 == target_bits && x.1.is_none())
-        {
-            cancelled = true;
-        }
-    }
-
-    if !cancelled {
-        if sel.as_str(&env.mem).ends_with(':') {
-            () = msg_send(env, (this, sel, arg));
-        } else {
-            () = msg_send(env, (this, sel));
-        }
+    if sel.as_str(&env.mem).ends_with(':') {
+        () = msg_send(env, (this, sel, arg));
+    } else {
+        () = msg_send(env, (this, sel));
     }
 
 }

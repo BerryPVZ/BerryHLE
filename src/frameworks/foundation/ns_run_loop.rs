@@ -915,3 +915,55 @@ pub(crate) fn run_loop_for_thread(env: &mut Environment, this: Class, thread_id:
         .ns_run_loop
         .run_loop
 }
+
+/// Cancel only delayed selectors that are already scheduled on this loop.
+/// A later performSelector request must not inherit an earlier cancellation.
+pub(super) fn cancel_delayed_performs(
+    env: &mut Environment,
+    run_loop: id,
+    target: id,
+    selector: Option<SEL>,
+    argument: id,
+) {
+    let timers = env
+        .objc
+        .borrow::<NSRunLoopHostObject>(run_loop)
+        .timers
+        .clone();
+    let fire = env
+        .objc
+        .lookup_selector("_touchHLE_timerFireMethod:")
+        .unwrap();
+    for &timer in &timers {
+        retain(env, timer);
+    }
+    for &timer in &timers {
+        let state = env.objc.borrow::<ns_timer::NSTimerHostObject>(timer);
+        if state.target != target || state.selector != fire || state.due_by.is_none() {
+            continue;
+        }
+        let info = state.user_info;
+        if let Some(selector) = selector {
+            let key = ns_string::get_static_str(env, "SEL");
+            let name: id = msg![env; info objectForKey:key];
+            if ns_string::to_rust_string(env, name) != selector.as_str(&env.mem) {
+                continue;
+            }
+            let key = ns_string::get_static_str(env, "arg");
+            let scheduled_argument: id = msg![env; info objectForKey:key];
+            if scheduled_argument != argument {
+                if scheduled_argument == nil || argument == nil {
+                    continue;
+                }
+                let equal: bool = msg![env; scheduled_argument isEqual:argument];
+                if !equal {
+                    continue;
+                }
+            }
+        }
+        () = msg![env; timer invalidate];
+    }
+    for timer in timers {
+        release(env, timer);
+    }
+}
