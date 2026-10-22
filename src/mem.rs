@@ -1291,6 +1291,19 @@ impl Mem {
         let bytes = self.cstr_at(ptr);
         std::str::from_utf8(bytes).map_err(|_| bytes)
     }
+
+    /// Get a C string (null-terminated) as a string, replacing invalid UTF-8
+    /// sequences with U+FFFD instead of failing.
+    ///
+    /// POSIX paths and most guest C strings are byte strings, so callers that
+    /// must accept arbitrary bytes (e.g. `open(2)`, which the kernel never
+    /// validates as UTF-8) use this instead of [Self::cstr_at_utf8].
+    pub fn cstr_at_utf8_lossy<const MUT: bool>(&self, ptr: Ptr<u8, MUT>) -> std::borrow::Cow<'_, str> {
+        match self.cstr_at_utf8(ptr) {
+            Ok(s) => std::borrow::Cow::Borrowed(s),
+            Err(bytes) => String::from_utf8_lossy(bytes),
+        }
+    }
     /// Compare a null-terminated guest C string against an expected byte
     /// string, returning true iff they are exactly equal. `expected` must not
     /// contain an interior NUL.
@@ -1495,6 +1508,28 @@ mod mem_tests {
             mem.bytes_at(Ptr::<u8, false>::from_bits(8), 3),
             &[13, 14, 15]
         );
+    }
+
+    #[test]
+    fn cstr_at_utf8_lossy_keeps_non_utf8_paths_usable() {
+        // Unity's shader cache opens paths whose name ends in uninitialised
+        // bytes. POSIX paths are byte strings, so the helper must return a
+        // string (with replacement characters) rather than failing.
+        let mut mem = Mem::new();
+        let p: MutPtr<u8> = Ptr::from_bits(0x1000);
+        mem.bytes_at_mut(p, 6)
+            .copy_from_slice(&[b'/', b'a', 0xA5, b'b', 0xAA, 0]);
+
+        assert!(mem.cstr_at_utf8(p).is_err());
+        assert_eq!(
+            mem.cstr_at_utf8_lossy(p).as_ref(),
+            "/a\u{FFFD}b\u{FFFD}"
+        );
+        // '/', 'a', U+FFFD, 'b', U+FFFD: each bad byte becomes one
+        // replacement character, and the name stays stable across calls so
+        // repeated opens of one cache entry still hit the same file.
+        assert_eq!(mem.cstr_at_utf8_lossy(p).chars().count(), 5);
+        assert_eq!(mem.cstr_at_utf8_lossy(p), mem.cstr_at_utf8_lossy(p));
     }
 
     #[test]
