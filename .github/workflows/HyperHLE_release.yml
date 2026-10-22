@@ -1,10 +1,10 @@
-name: Build HyperHLE
+name: Build BerryHLE
 
 on:
   workflow_dispatch:
     inputs:
       publish_hyperhle_release:
-        description: Publish a HyperHLE release (after all builds succeed)
+        description: Publish a BerryHLE release (after all builds succeed)
         type: boolean
         default: false
   push:
@@ -135,7 +135,7 @@ jobs:
           
       - uses: actions/upload-artifact@main
         with:
-          name: HyperHLE_macOS_x86_64
+          name: BerryHLE_macOS_x86_64
           path: touchHLE.dmg
 
   build-linux:
@@ -207,7 +207,7 @@ jobs:
 
       - uses: actions/upload-artifact@main
         with:
-          name: HyperHLE_Linux_x86_64
+          name: BerryHLE_Linux_x86_64
           path: touchHLE_linux_bundle/
 
   build-android:
@@ -311,7 +311,7 @@ jobs:
         java-version: '17'
 
     - name: Build for Android  
-      run: cd android && ../gradle/gradle-8.11.1/bin/gradle assembleRelease && mv app/build/outputs/apk/release/HyperHLE-Reborn-release.apk ../HyperHLE-Reborn.apk  
+      run: cd android && ../gradle/gradle-8.11.1/bin/gradle assembleRelease && mv app/build/outputs/apk/release/BerryHLE-release.apk ../BerryHLE.apk  
       env:  
         HYPERHLE_KEYSTORE_B64: ${{ secrets.HYPERHLE_KEYSTORE_B64 }}
         HYPERHLE_KEYSTORE_PASSWORD: ${{ secrets.HYPERHLE_KEYSTORE_PASSWORD }}
@@ -321,8 +321,8 @@ jobs:
 
     - uses: actions/upload-artifact@main
       with:  
-        name: HyperHLE_Android_AArch64  
-        path: HyperHLE-Reborn.apk
+        name: BerryHLE_Android_AArch64  
+        path: BerryHLE.apk
 
   build-ios:
     # The iOS app (platform/ios) and its packaging come from Applesauce
@@ -405,24 +405,24 @@ jobs:
       - name: Verify the IPAs
         run: |
           set -eu
-          sh platform/ios/scripts/verify-ipa.sh dist/HyperHLE-iOS-unsigned.ipa
-          sh platform/ios/scripts/verify-ipa.sh --trollstore dist/HyperHLE-iOS-trollstore.ipa
-          sh platform/ios/scripts/verify-ipa.sh --trollstore-permanent-jit dist/HyperHLE-iOS-trollstore-permanent-jit.ipa
+          sh platform/ios/scripts/verify-ipa.sh dist/BerryHLE-iOS-unsigned.ipa
+          sh platform/ios/scripts/verify-ipa.sh --trollstore dist/BerryHLE-iOS-trollstore.ipa
+          sh platform/ios/scripts/verify-ipa.sh --trollstore-permanent-jit dist/BerryHLE-iOS-trollstore-permanent-jit.ipa
 
       # Each IPA is uploaded as-is rather than wrapped in a zip.
       - uses: actions/upload-artifact@main
         with:
-          path: dist/HyperHLE-iOS-unsigned.ipa
+          path: dist/BerryHLE-iOS-unsigned.ipa
           archive: false
 
       - uses: actions/upload-artifact@main
         with:
-          path: dist/HyperHLE-iOS-trollstore.ipa
+          path: dist/BerryHLE-iOS-trollstore.ipa
           archive: false
 
       - uses: actions/upload-artifact@main
         with:
-          path: dist/HyperHLE-iOS-trollstore-permanent-jit.ipa
+          path: dist/BerryHLE-iOS-trollstore-permanent-jit.ipa
           archive: false
 
   build-win:
@@ -473,7 +473,7 @@ jobs:
       
     - uses: actions/upload-artifact@main
       with:
-        name: HyperHLE_Windows_x86_64
+        name: BerryHLE_Windows_x86_64
         path: touchHLE_windows_bundle/
 
     - name: Build installer
@@ -506,7 +506,7 @@ jobs:
     # Uploaded as-is rather than wrapped in a zip.
     - uses: actions/upload-artifact@main
       with:
-        path: HyperHLE_Windows_x86_64_Setup.exe
+        path: BerryHLE_Windows_x86_64_Setup.exe
         archive: false
 
   check-hyperhle-release:
@@ -525,7 +525,7 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
-      - name: Check whether a HyperHLE release is due
+      - name: Check whether a BerryHLE release is due
         id: check
         env:
           FORCE_HYPERHLE_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_hyperhle_release && 'true' || '' }}
@@ -554,48 +554,48 @@ jobs:
       - name: Download macOS artifact
         uses: actions/download-artifact@main
         with:
-          name: HyperHLE_macOS_x86_64
+          name: BerryHLE_macOS_x86_64
           path: artifacts/macos
       - name: Download Android artifact
         uses: actions/download-artifact@main
         with:
-          name: HyperHLE_Android_AArch64
+          name: BerryHLE_Android_AArch64
           path: artifacts/android
       - name: Download Windows artifact
         uses: actions/download-artifact@main
         with:
-          name: HyperHLE_Windows_x86_64
+          name: BerryHLE_Windows_x86_64
           path: artifacts/windows
       - name: Download Windows installer
         uses: actions/download-artifact@main
         with:
-          name: HyperHLE_Windows_x86_64_Setup.exe
+          name: BerryHLE_Windows_x86_64_Setup.exe
           path: artifacts/windows-installer
       - name: Download Linux artifact
         uses: actions/download-artifact@main
         with:
-          name: HyperHLE_Linux_x86_64
+          name: BerryHLE_Linux_x86_64
           path: artifacts/linux
       # Unzipped artifacts (upload-artifact archive: false) are documented to
       # download by their exact file name, so fetch each IPA by name.
       - name: Download iOS unsigned IPA
         uses: actions/download-artifact@main
         with:
-          name: HyperHLE-iOS-unsigned.ipa
+          name: BerryHLE-iOS-unsigned.ipa
           path: artifacts/ios
       - name: Download iOS TrollStore IPA
         uses: actions/download-artifact@main
         with:
-          name: HyperHLE-iOS-trollstore.ipa
+          name: BerryHLE-iOS-trollstore.ipa
           path: artifacts/ios
       - name: Download iOS TrollStore permanent-JIT IPA
         uses: actions/download-artifact@main
         with:
-          name: HyperHLE-iOS-trollstore-permanent-jit.ipa
+          name: BerryHLE-iOS-trollstore-permanent-jit.ipa
           path: artifacts/ios
       - name: Install packaging tools
         run: sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pandoc zip
-      - name: Package HyperHLE release files
+      - name: Package BerryHLE release files
         env:
           # Lets the changelog look up each commit author's GitHub username.
           GH_TOKEN: ${{ github.token }}
@@ -605,16 +605,16 @@ jobs:
           CHANGELOG_FROM: ${{ needs.check-hyperhle-release.outputs.changelog_from }}
           CHANGELOG_LIMIT: ${{ needs.check-hyperhle-release.outputs.changelog_limit }}
         run: ./dev-scripts/package-hyperhle-release.sh "$VERSION" "$CHANGELOG_FROM"
-      - name: Publish HyperHLE release
+      - name: Publish BerryHLE release
         uses: softprops/action-gh-release@master
         with:
           tag_name: ${{ needs.check-hyperhle-release.outputs.version }}
           # Tag the commit that was built, not whatever trunk points at by now.
           target_commitish: ${{ github.sha }}
-          name: HyperHLE ${{ needs.check-hyperhle-release.outputs.version }}
+          name: BerryHLE ${{ needs.check-hyperhle-release.outputs.version }}
           body_path: release/RELEASE_NOTES.md
           files: |
-            release/HyperHLE_*.zip
-            release/HyperHLE_Windows_x86_64_Setup.exe
-            release/HyperHLE-iOS-*.ipa
+            release/BerryHLE_*.zip
+            release/BerryHLE_Windows_x86_64_Setup.exe
+            release/BerryHLE-iOS-*.ipa
           fail_on_unmatched_files: true

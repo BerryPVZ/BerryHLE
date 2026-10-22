@@ -644,6 +644,38 @@ const CLASSES: ClassExports = objc_classes! {
 
 };
 
+fn fit_wallpaper((width, height): (u32, u32), screen: CGSize) -> CGRect {
+    let scale = (screen.width / width.max(1) as f32).min(screen.height / height.max(1) as f32);
+    let size = CGSize {
+        width: width as f32 * scale,
+        height: height as f32 * scale,
+    };
+    CGRect {
+        origin: CGPoint {
+            x: (screen.width - size.width) / 2.0,
+            y: (screen.height - size.height) / 2.0,
+        },
+        size,
+    }
+}
+
+/// Configure only the throwaway launcher environment; guest app options are
+/// parsed separately after selection, so these dimensions never leak to games.
+fn configure_picker_display(options: &mut Options, (width, height): (u32, u32)) {
+    if width <= height || height == 0 {
+        return;
+    }
+    if options.host_screen_size.is_none() {
+        let scale = (540.0 / height as f32).min(1280.0 / width as f32).min(1.0);
+        let wide = (width as f32 * scale).round() as u32;
+        let short = (height as f32 * scale).round() as u32;
+        options.host_screen_size = Some((short, wide));
+    }
+    options.initial_orientation = DeviceOrientation::LandscapeRight;
+    options.landscape_uiscreen_bounds = true;
+    options.present_rotate = Some(0);
+}
+
 fn show_app_picker_gui(
     mut options: Options,
     apps: Result<Vec<AppInfo>, String>,
@@ -666,6 +698,9 @@ fn show_app_picker_gui(
         image.round_icon_corners(/* add_sheen: */ true);
         image
     };
+    if let Some(host) = crate::window::host_screen_size() {
+        configure_picker_display(&mut options, host);
+    }
     let environment = Environment::new_without_app(options, icon)?;
     Ok(environment.run_app_picker(|env| app_picker_inner(env, apps)))
 }
@@ -695,6 +730,8 @@ fn app_picker_inner(
 
     let window: id = msg_class![env; UIWindow alloc];
     let window: id = msg![env; window initWithFrame:bounds];
+    let black: id = msg_class![env; UIColor blackColor];
+    () = msg![env; window setBackgroundColor:black];
 
     let app_frame: CGRect = msg![env; screen applicationFrame];
 
@@ -723,23 +760,17 @@ fn app_picker_inner(
             }
         };
 
+        let wallpaper_frame = fit_wallpaper(image.dimensions(), bounds.size);
         let image = cg_image::from_image(env, image);
         let image: id = msg_class![env; UIImage imageWithCGImage:image];
         let wallpaper: id = msg_class![env; UIImageView alloc];
         let wallpaper: id = msg![env; wallpaper initWithImage:image];
         // The wallpaper also covers the status bar strip above the
         // application frame, like the old iOS home screen.
-        let status_offset = app_frame.origin.y;
-        () = msg![env; wallpaper setFrame:(CGRect {
-            origin: CGPoint {
-                x: 0.0,
-                y: 0.0,
-            },
-            size: CGSize {
-                width: app_frame.size.width,
-                height: app_frame.size.height + status_offset,
-            },
-        })];
+        () = msg![env; wallpaper setFrame:wallpaper_frame];
+        let layer: id = msg![env; wallpaper layer];
+        let gravity = ns_string::get_static_str(env, "resizeAspect");
+        () = msg![env; layer setContentsGravity:gravity];
         () = msg![env; wallpaper setAlpha:(1.0 as CGFloat)];
         () = msg![env; window addSubview:wallpaper];
         wallpaper_view = Some(wallpaper);
@@ -871,7 +902,7 @@ fn app_picker_inner(
         let label: id = msg![env; label initWithFrame:label_frame];
         let text = ns_string::from_rust_string(
             env,
-            format!("{HYPERHLE_REBORN_NAME} ({})", crate::COMMIT_HASH),
+            format!("{BERRYHLE_NAME} ({})", crate::COMMIT_HASH),
         );
         () = msg![env; label setText:text];
         () = msg![env; label setTextAlignment:UITextAlignmentRight];
@@ -1529,9 +1560,9 @@ fn app_picker_inner(
     (app_path, option_args)
 }
 
-const HYPERHLE_REBORN_NAME: &str = "HyperHLE-Reborn";
+const BERRYHLE_NAME: &str = "BerryHLE";
 
-/// Old-iOS home screen layout: a fixed 4×4 icon grid above a row of page dots,
+/// Old-iOS home screen layout: portrait uses 4×4 cells; landscape adapts the grid
 /// and a translucent dock along the bottom edge.
 const APP_PICKER_ICON_COLS: usize = 4;
 const APP_PICKER_ICON_ROWS: usize = 4;
@@ -1567,9 +1598,11 @@ fn app_picker_grid_bottom(app_height: CGFloat) -> CGFloat {
     app_height - APP_PICKER_DOCK_HEIGHT - APP_PICKER_DOTS_ROW_HEIGHT
 }
 
-/// Geometry of the 4×4 icon grid.
+/// Geometry of the icon grid.
 #[derive(Clone, Copy, Debug)]
 struct AppPickerLayout {
+    cols: usize,
+    rows: usize,
     /// Side length of one (square) icon cell.
     icon_size: CGFloat,
     /// Horizontal distance between icon cells.
@@ -1583,14 +1616,21 @@ struct AppPickerLayout {
 }
 
 fn app_picker_layout(screen_width: CGFloat, screen_height: CGFloat) -> AppPickerLayout {
-    let cols = APP_PICKER_ICON_COLS as CGFloat;
-    let rows = APP_PICKER_ICON_ROWS as CGFloat;
+    let (columns, row_count) = if screen_width > screen_height {
+        (
+            (((screen_width - 20.0) / 76.0).floor() as usize).clamp(4, 10),
+            ((app_picker_grid_bottom(screen_height) / 90.0).floor() as usize).clamp(1, 6),
+        )
+    } else {
+        (APP_PICKER_ICON_COLS, APP_PICKER_ICON_ROWS)
+    };
+    let cols = columns as CGFloat;
+    let rows = row_count as CGFloat;
     let inner_width = (screen_width - APP_PICKER_SIDE_MARGIN * 2.0).max(1.0);
     let row_chrome = APP_PICKER_LABEL_TOP_GAP + APP_PICKER_LABEL_HEIGHT;
     let available_height = (app_picker_grid_bottom(screen_height) - APP_PICKER_GRID_TOP).max(1.0);
 
-    // The icons must fit both across (four columns) and down (four rows plus
-    // labels). Small screens get smaller icons rather than fewer cells.
+    // Keep icons square and fit both the selected columns and the labelled rows.
     let icon_by_width = (inner_width - APP_PICKER_ICON_GAP_X_MIN * (cols - 1.0)) / cols;
     let icon_by_height =
         (available_height - rows * row_chrome - APP_PICKER_ROW_GAP_MIN * (rows - 1.0)) / rows;
@@ -1598,14 +1638,16 @@ fn app_picker_layout(screen_width: CGFloat, screen_height: CGFloat) -> AppPicker
         .min(icon_by_height)
         .clamp(APP_PICKER_ICON_MIN_SIZE, APP_PICKER_ICON_MAX_SIZE)
         .floor();
-    let icon_gap_x = ((inner_width - icon_size * cols) / (cols - 1.0))
-        .clamp(0.0, APP_PICKER_ICON_GAP_X_MAX);
+    let icon_gap_x =
+        ((inner_width - icon_size * cols) / (cols - 1.0)).clamp(0.0, APP_PICKER_ICON_GAP_X_MAX);
     let grid_width = icon_size * cols + icon_gap_x * (cols - 1.0);
     let cell_height = icon_size + row_chrome;
-    let icon_gap_y = ((available_height - rows * cell_height) / (rows - 1.0))
-        .max(APP_PICKER_ROW_GAP_MIN);
+    let icon_gap_y =
+        ((available_height - rows * cell_height) / (rows - 1.0)).max(APP_PICKER_ROW_GAP_MIN);
 
     AppPickerLayout {
+        cols: columns,
+        rows: row_count,
         icon_size,
         icon_gap_x,
         icon_gap_y,
@@ -1637,6 +1679,52 @@ mod layout_tests {
             + 3.0 * layout.icon_gap_y
             + 4.0 * (APP_PICKER_LABEL_TOP_GAP + APP_PICKER_LABEL_HEIGHT);
         assert!(last_row_bottom <= app_picker_grid_bottom(460.0) + 0.5);
+    }
+
+    #[test]
+    fn wallpaper_is_fitted_without_stretch_or_crop() {
+        let wide = CGSize {
+            width: 960.0,
+            height: 540.0,
+        };
+        let frame = fit_wallpaper((320, 480), wide);
+        assert_eq!(
+            frame.size,
+            CGSize {
+                width: 360.0,
+                height: 540.0
+            }
+        );
+        assert_eq!(frame.origin, CGPoint { x: 300.0, y: 0.0 });
+        let frame = fit_wallpaper((1920, 1080), wide);
+        assert_eq!(frame.size, wide);
+        assert_eq!(frame.origin, CGPoint { x: 0.0, y: 0.0 });
+    }
+
+    #[test]
+    fn landscape_grids_fit_without_distorting_icons() {
+        for (w, h) in [
+            (480.0, 300.0),
+            (960.0, 520.0),
+            (1280.0, 520.0),
+            (1024.0, 748.0),
+        ] {
+            let l = app_picker_layout(w, h);
+            assert!(l.cols >= 6);
+            let right =
+                l.grid_origin.x + l.cols as f32 * l.icon_size + (l.cols - 1) as f32 * l.icon_gap_x;
+            let bottom = l.grid_origin.y
+                + l.rows as f32
+                    * (l.icon_size + APP_PICKER_LABEL_TOP_GAP + APP_PICKER_LABEL_HEIGHT)
+                + (l.rows - 1) as f32 * l.icon_gap_y;
+            assert!(l.grid_origin.x >= 0.0 && right <= w);
+            assert!(bottom <= app_picker_grid_bottom(h) + 0.5);
+        }
+        let mut o = Options::default();
+        configure_picker_display(&mut o, (1920, 1080));
+        assert_eq!(o.host_screen_size, Some((540, 960)));
+        assert!(o.landscape_uiscreen_bounds);
+        assert_eq!(o.present_rotate, Some(0));
     }
 
     #[test]
@@ -1675,8 +1763,8 @@ fn make_icon_grid(
     total_app_count: usize,
 ) -> IconGridStuff {
     let layout = app_picker_layout(app_frame.size.width, app_frame.size.height);
-    let num_cols = APP_PICKER_ICON_COLS;
-    let num_rows = APP_PICKER_ICON_ROWS;
+    let num_cols = layout.cols;
+    let num_rows = layout.rows;
     let cell_step_x = layout.icon_size + layout.icon_gap_x;
     let cell_step_y =
         layout.icon_size + APP_PICKER_LABEL_TOP_GAP + layout.label_size.height + layout.icon_gap_y;
@@ -1805,8 +1893,8 @@ fn make_icon_grid(
     }
 }
 
-/// Work out which apps go on each page of the icon grid. Every page is a full
-/// 4×4 grid; the "+" tile and Settings live in the dock instead of taking
+/// Work out which apps go on each page of the adaptive grid.
+/// The "+" tile and Settings live in the dock instead of taking
 /// grid slots.
 fn compute_pages(total_slots: usize, total_app_count: usize) -> Vec<std::ops::Range<usize>> {
     let total_slots = total_slots.max(1);
@@ -2289,7 +2377,7 @@ fn make_status_bar(env: &mut Environment, width: CGFloat, height: CGFloat) -> (i
     let carrier = new_label(
         env,
         rect(27.0, 1.0, width * 0.35, height - 2.0),
-        "HyperHLE",
+        "BerryHLE",
         12.0,
         true,
         white,
@@ -2891,6 +2979,9 @@ fn play_home_screen_unlock_animation(
     );
 
     if let Some(wallpaper) = wallpaper {
+        let layer: id = msg![env; wallpaper layer];
+        let gravity = ns_string::get_static_str(env, "resizeAspect");
+        () = msg![env; layer setContentsGravity:gravity];
         () = msg![env; wallpaper setAlpha:(1.0 as CGFloat)];
     }
     for &view in chrome_views {
@@ -3619,7 +3710,7 @@ fn setup_settings(
     let footer = new_label(
         env,
         rect(0.0, y, width, 18.0),
-        &format!("{HYPERHLE_REBORN_NAME} ({})", crate::COMMIT_HASH),
+        &format!("{BERRYHLE_NAME} ({})", crate::COMMIT_HASH),
         12.0,
         false,
         gray_text,

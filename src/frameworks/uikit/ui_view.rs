@@ -2141,7 +2141,13 @@ mod autoresize_tests {
 #[cfg(test)]
 mod berry_autoresizing_tests {
     fn autoresize_axis(origin: f32, size: f32, old: f32, new: f32, mask: u32) -> (f32, f32) {
-        super::autoresize_axis(origin, size, old, new, (mask & 1 != 0, mask & 2 != 0, mask & 4 != 0))
+        super::autoresize_axis(
+            origin,
+            size,
+            old,
+            new,
+            (mask & 1 != 0, mask & 2 != 0, mask & 4 != 0),
+        )
     }
     #[test]
     fn confirmation_buttons_keep_their_distinct_positions() {

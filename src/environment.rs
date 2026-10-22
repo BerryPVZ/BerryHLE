@@ -669,7 +669,7 @@ impl Environment {
                 });
             Some(Box::new(window::Window::new(
                 &format!(
-                    "{} (touchHLE {}{}{})",
+                    "{} (BerryHLE {}{}{})",
                     bundle.display_name(),
                     super::branding(),
                     if super::branding().is_empty() {
@@ -1163,7 +1163,7 @@ impl Environment {
         let window_icon = Some(icon);
         let window = Some(Box::new(window::Window::new(
             &format!(
-                "touchHLE {}{}{}",
+                "BerryHLE {}{}{}",
                 super::branding(),
                 if super::branding().is_empty() {
                     ""

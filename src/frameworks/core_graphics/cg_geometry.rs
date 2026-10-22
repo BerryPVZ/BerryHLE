@@ -552,13 +552,8 @@ fn CGRectContainsRect(env: &mut Environment, outer: CGRect, inner: CGRect) -> bo
         && outer.origin.y + outer.size.height >= inner.origin.y + inner.size.height
 }
 
-fn CGRectIntersectsRect(env: &mut Environment, rect1: CGRect, rect2: CGRect) -> bool {
-    let rect1 = CGRectStandardize(env, rect1);
-    let rect2 = CGRectStandardize(env, rect2);
-    rect1.origin.x.max(rect2.origin.x)
-        < (rect1.origin.x + rect1.size.width).min(rect2.origin.x + rect2.size.width)
-        && rect1.origin.y.max(rect2.origin.y)
-            < (rect1.origin.y + rect1.size.height).min(rect2.origin.y + rect2.size.height)
+fn CGRectIntersectsRect(_env: &mut Environment, rect1: CGRect, rect2: CGRect) -> bool {
+    rect_intersection(rect1, rect2) != CGRectNull
 }
 
 // =========================================================================
@@ -638,14 +633,22 @@ fn CGRectInset(_env: &mut Environment, rect: CGRect, dx: CGFloat, dy: CGFloat) -
 }
 
 fn CGRectIntersection(_env: &mut Environment, r1: CGRect, r2: CGRect) -> CGRect {
+    rect_intersection(r1, r2)
+}
+
+/// Core Graphics intersects closed extents: touching edges and zero-size
+/// rectangles inside another rectangle have a non-null, possibly empty result.
+fn rect_intersection(r1: CGRect, r2: CGRect) -> CGRect {
     if r1 == CGRectNull || r2 == CGRectNull {
         return CGRectNull;
     }
+    let r1 = standardize_rect(r1);
+    let r2 = standardize_rect(r2);
     let x1 = r1.origin.x.max(r2.origin.x);
     let y1 = r1.origin.y.max(r2.origin.y);
     let x2 = (r1.origin.x + r1.size.width).min(r2.origin.x + r2.size.width);
     let y2 = (r1.origin.y + r1.size.height).min(r2.origin.y + r2.size.height);
-    if x2 <= x1 || y2 <= y1 {
+    if x2 < x1 || y2 < y1 {
         return CGRectNull;
     }
     CGRect {
@@ -787,6 +790,10 @@ fn rect_divide(rect: CGRect, amount: CGFloat, edge: u32) -> (CGRect, CGRect) {
 /// Returns a rectangle with a positive width and height by flipping the origin
 /// if either dimension is negative.
 fn CGRectStandardize(_env: &mut Environment, rect: CGRect) -> CGRect {
+    standardize_rect(rect)
+}
+
+fn standardize_rect(rect: CGRect) -> CGRect {
     if rect == CGRectNull {
         return CGRectNull;
     }
@@ -1059,5 +1066,49 @@ mod geometry_string_tests {
         ] {
             assert!(text.parse::<CGRect>().is_err(), "{text}");
         }
+    }
+}
+
+#[cfg(test)]
+mod intersection_tests {
+    use super::*;
+    fn r(x: f32, y: f32, w: f32, h: f32) -> CGRect {
+        CGRect {
+            origin: CGPoint { x, y },
+            size: CGSize {
+                width: w,
+                height: h,
+            },
+        }
+    }
+    #[test]
+    fn point_projectiles_intersect_enemy_extents() {
+        let enemy = r(240.0, 73.0, 36.0, 61.0);
+        let point = r(258.0, 99.5, 0.0, 0.0);
+        assert_eq!(rect_intersection(enemy, point), point);
+        assert_eq!(rect_intersection(point, enemy), point);
+        assert_eq!(
+            rect_intersection(enemy, r(277.0, 99.5, 0.0, 0.0)),
+            CGRectNull
+        );
+    }
+    #[test]
+    fn closed_edges_and_negative_dimensions_match_core_graphics() {
+        let a = r(0.0, 0.0, 10.0, 10.0);
+        assert_eq!(
+            rect_intersection(a, r(10.0, 2.0, 5.0, 4.0)),
+            r(10.0, 2.0, 0.0, 4.0)
+        );
+        assert_eq!(
+            rect_intersection(a, r(10.0, 10.0, 5.0, 4.0)),
+            r(10.0, 10.0, 0.0, 0.0)
+        );
+        assert_eq!(
+            rect_intersection(a, r(12.0, 12.0, -5.0, -5.0)),
+            r(7.0, 7.0, 3.0, 3.0)
+        );
+        assert_eq!(rect_intersection(a, r(11.0, 0.0, 5.0, 4.0)), CGRectNull);
+        assert_eq!(rect_intersection(a, CGRectNull), CGRectNull);
+        assert_eq!(rect_intersection(CGRectNull, a), CGRectNull);
     }
 }

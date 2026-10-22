@@ -60,15 +60,15 @@ done
 case "$MODE" in
     unsigned)
         ENTITLEMENTS=
-        DEFAULT_OUTPUT="$REPO/dist/HyperHLE-iOS-unsigned.ipa"
+        DEFAULT_OUTPUT="$REPO/dist/BerryHLE-iOS-unsigned.ipa"
         ;;
     trollstore)
         ENTITLEMENTS="$ROOT/Config/TouchHLEHost-TrollStore.entitlements"
-        DEFAULT_OUTPUT="$REPO/dist/HyperHLE-iOS-trollstore.ipa"
+        DEFAULT_OUTPUT="$REPO/dist/BerryHLE-iOS-trollstore.ipa"
         ;;
     permanent)
         ENTITLEMENTS="$ROOT/Config/TouchHLEHost-TrollStore-PermanentJIT.entitlements"
-        DEFAULT_OUTPUT="$REPO/dist/HyperHLE-iOS-trollstore-permanent-jit.ipa"
+        DEFAULT_OUTPUT="$REPO/dist/BerryHLE-iOS-trollstore-permanent-jit.ipa"
         ;;
 esac
 

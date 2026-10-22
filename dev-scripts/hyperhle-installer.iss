@@ -1,4 +1,4 @@
-; Inno Setup script for the HyperHLE Windows installer.
+; Inno Setup script for the BerryHLE Windows installer.
 ;
 ; Packages the output of make-windows-bundle.sh plus the documentation that
 ; the release zip ships. Build it with Inno Setup 6.3 or newer, e.g.:
@@ -9,7 +9,7 @@
 ;
 ; touchHLE reads its resources from, and writes user data (sandbox, options,
 ; picker settings) to, the current directory. Shortcuts therefore start it
-; from the install directory, which has to be writable: by default HyperHLE is
+; from the install directory, which has to be writable: by default BerryHLE is
 ; installed per-user, and an all-users install grants users write access.
 
 #ifndef AppVersion
@@ -26,7 +26,7 @@
   #define OutputDir "."
 #endif
 
-#define AppName "HyperHLE"
+#define AppName "BerryHLE"
 #define AppExeName "touchHLE.exe"
 
 [Setup]
@@ -35,10 +35,10 @@ AppId={{240E0CC4-02F5-4DEB-A0F8-902393AEB609}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
-AppPublisher=HyperHLE Reborn contributors
-AppPublisherURL=https://github.com/KlugKlugTG/HyperHLE-Reborn
-AppSupportURL=https://github.com/KlugKlugTG/HyperHLE-Reborn/issues
-AppUpdatesURL=https://github.com/KlugKlugTG/HyperHLE-Reborn/releases
+AppPublisher=BerryHLE contributors
+AppPublisherURL=https://github.com/BerryPVZ/BerryHLE
+AppSupportURL=https://github.com/BerryPVZ/BerryHLE/issues
+AppUpdatesURL=https://github.com/BerryPVZ/BerryHLE/releases
 VersionInfoVersion={#AppNumericVersion}
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
@@ -50,7 +50,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 SetupIconFile=..\res\icon.ico
 UninstallDisplayIcon={app}\{#AppExeName}
 OutputDir={#OutputDir}
-OutputBaseFilename=HyperHLE_Windows_x86_64_Setup
+OutputBaseFilename=BerryHLE_Windows_x86_64_Setup
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Package HyperHLE release zips and write release notes for action-gh-release.
+# Package BerryHLE release zips and write release notes for action-gh-release.
 set -eu
 
 VERSION="$1"
@@ -37,6 +37,7 @@ done
 
 macos_dmg=""
 for candidate in \
+    artifacts/macos/BerryHLE.dmg \
     artifacts/macos/HyperHLE.dmg \
     artifacts/macos/touchHLE.dmg
 do
@@ -48,7 +49,7 @@ done
 
 android_apk=""
 for candidate in \
-    artifacts/android/HyperHLE-Reborn.apk \
+    artifacts/android/BerryHLE.apk \
     artifacts/android/touchHLE.apk
 do
     if [ -e "$candidate" ]; then
@@ -67,7 +68,7 @@ if [ -z "$windows_exe" ]; then
     echo "Missing build artifact (all platform builds must succeed): artifacts/windows/touchHLE.exe" >&2
     exit 1
 fi
-windows_installer="artifacts/windows-installer/HyperHLE_Windows_x86_64_Setup.exe"
+windows_installer="artifacts/windows-installer/BerryHLE_Windows_x86_64_Setup.exe"
 if [ ! -f "$windows_installer" ]; then
     echo "Missing build artifact (all platform builds must succeed): $windows_installer" >&2
     exit 1
@@ -76,7 +77,7 @@ if [ -z "$linux_bin" ]; then
     echo "Missing build artifact (all platform builds must succeed): artifacts/linux/touchHLE" >&2
     exit 1
 fi
-ios_ipas="HyperHLE-iOS-unsigned.ipa HyperHLE-iOS-trollstore.ipa HyperHLE-iOS-trollstore-permanent-jit.ipa"
+ios_ipas="BerryHLE-iOS-unsigned.ipa BerryHLE-iOS-trollstore.ipa BerryHLE-iOS-trollstore-permanent-jit.ipa"
 for ipa in $ios_ipas; do
     if [ ! -f "artifacts/ios/$ipa" ]; then
         echo "Missing build artifact (all platform builds must succeed): artifacts/ios/$ipa" >&2
@@ -153,7 +154,7 @@ write_changelog() {
 }
 
 {
-    printf '%s\n\n' "HyperHLE ${VERSION}"
+    printf '%s\n\n' "BerryHLE ${VERSION}"
     if [ "${FORCE_HYPERHLE_RELEASE:-}" = "true" ]; then
         printf '%s\n\n' "_Manual release — changelog shows the latest 6 commits._"
     fi
@@ -170,7 +171,7 @@ write_changelog() {
 cd "$ROOT/dev-scripts"
 ./prepare-release.sh --prepare-files
 
-prefix="HyperHLE"
+prefix="BerryHLE"
 
 ./prepare-release.sh --create-zip-macos "$ROOT/$macos_dmg" \
     -o "$ROOT/release/${prefix}_macOS_x86_64.zip"
@@ -183,7 +184,7 @@ prefix="HyperHLE"
     "$ROOT/$linux_bin" \
     -o "$ROOT/release/${prefix}_Linux_x86_64.zip"
 # The Windows installer is attached as it is (see build-win).
-cp "$ROOT/$windows_installer" "$ROOT/release/HyperHLE_Windows_x86_64_Setup.exe"
+cp "$ROOT/$windows_installer" "$ROOT/release/BerryHLE_Windows_x86_64_Setup.exe"
 # The iOS IPAs are attached as they are (see build-ios in HyperHLE_release.yml).
 for ipa in $ios_ipas; do
     cp "$ROOT/artifacts/ios/$ipa" "$ROOT/release/$ipa"

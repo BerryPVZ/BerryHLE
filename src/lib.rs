@@ -190,11 +190,11 @@ pub extern "C" fn SDL_main(
     match main([String::new()].into_iter()) {
         Ok(termination) => {
             let code = termination.map_or(0, |result| result.exit_code());
-            echo!("touchHLE finished with status {code}");
+            echo!("BerryHLE finished with status {code}");
             code
         }
         Err(e) => {
-            echo!("touchHLE errored: {e:?}");
+            echo!("BerryHLE errored: {e:?}");
             1
         }
     }
@@ -259,7 +259,7 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<Option<GuestTermi
     }
 
     echo!(
-        "touchHLE {}{}{}",
+        "BerryHLE {}{}{}",
         branding(),
         if branding().is_empty() { "" } else { " " },
         VERSION,
