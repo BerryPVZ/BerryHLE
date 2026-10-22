@@ -77,6 +77,150 @@ impl PerfHints {
     }
 }
 
+#[cfg(any(target_os = "android", test))]
+fn select_high_capacity_cores(values: &[(usize, u64)]) -> Option<Vec<usize>> {
+    if values.len() < 2 {
+        return None;
+    }
+    let max = values.iter().map(|(_, capacity)| *capacity).max()?;
+    let threshold = max.saturating_sub(max / 10);
+    let cores: Vec<usize> = values
+        .iter()
+        .filter(|(_, capacity)| *capacity >= threshold)
+        .map(|(cpu, _)| *cpu)
+        .collect();
+    if cores.len() == values.len() {
+        None
+    } else {
+        Some(cores)
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn arm_core_performance_cores(cpuinfo: &str) -> Option<Vec<usize>> {
+    let mut records = Vec::new();
+    let mut processor = None;
+    let mut implementer = None;
+    let mut part = None;
+
+    for line in cpuinfo.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        match key.trim() {
+            "processor" => {
+                if processor.is_some() {
+                    records.push((processor.take()?, implementer.take()?, part.take()?));
+                }
+                processor = value.trim().parse::<usize>().ok();
+                if processor.is_none() {
+                    return None;
+                }
+            }
+            "CPU implementer" => implementer = parse_cpuinfo_hex(value),
+            "CPU part" => part = parse_cpuinfo_hex(value),
+            _ => {}
+        }
+    }
+
+    if processor.is_some() {
+        records.push((processor.take()?, implementer.take()?, part.take()?));
+    }
+    if records.len() < 2 {
+        return None;
+    }
+
+    let mut high_performance_cores = Vec::new();
+    let mut has_efficiency_core = false;
+    for (processor, implementer, part) in records {
+        if arm_core_is_high_performance(implementer, part)? {
+            high_performance_cores.push(processor);
+        } else {
+            has_efficiency_core = true;
+        }
+    }
+
+    if high_performance_cores.is_empty() || !has_efficiency_core {
+        None
+    } else {
+        Some(high_performance_cores)
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn parse_cpuinfo_hex(value: &str) -> Option<u32> {
+    let value = value.trim();
+    let value = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    u32::from_str_radix(value, 16).ok()
+}
+
+#[cfg(any(target_os = "android", test))]
+fn arm_core_is_high_performance(implementer: u32, part: u32) -> Option<bool> {
+    if implementer != 0x41 {
+        return None;
+    }
+    match part {
+        0xd03 | 0xd04 | 0xd05 | 0xd06 | 0xd46 | 0xd80 | 0xd8f => Some(false),
+        0xd07 | 0xd08 | 0xd09 | 0xd0a | 0xd0b | 0xd0c | 0xd0d | 0xd0e | 0xd41 | 0xd42 | 0xd44
+        | 0xd47 | 0xd48 | 0xd49 | 0xd4b | 0xd4c | 0xd4d | 0xd4e | 0xd4f | 0xd81 | 0xd82 | 0xd83
+        | 0xd84 | 0xd85 | 0xd87 | 0xd89 | 0xd8e => Some(true),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{arm_core_performance_cores, select_high_capacity_cores};
+
+    #[test]
+    fn selects_high_capacity_cluster() {
+        assert_eq!(
+            select_high_capacity_cores(&[(0, 512), (1, 512), (2, 1024), (3, 1024)]),
+            Some(vec![2, 3])
+        );
+    }
+
+    #[test]
+    fn includes_cores_within_ten_percent_of_maximum() {
+        assert_eq!(
+            select_high_capacity_cores(&[(0, 100), (1, 90), (2, 89)]),
+            Some(vec![0, 1])
+        );
+    }
+
+    #[test]
+    fn leaves_homogeneous_or_unknown_topology_unpinned() {
+        assert_eq!(select_high_capacity_cores(&[(0, 512), (1, 512)]), None);
+        assert_eq!(select_high_capacity_cores(&[(0, 512)]), None);
+        assert_eq!(select_high_capacity_cores(&[]), None);
+    }
+
+    #[test]
+    fn selects_cortex_a75_cores_when_frequency_limits_are_identical() {
+        let mut cpuinfo = String::new();
+        for processor in 0..8 {
+            let part = if processor < 6 { 0xd05 } else { 0xd0a };
+            cpuinfo.push_str(&format!(
+                "processor : {processor}\nCPU implementer : 0x41\nCPU part : 0x{part:x}\n\n"
+            ));
+        }
+        assert_eq!(arm_core_performance_cores(&cpuinfo), Some(vec![6, 7]));
+    }
+
+    #[test]
+    fn does_not_guess_for_homogeneous_unknown_or_incomplete_cpuinfo() {
+        let homogeneous = "processor : 0\nCPU implementer : 0x41\nCPU part : 0xd05\n\nprocessor : 1\nCPU implementer : 0x41\nCPU part : 0xd05";
+        let unknown = "processor : 0\nCPU implementer : 0x51\nCPU part : 0xd05\n\nprocessor : 1\nCPU implementer : 0x51\nCPU part : 0xd0a";
+        let incomplete = "processor : 0\nCPU implementer : 0x41\n\nprocessor : 1\nCPU implementer : 0x41\nCPU part : 0xd0a";
+        assert_eq!(arm_core_performance_cores(homogeneous), None);
+        assert_eq!(arm_core_performance_cores(unknown), None);
+        assert_eq!(arm_core_performance_cores(incomplete), None);
+    }
+}
+
 #[cfg(target_os = "android")]
 mod android {
     use std::ffi::{c_int, c_void, CStr};
@@ -169,63 +313,92 @@ mod android {
         set_affinity(&cores, &format!("CPU list {override_}"));
     }
 
-    /// The CPUs of the big cluster, discovered from sysfs. `None` when the
-    /// layout can't be determined or there is nothing to pin to.
+    fn scheduler_capacity_cores() -> Option<Vec<usize>> {
+        let mut capacities = Vec::new();
+        for cpu in 0..64 {
+            let path = format!("/sys/devices/system/cpu/cpu{cpu}/cpu_capacity");
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(capacity) = text.trim().parse::<u64>() {
+                    capacities.push((cpu, capacity));
+                }
+            }
+        }
+        super::select_high_capacity_cores(&capacities)
+    }
+
+    /// Discover the fastest cluster without guessing when the host exposes no topology.
     fn big_core_cpus() -> Option<Vec<usize>> {
+        if let Some(cores) = scheduler_capacity_cores() {
+            log!(
+                "CPU affinity: scheduler capacity selected high-performance cores {:?}.",
+                cores
+            );
+            return Some(cores);
+        }
+
         let mut freqs: Vec<(usize, u64)> = Vec::new();
         for cpu in 0..64 {
             let path = format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_max_freq");
-            if !std::path::Path::new(&path).exists() {
-                if cpu == 0 {
-                    return None;
-                }
-                continue;
-            }
-            if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(text) = std::fs::read_to_string(path) {
                 if let Ok(khz) = text.trim().parse::<u64>() {
                     freqs.push((cpu, khz));
                 }
             }
         }
-        if freqs.len() < 2 {
-            return None;
-        }
-        let max = freqs.iter().map(|(_, f)| *f).max()?;
-        // A core is "big" when within 10% of the fastest core: 2.7 GHz
-        // against a 2.2 GHz mid cluster does not qualify, sibling big cores
-        // (e.g. 3.19 GHz vs 3.00 GHz on the same SoC) do.
-        let big: Vec<usize> = freqs
-            .iter()
-            .filter(|(_, f)| *f * 10 >= max * 9)
-            .map(|(cpu, _)| *cpu)
-            .collect();
-        // Nothing to gain from pinning when every core qualifies.
-        if big.len() == freqs.len() {
+        if freqs.len() >= 2 {
+            let max = freqs.iter().map(|(_, f)| *f).max()?;
+            let big: Vec<usize> = freqs
+                .iter()
+                .filter(|(_, f)| *f * 10 >= max * 9)
+                .map(|(cpu, _)| *cpu)
+                .collect();
+            if big.len() < freqs.len() {
+                return Some(big);
+            }
             log!(
-                "CPU affinity: all {} cores run at the same maximum frequency, leaving the scheduler alone.",
+                "CPU affinity: all {} cores report the same top frequency; checking ARM core types.",
                 freqs.len()
             );
-            return None;
         }
-        Some(big)
+
+        let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+        let cores = super::arm_core_performance_cores(&cpuinfo)?;
+        log!(
+            "CPU affinity: ARM CPU part IDs selected high-performance cores {:?}.",
+            cores
+        );
+        Some(cores)
     }
 
     /// Apply a CPU affinity mask to the calling thread. Logging is best
     /// effort: affinity is an optimization, never a correctness requirement.
     fn set_affinity(cores: &[usize], what: &str) -> bool {
-        // SAFETY: a zeroed `cpu_set_t` is valid (an empty set), and
-        // `CPU_SET` refuses indices >= CPU_SETSIZE.
+        let cpu_set_size = ::libc::CPU_SETSIZE as usize;
+        if cores.is_empty() {
+            log!(
+                "Could not pin the emulator thread to the {}: empty CPU set.",
+                what
+            );
+            return false;
+        }
+        if let Some(&cpu) = cores.iter().find(|&&cpu| cpu >= cpu_set_size) {
+            log!(
+                "Could not pin the emulator thread to the {}: CPU {} exceeds this process's {}-CPU affinity mask.",
+                what,
+                cpu,
+                cpu_set_size
+            );
+            return false;
+        }
+
+        // SAFETY: each CPU index is below CPU_SETSIZE and `set` is zeroed.
         unsafe {
             let mut set: ::libc::cpu_set_t = std::mem::zeroed();
             ::libc::CPU_ZERO(&mut set);
             for &cpu in cores {
                 ::libc::CPU_SET(cpu, &mut set);
             }
-            let res = ::libc::sched_setaffinity(
-                0,
-                std::mem::size_of::<::libc::cpu_set_t>(),
-                &set,
-            );
+            let res = ::libc::sched_setaffinity(0, std::mem::size_of::<::libc::cpu_set_t>(), &set);
             if res == 0 {
                 log!(
                     "Emulator thread pinned to the {} (cores {:?}).",
@@ -253,8 +426,7 @@ mod android {
     /// resolved at runtime from `libandroid.so`.
     struct Api {
         get_manager: unsafe extern "C" fn() -> *mut APerformanceHintManager,
-        get_preferred_update_rate_nanos:
-            unsafe extern "C" fn(*mut APerformanceHintManager) -> i64,
+        get_preferred_update_rate_nanos: unsafe extern "C" fn(*mut APerformanceHintManager) -> i64,
         create_session: unsafe extern "C" fn(
             *mut APerformanceHintManager,
             *const i32,
@@ -293,7 +465,9 @@ mod android {
                     get_preferred_update_rate_nanos: std::mem::transmute::<
                         *mut c_void,
                         unsafe extern "C" fn(*mut APerformanceHintManager) -> i64,
-                    >(sym(c"APerformanceHint_getPreferredUpdateRateNanos")?),
+                    >(sym(
+                        c"APerformanceHint_getPreferredUpdateRateNanos",
+                    )?),
                     create_session: std::mem::transmute::<
                         *mut c_void,
                         unsafe extern "C" fn(
@@ -301,12 +475,15 @@ mod android {
                             *const i32,
                             usize,
                             i64,
-                        ) -> *mut APerformanceHintSession,
+                        )
+                            -> *mut APerformanceHintSession,
                     >(sym(c"APerformanceHint_createSession")?),
                     report_actual_work_duration: std::mem::transmute::<
                         *mut c_void,
                         unsafe extern "C" fn(*mut APerformanceHintSession, i64) -> c_int,
-                    >(sym(c"APerformanceHint_reportActualWorkDuration")?),
+                    >(sym(
+                        c"APerformanceHint_reportActualWorkDuration",
+                    )?),
                     close_session: std::mem::transmute::<
                         *mut c_void,
                         unsafe extern "C" fn(*mut APerformanceHintSession),

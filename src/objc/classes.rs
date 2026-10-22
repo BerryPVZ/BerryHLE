@@ -494,7 +494,7 @@ fn substitute_classes(
         }
     }
 
-    log!(
+    log_dbg!(
         "Note: substituting fake class for {} to improve compatibility",
         name
     );
@@ -965,7 +965,7 @@ impl ObjC {
                     (host.name.clone(), host.superclass)
                 };
                 let superclass_name = self.borrow::<ClassHostObject>(superclass).name.clone();
-                log!(
+                log_dbg!(
                     "Class {} need ivar reconciliation with superclass {}!",
                     name,
                     superclass_name
@@ -2491,15 +2491,14 @@ pub fn objc_autorelease(env: &mut crate::Environment, obj: id) -> id {
 /// id objc_retainBlock(id x) { return (id)_Block_copy(x); }
 /// ```
 ///
-/// touchHLE's `_Block_copy` (see `src/libc/blocks.rs`) does not physically
-/// duplicate the block — global blocks (the common case for static literal
-/// blocks) are not reference-counted, and stack-block promotion needs deeper
-/// Block ABI work — so it returns the same pointer. Mirroring that here keeps
-/// `objc_retainBlock` consistent with the rest of the Block runtime, while
-/// still providing the correct return value the ARC-generated code expects.
+/// ARC emits this whenever a block is stored, so a stack block has to be
+/// promoted to the heap here like in `_Block_copy` (see `src/libc/blocks.rs`).
+/// Returning the stack block itself left a dangling pointer once its frame
+/// was gone: Bolts' `BFExecutor` (Charlie, the Steak) then jumped to whatever
+/// the reused stack held in place of the invoke function.
 pub fn objc_retainBlock(env: &mut crate::Environment, block: id) -> id {
-    let _ = env;
-    block
+    let copy = crate::libc::blocks::_Block_copy(env, block.cast().cast_const());
+    copy.cast_mut().cast()
 }
 
 /// `IMP imp_implementationWithBlock(id block)` — returns an IMP that invokes

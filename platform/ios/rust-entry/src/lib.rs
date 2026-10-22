@@ -32,7 +32,14 @@ fn run_touchhle(args: Vec<String>) -> i32 {
     }));
 
     match outcome {
-        Ok(Ok(())) => 0,
+        Ok(Ok(termination)) => {
+            if let Some(termination) = termination {
+                eprintln!("Guest session ended: {termination:?}");
+            }
+            // This ABI reports host failures to the launcher. A guest exit,
+            // including a crash, must not become a "could not start" error.
+            0
+        }
         Ok(Err(error)) => {
             eprintln!("touchHLE failed: {error}");
             1

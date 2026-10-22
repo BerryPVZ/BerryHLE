@@ -81,8 +81,19 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; this hashTableWithOptions:5u32]
 }
 
-- (id)copyWithZone:(NSZonePtr)_zone {
-    crate::objc::retain(env, this)
+- (id)copyWithZone:(NSZonePtr)zone {
+    let options = env.objc.borrow::<HashTableHostObject>(this).options;
+    // allObjects keeps the members alive while building an independent table.
+    let objects: id = msg![env; this allObjects];
+    let count: NSUInteger = msg![env; objects count];
+    let class: id = msg![env; this class];
+    let copy: id = msg![env; class allocWithZone:zone];
+    let copy: id = msg![env; copy initWithOptions:options capacity:count];
+    for index in 0..count {
+        let object: id = msg![env; objects objectAtIndex:index];
+        () = msg![env; copy addObject:object];
+    }
+    copy
 }
 
 - (id)init {

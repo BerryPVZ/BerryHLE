@@ -9,7 +9,9 @@
 use std::time::Instant;
 
 use crate::audio::openal::al_types::{ALsizei, ALuint, ALvoid};
-use crate::audio::openal::{AL_BUFFERS_PROCESSED, AL_BUFFERS_QUEUED, AL_PLAYING, AL_SOURCE_STATE};
+use crate::audio::openal::{
+    AL_BUFFERS_PROCESSED, AL_BUFFERS_QUEUED, AL_GAIN, AL_PITCH, AL_PLAYING, AL_SOURCE_STATE,
+};
 
 const AL_POSITION: i32 = 0x1004;
 const AL_REFERENCE_DISTANCE: i32 = 0x1020;
@@ -217,6 +219,8 @@ const kAudioUnitProperty_3DMixerRenderingFlags: AudioUnitPropertyID = fourcc(b"3
 const k3DMixerParam_Azimuth: AudioUnitParameterID = 0;
 const k3DMixerParam_Elevation: AudioUnitParameterID = 1;
 const k3DMixerParam_Distance: AudioUnitParameterID = 2;
+const k3DMixerParam_Gain: AudioUnitParameterID = 3;
+const k3DMixerParam_PlaybackRate: AudioUnitParameterID = 4;
 
 // =========================================================================
 // MARK: - Инициализация / Деинициализация AudioUnit
@@ -425,6 +429,8 @@ fn AudioUnitSetProperty(
         in_data_size
     );
     let mut update_al_distance = None;
+    let mut make_connection = None;
+    let mut set_up_running_unit = false;
 
     // Ограничиваем область видимости заимствования
     {
@@ -467,12 +473,21 @@ fn AudioUnitSetProperty(
                 let render_callback = env
                     .mem
                     .read::<AURenderCallbackStruct, false>(in_data.cast());
+                // A NULL procedure removes the callback.
+                let callback = if render_callback.input_proc.addr_with_thumb_bit() == 0 {
+                    None
+                } else {
+                    Some(render_callback)
+                };
                 if in_scope == kAudioUnitScope_Input {
                     let bus = host_object.mixer_buses.entry(in_element).or_default();
-                    bus.render_callback = Some(render_callback);
+                    bus.render_callback = callback;
                 } else {
-                    host_object.render_callback = Some(render_callback);
+                    host_object.render_callback = callback;
                 }
+                // A unit that is already rendering needs an OpenAL source for
+                // the new callback.
+                set_up_running_unit = callback.is_some() && host_object.started;
                 let proc_copy = render_callback.input_proc;
                 let ref_con_copy = render_callback.input_proc_ref_con;
                 log_dbg!(
@@ -572,6 +587,7 @@ fn AudioUnitSetProperty(
                     src_unit,
                     src_out
                 );
+                make_connection = Some((dst_in, src_unit));
             }
             kAudioOutputUnitProperty_EnableIO => {
                 let enabled: u32 = env.mem.read::<u32, false>(in_data.cast());
@@ -691,12 +707,11 @@ fn AudioUnitSetProperty(
         }
     }
 
-    // Games attach effects while their mixer graph is already running.
-    if in_id == kAudioUnitProperty_SetRenderCallback
-        && audio_components::State::get(&mut env.framework_state)
-            .audio_component_instances.get(&in_unit).is_some_and(|obj| obj.started)
-    {
+    if set_up_running_unit {
         setup_audio_unit_for_render(env, in_unit);
+    }
+    if let Some((dest_input, source)) = make_connection {
+        connect_audio_units(env, in_unit, dest_input, source);
     }
 
     // Audio Unit Services notifies property listeners synchronously after a
@@ -705,6 +720,168 @@ fn AudioUnitSetProperty(
     notify_audio_unit_property(env, in_unit, in_id, in_scope, in_element);
 
     0
+}
+
+// =========================================================================
+// MARK: - Connections (kAudioUnitProperty_MakeConnection)
+// =========================================================================
+//
+// Every unit with a render callback is played through OpenAL sources of its
+// own and OpenAL mixes them, so a connection doesn't carry audio. What it
+// decides is whether a unit is pulled at all: on iOS a unit only renders while
+// a running output unit pulls on it, directly or through other units (e.g.
+// per-voice converters feeding a mixer feeding RemoteIO, as built by hand in
+// Plants vs. Zombies HD instead of with an AUGraph).
+
+/// The units connected to the inputs of `unit`.
+fn units_feeding(env: &mut Environment, unit: AudioUnit) -> Vec<AudioUnit> {
+    audio_components::State::get(&mut env.framework_state)
+        .connections
+        .iter()
+        .filter(|((dest, _), _)| *dest == unit)
+        .map(|(_, src)| *src)
+        .collect()
+}
+
+/// Whether `unit` is, or feeds into, an output unit that has been started.
+fn feeds_running_output(env: &mut Environment, unit: AudioUnit) -> bool {
+    let state = audio_components::State::get(&mut env.framework_state);
+    let mut pending = vec![unit];
+    let mut visited = Vec::new();
+    while let Some(unit) = pending.pop() {
+        if visited.contains(&unit) {
+            continue;
+        }
+        visited.push(unit);
+        let is_running_output = state
+            .audio_component_instances
+            .get(&unit)
+            .is_some_and(|obj| {
+                obj.started
+                    && obj
+                        .component_desc
+                        .is_some_and(|(component_type, _, _)| component_type == fourcc(b"auou"))
+            });
+        if is_running_output {
+            return true;
+        }
+        pending.extend(
+            state
+                .connections
+                .iter()
+                .filter(|(_, src)| **src == unit)
+                .map(|((dest, _), _)| *dest),
+        );
+    }
+    false
+}
+
+/// Start or stop rendering every unit feeding `unit`.
+fn set_upstream_units_running(env: &mut Environment, unit: AudioUnit, running: bool) {
+    let sources = units_feeding(env, unit);
+    set_units_running(env, sources, running, 0);
+}
+
+/// Start or stop rendering `units` and every unit feeding them.
+fn set_units_running(env: &mut Environment, units: Vec<AudioUnit>, running: bool, depth: u32) {
+    // Core Audio rejects connection cycles; don't loop forever on one anyway.
+    if depth > 16 {
+        return;
+    }
+    for unit in units {
+        if running {
+            let needs_start = audio_components::State::get(&mut env.framework_state)
+                .audio_component_instances
+                .get(&unit)
+                .is_some_and(|obj| {
+                    !obj.started
+                        && (obj.render_callback.is_some()
+                            || obj.mixer_buses.values().any(|bus| bus.render_callback.is_some()))
+                });
+            if needs_start {
+                setup_audio_unit_for_render(env, unit);
+            }
+        } else if let Some(obj) = audio_components::State::get(&mut env.framework_state)
+            .audio_component_instances
+            .get_mut(&unit)
+        {
+            // Stop pulling on the callbacks. The OpenAL sources are kept so
+            // that what is already queued plays out, and are reused when the
+            // unit is connected again.
+            obj.started = false;
+            obj.last_render_time = None;
+            for bus in obj.mixer_buses.values_mut() {
+                bus.last_render_time = None;
+            }
+        }
+        let sources = units_feeding(env, unit);
+        set_units_running(env, sources, running, depth + 1);
+    }
+}
+
+fn connect_audio_units(
+    env: &mut Environment,
+    dest: AudioUnit,
+    dest_input: u32,
+    source: AudioUnit,
+) {
+    let connections = &mut audio_components::State::get(&mut env.framework_state).connections;
+    let old_source = if source.is_null() {
+        connections.remove(&(dest, dest_input))
+    } else {
+        connections.insert((dest, dest_input), source)
+    };
+    if let Some(old_source) = old_source.filter(|&old| old != source) {
+        if !feeds_running_output(env, old_source) {
+            set_units_running(env, vec![old_source], false, 0);
+        }
+    }
+    if !source.is_null() && feeds_running_output(env, dest) {
+        set_units_running(env, vec![source], true, 0);
+    }
+    if !source.is_null() {
+        apply_mixer_bus_gain_and_rate(env, dest, dest_input);
+    }
+}
+
+/// Apply a mixer input bus's gain and playback rate to the OpenAL sources
+/// playing it: the bus's own (if it has a render callback) and those of the
+/// unit connected to it. Real mixers apply them while mixing, but here each
+/// input is mixed by OpenAL.
+fn apply_mixer_bus_gain_and_rate(env: &mut Environment, mixer: AudioUnit, bus_id: u32) {
+    let state = audio_components::State::get(&mut env.framework_state);
+    let Some(bus) = state
+        .audio_component_instances
+        .get(&mixer)
+        .and_then(|obj| obj.mixer_buses.get(&bus_id))
+    else {
+        return;
+    };
+    let (gain, rate) = (bus.volume, bus.playback_rate);
+    let mut sources: Vec<ALuint> = bus.al_source.into_iter().collect();
+    if let Some(source_unit) = state
+        .connections
+        .get(&(mixer, bus_id))
+        .and_then(|unit| state.audio_component_instances.get(unit))
+    {
+        sources.extend(source_unit.al_source);
+        sources.extend(source_unit.mixer_buses.values().filter_map(|bus| bus.al_source));
+    }
+    if sources.is_empty() {
+        return;
+    }
+    let context = env
+        .framework_state
+        .audio_toolbox
+        .make_al_context_current(&mut env.openal_manager);
+    for source in sources {
+        unsafe {
+            context.Sourcef(source, AL_GAIN, gain.max(0.0));
+            // OpenAL accepts any positive pitch; Core Audio clamps the rate
+            // to 0.5-2.
+            context.Sourcef(source, AL_PITCH, rate.clamp(0.5, 2.0));
+        }
+    }
 }
 
 // =========================================================================
@@ -981,6 +1158,7 @@ fn AudioUnitSetParameter(
         in_value
     );
     let mut update_al_pos = None;
+    let mut update_bus_gain_and_rate = false;
 
     // Ограничиваем область видимости заимствования
     {
@@ -1008,9 +1186,28 @@ fn AudioUnitSetParameter(
                     update_al_pos = Some((source, bus.position));
                 }
             }
+            k3DMixerParam_Gain | k3DMixerParam_PlaybackRate
+                if in_scope == kAudioUnitScope_Input
+                    && host_object
+                        .component_desc
+                        .is_some_and(|(_, sub_type, _)| sub_type == fourcc(b"3dem")) =>
+            {
+                let bus = host_object.mixer_buses.entry(in_element).or_default();
+                if in_id == k3DMixerParam_Gain {
+                    // The gain is in decibels.
+                    bus.volume = 10f32.powf(in_value / 20.0);
+                } else {
+                    bus.playback_rate = in_value;
+                }
+                update_bus_gain_and_rate = true;
+            }
             _ => {}
         }
     } // Конец заимствования
+
+    if update_bus_gain_and_rate {
+        apply_mixer_bus_gain_and_rate(env, in_unit, in_element);
+    }
 
     // Теперь безопасно вызываем OpenAL
     if let Some((source, pos)) = update_al_pos {
@@ -1089,6 +1286,7 @@ fn AudioOutputUnitStart(env: &mut Environment, ci: AudioUnit) -> OSStatus {
     if !au_graph::start_graph_for_output(env, ci) {
         setup_audio_unit_for_render(env, ci);
     }
+    set_upstream_units_running(env, ci, true);
     0
 }
 
@@ -1189,6 +1387,7 @@ pub fn setup_audio_unit_for_render(env: &mut Environment, ci: AudioUnit) {
 
 fn AudioOutputUnitStop(env: &mut Environment, ci: AudioUnit) -> OSStatus {
     au_graph::stop_graph_for_output(env, ci);
+    set_upstream_units_running(env, ci, false);
     let was_started = audio_components::State::get(&mut env.framework_state)
         .audio_component_instances
         .get(&ci)
@@ -1874,9 +2073,116 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
 const AUDIO_RENDER_TARGET_DEPTH: i32 = 6;
 
 /// `kAudioUnitRenderAction_PreRender` / `PostRender` flags passed to render
-/// notify callbacks (see AudioUnitProperties.h).
-const kAudioUnitRenderAction_PreRender: u32 = 1 << 0;
-const kAudioUnitRenderAction_PostRender: u32 = 1 << 1;
+/// notify callbacks (see AUComponent.h).
+const kAudioUnitRenderAction_PreRender: u32 = 1 << 2;
+const kAudioUnitRenderAction_PostRender: u32 = 1 << 3;
+
+/// Run the render notifies of a unit that has no render callback of its own,
+/// such as a RemoteIO unit pulling from a mixer through a connection. Its
+/// input is rendered elsewhere (every callback has its own OpenAL source), but
+/// apps still expect the render cycle: Plants vs. Zombies HD connects, retunes
+/// and disconnects its voices from a post-render notify on RemoteIO.
+fn pump_render_notifies(
+    env: &mut Environment,
+    audio_unit: AudioUnit,
+    sample_rate: f64,
+    format: &AudioStreamBasicDescription,
+    last_render_time: Instant,
+    sample_time: f64,
+) {
+    let has_notifies = audio_components::State::get(&mut env.framework_state)
+        .audio_component_instances
+        .get(&audio_unit)
+        .is_some_and(|obj| !obj.render_notifies.is_empty());
+    if !has_notifies {
+        return;
+    }
+    let io_buffer_duration = env
+        .framework_state
+        .audio_toolbox
+        .audio_session
+        .current_hardware_io_buffer_duration as f64;
+    let nominal_frames = ((io_buffer_duration * sample_rate) as u32).clamp(64, 4096);
+    let now = Instant::now();
+    let elapsed_frames = (now.duration_since(last_render_time).as_secs_f64() * sample_rate) as u32;
+    if elapsed_frames < nominal_frames {
+        return;
+    }
+    let frames = elapsed_frames.min(4096);
+
+    // Hand over silence in the unit's format: one buffer, or one per channel
+    // for non-interleaved formats.
+    let planar = format.format_flags & kAudioFormatFlagIsNonInterleaved != 0;
+    let bytes_per_frame = if format.bytes_per_frame > 0 {
+        format.bytes_per_frame
+    } else {
+        4
+    };
+    let channels = format.channels_per_frame.clamp(1, 2);
+    let buffer_size = frames * bytes_per_frame;
+    let first = env.mem.alloc(buffer_size);
+    let (abl, second) = if planar && channels == 2 {
+        let second = env.mem.alloc(buffer_size);
+        let abl = env.mem.alloc_and_write(AudioBufferList::<2> {
+            number_buffers: 2,
+            buffers: [
+                AudioBuffer {
+                    number_channels: 1,
+                    data_byte_size: buffer_size,
+                    data: first,
+                },
+                AudioBuffer {
+                    number_channels: 1,
+                    data_byte_size: buffer_size,
+                    data: second,
+                },
+            ],
+        });
+        (abl.cast::<std::ffi::c_void>(), Some(second))
+    } else {
+        let abl = env.mem.alloc_and_write(AudioBufferList::<1> {
+            number_buffers: 1,
+            buffers: [AudioBuffer {
+                number_channels: if planar { 1 } else { channels },
+                data_byte_size: buffer_size,
+                data: first,
+            }],
+        });
+        (abl.cast::<std::ffi::c_void>(), None)
+    };
+    let action_flags = env.mem.alloc_and_write(0u32);
+    let timestamp = alloc_render_timestamp(env, sample_time);
+    for flag in [
+        kAudioUnitRenderAction_PreRender,
+        kAudioUnitRenderAction_PostRender,
+    ] {
+        call_render_notifies(
+            env,
+            audio_unit,
+            action_flags,
+            flag,
+            timestamp.cast_const(),
+            0,
+            frames,
+            abl,
+        );
+    }
+    env.mem.free(action_flags.cast_void());
+    env.mem.free(timestamp);
+    env.mem.free(abl);
+    env.mem.free(first);
+    if let Some(second) = second {
+        env.mem.free(second);
+    }
+
+    if let Some(obj) = audio_components::State::get(&mut env.framework_state)
+        .audio_component_instances
+        .get_mut(&audio_unit)
+    {
+        obj.last_render_time = Some(now);
+        obj.sample_time = sample_time + f64::from(frames);
+    }
+}
 
 pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
     if env.bundle.bundle_identifier().starts_with("com.ea.simcity") {
@@ -1959,7 +2265,7 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
         }
         return;
     };
-    let Some(_last_render_time) = last_render_time else {
+    let Some(last_render_time) = last_render_time else {
         log_once!("render_audio_unit: skipped (last_render_time = None)");
         if let Some(obj) = env
             .framework_state
@@ -1976,6 +2282,14 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
         // Без unit-level callback'а просто молча выходим: бус-рендер уже
         // сделан, а 3D Mixer / RemoteIO без своего собственного callback'а
         // — это нормальный кейс при работе через AUGraph.
+        pump_render_notifies(
+            env,
+            audio_unit,
+            sample_rate,
+            &stream_format,
+            last_render_time,
+            start_sample_time,
+        );
         if let Some(obj) = env
             .framework_state
             .audio_toolbox

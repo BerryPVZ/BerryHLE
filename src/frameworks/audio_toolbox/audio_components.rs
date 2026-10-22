@@ -62,6 +62,8 @@ pub struct MixerBusState {
     pub distance_params: MixerDistanceParams,
     pub render_callback: Option<AURenderCallbackStruct>,
     pub stream_format: Option<AudioStreamBasicDescription>,
+    /// `k3DMixerParam_PlaybackRate`, as a factor of the normal rate.
+    pub playback_rate: f32,
     pub last_render_time: Option<Instant>,
     /// Running total of frames handed to this bus's render callback, used as
     /// the `mSampleTime` of the `AudioTimeStamp` we pass to it. Must advance
@@ -84,6 +86,7 @@ impl Default for MixerBusState {
             },
             render_callback: None,
             stream_format: None,
+            playback_rate: 1.0,
             last_render_time: None,
             sample_time: 0.0,
         }
@@ -101,6 +104,9 @@ pub struct State {
     /// `AudioComponentInstanceHostObject::component_desc` при создании
     /// инстанса — для ответов на `kAudioUnitProperty_ClassInfo`.
     pub pending_component_desc: Option<(u32, u32, u32)>,
+    /// Connections made with `kAudioUnitProperty_MakeConnection`, from
+    /// (destination unit, input bus) to the source unit feeding it.
+    pub connections: HashMap<(AudioComponentInstance, u32), AudioComponentInstance>,
 }
 impl State {
     pub fn get(framework_state: &mut crate::frameworks::State) -> &mut Self {
@@ -357,9 +363,11 @@ fn AudioComponentInstanceDispose(
         return paramErr;
     }
 
-    State::get(&mut env.framework_state)
-        .audio_component_instances
-        .remove(&in_instance);
+    let state = State::get(&mut env.framework_state);
+    state.audio_component_instances.remove(&in_instance);
+    state
+        .connections
+        .retain(|&(dest, _), src| dest != in_instance && *src != in_instance);
     env.mem.free(in_instance.cast());
 
     0

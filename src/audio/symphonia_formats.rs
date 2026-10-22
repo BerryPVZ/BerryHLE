@@ -30,7 +30,8 @@
 //!   `channels()` accessors), replacing 0.5's `SignalSpec`.
 
 use std::io::Cursor;
-use symphonia::core::codecs::audio::well_known::CODEC_ID_MP3;
+use symphonia::core::audio::{Channels, Position};
+use symphonia::core::codecs::audio::well_known::{CODEC_ID_AAC, CODEC_ID_MP3};
 use symphonia::core::codecs::audio::{
     AudioCodecParameters, AudioDecoder, AudioDecoderOptions, CODEC_ID_NULL_AUDIO,
 };
@@ -199,35 +200,61 @@ pub fn decode_symphonia_to_pcm(file: Cursor<Vec<u8>>) -> Result<SymphoniaDecoded
     })
 }
 
-/// MP3 decoder fed one frame at a time, keeping its state between frames.
+/// MP3 or AAC decoder fed one frame at a time, keeping its state between
+/// frames.
 ///
 /// Layer III frames borrow bits from the frames before them (the "bit
-/// reservoir"), so a stream that arrives a frame or two at a time, like the
-/// packets an app enqueues on an `AudioQueue`, can't be decoded by starting
-/// afresh for each chunk.
-pub struct Mp3FrameDecoder {
+/// reservoir"), and AAC frames overlap-add with the previous frame's MDCT
+/// output, so a stream that arrives a frame or two at a time, like the packets
+/// an app enqueues on an `AudioQueue`, can't be decoded by starting afresh for
+/// each chunk.
+pub struct FrameDecoder {
     decoder: Box<dyn AudioDecoder>,
     packet_bytes: Vec<u8>,
 }
 
-impl Mp3FrameDecoder {
-    pub fn new() -> Option<Self> {
+impl FrameDecoder {
+    pub fn new_mp3() -> Option<Self> {
         let mut params = AudioCodecParameters::new();
         params.for_codec(CODEC_ID_MP3);
+        Self::with_params(&params, "MP3")
+    }
+
+    /// AAC-LC decoder for raw access units (no ADTS header) of a stream with
+    /// the given sample rate and channel count.
+    pub fn new_aac(sample_rate: u32, channels: u32) -> Option<Self> {
+        let channels = match channels {
+            1 => Position::FRONT_CENTER,
+            2 => Position::FRONT_LEFT | Position::FRONT_RIGHT,
+            _ => {
+                log!("AAC: unsupported channel count {}", channels);
+                return None;
+            }
+        };
+        let mut params = AudioCodecParameters::new();
+        params
+            .for_codec(CODEC_ID_AAC)
+            .with_sample_rate(sample_rate)
+            .with_channels(Channels::Positioned(channels));
+        Self::with_params(&params, "AAC")
+    }
+
+    fn with_params(params: &AudioCodecParameters, name: &str) -> Option<Self> {
         let decoder = symphonia::default::get_codecs()
-            .make_audio_decoder(&params, &AudioDecoderOptions::default())
-            .map_err(|e| log!("Symphonia failed to create MP3 decoder: {:?}", e))
+            .make_audio_decoder(params, &AudioDecoderOptions::default())
+            .map_err(|e| log!("Symphonia failed to create {} decoder: {:?}", name, e))
             .ok()?;
-        Some(Mp3FrameDecoder {
+        Some(FrameDecoder {
             decoder,
             packet_bytes: Vec::new(),
         })
     }
 
-    /// Decodes a single MPEG audio frame (header included) to 16-bit
-    /// little-endian interleaved PCM. Returns the PCM with its sample rate
-    /// and channel count, or [None] if the frame couldn't be decoded, which
-    /// is normal for the first frames after a discontinuity.
+    /// Decodes a single frame (an MPEG audio frame with its header, or a raw
+    /// AAC access unit) to 16-bit little-endian interleaved PCM. Returns the
+    /// PCM with its sample rate and channel count, or [None] if the frame
+    /// couldn't be decoded, which is normal for the first frames after a
+    /// discontinuity.
     pub fn decode_frame(&mut self, frame: &[u8]) -> Option<(&[u8], u32, u32)> {
         let packet = PacketRef::new(0, Timestamp::new(0), Duration::new(0), frame);
         let decoder = &mut self.decoder;
@@ -243,11 +270,11 @@ impl Mp3FrameDecoder {
         match result {
             Ok(Ok((rate, channels))) => Some((&self.packet_bytes, rate, channels as u32)),
             Ok(Err(e)) => {
-                log_dbg!("MP3 frame could not be decoded: {:?}", e);
+                log_dbg!("Audio frame could not be decoded: {:?}", e);
                 None
             }
             Err(_) => {
-                log!("Symphonia MP3 decoder panicked; resetting it");
+                log!("Symphonia frame decoder panicked; resetting it");
                 self.decoder.reset();
                 None
             }

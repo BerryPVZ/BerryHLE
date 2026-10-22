@@ -302,7 +302,10 @@ impl<T: SafeRead> SafeWrite for T {}
 // 4 GiB boundary so that off-by-one/OOB guest addresses (e.g. computations
 // yielding 0x1_0000_0000..0x1_0000_0fff) stay addressable instead of tripping
 // range assertions in the memory accessors.
-type Bytes = [u8; (1_usize << 32) + 4096];
+const GUEST_ADDRESS_SPACE_SIZE: usize = 1_usize << 32;
+const GUEST_MEMORY_TAIL_SIZE: usize = 4096;
+const GUEST_MEMORY_SIZE: usize = GUEST_ADDRESS_SPACE_SIZE + GUEST_MEMORY_TAIL_SIZE;
+type Bytes = [u8; GUEST_MEMORY_SIZE];
 pub const PAGE_SIZE: GuestUSize = 4096;
 pub const PAGE_SIZE_ALIGN_MASK: GuestUSize = 0xfff;
 
@@ -510,11 +513,39 @@ impl Mem {
         self.bytes.cast()
     }
 
-    fn bytes(&self) -> &Bytes {
-        unsafe { &*self.bytes }
-    }
-    fn bytes_mut(&mut self) -> &mut Bytes {
-        unsafe { &mut *self.bytes }
+    pub(crate) fn enable_fastmem(&mut self) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            if self.null_segment_size == 0 {
+                log!("Dynarmic Fastmem enabled (no reserved null segment).");
+                return true;
+            }
+            match unsafe {
+                crate::mem::host::protect_guest_null_segment(
+                    self.bytes.cast(),
+                    self.null_segment_size as usize,
+                )
+            } {
+                Ok(()) => {
+                    log!(
+                        "Dynarmic Fastmem enabled with a {}-byte guarded null segment.",
+                        self.null_segment_size
+                    );
+                    true
+                }
+                Err(error) => {
+                    log!(
+                        "Dynarmic Fastmem unavailable (could not guard null segment: {}); using page table.",
+                        error
+                    );
+                    false
+                }
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            false
+        }
     }
 
     // Soft handler for null-page accesses. No panic; returns a stub page.
@@ -655,13 +686,13 @@ impl Mem {
     fn guest_code_dump(mem: &Mem, addr: VAddr) -> String {
         let mut out = String::new();
         for word in 0..8u32 {
-            let at = addr.wrapping_add(word * 4) as usize;
-            match mem.bytes().get(at..).and_then(|s| s.get(..4)) {
-                Some(b) => out.push_str(&format!(
+            let at = addr.wrapping_add(word * 4);
+            match mem.get_bytes_fallible(ConstVoidPtr::from_bits(at), 4) {
+                Some(bytes) if bytes.len() == 4 => out.push_str(&format!(
                     "{:02x}{:02x}{:02x}{:02x} ",
-                    b[0], b[1], b[2], b[3]
+                    bytes[0], bytes[1], bytes[2], bytes[3]
                 )),
-                None => out.push_str("???????? "),
+                _ => out.push_str("???????? "),
             }
         }
         out
@@ -680,9 +711,14 @@ impl Mem {
             };
             return Some(&stub_slice[..count_usize.min(stub_slice.len())]);
         }
-        self.bytes()
-            .get(addr.to_bits() as usize..)?
-            .get(..count as usize)
+        let start = addr.to_bits() as usize;
+        let end = start.checked_add(count as usize)?;
+        if end > GUEST_MEMORY_SIZE {
+            return None;
+        }
+        Some(unsafe {
+            std::slice::from_raw_parts(self.bytes.cast::<u8>().add(start), count as usize)
+        })
     }
     /// Special version of [Self::bytes_at_mut] that returns [None] rather than
     /// panicking on failure.
@@ -696,9 +732,14 @@ impl Mem {
             return None;
             // GDB не должен писать в null-page
         }
-        self.bytes_mut()
-            .get_mut(addr.to_bits() as usize..)?
-            .get_mut(..count as usize)
+        let start = addr.to_bits() as usize;
+        let end = start.checked_add(count as usize)?;
+        if end > GUEST_MEMORY_SIZE {
+            return None;
+        }
+        Some(unsafe {
+            std::slice::from_raw_parts_mut(self.bytes.cast::<u8>().add(start), count as usize)
+        })
     }
 
     /// Get a slice for reading `count` bytes.
@@ -729,7 +770,7 @@ impl Mem {
         // another near-max address as a pointer (corrupted pointer arithmetic).
         let addr = ptr.to_bits() as usize;
         let end = addr.saturating_add(count as usize);
-        if end > self.bytes().len() || end < addr {
+        if end > GUEST_MEMORY_SIZE || end < addr {
             Self::null_check_fail(ptr.to_bits(), count, false, "bytes_at(OOB)", self);
             let offset = (ptr.to_bits() % PAGE_SIZE) as usize;
             let count_usize = count as usize;
@@ -737,7 +778,7 @@ impl Mem {
             let actual_count = count_usize.min(available);
             return unsafe { std::slice::from_raw_parts(self.null_page.add(offset), actual_count) };
         }
-        &self.bytes()[addr..][..count as usize]
+        unsafe { std::slice::from_raw_parts(self.bytes.cast::<u8>().add(addr), count as usize) }
     }
     /// Get a slice for reading `count` bytes without a null-page check.
     ///
@@ -750,8 +791,15 @@ impl Mem {
         count: GuestUSize,
     ) -> &[u8] {
         let addr = ptr.to_bits() as usize;
+        if ptr.to_bits() < self.null_segment_size {
+            let offset = (ptr.to_bits() % PAGE_SIZE) as usize;
+            let count_usize = count as usize;
+            let available = PAGE_SIZE as usize - offset;
+            let actual_count = count_usize.min(available);
+            return unsafe { std::slice::from_raw_parts(self.null_page.add(offset), actual_count) };
+        }
         let end = addr.saturating_add(count as usize);
-        if end > self.bytes().len() || end < addr {
+        if end > GUEST_MEMORY_SIZE || end < addr {
             Self::null_check_fail(ptr.to_bits(), count, false, "unchecked_bytes_at(OOB)", self);
             let offset = (ptr.to_bits() % PAGE_SIZE) as usize;
             let count_usize = count as usize;
@@ -759,7 +807,7 @@ impl Mem {
             let actual_count = count_usize.min(available);
             return unsafe { std::slice::from_raw_parts(self.null_page.add(offset), actual_count) };
         }
-        &self.bytes()[addr..][..count as usize]
+        unsafe { std::slice::from_raw_parts(self.bytes.cast::<u8>().add(addr), count as usize) }
     }
     /// Get a slice for reading or writing `count` bytes.
     /// This is the basic
@@ -789,7 +837,7 @@ impl Mem {
         // address space (e.g. corrupted pointer = 0xFFFFFFFF).
         let addr = ptr.to_bits() as usize;
         let end = addr.saturating_add(count as usize);
-        if end > self.bytes().len() || end < addr {
+        if end > GUEST_MEMORY_SIZE || end < addr {
             Self::null_check_fail(ptr.to_bits(), count, true, "bytes_at_mut(OOB)", self);
             let offset = (ptr.to_bits() % PAGE_SIZE) as usize;
             let count_usize = count as usize;
@@ -799,7 +847,7 @@ impl Mem {
                 std::slice::from_raw_parts_mut(self.null_page.add(offset), actual_count)
             };
         }
-        &mut self.bytes_mut()[addr..][..count as usize]
+        unsafe { std::slice::from_raw_parts_mut(self.bytes.cast::<u8>().add(addr), count as usize) }
     }
 
     /// Get a pointer for reading an array of `count` elements of type `T`.
@@ -867,10 +915,11 @@ impl Mem {
     ///
     /// Panics if the host pointer is not addressing a location in guest memory.
     pub fn host_ptr_to_guest_ptr(&self, host_ptr: *const std::ffi::c_void) -> ConstVoidPtr {
-        let host_ptr = host_ptr.cast::<u8>();
-        let guest_mem_range = self.bytes().as_ptr_range();
-        assert!(guest_mem_range.contains(&host_ptr));
-        let guest_addr = host_ptr as usize - guest_mem_range.start as usize;
+        let host_ptr = host_ptr as usize;
+        let guest_mem_start = self.bytes.cast::<u8>() as usize;
+        let guest_mem_end = guest_mem_start + GUEST_MEMORY_SIZE;
+        assert!((guest_mem_start..guest_mem_end).contains(&host_ptr));
+        let guest_addr = host_ptr - guest_mem_start;
         // XaView BypassGuestAddrOverflow: the extended address space (see
         // `Bytes`) can legitimately produce addresses past 32 bits; truncate
         // instead of panicking.
@@ -882,8 +931,9 @@ impl Mem {
     /// APIs (e.g. client-side OpenGL vertex arrays): a pointer outside this
     /// range is wild and dereferencing it on the host would crash the emulator.
     pub fn is_host_ptr_in_guest_mem(&self, host_ptr: *const std::ffi::c_void) -> bool {
-        let host_ptr = host_ptr.cast::<u8>();
-        self.bytes().as_ptr_range().contains(&host_ptr)
+        let host_ptr = host_ptr as usize;
+        let guest_mem_start = self.bytes.cast::<u8>() as usize;
+        (guest_mem_start..guest_mem_start + GUEST_MEMORY_SIZE).contains(&host_ptr)
     }
 
     /// Read a value for memory.
@@ -930,7 +980,7 @@ impl Mem {
         let src_addr = src.to_bits() as usize;
         let dest_addr = dest.to_bits() as usize;
         let size_us = size as usize;
-        let max = self.bytes_mut().len();
+        let max = GUEST_MEMORY_SIZE;
 
         // Early reject: if size looks like a negative i32 cast to u32
         // (>= 0x8000_0000), it's almost certainly corrupted. Guest code on
@@ -987,8 +1037,83 @@ impl Mem {
         };
         let _ = (src_end, dest_end);
 
-        self.bytes_mut()
-            .copy_within(src_addr..src_addr + size_us, dest_addr)
+        if size_us == 0 {
+            return;
+        }
+        if src_addr < self.null_segment_size as usize || dest_addr < self.null_segment_size as usize
+        {
+            const MAX_NULL_MEMMOVE_SIZE: usize = 16 * 1024 * 1024;
+            if size_us > MAX_NULL_MEMMOVE_SIZE {
+                log!(
+                    "WARNING: memmove intersecting PAGEZERO with large size ({:#x}) — skipping",
+                    size_us
+                );
+                return;
+            }
+
+            let mut source = Vec::with_capacity(size_us);
+            let mut offset = 0;
+            while offset < size_us {
+                let source_address = src_addr + offset;
+                let chunk_size = if source_address < self.null_segment_size as usize {
+                    (size_us - offset)
+                        .min(self.null_segment_size as usize - source_address)
+                        .min(PAGE_SIZE as usize - source_address % PAGE_SIZE as usize)
+                } else {
+                    size_us - offset
+                };
+                if source_address < self.null_segment_size as usize {
+                    let page_offset = source_address % PAGE_SIZE as usize;
+                    source.extend_from_slice(unsafe {
+                        std::slice::from_raw_parts(self.null_page.add(page_offset), chunk_size)
+                    });
+                } else {
+                    source.extend_from_slice(unsafe {
+                        std::slice::from_raw_parts(
+                            self.bytes.cast::<u8>().add(source_address),
+                            chunk_size,
+                        )
+                    });
+                }
+                offset += chunk_size;
+            }
+
+            let mut offset = 0;
+            while offset < size_us {
+                let destination_address = dest_addr + offset;
+                let chunk_size = if destination_address < self.null_segment_size as usize {
+                    (size_us - offset)
+                        .min(self.null_segment_size as usize - destination_address)
+                        .min(PAGE_SIZE as usize - destination_address % PAGE_SIZE as usize)
+                } else {
+                    size_us - offset
+                };
+                if destination_address < self.null_segment_size as usize {
+                    let page_offset = destination_address % PAGE_SIZE as usize;
+                    unsafe {
+                        std::slice::from_raw_parts_mut(self.null_page.add(page_offset), chunk_size)
+                    }
+                    .copy_from_slice(&source[offset..offset + chunk_size]);
+                } else {
+                    unsafe {
+                        std::slice::from_raw_parts_mut(
+                            self.bytes.cast::<u8>().add(destination_address),
+                            chunk_size,
+                        )
+                    }
+                    .copy_from_slice(&source[offset..offset + chunk_size]);
+                }
+                offset += chunk_size;
+            }
+            return;
+        }
+        unsafe {
+            std::ptr::copy(
+                self.bytes.cast::<u8>().add(src_addr),
+                self.bytes.cast::<u8>().add(dest_addr),
+                size_us,
+            );
+        }
     }
 
     /// Allocate `size` bytes.
@@ -1289,6 +1414,87 @@ mod mem_tests {
         // `*(void**)NULL` remains NULL.
         let untouched: MutPtr<u32> = Ptr::from_bits(0x800);
         assert_eq!(mem.read(untouched.cast_const()), 0);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn fastmem_null_guard_preserves_guest_memory_access() {
+        let mut mem = Mem::new();
+        mem.set_null_segment_size(super::PAGE_SIZE);
+        let host_page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let fastmem_enabled = mem.enable_fastmem();
+        assert_eq!(
+            fastmem_enabled,
+            host_page_size > 0
+                && (super::PAGE_SIZE as usize).is_multiple_of(host_page_size as usize)
+        );
+
+        let null_ptr: MutPtr<u32> = Ptr::from_bits(0);
+        mem.write(null_ptr, 0x1234_5678);
+        assert_eq!(mem.read(null_ptr.cast_const()), 0x1234_5678);
+
+        let normal_ptr: MutPtr<u32> = Ptr::from_bits(super::PAGE_SIZE);
+        mem.write(normal_ptr, 0x8765_4321);
+        assert_eq!(mem.read(normal_ptr.cast_const()), 0x8765_4321);
+    }
+
+    #[test]
+    fn memmove_handles_overlapping_and_null_page_ranges() {
+        use super::ConstVoidPtr;
+
+        let mut mem = Mem::new();
+        mem.set_null_segment_size(super::PAGE_SIZE);
+        let regular_src: MutPtr<u8> = Ptr::from_bits(super::PAGE_SIZE);
+        mem.bytes_at_mut(regular_src, 6)
+            .copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        mem.memmove(
+            Ptr::<u8, true>::from_bits(super::PAGE_SIZE + 1).cast(),
+            regular_src.cast_const().cast(),
+            5,
+        );
+        assert_eq!(
+            mem.bytes_at(Ptr::<u8, false>::from_bits(super::PAGE_SIZE + 1), 5),
+            &[1, 2, 3, 4, 5]
+        );
+
+        mem.bytes_at_mut(Ptr::<u8, true>::from_bits(1), 4)
+            .copy_from_slice(&[7, 8, 9, 10]);
+        mem.memmove(
+            Ptr::<u8, true>::from_bits(super::PAGE_SIZE + 8).cast(),
+            ConstVoidPtr::from_bits(1),
+            4,
+        );
+        assert_eq!(
+            mem.bytes_at(Ptr::<u8, false>::from_bits(super::PAGE_SIZE + 8), 4),
+            &[7, 8, 9, 10]
+        );
+
+        mem.bytes_at_mut(Ptr::<u8, true>::from_bits(super::PAGE_SIZE - 1), 1)
+            .copy_from_slice(&[11]);
+        mem.bytes_at_mut(Ptr::<u8, true>::from_bits(super::PAGE_SIZE), 1)
+            .copy_from_slice(&[12]);
+        mem.memmove(
+            Ptr::<u8, true>::from_bits(super::PAGE_SIZE + 0x20).cast(),
+            ConstVoidPtr::from_bits(super::PAGE_SIZE - 1),
+            2,
+        );
+        assert_eq!(
+            mem.bytes_at(Ptr::<u8, false>::from_bits(super::PAGE_SIZE + 0x20), 2),
+            &[11, 12]
+        );
+
+        let valid_src: MutPtr<u8> = Ptr::from_bits(super::PAGE_SIZE + 0x30);
+        mem.bytes_at_mut(valid_src, 3)
+            .copy_from_slice(&[13, 14, 15]);
+        mem.memmove(
+            Ptr::<u8, true>::from_bits(8).cast(),
+            valid_src.cast_const().cast(),
+            3,
+        );
+        assert_eq!(
+            mem.bytes_at(Ptr::<u8, false>::from_bits(8), 3),
+            &[13, 14, 15]
+        );
     }
 
     #[test]

@@ -158,7 +158,7 @@ impl Cpu {
     /// is provided, direct memory access is enabled, and the CPU instance
     /// becomes bound to that [Mem] instance (subsequent calls must use the same
     /// one).
-    pub fn new(direct_memory_access: Option<&mut Mem>) -> Cpu {
+    pub fn new(mut direct_memory_access: Option<&mut Mem>) -> Cpu {
         // Null page count is in pages rather than bytes. Mem ensures it is
         // page aligned.
         let null_page_count: usize = direct_memory_access
@@ -166,6 +166,9 @@ impl Cpu {
             .map_or(0, |mem| mem.null_segment_size() / 0x1000)
             .try_into()
             .unwrap();
+        let fastmem_enabled = direct_memory_access
+            .as_deref_mut()
+            .map_or(false, Mem::enable_fastmem);
         // Safety: the direct memory access pointer will be retained directly by
         // the dynarmic wrapper and indirectly by cached JIT code, so we must
         // ensure we only execute the CPU while holding a &mut on the Mem object
@@ -174,8 +177,9 @@ impl Cpu {
             .map_or(std::ptr::null_mut(), |mem| unsafe {
                 mem.direct_memory_access_ptr()
             });
-        let dynarmic_wrapper =
-            unsafe { touchHLE_DynarmicWrapper_new(direct_memory_access_ptr, null_page_count) };
+        let dynarmic_wrapper = unsafe {
+            touchHLE_DynarmicWrapper_new(direct_memory_access_ptr, null_page_count, fastmem_enabled)
+        };
         Cpu {
             dynarmic_wrapper,
             direct_memory_access_ptr,
@@ -351,5 +355,43 @@ impl Cpu {
             _ if res < -4 => panic!("Unexpected CPU execution result"),
             svc => CpuState::Svc(svc as u32),
         }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod fastmem_tests {
+    use super::{Cpu, CpuState};
+    use crate::mem::{Mem, MutPtr, Ptr, PAGE_SIZE};
+
+    #[test]
+    fn guarded_null_reads_and_direct_guest_memory_access_work() {
+        let mut mem = Mem::new();
+        mem.set_null_segment_size(PAGE_SIZE);
+
+        let code: MutPtr<u32> = Ptr::from_bits(PAGE_SIZE);
+        mem.write(code, 0xE591_0000);
+        mem.write(code + 1, 0xE581_2000);
+        mem.write(code + 2, 0xE591_0000);
+        mem.write(Ptr::<u32, true>::from_bits(PAGE_SIZE * 2), 0xCAFE_BABE);
+
+        let mut cpu = Cpu::new(Some(&mut mem));
+        cpu.set_cpsr(Cpu::CPSR_USER_MODE);
+        cpu.regs_mut()[1] = 0;
+        cpu.regs_mut()[2] = 0x1234_5678;
+        cpu.regs_mut()[Cpu::PC] = PAGE_SIZE;
+        assert!(matches!(cpu.run_or_step(&mut mem, None), CpuState::Normal));
+        assert_eq!(cpu.regs()[0], 0);
+
+        cpu.regs_mut()[1] = PAGE_SIZE * 2;
+        cpu.regs_mut()[Cpu::PC] = PAGE_SIZE + 4;
+        assert!(matches!(cpu.run_or_step(&mut mem, None), CpuState::Normal));
+        assert_eq!(
+            mem.read(Ptr::<u32, true>::from_bits(PAGE_SIZE * 2).cast_const()),
+            0x1234_5678
+        );
+
+        cpu.regs_mut()[Cpu::PC] = PAGE_SIZE + 8;
+        assert!(matches!(cpu.run_or_step(&mut mem, None), CpuState::Normal));
+        assert_eq!(cpu.regs()[0], 0x1234_5678);
     }
 }

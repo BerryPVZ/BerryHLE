@@ -423,7 +423,11 @@ fn __cxa_throw(env: &mut Environment, exception: MutVoidPtr, tinfo: ConstVoidPtr
         );
         // Returning to the caller just re-enters the same throw site. With no
         // catch block reached, the only truthful outcome is termination.
-        env.request_guest_termination();
+        // This is a forced failure, not a successful exit. Keep the existing
+        // immediate stop without running guest handlers or exit callbacks.
+        env.request_guest_termination(crate::environment::GuestTermination::Signal(
+            crate::libc::signal::SIGABRT,
+        ));
         return;
     }
 

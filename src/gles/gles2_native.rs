@@ -40,6 +40,8 @@ pub struct GLES2NativeContext {
     texture_lod_ext_supported: bool,
     /// Whether the host driver advertises `GL_EXT_shadow_samplers`.
     shadow_samplers_ext_supported: bool,
+    /// Whether the host driver advertises `GL_OES_texture_3D`.
+    texture_3d_ext_supported: bool,
 }
 
 impl GLESContext for GLES2NativeContext {
@@ -55,6 +57,7 @@ impl GLESContext for GLES2NativeContext {
             pvrtc_native_checked: false,
             texture_lod_ext_supported: false,
             shadow_samplers_ext_supported: false,
+            texture_3d_ext_supported: false,
         })
     }
 
@@ -68,6 +71,7 @@ impl GLESContext for GLES2NativeContext {
                 pvrtc_native: self.pvrtc_native,
                 texture_lod_ext_supported: self.texture_lod_ext_supported,
                 shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
+                texture_3d_ext_supported: self.texture_3d_ext_supported,
                 map_buffer_stagings: Vec::new(),
             });
         }
@@ -84,6 +88,7 @@ impl GLESContext for GLES2NativeContext {
             self.pvrtc_native = unsafe { detect_pvrtc_support() };
             self.texture_lod_ext_supported = unsafe { detect_texture_lod_ext_support() };
             self.shadow_samplers_ext_supported = unsafe { detect_shadow_samplers_ext_support() };
+            self.texture_3d_ext_supported = unsafe { detect_texture_3d_ext_support() };
             self.pvrtc_native_checked = true;
         }
         Box::new(GLES2Native {
@@ -91,6 +96,7 @@ impl GLESContext for GLES2NativeContext {
             pvrtc_native: self.pvrtc_native,
             texture_lod_ext_supported: self.texture_lod_ext_supported,
             shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
+            texture_3d_ext_supported: self.texture_3d_ext_supported,
             map_buffer_stagings: Vec::new(),
         })
     }
@@ -106,6 +112,7 @@ impl GLESContext for GLES2NativeContext {
                 pvrtc_native: self.pvrtc_native,
                 texture_lod_ext_supported: self.texture_lod_ext_supported,
                 shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
+                texture_3d_ext_supported: self.texture_3d_ext_supported,
                 map_buffer_stagings: Vec::new(),
             });
         }
@@ -117,6 +124,7 @@ impl GLESContext for GLES2NativeContext {
             self.pvrtc_native = detect_pvrtc_support();
             self.texture_lod_ext_supported = detect_texture_lod_ext_support();
             self.shadow_samplers_ext_supported = detect_shadow_samplers_ext_support();
+            self.texture_3d_ext_supported = detect_texture_3d_ext_support();
             self.pvrtc_native_checked = true;
         }
         Box::new(GLES2Native {
@@ -124,6 +132,7 @@ impl GLESContext for GLES2NativeContext {
             pvrtc_native: self.pvrtc_native,
             texture_lod_ext_supported: self.texture_lod_ext_supported,
             shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
+            texture_3d_ext_supported: self.texture_3d_ext_supported,
             map_buffer_stagings: Vec::new(),
         })
     }
@@ -190,6 +199,21 @@ unsafe fn detect_shadow_samplers_ext_support() -> bool {
         .any(|extension| extension == "GL_EXT_shadow_samplers")
 }
 
+/// Query `GL_EXTENSIONS` and return whether the current driver supports 3D
+/// textures for OpenGL ES 2.0 shaders.
+unsafe fn detect_texture_3d_ext_support() -> bool {
+    let legacy = gles2::GetString(gles11::EXTENSIONS);
+    if legacy.is_null() {
+        return false;
+    }
+    let Ok(extensions) = CStr::from_ptr(legacy as *const _).to_str() else {
+        return false;
+    };
+    extensions
+        .split_whitespace()
+        .any(|extension| extension == "GL_OES_texture_3D")
+}
+
 /// Returns `true` if the shader source contains a top-level default float
 /// precision declaration (`precision lowp|mediump|highp float;`).
 fn shader_has_default_float_precision(source: &str) -> bool {
@@ -232,9 +256,12 @@ fn shader_has_default_float_precision(source: &str) -> bool {
 ///    default to `highp` and must not be downgraded).
 /// 5. Fixing variable redeclaration errors by deduplicating identical
 ///    variable declarations in function scope.
+/// 6. Enabling `GL_OES_texture_3D` for shaders that use 3D samplers when the
+///    host driver advertises support.
 fn patch_shader_for_native_es2(
     source: &str,
     texture_lod_ext_supported: bool,
+    texture_3d_ext_supported: bool,
     shadow_samplers_ext_supported: bool,
     inject_default_float_precision: bool,
     is_vertex_shader: bool,
@@ -273,6 +300,15 @@ fn patch_shader_for_native_es2(
                 has_default_float_precision = true;
             }
         }
+    }
+
+    if texture_3d_ext_supported
+        && (source.contains("sampler3D") || source.contains("texture3D"))
+        && !extension_lines
+            .iter()
+            .any(|line| line.contains("GL_OES_texture_3D"))
+    {
+        extension_lines.push("#extension GL_OES_texture_3D : enable".to_owned());
     }
 
     let mut out = String::with_capacity(source.len() + 64);
@@ -395,7 +431,7 @@ mod tests {
     fn injects_default_float_precision_when_missing() {
         let src = "#version 100\nvoid main() { gl_FragColor = vec4(1.0); }\n";
         assert!(!shader_has_default_float_precision(src));
-        let out = patch_shader_for_native_es2(src, true, true, true, false);
+        let out = patch_shader_for_native_es2(src, true, false, true, true, false);
         assert!(out.contains("precision mediump float;"));
         assert!(out.contains("void main()"));
     }
@@ -405,7 +441,7 @@ mod tests {
         let src =
             "#version 100\nprecision highp float;\nvoid main() { gl_FragColor = vec4(1.0); }\n";
         assert!(shader_has_default_float_precision(src));
-        let out = patch_shader_for_native_es2(src, true, true, true, false);
+        let out = patch_shader_for_native_es2(src, true, false, true, true, false);
         assert!(out.contains("precision highp float;"));
         assert_eq!(out.matches("precision").count(), 1);
     }
@@ -413,14 +449,14 @@ mod tests {
     #[test]
     fn does_not_inject_when_not_requested() {
         let src = "#version 100\nvoid main() { gl_Position = vec4(1.0); }\n";
-        let out = patch_shader_for_native_es2(src, true, false, true, true);
+        let out = patch_shader_for_native_es2(src, true, false, false, true, true);
         assert!(!out.contains("precision"));
     }
 
     #[test]
     fn hoists_extension_directives_before_body_code() {
         let src = "#version 100\nvoid helper() {}\n#extension GL_OES_texture_3D : enable\nvoid main() { gl_FragColor = vec4(1.0); }\n";
-        let out = patch_shader_for_native_es2(src, true, false, true, false);
+        let out = patch_shader_for_native_es2(src, true, false, false, true, false);
         let ext_pos = out.find("#extension GL_OES_texture_3D : enable").unwrap();
         let helper_pos = out.find("void helper()").unwrap();
         assert!(ext_pos < helper_pos);
@@ -428,11 +464,35 @@ mod tests {
     }
 
     #[test]
+    fn injects_texture_3d_extension_when_supported() {
+        let src = "#version 100\nprecision highp float;\nuniform highp sampler3D _DitherMaskLOD;\nvoid main() { gl_FragColor = texture3D(_DitherMaskLOD, vec3(0.5)); }\n";
+        let out = patch_shader_for_native_es2(src, true, true, true, true, false);
+        assert!(out.starts_with("#version 100\n#extension GL_OES_texture_3D : enable\n"));
+        assert_eq!(out.matches("GL_OES_texture_3D").count(), 1);
+    }
+
+    #[test]
+    fn does_not_inject_texture_3d_extension_when_unsupported() {
+        let src = "#version 100\nprecision highp float;\nuniform highp sampler3D _DitherMaskLOD;\nvoid main() { gl_FragColor = texture3D(_DitherMaskLOD, vec3(0.5)); }\n";
+        let out = patch_shader_for_native_es2(src, true, false, true, true, false);
+        assert!(!out.contains("GL_OES_texture_3D"));
+    }
+
+    #[test]
+    fn does_not_duplicate_existing_texture_3d_extension() {
+        let src = "#version 100\n#extension GL_OES_texture_3D : enable\nprecision highp float;\nuniform highp sampler3D _DitherMaskLOD;\nvoid main() { gl_FragColor = texture3D(_DitherMaskLOD, vec3(0.5)); }\n";
+        let out = patch_shader_for_native_es2(src, true, true, true, true, false);
+        assert_eq!(out.matches("GL_OES_texture_3D").count(), 1);
+        assert!(out.starts_with("#version 100\n#extension GL_OES_texture_3D : enable\n"));
+    }
+
+    #[test]
     fn patches_shadow_sampler_extension_by_shader_stage() {
         let src = "#version 100\n#extension GL_EXT_shadow_samplers : require\nvoid main() {}\n";
-        let vertex = patch_shader_for_native_es2(src, true, false, true, true);
-        let unsupported_fragment = patch_shader_for_native_es2(src, true, false, true, false);
-        let supported_fragment = patch_shader_for_native_es2(src, true, true, true, false);
+        let vertex = patch_shader_for_native_es2(src, true, false, false, true, true);
+        let unsupported_fragment =
+            patch_shader_for_native_es2(src, true, false, false, true, false);
+        let supported_fragment = patch_shader_for_native_es2(src, true, false, true, true, false);
         assert!(!vertex.contains("GL_EXT_shadow_samplers"));
         assert!(!unsupported_fragment.contains("GL_EXT_shadow_samplers"));
         assert!(supported_fragment.contains("#extension GL_EXT_shadow_samplers : require"));
@@ -445,6 +505,7 @@ pub struct GLES2Native<'gl_ctx> {
     /// Whether `GL_EXT_shader_texture_lod` is advertised by the host driver.
     texture_lod_ext_supported: bool,
     shadow_samplers_ext_supported: bool,
+    texture_3d_ext_supported: bool,
     /// CPU staging buffers for the `glMapBufferOES` fallback (see below).
     ///
     /// Games can legitimately have more than one buffer mapped at a time
@@ -1276,6 +1337,8 @@ impl GLES for GLES2Native<'_> {
         // - When GL_EXT_shader_texture_lod is not supported, strip the
         //   #extension directive and replace texture2DLodEXT and friends
         //   with texture2D (dropping the LOD bias parameter).
+        // - Enable GL_OES_texture_3D for shaders that use 3D samplers when
+        //   the host driver exposes it.
         // - Fix variable redeclarations in some Unity shaders.
         use std::ffi::CString;
 
@@ -1323,8 +1386,13 @@ impl GLES for GLES2Native<'_> {
             && (joined.contains("texture2DLodEXT")
                 || joined.contains("texture2DProjLodEXT")
                 || joined.contains("textureCubeLodEXT"));
-        let needs_patch =
-            joined.contains("#extension") || needs_lod_patch || needs_precision_inject;
+        let needs_texture_3d_patch = self.texture_3d_ext_supported
+            && (joined.contains("sampler3D") || joined.contains("texture3D"));
+
+        let needs_patch = joined.contains("#extension")
+            || needs_lod_patch
+            || needs_texture_3d_patch
+            || needs_precision_inject;
 
         if !needs_patch {
             // No patching needed — pass through directly.
@@ -1335,6 +1403,7 @@ impl GLES for GLES2Native<'_> {
         let patched = patch_shader_for_native_es2(
             &joined,
             self.texture_lod_ext_supported,
+            self.texture_3d_ext_supported,
             self.shadow_samplers_ext_supported,
             needs_precision_inject,
             shader_type as GLenum == gles2::VERTEX_SHADER,
