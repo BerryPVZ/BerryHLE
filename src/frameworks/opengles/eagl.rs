@@ -2563,6 +2563,11 @@ unsafe fn present_renderbuffer(
     // `--rotation-fix` path instead checks whether UIKit actually applied the
     // autorotation transform, avoiding an extra 180-degree turn for apps that
     // do not rotate their root view.
+    //
+    // This is only a fallback: `layer_rotation` is the rotation Core Animation
+    // itself would apply, measured from the layer tree. An extra 180 degrees
+    // cannot stand in for it, because the tree can be rotated by a quarter turn
+    // (and the two answers differ by 90 degrees, not 0 or 180).
     let rotation_compensation_trigger = if env.options.rotation_fix {
         env.framework_state.uikit.autorotation_transform_applied
     } else {
@@ -2572,7 +2577,8 @@ unsafe fn present_renderbuffer(
         && !matches!(
             device_orientation,
             crate::window::DeviceOrientation::Portrait
-        );
+        )
+        && options.layer_rotation == 0.0;
     // PERF: cached read-once flag; present_renderbuffer runs every frame.
     let rotation_matrix = if crate::env_flag_cached!("TOUCHHLE_DISABLE_PRESENT_ROTATION") {
         log_once!(
@@ -2608,10 +2614,9 @@ unsafe fn present_renderbuffer(
     // drawn in display orientation, so rotating again would turn it sideways.
     let rotation_matrix = if options.skip_rotation && rotate_override.is_none() {
         crate::matrix::Matrix::<2>::identity()
-    } else if options.layer_rotation != 0.0 && !needs_autorotation_compensation {
-        // The iPad compensation above is a guess for apps whose root view is
-        // autorotated; when the layer transform is known there is nothing left
-        // to guess, so compose the layer's own rotation with the window's.
+    } else if options.layer_rotation != 0.0 {
+        // The layer transform is what Core Animation would have applied, so
+        // compose it with the window's rotation instead of guessing.
         rotation_matrix.multiply(&crate::matrix::Matrix::z_rotation(options.layer_rotation))
     } else {
         rotation_matrix
@@ -2622,11 +2627,12 @@ unsafe fn present_renderbuffer(
         static GEOM_LOGGED: std::sync::Once = std::sync::Once::new();
         GEOM_LOGGED.call_once(|| {
             log!(
-                "PRESENT-GEOM viewport={:?} device_family_ipad={} orientation={:?} needs_autorot={}",
+                "PRESENT-GEOM viewport={:?} device_family_ipad={} orientation={:?} needs_autorot={} layer_rotation={}",
                 viewport,
                 device_family.is_ipad(),
                 device_orientation,
-                needs_autorotation_compensation
+                needs_autorotation_compensation,
+                options.layer_rotation
             );
         });
     }
