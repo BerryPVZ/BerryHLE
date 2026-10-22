@@ -41,6 +41,7 @@ pub mod ui_bezier_path;
 pub mod ui_font;
 pub mod ui_geometry;
 pub mod ui_gesture_recognizer;
+mod globbert_debug;
 pub mod ui_graphics;
 pub mod ui_image;
 pub mod ui_image_picker_controller;
@@ -945,6 +946,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ui_event::CLASSES,
         ui_font::CLASSES,
         ui_gesture_recognizer::CLASSES,
+        globbert_debug::CLASSES,
         ui_image::CLASSES,
         ui_image_picker_controller::CLASSES,
         ui_keyboard::CLASSES,
@@ -1016,6 +1018,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
 
 #[derive(Default)]
 pub struct State {
+    globbert_debug: globbert_debug::State,
     ui_accelerometer: ui_accelerometer::State,
     ui_application: ui_application::State,
     ui_color: ui_color::State,
@@ -1055,6 +1058,7 @@ pub(crate) fn handle_events_with_result(env: &mut Environment) -> (Option<Instan
         return (None, false);
     }
 
+    globbert_debug::tick(env);
     let mut handled = false;
     loop {
         let Some(event) = env.window_mut().pop_event() else {

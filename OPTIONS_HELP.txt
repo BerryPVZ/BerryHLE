@@ -524,3 +524,12 @@ Other options:
     --no-rotation-fix
         Explicitly use the legacy iPad/non-portrait rotation heuristic, even if
         the fix was enabled by an app-specific options file.
+
+    --globbert-debug
+        Show an optional animation and ending browser on top of Globbert.
+        Enable per app with: com.andydev.globbert: --globbert-debug
+        Disabled by default and ignored for other apps.
+
+    --no-globbert-debug
+        Disable Globbert's debug overlay.
+

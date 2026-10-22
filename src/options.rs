@@ -105,6 +105,8 @@ pub struct Options {
     /// Disable the Cheat Engine-style memory trainer overlay. The trainer
     /// is off by default; opt in with `--trainer`.
     pub trainer_disabled: bool,
+    /// Opt-in animation and ending controls for Globbert only.
+    pub globbert_debug: bool,
     /// Enable app-specific Objective-C return overrides from Quick Options.
     pub runtime_hooks_enabled: bool,
     pub initial_orientation: DeviceOrientation,
@@ -290,6 +292,7 @@ impl Default for Options {
             fullscreen: false,
             preserve_aspect_ratio: false,
             trainer_disabled: true,
+            globbert_debug: false,
             runtime_hooks_enabled: false,
             device_family: None,
             auto_device_family: false,
@@ -701,6 +704,10 @@ impl Options {
             self.trainer_disabled = true;
         } else if arg == "--trainer" {
             self.trainer_disabled = false;
+        } else if arg == "--globbert-debug" {
+            self.globbert_debug = true;
+        } else if arg == "--no-globbert-debug" {
+            self.globbert_debug = false;
         } else {
             return Ok(false);
         };
@@ -783,6 +790,19 @@ fn parse_dump_options(options: &str) -> Result<DumpingOptions, String> {
 #[cfg(test)]
 mod option_parsing_tests {
     use super::*;
+
+    #[test]
+    fn globbert_debug_option_is_scoped_and_opt_in() {
+        let mut options = Options::default();
+        assert!(!options.globbert_debug);
+        let file = b"com.andydev.globbert: --globbert-debug\n";
+        let argument = get_options_from_file(&file[..], "com.andydev.globbert").unwrap().unwrap();
+        assert!(get_options_from_file(&file[..], "com.iphogame.petswar").unwrap().is_none());
+        assert!(options.parse_argument(&argument).unwrap());
+        assert!(options.globbert_debug);
+        assert!(options.parse_argument("--no-globbert-debug").unwrap());
+        assert!(!options.globbert_debug);
+    }
 
     #[test]
     fn force_composition_can_be_enabled_and_disabled() {
