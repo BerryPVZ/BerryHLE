@@ -21,10 +21,20 @@ fn parse_tuple(s: &str) -> Result<(f32, f32), ()> {
     // TexturePacker/Cocos2D plists commonly omit spaces after commas.
     // Whitespace is formatting, not part of the geometry's syntax.
     let (a, b) = s.split_once(',').ok_or(())?;
-    Ok((
-        a.trim().parse().map_err(|_| ())?,
-        b.trim().parse().map_err(|_| ())?,
-    ))
+    fn component(s: &str) -> Result<f32, ()> {
+        let s = s.trim();
+        // Some shipped Cocos2D configuration plists (PetsWar 1.0) retain
+        // C float suffixes, e.g. "{{0.0f, 0.0f}, {40.0f, 53.0f}}".
+        // Rejecting the whole rectangle makes its sprite frame zero-sized.
+        s.parse().or_else(|_| {
+            s.strip_suffix('f')
+                .or_else(|| s.strip_suffix('F'))
+                .ok_or(())?
+                .parse()
+                .map_err(|_| ())
+        })
+    }
+    Ok((component(a)?, component(b)?))
 }
 
 // =========================================================================
@@ -950,6 +960,38 @@ mod tests {
 #[cfg(test)]
 mod geometry_string_tests {
     use super::{CGPoint, CGRect, CGSize};
+
+    #[test]
+    fn parses_petswar_float_suffixes_without_zeroing_sprite_frames() {
+        assert_eq!(
+            "{{0.0f, 0.0f}, {40.0f, 53.0f}}".parse::<CGRect>(),
+            Ok(CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize {
+                    width: 40.0,
+                    height: 53.0
+                },
+            })
+        );
+        assert_eq!(
+            "{3.0f, -4.0f}".parse::<CGPoint>(),
+            Ok(CGPoint { x: 3.0, y: -4.0 })
+        );
+        assert_eq!(
+            "{0.5f, 0.0f}".parse::<CGPoint>(),
+            Ok(CGPoint { x: 0.5, y: 0.0 })
+        );
+        assert_eq!(
+            "{4e1F,53f}".parse::<CGSize>(),
+            Ok(CGSize {
+                width: 40.0,
+                height: 53.0
+            })
+        );
+        for text in ["{1ff,2}", "{f,2}", "{1fmore,2}"] {
+            assert!(text.parse::<CGPoint>().is_err());
+        }
+    }
 
     #[test]
     fn parses_texturepacker_frames_without_spaces() {

@@ -122,7 +122,7 @@ struct ArrayStateBackup {
 
 /// List of arrays shared by OpenGL ES 1.1 and OpenGL 2.1.
 ///
-/// TODO: GL_POINT_SIZE_ARRAY_OES?
+/// Point sizes are tracked separately: desktop GL has no equivalent array.
 pub const ARRAYS: &[ArrayInfo] = &[
     ArrayInfo {
         name: gl21::COLOR_ARRAY,
@@ -514,6 +514,7 @@ pub struct GLES1OnGL2State {
     palette_matrices: Vec<[GLfloat; 16]>,
     palette_weight_state: MatrixArrayPointerState,
     palette_index_state: MatrixArrayPointerState,
+    point_size_state: MatrixArrayPointerState,
 }
 
 pub struct GLES1OnGL2Context {
@@ -537,6 +538,11 @@ fn new_gles1_on_gl2_state() -> GLES1OnGL2State {
         palette_matrices: vec![MATRIX_IDENTITY; MATRIX_PALETTE_MIN_MATRICES],
         palette_weight_state: MatrixArrayPointerState::default(),
         palette_index_state: MatrixArrayPointerState::default(),
+        point_size_state: MatrixArrayPointerState {
+            size: 1,
+            type_: gl21::FLOAT,
+            ..Default::default()
+        },
     }
 }
 
@@ -600,6 +606,65 @@ pub struct GLES1OnGL2<'a> {
 }
 
 impl GLES1OnGL2<'_> {
+    /// Desktop GL has no point-size client array. Submit each point with its
+    /// own scalar size, preserving the ordinary vertex/colour/texture arrays.
+    /// Copy VBO data before drawing so no buffer remains mapped during a draw.
+    unsafe fn draw_sized_points(&mut self, vertices: &[GLint]) {
+        let array = &self.state.point_size_state;
+        let stride = if array.stride == 0 {
+            4
+        } else {
+            array.stride as usize
+        };
+        let mut saved_binding = 0;
+        if array.buffer_binding != 0 {
+            gl21::GetIntegerv(gl21::ARRAY_BUFFER_BINDING, &mut saved_binding);
+            gl21::BindBuffer(gl21::ARRAY_BUFFER, array.buffer_binding);
+        }
+        let sizes: Vec<GLfloat> = vertices
+            .iter()
+            .map(|&vertex| {
+                let offset = vertex as usize * stride;
+                let mut bits = 0u32;
+                if array.buffer_binding != 0 {
+                    gl21::GetBufferSubData(
+                        gl21::ARRAY_BUFFER,
+                        (array.pointer as usize + offset) as isize,
+                        4,
+                        &mut bits as *mut _ as *mut GLvoid,
+                    );
+                } else {
+                    bits = array
+                        .pointer
+                        .cast::<u8>()
+                        .add(offset)
+                        .cast::<u32>()
+                        .read_unaligned();
+                }
+                if array.type_ == gles11::FIXED {
+                    fixed_to_float(bits as GLfixed)
+                } else {
+                    GLfloat::from_bits(bits)
+                }
+            })
+            .collect();
+        if array.buffer_binding != 0 {
+            gl21::BindBuffer(gl21::ARRAY_BUFFER, saved_binding as GLuint);
+        }
+        let mut saved_size = 1.0;
+        gl21::GetFloatv(gl21::POINT_SIZE, &mut saved_size);
+        self.state.point_size_state.enabled = false;
+        for (&vertex, size) in vertices.iter().zip(sizes) {
+            // Zero-sized particles must not inherit the preceding point size.
+            if size > 0.0 && size.is_finite() {
+                gl21::PointSize(size);
+                self.DrawArrays(gl21::POINTS, vertex, 1);
+            }
+        }
+        self.state.point_size_state.enabled = true;
+        gl21::PointSize(saved_size);
+    }
+
     /// If any arrays with fixed-point data are in use at the time of a draw
     /// call, this function will convert the data to floating-point and
     /// replace the pointers. [Self::restore_fixed_point_arrays] can be called
@@ -1264,6 +1329,9 @@ impl GLES for GLES1OnGL2<'_> {
         gl21::Enable(cap);
     }
     unsafe fn IsEnabled(&mut self, cap: GLenum) -> GLboolean {
+        if cap == gles11::POINT_SIZE_ARRAY_OES {
+            return self.state.point_size_state.enabled as GLboolean;
+        }
         if cap == gles11::MATRIX_PALETTE_OES {
             return if self.state.matrix_palette_enabled {
                 gl21::TRUE
@@ -1329,6 +1397,10 @@ impl GLES for GLES1OnGL2<'_> {
         gl21::ClientActiveTexture(texture);
     }
     unsafe fn EnableClientState(&mut self, array: GLenum) {
+        if array == gles11::POINT_SIZE_ARRAY_OES {
+            self.state.point_size_state.enabled = true;
+            return;
+        }
         if array == gles11::MATRIX_INDEX_ARRAY_OES {
             self.state.palette_index_state.enabled = true;
             return;
@@ -1348,6 +1420,10 @@ impl GLES for GLES1OnGL2<'_> {
         gl21::EnableClientState(array);
     }
     unsafe fn DisableClientState(&mut self, array: GLenum) {
+        if array == gles11::POINT_SIZE_ARRAY_OES {
+            self.state.point_size_state.enabled = false;
+            return;
+        }
         if array == gles11::MATRIX_INDEX_ARRAY_OES {
             self.state.palette_index_state.enabled = false;
             return;
@@ -1473,6 +1549,21 @@ impl GLES for GLES1OnGL2<'_> {
     /// `GetFixedv` above: query the underlying state at its native type and
     /// convert each component per the spec.
     unsafe fn GetIntegerv(&mut self, pname: GLenum, params: *mut GLint) {
+        match pname {
+            gles11::POINT_SIZE_ARRAY_TYPE_OES => {
+                *params = self.state.point_size_state.type_ as GLint;
+                return;
+            }
+            gles11::POINT_SIZE_ARRAY_STRIDE_OES => {
+                *params = self.state.point_size_state.stride;
+                return;
+            }
+            gles11::POINT_SIZE_ARRAY_BUFFER_BINDING_OES => {
+                *params = self.state.point_size_state.buffer_binding as GLint;
+                return;
+            }
+            _ => {}
+        }
         // GL_OES_matrix_palette queries: the host desktop driver does not
         // expose GL_ARB_matrix_palette / GL_ARB_vertex_blend (Mesa never
         // implemented them), so answer these from our emulated state instead
@@ -1700,6 +1791,10 @@ impl GLES for GLES1OnGL2<'_> {
         }
     }
     unsafe fn GetPointerv(&mut self, pname: GLenum, params: *mut *const GLvoid) {
+        if pname == gles11::POINT_SIZE_ARRAY_POINTER_OES {
+            *params = self.state.point_size_state.pointer;
+            return;
+        }
         assert!(ARRAYS
             .iter()
             .any(|&ArrayInfo { pointer, .. }| pname == pointer));
@@ -2268,7 +2363,28 @@ impl GLES for GLES1OnGL2<'_> {
     }
 
     // Drawing
+    unsafe fn PointSizePointerOES(
+        &mut self,
+        type_: GLenum,
+        stride: GLsizei,
+        pointer: *const GLvoid,
+    ) {
+        assert!(type_ == gl21::FLOAT || type_ == gles11::FIXED);
+        assert!(stride >= 0);
+        let mut binding = 0;
+        gl21::GetIntegerv(gl21::ARRAY_BUFFER_BINDING, &mut binding);
+        let array = &mut self.state.point_size_state;
+        array.type_ = type_;
+        array.stride = stride;
+        array.pointer = pointer;
+        array.buffer_binding = binding as GLuint;
+    }
+
     unsafe fn DrawArrays(&mut self, mode: GLenum, first: GLint, count: GLsizei) {
+        if mode == gl21::POINTS && self.state.point_size_state.enabled && count > 0 && first >= 0 {
+            self.draw_sized_points(&(first..first + count).collect::<Vec<_>>());
+            return;
+        }
         assert!([
             gl21::POINTS,
             gl21::LINE_STRIP,
@@ -2302,6 +2418,38 @@ impl GLES for GLES1OnGL2<'_> {
         type_: GLenum,
         indices: *const GLvoid,
     ) {
+        if mode == gl21::POINTS && self.state.point_size_state.enabled && count > 0 {
+            let width = match type_ {
+                gl21::UNSIGNED_BYTE => 1,
+                gl21::UNSIGNED_SHORT => 2,
+                _ => return,
+            };
+            let mut binding = 0;
+            gl21::GetIntegerv(gl21::ELEMENT_ARRAY_BUFFER_BINDING, &mut binding);
+            let mut data = vec![0u8; count as usize * width];
+            if binding != 0 {
+                gl21::GetBufferSubData(
+                    gl21::ELEMENT_ARRAY_BUFFER,
+                    indices as isize,
+                    data.len() as isize,
+                    data.as_mut_ptr().cast(),
+                );
+            } else {
+                std::ptr::copy_nonoverlapping(indices.cast::<u8>(), data.as_mut_ptr(), data.len());
+            }
+            let vertices: Vec<GLint> = data
+                .chunks_exact(width)
+                .map(|v| {
+                    if width == 1 {
+                        v[0] as GLint
+                    } else {
+                        u16::from_ne_bytes([v[0], v[1]]) as GLint
+                    }
+                })
+                .collect();
+            self.draw_sized_points(&vertices);
+            return;
+        }
         assert!([
             gl21::POINTS,
             gl21::LINE_STRIP,
