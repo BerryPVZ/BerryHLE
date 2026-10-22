@@ -255,11 +255,20 @@ fn classify_fullscreen_layer_transform(
     let angle = match orientation {
         crate::window::DeviceOrientation::Portrait => return None,
         crate::window::DeviceOrientation::PortraitUpsideDown => std::f32::consts::PI,
-        crate::window::DeviceOrientation::LandscapeLeft => -std::f32::consts::FRAC_PI_2,
-        crate::window::DeviceOrientation::LandscapeRight => std::f32::consts::FRAC_PI_2,
+        // A landscape app can show up with either quarter turn: UIKit
+        // interface orientations and device orientations use opposite
+        // handedness, so an app that autorotates its root view for
+        // `UIInterfaceOrientationLandscapeRight` produces a +90 degree matrix
+        // while the device reports `LandscapeLeft`, and vice versa. Both are
+        // just quarter turns of an otherwise full-screen layer, and the
+        // presenter ignores the transform (it applies its own orientation
+        // compensation), so accept either direction.
+        crate::window::DeviceOrientation::LandscapeLeft
+        | crate::window::DeviceOrientation::LandscapeRight => std::f32::consts::FRAC_PI_2,
     };
-    nearly_equal_transform(transform, CGAffineTransform::make_rotation(angle))
-        .then_some(FullscreenLayerTransform::DeviceRotation)
+    (nearly_equal_transform(transform, CGAffineTransform::make_rotation(angle))
+        || nearly_equal_transform(transform, CGAffineTransform::make_rotation(-angle)))
+    .then_some(FullscreenLayerTransform::DeviceRotation)
 }
 
 fn fullscreen_frame_matches_screen(frame: CGRect, screen: CGRect) -> bool {
@@ -374,15 +383,19 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
         {
             if crate::env_flag_cached!("TOUCHHLE_TRACE_PRESENT") {
                 log!(
-                    "FULLSCREEN-DIAG layer {:?} rejected: frame={:?} screen={:?} frame_match={} bounds_origin={:?} anchor={:?} hidden={} opacity={} transform_kind={:?} transform_usable={}",
+                    "FULLSCREEN-DIAG layer {:?} rejected: frame={:?} screen={:?} frame_match={} bounds={:?} bounds_origin={:?} anchor={:?} hidden={} opacity={} transform={:?} sl2l={:?} orientation={:?} transform_kind={:?} transform_usable={}",
                     layer,
                     layer_frame,
                     screen_bounds,
                     fullscreen_frame_matches_screen(layer_frame, screen_bounds),
+                    layer_bounds,
                     layer_bounds.origin,
                     anchor_point,
                     hidden,
                     opacity,
+                    affine_transform,
+                    superlayer_to_layer_transform,
+                    orientation,
                     transform_kind,
                     transform_is_usable
                 );
@@ -446,7 +459,7 @@ mod fullscreen_layer_tests {
     use crate::window::DeviceOrientation;
 
     #[test]
-    fn accepts_identity_and_the_current_device_rotation_only() {
+    fn accepts_identity_and_landscape_quarter_turns() {
         assert_eq!(
             classify_fullscreen_layer_transform(
                 CGAffineTransformIdentity,
@@ -454,24 +467,40 @@ mod fullscreen_layer_tests {
             ),
             Some(FullscreenLayerTransform::Identity),
         );
-        assert_eq!(
-            classify_fullscreen_layer_transform(
-                CGAffineTransform::make_rotation(-std::f32::consts::FRAC_PI_2),
-                DeviceOrientation::LandscapeLeft,
-            ),
-            Some(FullscreenLayerTransform::DeviceRotation),
-        );
+        // `UIInterfaceOrientation` and `UIDeviceOrientation` are mirror images,
+        // so an app can arrive with either quarter turn for a given device
+        // orientation.
+        for orientation in [
+            DeviceOrientation::LandscapeLeft,
+            DeviceOrientation::LandscapeRight,
+        ] {
+            for angle in [std::f32::consts::FRAC_PI_2, -std::f32::consts::FRAC_PI_2] {
+                assert_eq!(
+                    classify_fullscreen_layer_transform(
+                        CGAffineTransform::make_rotation(angle),
+                        orientation,
+                    ),
+                    Some(FullscreenLayerTransform::DeviceRotation),
+                    "{orientation:?} should accept a {} degree layer rotation",
+                    angle.to_degrees(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn portrait_only_accepts_identity() {
         assert_eq!(
             classify_fullscreen_layer_transform(
                 CGAffineTransform::make_rotation(std::f32::consts::FRAC_PI_2),
-                DeviceOrientation::LandscapeLeft,
+                DeviceOrientation::Portrait,
             ),
             None,
         );
         assert_eq!(
             classify_fullscreen_layer_transform(
-                CGAffineTransform::make_rotation(std::f32::consts::FRAC_PI_2),
-                DeviceOrientation::LandscapeRight,
+                CGAffineTransform::make_rotation(std::f32::consts::PI),
+                DeviceOrientation::PortraitUpsideDown,
             ),
             Some(FullscreenLayerTransform::DeviceRotation),
         );
