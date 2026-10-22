@@ -8,8 +8,8 @@
 use super::software_vao::VertexArrayState;
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
 use crate::frameworks::core_animation::ca_eagl_layer::{
-    find_fullscreen_eagl_layer, get_pixels_vec_for_presenting, mark_presented_directly,
-    present_pixels,
+    find_fullscreen_eagl_layer, get_pixels_vec_for_presenting, layer_screen_rotation,
+    mark_presented_directly, present_pixels,
 };
 use crate::frameworks::core_graphics::{CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::get_static_str;
@@ -46,6 +46,11 @@ struct EaglPresentOptions {
     /// direct presenter (see `--ios-es2-direct-present`), whose frames are
     /// already in display orientation.
     skip_rotation: bool,
+    /// Rotation, in radians, that Core Animation would have applied to the
+    /// presented layer before it reached the screen (its `affineTransform`
+    /// plus those of its ancestors). Zero when the layer is not transformed or
+    /// when the drawable is not the layer that is being presented as fullscreen.
+    layer_rotation: f32,
 }
 
 // These are used by the EAGLDrawable protocol implemented by CAEAGLayer.
@@ -1205,6 +1210,11 @@ pub const CLASSES: ClassExports = objc_classes! {
                     .borrow::<EAGLContextHostObject>(this)
                     .drawable_framebuffer,
                 skip_rotation: use_ios_es2_direct_path,
+                layer_rotation: if drawable == fullscreen_layer {
+                    layer_screen_rotation(env, drawable)
+                } else {
+                    0.0
+                },
             };
             // Tell the Core Animation compositor this layer is live, so it
             // takes its CAEAGLLayer fast path instead of compositing (and
@@ -2598,6 +2608,11 @@ unsafe fn present_renderbuffer(
     // drawn in display orientation, so rotating again would turn it sideways.
     let rotation_matrix = if options.skip_rotation && rotate_override.is_none() {
         crate::matrix::Matrix::<2>::identity()
+    } else if options.layer_rotation != 0.0 && !needs_autorotation_compensation {
+        // The iPad compensation above is a guess for apps whose root view is
+        // autorotated; when the layer transform is known there is nothing left
+        // to guess, so compose the layer's own rotation with the window's.
+        rotation_matrix.multiply(&crate::matrix::Matrix::z_rotation(options.layer_rotation))
     } else {
         rotation_matrix
     };

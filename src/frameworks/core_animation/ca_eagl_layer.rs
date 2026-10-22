@@ -653,6 +653,63 @@ mod layer_visibility_tests {
     }
 }
 
+/// Rotation, in radians, that Core Animation applies to `layer` on its way to
+/// the screen: the `affineTransform` rotations of the layer itself and of every
+/// ancestor up to the window, added together.
+///
+/// `presentRenderbuffer:` normally hands the frame to the compositor, which
+/// applies these transforms for us. The GPU presenter bypasses the compositor
+/// and draws the renderbuffer straight into the window, so it has to apply the
+/// same rotation; without it, an app that lets UIKit autorotate its root view
+/// (all iOS 5-style landscape games) is presented a quarter turn out.
+pub fn layer_screen_rotation(env: &mut Environment, layer: id) -> f32 {
+    let mut rotation = 0.0;
+    let mut current = layer;
+    while current != nil {
+        let (transform, superlayer) = {
+            let host = env.objc.borrow::<CALayerHostObject>(current);
+            (host.affine_transform, host.superlayer)
+        };
+        rotation += transform.b.atan2(transform.a);
+        current = superlayer;
+    }
+    snap_to_quarter_turn(rotation)
+}
+
+/// Snaps float noise onto the nearest quarter turn. Autorotation produces
+/// matrices like `{ a: -4.371139e-8, b: 1.0 }`, whose `atan2` is 1.5707965
+/// rather than exactly PI/2; presenting with that residue resamples the frame
+/// and makes it soft.
+fn snap_to_quarter_turn(rotation: f32) -> f32 {
+    let quarter = std::f32::consts::FRAC_PI_2;
+    let snapped = (rotation / quarter).round() * quarter;
+    if (rotation - snapped).abs() < 1e-3 {
+        snapped
+    } else {
+        rotation
+    }
+}
+
+#[cfg(test)]
+mod layer_rotation_tests {
+    use super::*;
+
+    #[test]
+    fn snaps_quarter_turn_float_noise() {
+        assert_eq!(
+            snap_to_quarter_turn(1.0f32.atan2(-4.371139e-8)),
+            std::f32::consts::FRAC_PI_2,
+        );
+        assert_eq!(
+            snap_to_quarter_turn((-4.371139e-8f32).atan2(-1.0)),
+            -std::f32::consts::FRAC_PI_2,
+        );
+        assert_eq!(snap_to_quarter_turn(0.0), 0.0);
+        // A rotation that is not a quarter turn is passed through untouched.
+        assert_eq!(snap_to_quarter_turn(0.3), 0.3);
+    }
+}
+
 // =========================================================================
 // MARK: - Pixel buffer helpers (used by EAGLContext)
 // =========================================================================

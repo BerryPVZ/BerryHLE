@@ -48,7 +48,7 @@ pub(crate) struct CALayerHostObject {
     pub(crate) metal_framebuffer_only: bool,
     delegate: id,
     pub(super) sublayers: Vec<id>,
-    superlayer: id,
+    pub(super) superlayer: id,
     pub(super) bounds: CGRect,
     pub(super) position: CGPoint,
     pub(super) z_position: CGFloat, // <-- ДОБАВЛЕНО СВОЙСТВО Z-POSITION
