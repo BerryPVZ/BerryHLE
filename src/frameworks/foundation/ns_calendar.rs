@@ -267,12 +267,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     let calendar: id = msg![env; calendar initWithCalendarIdentifier:identifier];
     autorelease(env, calendar)
 }
-// iOS 7+ spelling used by SDKs that request a specific calendar.
-+ (id)calendarWithIdentifier:(id)identifier {
-    let new_calendar: id = msg![env; this alloc];
-    let new_calendar: id = msg![env; new_calendar initWithCalendarIdentifier:identifier];
-    autorelease(env, new_calendar)
-}
 
 - (id)initWithCalendarIdentifier:(id)identifier { // NSString *
     // Only the Gregorian calendar is supported for now.

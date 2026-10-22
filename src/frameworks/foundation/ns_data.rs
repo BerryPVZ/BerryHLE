@@ -361,8 +361,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.mem
         .bytes_at_mut(buffer.cast(), len)
         .copy_from_slice(&encoded);
-    let buffer_const: ConstVoidPtr = buffer.cast_const();
-    msg_class![env; NSData dataWithBytes:buffer_const length:len]
+    msg_class![env; NSData dataWithBytesNoCopy:buffer length:len freeWhenDone:true]
 }
 
 // =========================================================================
