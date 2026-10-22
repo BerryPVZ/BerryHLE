@@ -18,7 +18,7 @@ use crate::frameworks::audio_toolbox::audio_converter::{
 use crate::frameworks::audio_toolbox::audio_unit::alloc_render_timestamp;
 use crate::audio::openal as al;
 use crate::audio::parse_mp3_frame_header;
-use crate::audio::symphonia_formats::Mp3FrameDecoder;
+use crate::audio::symphonia_formats::FrameDecoder;
 use crate::audio::openal::al_types::*;
 use crate::audio::openal::{OpenAL, OpenALManager};
 use crate::dyld::{export_c_func, FunctionExports};
@@ -129,9 +129,12 @@ struct AudioQueueHostObject {
     /// handed out yet, interleaved 16-bit samples at `offline_pcm_channels`.
     offline_pcm: VecDeque<i16>,
     offline_pcm_channels: u32,
-    /// For MP3 queues: the decoder, which has to carry over from one buffer
-    /// to the next. Created on first use.
-    mp3_decoder: Option<Mp3FrameDecoder>,
+    /// For MP3 and AAC queues: the decoder, which has to carry over from one
+    /// buffer to the next. Created on first use.
+    frame_decoder: Option<FrameDecoder>,
+    /// OpenAL format and frequency of the buffers queued on `al_source`.
+    /// OpenAL refuses to queue a buffer with a different format behind them.
+    al_queued_format: Option<(ALenum, ALsizei)>,
 }
 
 /// Track whether the audio queue is meant to be running, in order to handle
@@ -345,7 +348,8 @@ pub fn AudioQueueNewOutput(
         offline_render_format: None,
         offline_pcm: VecDeque::new(),
         offline_pcm_channels: 0,
-        mp3_decoder: None,
+        frame_decoder: None,
+        al_queued_format: None,
     };
 
     let aq_ref = env.mem.alloc_and_write(OpaqueAudioQueue { _filler: 0 });
@@ -1207,7 +1211,7 @@ fn AudioQueueOfflineRender(
             .unwrap_or_default();
         let buffer = env.mem.read(buffer_ref);
         let (al_format, sample_rate, pcm) = decode_queue_buffer(
-            &mut host_object.mp3_decoder,
+            &mut host_object.frame_decoder,
             &env.mem,
             &in_format,
             buffer.audio_data.cast(),
@@ -1515,45 +1519,136 @@ fn wrap_raw_aac_as_adts(
     out
 }
 
-/// [decode_buffer] for a buffer enqueued on an audio queue. MP3 is decoded
-/// with the queue's own decoder, since a frame can depend on the ones in
-/// earlier buffers and a buffer may hold as little as one frame (FMOD).
+/// A parsed ADTS frame header: `(header_len, frame_len, object_type,
+/// sample_rate, channels)`. `frame_len` includes the header.
+fn parse_adts_header(bytes: &[u8]) -> Option<(usize, usize, u8, u32, u32)> {
+    const SAMPLE_RATES: [u32; 13] = [
+        96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
+    ];
+    let &[b0, b1, b2, b3, b4, b5, ..] = bytes else {
+        return None;
+    };
+    // 12-bit sync word, then MPEG version (1 bit) and layer (2 bits, always 0).
+    if b0 != 0xFF || (b1 & 0xF6) != 0xF0 {
+        return None;
+    }
+    // "protection absent" is 0 when a 16-bit CRC follows the header.
+    let header_len = if b1 & 1 == 1 { 7 } else { 9 };
+    let object_type = (b2 >> 6) + 1;
+    let sample_rate = *SAMPLE_RATES.get(usize::from((b2 >> 2) & 0xF))?;
+    let channels = u32::from(((b2 & 1) << 2) | (b3 >> 6));
+    let frame_len = (usize::from(b3 & 0x3) << 11) | (usize::from(b4) << 3) | usize::from(b5 >> 5);
+    if frame_len <= header_len {
+        return None;
+    }
+    Some((header_len, frame_len, object_type, sample_rate, channels))
+}
+
+/// Split an AAC audio queue buffer into raw access units. Apps either hand
+/// over ADTS frames (self-framing, as read from an `.aac` file) or raw access
+/// units whose boundaries are in the packet descriptions.
+fn split_aac_access_units<'a>(data: &'a [u8], packet_descs: &[(u32, u32)]) -> Vec<&'a [u8]> {
+    let strip_adts = |frame: &'a [u8]| match parse_adts_header(frame) {
+        Some((header_len, frame_len, ..)) => &frame[header_len..frame_len.min(frame.len())],
+        None => frame,
+    };
+    if !packet_descs.is_empty() {
+        return packet_descs
+            .iter()
+            .filter_map(|&(start, size)| data.get(start as usize..)?.get(..size as usize))
+            .filter(|unit| !unit.is_empty())
+            .map(strip_adts)
+            .collect();
+    }
+    if parse_adts_header(data).is_none() {
+        return if data.is_empty() { Vec::new() } else { vec![data] };
+    }
+    let mut units = Vec::new();
+    let mut pos = 0;
+    while let Some((header_len, frame_len, ..)) = parse_adts_header(&data[pos..]) {
+        let Some(frame) = data[pos..].get(..frame_len) else {
+            break;
+        };
+        units.push(&frame[header_len..]);
+        pos += frame_len;
+    }
+    units
+}
+
+/// [decode_buffer] for a buffer enqueued on an audio queue. MP3 and AAC are
+/// decoded with the queue's own decoder, since a frame depends on the ones in
+/// earlier buffers (MP3's bit reservoir, AAC's overlapping transform) and a
+/// buffer may hold as little as one frame (FMOD, or the last frame of a
+/// looping track).
 fn decode_queue_buffer(
-    mp3_decoder: &mut Option<Mp3FrameDecoder>,
+    frame_decoder: &mut Option<FrameDecoder>,
     mem: &Mem,
     format: &AudioStreamBasicDescription,
     audio_data: MutPtr<u8>,
     audio_data_byte_size: GuestUSize,
     packet_descs: &[(u32, u32)],
 ) -> (ALenum, ALsizei, Vec<u8>) {
-    if format.format_id != kAudioFormatMPEGLayer3 {
+    let is_mp3 = format.format_id == kAudioFormatMPEGLayer3;
+    let is_aac = format.format_id == kAudioFormatMPEG4AAC;
+    if !is_mp3 && !is_aac {
         return decode_buffer(mem, format, audio_data, audio_data_byte_size, packet_descs);
     }
-    if mp3_decoder.is_none() {
-        *mp3_decoder = Mp3FrameDecoder::new();
+
+    let data = mem.bytes_at(audio_data, audio_data_byte_size);
+    if frame_decoder.is_none() {
+        *frame_decoder = if is_mp3 {
+            FrameDecoder::new_mp3()
+        } else {
+            // The ADTS header describes the coded stream; Apple's format flags
+            // carry the MPEG-4 object type for raw access units. Only AAC-LC
+            // (object type 2) can be decoded frame by frame.
+            let (object_type, sample_rate, channels) = match parse_adts_header(data) {
+                Some((_, _, object_type, sample_rate, channels)) => {
+                    (u32::from(object_type), sample_rate, channels)
+                }
+                None => (
+                    if format.format_flags == 0 {
+                        2
+                    } else {
+                        format.format_flags
+                    },
+                    format.sample_rate as u32,
+                    format.channels_per_frame,
+                ),
+            };
+            if object_type == 2 {
+                FrameDecoder::new_aac(sample_rate, channels)
+            } else {
+                None
+            }
+        };
     }
-    let Some(decoder) = mp3_decoder else {
+    let Some(decoder) = frame_decoder else {
         return decode_buffer(mem, format, audio_data, audio_data_byte_size, packet_descs);
     };
 
-    let data = mem.bytes_at(audio_data, audio_data_byte_size);
-    let mut frames: Vec<&[u8]> = packet_descs
-        .iter()
-        .filter_map(|&(start, size)| data.get(start as usize..)?.get(..size as usize))
-        .collect();
-    if frames.is_empty() {
-        // MP3 is self-framing, so packet descriptions are optional.
-        let mut pos = 0;
-        while pos + 4 <= data.len() {
-            match parse_mp3_frame_header(&data[pos..]) {
-                Some(header) if pos + header.frame_len <= data.len() => {
-                    frames.push(&data[pos..][..header.frame_len]);
-                    pos += header.frame_len;
+    let frames: Vec<&[u8]> = if is_aac {
+        split_aac_access_units(data, packet_descs)
+    } else {
+        let mut frames: Vec<&[u8]> = packet_descs
+            .iter()
+            .filter_map(|&(start, size)| data.get(start as usize..)?.get(..size as usize))
+            .collect();
+        if frames.is_empty() {
+            // MP3 is self-framing, so packet descriptions are optional.
+            let mut pos = 0;
+            while pos + 4 <= data.len() {
+                match parse_mp3_frame_header(&data[pos..]) {
+                    Some(header) if pos + header.frame_len <= data.len() => {
+                        frames.push(&data[pos..][..header.frame_len]);
+                        pos += header.frame_len;
+                    }
+                    _ => pos += 1,
                 }
-                _ => pos += 1,
             }
         }
-    }
+        frames
+    };
 
     let mut pcm = Vec::new();
     let mut spec: Option<(u32, u32)> = None;
@@ -2071,7 +2166,7 @@ fn prime_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
             .unwrap_or_default();
 
         let (al_format, al_frequency, data) = decode_queue_buffer(
-            &mut host_object.mp3_decoder,
+            &mut host_object.frame_decoder,
             &env.mem,
             &host_object.format,
             next_buffer.audio_data.cast(),
@@ -2079,19 +2174,100 @@ fn prime_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
             &packet_descs,
         );
 
-        unsafe {
+        // OpenAL only queues buffers that match the format and frequency of
+        // those already on the source, and a buffer that couldn't be decoded
+        // comes back empty, so convert anything else to the queued format.
+        let target = match host_object.al_queued_format {
+            Some(queued) if al_buffers_queued > 0 => queued,
+            _ => (al_format, al_frequency),
+        };
+        let data = if (al_format, al_frequency) != target || data.is_empty() {
+            conform_pcm((al_format, al_frequency), &data, target)
+        } else {
+            data
+        };
+        let (al_format, al_frequency) = target;
+
+        let err = unsafe {
             context.BufferData(
                 next_al_buffer,
                 al_format,
                 data.as_ptr() as *const ALvoid,
                 data.len().try_into().unwrap(),
                 al_frequency,
-            )
+            );
+            context.SourceQueueBuffers(al_source, 1, &next_al_buffer);
+            context.GetError()
         };
-
-        unsafe { context.SourceQueueBuffers(al_source, 1, &next_al_buffer) };
-        assert!(unsafe { context.GetError() } == 0);
+        if err != 0 {
+            log!(
+                "Warning: audio queue {:?} could not queue an OpenAL buffer: {:#x}; stopping refill.",
+                in_aq,
+                err
+            );
+            host_object.al_unused_buffers.push(next_al_buffer);
+            break;
+        }
+        host_object.al_queued_format = Some(target);
     }
+}
+
+/// Interleaved 16-bit samples of decoded `data` in OpenAL `format`, as
+/// `(samples, channels)`.
+fn pcm_to_i16(format: ALenum, data: &[u8]) -> (Vec<i16>, usize) {
+    match format {
+        al::AL_FORMAT_MONO8 | al::AL_FORMAT_STEREO8 => (
+            // 8-bit OpenAL samples are unsigned.
+            data.iter().map(|&b| (i16::from(b) - 128) << 8).collect(),
+            if format == al::AL_FORMAT_STEREO8 { 2 } else { 1 },
+        ),
+        _ => (
+            data.chunks_exact(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]))
+                .collect(),
+            if format == al::AL_FORMAT_STEREO16 { 2 } else { 1 },
+        ),
+    }
+}
+
+/// Convert decoded PCM to another OpenAL format and frequency, so it can be
+/// queued behind buffers of that format. Channels are duplicated or averaged,
+/// and the rate is converted by picking the nearest sample. Empty input
+/// becomes a short stretch of silence, so the queue still advances.
+fn conform_pcm(from: (ALenum, ALsizei), data: &[u8], to: (ALenum, ALsizei)) -> Vec<u8> {
+    let (samples, from_channels) = pcm_to_i16(from.0, data);
+    let to_stereo = matches!(to.0, al::AL_FORMAT_STEREO8 | al::AL_FORMAT_STEREO16);
+    let to_8bit = matches!(to.0, al::AL_FORMAT_MONO8 | al::AL_FORMAT_STEREO8);
+    let from_frames = samples.len() / from_channels;
+    let (from_rate, to_rate) = (from.1.max(1) as u64, to.1.max(1) as u64);
+    let to_frames = if from_frames == 0 {
+        // 10ms of silence.
+        (to_rate / 100).max(1) as usize
+    } else {
+        ((from_frames as u64 * to_rate / from_rate) as usize).max(1)
+    };
+
+    let mut out = Vec::with_capacity(to_frames * if to_stereo { 2 } else { 1 } * 2);
+    for i in 0..to_frames {
+        let (left, right) = if from_frames == 0 {
+            (0, 0)
+        } else {
+            let src = ((i as u64 * from_rate / to_rate) as usize).min(from_frames - 1);
+            let frame = &samples[src * from_channels..][..from_channels];
+            (frame[0], *frame.get(1).unwrap_or(&frame[0]))
+        };
+        let stereo = [left, right];
+        let mono = [((i32::from(left) + i32::from(right)) / 2) as i16];
+        let channels: &[i16] = if to_stereo { &stereo } else { &mono };
+        for &sample in channels {
+            if to_8bit {
+                out.push(((sample >> 8) + 128) as u8);
+            } else {
+                out.extend_from_slice(&sample.to_le_bytes());
+            }
+        }
+    }
+    out
 }
 
 fn unqueue_buffers<F: FnMut(ALuint)>(al_source: ALuint, context: &OpenAL<'_>, mut callback: F) {
@@ -2878,7 +3054,7 @@ fn AudioQueueReset(env: &mut Environment, in_aq: AudioQueueRef) -> OSStatus {
     host_object.buffer_queue.clear();
     host_object.offline_pcm.clear();
     // Whatever's enqueued next needn't follow on from what came before.
-    host_object.mp3_decoder = None;
+    host_object.frame_decoder = None;
 
     if host_object.is_input {
         // Drop pending data: delivery resumes from the current capture
@@ -3070,7 +3246,8 @@ pub fn AudioQueueNewInput(
         offline_render_format: None,
         offline_pcm: VecDeque::new(),
         offline_pcm_channels: 0,
-        mp3_decoder: None,
+        frame_decoder: None,
+        al_queued_format: None,
     };
 
     let aq_ref = env.mem.alloc_and_write(OpaqueAudioQueue { _filler: 0 });
@@ -3120,6 +3297,58 @@ mod tests {
         kAudioFormatFlagIsFloat, kAudioFormatFlagIsPacked, kAudioFormatLinearPCM,
         kAudioFormatMPEG4AAC,
     };
+
+    #[test]
+    fn adts_frames_are_split_into_raw_access_units() {
+        use super::{parse_adts_header, split_aac_access_units};
+        // AAC-LC, 22050 Hz, stereo, no CRC, 9-byte frame (2-byte payload).
+        let frame = |payload: [u8; 2]| {
+            let mut frame = vec![0xFF, 0xF1, 0x5C, 0x80, 0x01, 0x3F, 0xFC];
+            frame.extend_from_slice(&payload);
+            frame
+        };
+        let mut data = frame([1, 2]);
+        assert_eq!(parse_adts_header(&data), Some((7, 9, 2, 22050, 2)));
+        // A lone frame is enough: there's no container to probe.
+        assert_eq!(split_aac_access_units(&data, &[]), [&[1u8, 2][..]]);
+        data.extend(frame([3, 4]));
+        assert_eq!(
+            split_aac_access_units(&data, &[]),
+            [&[1u8, 2][..], &[3, 4][..]]
+        );
+        // Raw access units are delimited by the packet descriptions.
+        assert_eq!(
+            split_aac_access_units(&[5, 6, 7], &[(0, 1), (1, 2)]),
+            [&[5u8][..], &[6, 7][..]]
+        );
+    }
+
+    #[test]
+    fn conform_pcm_matches_the_queued_format() {
+        use super::{al, conform_pcm};
+        let mono = [100i16, -200]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let stereo = conform_pcm(
+            (al::AL_FORMAT_MONO16, 11025),
+            &mono,
+            (al::AL_FORMAT_STEREO16, 22050),
+        );
+        let samples = stereo
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+            .collect::<Vec<_>>();
+        assert_eq!(samples, [100, 100, 100, 100, -200, -200, -200, -200]);
+        // An undecodable buffer becomes 10ms of silence.
+        let silence = conform_pcm(
+            (al::AL_FORMAT_MONO16, 22050),
+            &[],
+            (al::AL_FORMAT_STEREO16, 22050),
+        );
+        assert_eq!(silence.len(), 220 * 2 * 2);
+        assert!(silence.iter().all(|&b| b == 0));
+    }
 
     #[test]
     fn downmix_averages_each_interleaved_frame() {

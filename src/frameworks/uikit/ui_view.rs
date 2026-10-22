@@ -178,6 +178,101 @@ pub fn set_view_controller(env: &mut Environment, view: id, controller: id) {
     host_obj.view_controller = controller;
 }
 
+/// Distribute a change of the superview's size along one axis over the
+/// flexible parts of a subview (leading margin, size, trailing margin), in
+/// proportion to their current lengths, or evenly if they are all zero. This
+/// is how UIKit's autoresizing behaves. Returns the new `(origin, size)`.
+fn autoresize_axis(
+    origin: CGFloat,
+    size: CGFloat,
+    old_parent: CGFloat,
+    new_parent: CGFloat,
+    (flex_lead, flex_size, flex_trail): (bool, bool, bool),
+) -> (CGFloat, CGFloat) {
+    let delta = new_parent - old_parent;
+    let trail = old_parent - origin - size;
+    let parts = [(flex_lead, origin), (flex_size, size), (flex_trail, trail)];
+    let flexible_count = parts.iter().filter(|(flexible, _)| *flexible).count();
+    if delta == 0.0 || flexible_count == 0 {
+        return (origin, size);
+    }
+    let flexible_total: CGFloat = parts
+        .iter()
+        .filter(|(flexible, _)| *flexible)
+        .map(|(_, len)| len.max(0.0))
+        .sum();
+    let share = |flexible: bool, len: CGFloat| match (flexible, flexible_total > 0.0) {
+        (false, _) => 0.0,
+        (true, true) => delta * len.max(0.0) / flexible_total,
+        (true, false) => delta / flexible_count as CGFloat,
+    };
+    let new_origin = origin + share(flex_lead, origin);
+    let new_size = (size + share(flex_size, size)).max(0.0);
+    (new_origin, new_size)
+}
+
+/// Apply the subviews' autoresizing masks after `view`'s bounds changed from
+/// `old_size`, like UIKit does when a view is resized, then lay out each
+/// subview whose size changed (e.g. so an EAGLView rebuilds its renderbuffer).
+fn resize_subviews_with_old_size(env: &mut Environment, view: id, old_size: CGSize) {
+    let autoresizes: bool = msg![env; view autoresizesSubviews];
+    if !autoresizes {
+        return;
+    }
+    let new_size = {
+        let bounds: CGRect = msg![env; view bounds];
+        bounds.size
+    };
+    // A view that had no size yet (still being set up) has nothing to resize
+    // its subviews relative to.
+    if new_size == old_size || old_size.width <= 0.0 || old_size.height <= 0.0 {
+        return;
+    }
+    let subviews = env.objc.borrow::<UIViewHostObject>(view).subviews.clone();
+    for subview in subviews {
+        let mask: NSUInteger = msg![env; subview autoresizingMask];
+        if mask == 0 {
+            continue;
+        }
+        let flag = |bit: u32| mask & (1 << bit) != 0;
+        let frame: CGRect = msg![env; subview frame];
+        let (x, width) = autoresize_axis(
+            frame.origin.x,
+            frame.size.width,
+            old_size.width,
+            new_size.width,
+            (flag(0), flag(1), flag(2)),
+        );
+        let (y, height) = autoresize_axis(
+            frame.origin.y,
+            frame.size.height,
+            old_size.height,
+            new_size.height,
+            (flag(3), flag(4), flag(5)),
+        );
+        let new_frame = CGRect {
+            origin: CGPoint { x, y },
+            size: CGSize { width, height },
+        };
+        if new_frame == frame {
+            continue;
+        }
+        let old_subview_size = {
+            let bounds: CGRect = msg![env; subview bounds];
+            bounds.size
+        };
+        // This autoresizes the subview's own subviews in turn.
+        () = msg![env; subview setFrame:new_frame];
+        let new_subview_size = {
+            let bounds: CGRect = msg![env; subview bounds];
+            bounds.size
+        };
+        if new_subview_size != old_subview_size {
+            () = msg![env; subview layoutSubviews];
+        }
+    }
+}
+
 pub(super) fn gesture_recognizers(env: &Environment, view: id) -> Vec<id> {
     env.objc
         .borrow::<UIViewHostObject>(view)
@@ -1721,7 +1816,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
-    msg![env; layer setBounds:bounds]
+    let old_bounds: CGRect = msg![env; layer bounds];
+    () = msg![env; layer setBounds:bounds];
+    resize_subviews_with_old_size(env, this, old_bounds.size);
 }
 - (CGPoint)center {
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
@@ -1777,7 +1874,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
-    msg![env; layer setFrame:frame]
+    let old_bounds: CGRect = msg![env; layer bounds];
+    () = msg![env; layer setFrame:frame];
+    resize_subviews_with_old_size(env, this, old_bounds.size);
 }
 - (CGAffineTransform)transform {
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
@@ -2056,4 +2155,45 @@ fn invoke_bool_block(env: &mut Environment, block: MutPtr<()>, arg: bool) {
     <crate::abi::GuestFunction as CallFromHost<(), (crate::mem::ConstVoidPtr, bool)>>::call_from_host(
         &func, env, (block_arg, arg),
     );
+}
+
+#[cfg(test)]
+mod autoresize_tests {
+    use super::autoresize_axis;
+
+    #[test]
+    fn flexible_size_absorbs_the_whole_change() {
+        // A 320x460 view filling its portrait superview, rotated to landscape.
+        assert_eq!(
+            autoresize_axis(0.0, 320.0, 320.0, 480.0, (false, true, false)),
+            (0.0, 480.0)
+        );
+        assert_eq!(
+            autoresize_axis(0.0, 460.0, 460.0, 320.0, (false, true, false)),
+            (0.0, 320.0)
+        );
+    }
+
+    #[test]
+    fn change_is_split_in_proportion_to_flexible_parts() {
+        // Flexible margins keep a 100-wide view centred.
+        assert_eq!(
+            autoresize_axis(110.0, 100.0, 320.0, 480.0, (true, false, true)),
+            (190.0, 100.0)
+        );
+        // A fixed view with a flexible leading margin stays pinned right.
+        assert_eq!(
+            autoresize_axis(220.0, 100.0, 320.0, 480.0, (true, false, false)),
+            (380.0, 100.0)
+        );
+        // Zero-length flexible parts share the change evenly.
+        assert_eq!(
+            autoresize_axis(0.0, 0.0, 0.0, 100.0, (true, true, true)),
+            (100.0 / 3.0, 100.0 / 3.0)
+        );
+        assert_eq!(
+            autoresize_axis(5.0, 10.0, 20.0, 40.0, (false, false, false)),
+            (5.0, 10.0)
+        );
+    }
 }
