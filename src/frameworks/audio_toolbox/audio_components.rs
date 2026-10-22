@@ -284,7 +284,10 @@ const AVAILABLE_COMPONENTS: &[(u32, u32)] = &[
     (kAudioUnitType_Mixer, fourcc(b"smxr")), // StereoMixer
     (kAudioUnitType_Mixer, fourcc(b"mxmx")), // MatrixMixer
     // kAudioUnitType_FormatConverter
-    (kAudioUnitType_FormatConverter, kAudioUnitSubType_AUConverter),
+    (
+        kAudioUnitType_FormatConverter,
+        kAudioUnitSubType_AUConverter,
+    ),
     (kAudioUnitType_FormatConverter, fourcc(b"vare")), // VariSpeed
     (kAudioUnitType_FormatConverter, fourcc(b"tmpt")), // TimePitch
     (kAudioUnitType_FormatConverter, fourcc(b"nutp")), // NewTimePitch
@@ -391,8 +394,7 @@ fn AudioComponentInstanceNew(
     host_object.is_3d_mixer = true;
     // Описание компонента, запомненное последним AudioComponentFindNext
     // (см. State::pending_component_desc) — для kAudioUnitProperty_ClassInfo.
-    host_object.component_desc =
-        State::get(&mut env.framework_state).pending_component_desc;
+    host_object.component_desc = State::get(&mut env.framework_state).pending_component_desc;
 
     let guest_instance: AudioComponentInstance = env
         .mem
@@ -498,7 +500,10 @@ mod component_search_tests {
             Some((fourcc(b"auou"), fourcc(b"rioc")))
         );
         let anything = desc(0, 0, 0);
-        assert_eq!(find_component_desc(&anything, None), AVAILABLE_COMPONENTS.first().copied());
+        assert_eq!(
+            find_component_desc(&anything, None),
+            AVAILABLE_COMPONENTS.first().copied()
+        );
     }
 
     /// An app that installs a reverb keeps running because the component
