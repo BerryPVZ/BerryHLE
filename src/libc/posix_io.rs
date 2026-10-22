@@ -13,8 +13,7 @@ use crate::abi::DotDotDot;
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::fs::{GuestFile, GuestOpenOptions, GuestPath};
 use crate::libc::errno::{
-    set_errno, EAGAIN, EBADF, EFAULT, EINTR, EINVAL, EIO, EISDIR, EMFILE, EOVERFLOW, EPIPE,
-    ESPIPE,
+    set_errno, EAGAIN, EBADF, EFAULT, EINTR, EINVAL, EIO, EISDIR, EMFILE, EOVERFLOW, EPIPE, ESPIPE,
 };
 use crate::libc::sys::socket::{close_socket, duplicate_socket, read_socket, write_socket};
 use crate::libc::unistd::pid_t;
@@ -23,6 +22,61 @@ use crate::mem::{
 };
 use crate::Environment;
 use std::io::{Read, Seek, SeekFrom, Write};
+
+fn read_into_guest_memory(
+    reader: &mut impl Read,
+    destination: &mut [u8],
+) -> std::io::Result<usize> {
+    #[cfg(target_os = "windows")]
+    {
+        // Guest pages are committed lazily by a user-mode fault handler.
+        // ReadFile probes its destination in kernel mode, where that handler
+        // cannot run; an untouched guest allocation can therefore fail with
+        // ERROR_NOACCESS (998). Read into committed host storage, then copy
+        // only the bytes returned through the normal guest memory path.
+        let mut staging = Vec::new();
+        staging
+            .try_reserve_exact(destination.len())
+            .map_err(std::io::Error::other)?;
+        staging.resize(destination.len(), 0);
+        let count = reader.read(&mut staging)?;
+        destination[..count].copy_from_slice(&staging[..count]);
+        Ok(count)
+    }
+    #[cfg(not(target_os = "windows"))]
+    reader.read(destination)
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_guest_read_tests {
+    use super::read_into_guest_memory;
+    use crate::mem::{Mem, MutPtr};
+    #[test]
+    fn file_read_commits_guest_pages_and_preserves_short_read_tail() {
+        let path = std::env::temp_dir().join(format!(
+            "hyperhle-read-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let expected: Vec<u8> = (0..0x17fa4).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &expected).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut memory = Mem::new();
+        let destination = memory.bytes_at_mut(MutPtr::from_bits(0x78000000), 0x17fb5);
+        let count = read_into_guest_memory(&mut file, destination).unwrap();
+        assert_eq!(count, expected.len());
+        assert_eq!(&destination[..count], expected.as_slice());
+        assert!(destination[count..].iter().all(|&b| b == 0));
+        let mut tail = [0xa5; 16];
+        assert_eq!(read_into_guest_memory(&mut file, &mut tail).unwrap(), 0);
+        assert_eq!(tail, [0xa5; 16]);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+}
 
 #[derive(Default)]
 pub struct State {
@@ -588,7 +642,7 @@ pub fn read(
         let archive_path = file.path.clone();
         let read_result = {
             let buffer_slice = env.mem.bytes_at_mut(buffer.cast(), size);
-            file.file.read(buffer_slice)
+            read_into_guest_memory(&mut file.file, buffer_slice)
         };
         if let Ok(bytes_read) = &read_result {
             if *bytes_read == 0 && size != 0 {
@@ -1626,9 +1680,7 @@ fn poll(env: &mut Environment, fds: MutPtr<PollFd>, nfds: u32, timeout: i32) -> 
     let deadline = if timeout < 0 {
         None
     } else {
-        Some(
-            std::time::Instant::now() + std::time::Duration::from_millis(timeout as u64),
-        )
+        Some(std::time::Instant::now() + std::time::Duration::from_millis(timeout as u64))
     };
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
