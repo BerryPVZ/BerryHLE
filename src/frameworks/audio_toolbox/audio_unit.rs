@@ -487,7 +487,7 @@ fn AudioUnitSetProperty(
                 }
                 // A unit that is already rendering needs an OpenAL source for
                 // the new callback.
-                set_up_running_unit = callback.is_some() && host_object.started;
+                set_up_running_unit = callback.is_some();
                 let proc_copy = render_callback.input_proc;
                 let ref_con_copy = render_callback.input_proc_ref_con;
                 log_dbg!(
@@ -707,8 +707,17 @@ fn AudioUnitSetProperty(
         }
     }
 
+    // The mixer may have been connected to an already-running output before
+    // it had any callbacks. Installing a voice on such a mixer must start its
+    // render cycle too, even though its own started flag is still false.
     if set_up_running_unit {
-        setup_audio_unit_for_render(env, in_unit);
+        let started = audio_components::State::get(&mut env.framework_state)
+            .audio_component_instances
+            .get(&in_unit)
+            .is_some_and(|obj| obj.started);
+        if started || feeds_running_output(env, in_unit) {
+            setup_audio_unit_for_render(env, in_unit);
+        }
     }
     if let Some((dest_input, source)) = make_connection {
         connect_audio_units(env, in_unit, dest_input, source);
@@ -745,7 +754,10 @@ fn units_feeding(env: &mut Environment, unit: AudioUnit) -> Vec<AudioUnit> {
 
 /// Whether `unit` is, or feeds into, an output unit that has been started.
 fn feeds_running_output(env: &mut Environment, unit: AudioUnit) -> bool {
-    let state = audio_components::State::get(&mut env.framework_state);
+    unit_feeds_running_output(audio_components::State::get(&mut env.framework_state), unit)
+}
+
+fn unit_feeds_running_output(state: &audio_components::State, unit: AudioUnit) -> bool {
     let mut pending = vec![unit];
     let mut visited = Vec::new();
     while let Some(unit) = pending.pop() {
@@ -2746,5 +2758,50 @@ mod tests {
     #[test]
     fn planar_pcm_rejects_mismatched_plane_lengths() {
         assert_eq!(interleave_planar_pcm(&[&[1, 2], &[3]], 1), None);
+    }
+}
+
+#[cfg(test)]
+mod connection_lifecycle_tests {
+    use super::*;
+    use crate::frameworks::audio_toolbox::audio_components::AudioComponentInstanceHostObject;
+
+    #[test]
+    fn a_late_voice_feeds_running_output_through_a_dormant_mixer() {
+        let voice = AudioUnit::from_bits(0x100);
+        let mixer = AudioUnit::from_bits(0x200);
+        let output = AudioUnit::from_bits(0x300);
+        let mut state = audio_components::State::default();
+        state
+            .audio_component_instances
+            .insert(voice, AudioComponentInstanceHostObject::default());
+        state
+            .audio_component_instances
+            .insert(mixer, AudioComponentInstanceHostObject::default());
+        state.audio_component_instances.insert(
+            output,
+            AudioComponentInstanceHostObject {
+                started: true,
+                component_desc: Some((fourcc(b"auou"), fourcc(b"rioc"), fourcc(b"appl"))),
+                ..Default::default()
+            },
+        );
+        state.connections.insert((output, 0), mixer);
+        state.connections.insert((mixer, 7), voice);
+        assert!(unit_feeds_running_output(&state, voice));
+        assert!(unit_feeds_running_output(&state, mixer));
+        assert!(!state.audio_component_instances[&mixer].started);
+        state.connections.remove(&(mixer, 7));
+        assert!(!unit_feeds_running_output(&state, voice));
+        state
+            .audio_component_instances
+            .get_mut(&output)
+            .unwrap()
+            .started = false;
+        assert!(!unit_feeds_running_output(&state, mixer));
+        // Malformed connection cycles also terminate without starting audio.
+        state.connections.insert((voice, 0), mixer);
+        state.connections.insert((mixer, 7), voice);
+        assert!(!unit_feeds_running_output(&state, voice));
     }
 }

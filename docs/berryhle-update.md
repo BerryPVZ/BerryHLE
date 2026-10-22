@@ -52,7 +52,7 @@ IPA was tested with its own scratch copy of saved data.
 
 ## Validation
 
-440 Rust library tests passed. The ARM TestApp integration suite was not run
+441 Rust library tests passed. The ARM TestApp integration suite was not run
 locally; it requires the custom SDK/toolchain and is covered by upstream macOS
 CI. Windows runtime checks and their limits are in the packaged validation.txt.
 No game IPAs, assets, saves or temporary diagnostic controls are shipped.
