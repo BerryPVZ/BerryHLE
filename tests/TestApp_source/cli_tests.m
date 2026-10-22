@@ -70,6 +70,11 @@
 
 extern NSString *const NSDefaultRunLoopMode;
 
+int test_NSHashTable_copy_is_independent(void);
+int test_NSHashTable_copy_owns_members(void);
+int test_NSHashTable_copy_empty(void);
+int test_NSData_base64_data(void);
+
 static int perform_selector_on_main_thread_calls;
 
 @interface PerformSelectorOnMainThreadProbe : NSObject
@@ -7506,6 +7511,10 @@ struct {
     FUNC_DEF(test_runloop_common_is_not_a_run_mode),
     FUNC_DEF(test_UIApplication_canOpenURL_own_registered_scheme),
     FUNC_DEF(test_UIApplication_tracking_is_common_mode),
+    FUNC_DEF(test_NSHashTable_copy_is_independent),
+    FUNC_DEF(test_NSHashTable_copy_owns_members),
+    FUNC_DEF(test_NSHashTable_copy_empty),
+    FUNC_DEF(test_NSData_base64_data),
     FUNC_DEF(test_NSBundle_subbundleCacheRetainsAutoreleasedBundle),
 };
 // clang-format on

@@ -49,7 +49,7 @@ use crate::frameworks::core_graphics::cg_font::{
     cg_font_with_font, data_provider_font, CGFontCreateWithFontName, CGFontRef, CGGlyph,
 };
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
-use crate::frameworks::foundation::ns_string::{get_static_str, to_rust_string};
+use crate::frameworks::foundation::ns_string::{from_rust_string, get_static_str, to_rust_string};
 use crate::frameworks::foundation::{unichar, NSRange, NSUInteger};
 use crate::frameworks::uikit::ui_font::{
     custom_font_of_uifont, draw_font_glyph, font_for_text, font_from_uifont, is_uifont,
@@ -373,6 +373,108 @@ fn CTFontDescriptorCreateMatchingFontDescriptors(
     let empty: CFArrayRef = msg_class![env; NSArray array];
     retain(env, empty);
     empty
+}
+
+/// `CTFontDescriptorCreateMatchingFontDescriptor` — the single best match
+/// for a descriptor. Every name falls back to one of the bundled fonts (see
+/// [CTFontDescriptorCopyAttribute]), so the descriptor matches itself.
+fn CTFontDescriptorCreateMatchingFontDescriptor(
+    env: &mut Environment,
+    descriptor: CTFontDescriptorRef,
+    _mandatory_attributes: CFTypeRef, // CFSetRef of attribute keys
+) -> CTFontDescriptorRef {
+    if descriptor == nil {
+        return nil;
+    }
+    retain(env, descriptor)
+}
+
+/// The file in `/System/Library/Fonts/Cache` (see `fs.rs`) that stands in for
+/// a font with this name or family and style. touchHLE ships the metric
+/// compatible Liberation fonts, plus Arial and a bold Helvetica.
+fn system_font_file(name: &str, style: &str) -> &'static str {
+    let name = name.to_ascii_lowercase();
+    let style = style.to_ascii_lowercase();
+    let bold = name.contains("bold") || style.contains("bold");
+    let italic = ["italic", "oblique"]
+        .iter()
+        .any(|word| name.contains(word) || style.contains(word));
+    let family = if name.contains("courier") || name.contains("mono") {
+        "LiberationMono"
+    } else if ["times", "georgia", "serif"]
+        .iter()
+        .any(|word| name.contains(word))
+        && !name.contains("sans")
+    {
+        "LiberationSerif"
+    } else if name.contains("helvetica") && bold && !italic {
+        return "helvetica-bold.ttf";
+    } else if name.contains("arial") && !bold && !italic {
+        return "Arial.ttf";
+    } else {
+        "LiberationSans"
+    };
+    match (family, bold, italic) {
+        ("LiberationMono", false, false) => "LiberationMono-Regular.ttf",
+        ("LiberationMono", true, false) => "LiberationMono-Bold.ttf",
+        ("LiberationMono", false, true) => "LiberationMono-Italic.ttf",
+        ("LiberationMono", true, true) => "LiberationMono-BoldItalic.ttf",
+        ("LiberationSerif", false, false) => "LiberationSerif-Regular.ttf",
+        ("LiberationSerif", true, false) => "LiberationSerif-Bold.ttf",
+        ("LiberationSerif", false, true) => "LiberationSerif-Italic.ttf",
+        ("LiberationSerif", true, true) => "LiberationSerif-BoldItalic.ttf",
+        (_, false, false) => "LiberationSans-Regular.ttf",
+        (_, true, false) => "LiberationSans-Bold.ttf",
+        (_, false, true) => "LiberationSans-Italic.ttf",
+        (_, true, true) => "LiberationSans-BoldItalic.ttf",
+    }
+}
+
+/// `CFTypeRef CTFontDescriptorCopyAttribute(CTFontDescriptorRef descriptor,
+///     CFStringRef attribute)`. Attributes the descriptor was created with are
+/// returned as is. The font file URL is filled in from the bundled fonts:
+/// engines such as Unity load the font file themselves through it, and draw
+/// no text at all without one.
+fn CTFontDescriptorCopyAttribute(
+    env: &mut Environment,
+    descriptor: CTFontDescriptorRef,
+    attribute: id,
+) -> CFTypeRef {
+    if descriptor == nil || attribute == nil {
+        return nil;
+    }
+    let attrs = descriptor_attrs(env, descriptor);
+    if attrs != nil {
+        let value: id = msg![env; attrs objectForKey:attribute];
+        if value != nil {
+            return retain(env, value);
+        }
+    }
+    let url_key = get_static_str(env, "NSCTFontFileURLAttribute");
+    let is_url_key: bool = msg![env; attribute isEqualToString:url_key];
+    if !is_url_key {
+        return nil;
+    }
+    let mut attr_string = |key: &'static str| {
+        if attrs == nil {
+            return None;
+        }
+        let key = get_static_str(env, key);
+        let value: id = msg![env; attrs objectForKey:key];
+        (value != nil).then(|| to_rust_string(env, value).into_owned())
+    };
+    let name = attr_string("NSFontNameAttribute")
+        .or_else(|| attr_string("NSFontFamilyAttribute"))
+        .unwrap_or_default();
+    let style = attr_string("NSFontFaceAttribute").unwrap_or_default();
+    let path = format!(
+        "/System/Library/Fonts/Cache/{}",
+        system_font_file(&name, &style)
+    );
+    let path = from_rust_string(env, path);
+    let url: id = msg_class![env; NSURL fileURLWithPath:path];
+    release(env, path);
+    retain(env, url)
 }
 
 fn CTFontCreateWithFontDescriptor(
@@ -1369,6 +1471,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CTFontCreateCopyWithAttributes(_, _, _, _)),
     export_c_func!(CTFontDescriptorCreateWithAttributes(_)),
     export_c_func!(CTFontDescriptorCreateMatchingFontDescriptors(_, _)),
+    export_c_func!(CTFontDescriptorCreateMatchingFontDescriptor(_, _)),
+    export_c_func!(CTFontDescriptorCopyAttribute(_, _)),
     export_c_func!(CTFontManagerRegisterGraphicsFont(_, _)),
     export_c_func!(CTFontGetAscent(_)),
     export_c_func!(CTFontGetDescent(_)),
@@ -1636,3 +1740,22 @@ pub const DYLIB: HostDylib = HostDylib {
     constant_exports: &[CONSTANTS],
     function_exports: &[FUNCTIONS],
 };
+
+#[cfg(test)]
+mod tests {
+    use super::system_font_file;
+
+    #[test]
+    fn font_names_map_to_bundled_files() {
+        assert_eq!(system_font_file("Arial", ""), "Arial.ttf");
+        assert_eq!(system_font_file("ArialMT", "Bold"), "LiberationSans-Bold.ttf");
+        assert_eq!(system_font_file("Helvetica-Bold", ""), "helvetica-bold.ttf");
+        assert_eq!(system_font_file("Helvetica", ""), "LiberationSans-Regular.ttf");
+        assert_eq!(
+            system_font_file("TimesNewRomanPS-ItalicMT", ""),
+            "LiberationSerif-Italic.ttf"
+        );
+        assert_eq!(system_font_file("Courier New", "Bold Italic"), "LiberationMono-BoldItalic.ttf");
+        assert_eq!(system_font_file("", ""), "LiberationSans-Regular.ttf");
+    }
+}
