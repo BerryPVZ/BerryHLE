@@ -19,7 +19,7 @@ use crate::frameworks::core_audio_types::{
     fourcc, kAudioFormatFlagIsAlignedHigh, kAudioFormatFlagIsFloat, kAudioFormatFlagIsPacked,
     kAudioFormatFlagIsSignedInteger, kAudioFormatLinearPCM, AudioStreamBasicDescription,
 };
-use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr, MutVoidPtr, SafeRead};
+use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr, MutVoidPtr, SafeRead, SafeWrite};
 
 const kAudioUnitType_Output: u32 = fourcc(b"auou");
 const kAudioUnitSubType_RemoteIO: u32 = fourcc(b"rioc");
@@ -41,6 +41,8 @@ const kAudioUnitSubType_3DMixer: u32 = fourcc(b"3dem");
 const kAudioUnitSubType_MultiChannelMixer: u32 = fourcc(b"mcmx");
 const kAudioUnitType_FormatConverter: u32 = fourcc(b"aufc");
 const kAudioUnitSubType_AUConverter: u32 = fourcc(b"conv");
+// Apple `AUComponent.h`: kAudioUnitType_Effect = 'aufx'
+const kAudioUnitType_Effect: u32 = fourcc(b"aufx");
 
 // --- 3D Mixer Structures ---
 #[repr(C, packed)]
@@ -215,9 +217,17 @@ pub struct AURenderCallbackStruct {
 }
 unsafe impl SafeRead for AURenderCallbackStruct {}
 
+/// Token returned by `AudioComponentFindNext`.
+///
+/// It carries the descriptor of the component it stands for, because the guest
+/// passes it straight back in to continue the search: Apple's iterator skips
+/// the component it returned last time.
 #[repr(C, packed)]
+#[derive(Debug, Default)]
 pub struct OpaqueAudioComponent {
-    _pad: u8,
+    component_type: u32,
+    component_sub_type: u32,
+    component_manufacturer: u32,
 }
 unsafe impl SafeRead for OpaqueAudioComponent {}
 
@@ -242,61 +252,129 @@ struct AudioComponentDescription {
 }
 unsafe impl SafeRead for AudioComponentDescription {}
 
+/// `AudioComponentDescription` fields are matched verbatim, except that 0
+/// matches anything (Apple's `AudioComponent.h`: "the type, subtype and
+/// manufacturer fields can be set to 0, in which case they match any value").
+fn component_field_matches(wanted: u32, available: u32) -> bool {
+    wanted == 0 || wanted == available
+}
+
+/// Components that `AudioComponentFindNext` reports as available.
+///
+/// touchHLE implements one pass-through audio unit: it pulls frames from the
+/// render callback of each input bus and mixes them, which covers output
+/// units, mixers and format converters. Effects are also worth matching
+/// because apps that install one (a reverb on a mixer's output, say) behave
+/// the same way whether the effect passes audio through untouched or is
+/// bypassed -- but they abort or fall back to silence if the component is
+/// missing. Sampler/instrument units are deliberately absent: they synthesise
+/// their own audio rather than pulling from an input, so passing them through
+/// would produce silence instead of the samples the app asked for.
+const AVAILABLE_COMPONENTS: &[(u32, u32)] = &[
+    // kAudioUnitType_Output
+    (kAudioUnitType_Output, kAudioUnitSubType_RemoteIO), // 'rioc'
+    (kAudioUnitType_Output, fourcc(b"vpio")),            // VoiceProcessingIO
+    (kAudioUnitType_Output, fourcc(b"genr")),            // GenericOutput
+    (kAudioUnitType_Output, fourcc(b"sys ")),            // SystemOutput
+    (kAudioUnitType_Output, fourcc(b"ahal")),            // HALOutput
+    (kAudioUnitType_Output, fourcc(b"def ")),            // DefaultOutput
+    // kAudioUnitType_Mixer
+    (kAudioUnitType_Mixer, kAudioUnitSubType_3DMixer),
+    (kAudioUnitType_Mixer, kAudioUnitSubType_MultiChannelMixer),
+    (kAudioUnitType_Mixer, fourcc(b"smxr")), // StereoMixer
+    (kAudioUnitType_Mixer, fourcc(b"mxmx")), // MatrixMixer
+    // kAudioUnitType_FormatConverter
+    (kAudioUnitType_FormatConverter, kAudioUnitSubType_AUConverter),
+    (kAudioUnitType_FormatConverter, fourcc(b"vare")), // VariSpeed
+    (kAudioUnitType_FormatConverter, fourcc(b"tmpt")), // TimePitch
+    (kAudioUnitType_FormatConverter, fourcc(b"nutp")), // NewTimePitch
+    // kAudioUnitType_Effect
+    (kAudioUnitType_Effect, fourcc(b"rvb2")), // Reverb2
+    (kAudioUnitType_Effect, fourcc(b"dely")), // Delay
+    (kAudioUnitType_Effect, fourcc(b"nbeq")), // NBandEQ
+    (kAudioUnitType_Effect, fourcc(b"bpas")), // Bandpass
+    (kAudioUnitType_Effect, fourcc(b"hpas")), // Highpass
+    (kAudioUnitType_Effect, fourcc(b"lpas")), // Lowpass
+    (kAudioUnitType_Effect, fourcc(b"dist")), // Distortion
+    (kAudioUnitType_Effect, fourcc(b"dcmp")), // DynamicsProcessor
+    (kAudioUnitType_Effect, fourcc(b"lmtr")), // PeakLimiter
+];
+
+fn find_component_desc(
+    desc: &AudioComponentDescription,
+    after: Option<(u32, u32)>,
+) -> Option<(u32, u32)> {
+    let mut passed_after = after.is_none();
+    for &(component_type, sub_type) in AVAILABLE_COMPONENTS {
+        if !component_field_matches(desc.component_type, component_type)
+            || !component_field_matches(desc.component_sub_type, sub_type)
+            || !component_field_matches(desc.component_manufacturer, kAudioUnitManufacturer_Apple)
+        {
+            continue;
+        }
+        if !passed_after {
+            if after == Some((component_type, sub_type)) {
+                passed_after = true;
+            }
+            continue;
+        }
+        return Some((component_type, sub_type));
+    }
+    None
+}
+
 fn AudioComponentFindNext(
     env: &mut Environment,
     in_component: AudioComponent,
     in_desc: ConstPtr<AudioComponentDescription>,
 ) -> AudioComponent {
-    assert!(in_component.is_null());
-    let audio_comp_descr = env.mem.read::<_, false>(in_desc);
+    let desc = env.mem.read::<_, false>(in_desc);
 
-    let comp_type = audio_comp_descr.component_type;
-    let comp_sub_type = audio_comp_descr.component_sub_type;
-    let comp_manufacturer = audio_comp_descr.component_manufacturer;
+    // Calling with a component found earlier continues the search, so a unit
+    // whose first match the app did not like can still reach the next one.
+    let after = if in_component.is_null() {
+        None
+    } else {
+        let previous = env.mem.read::<_, true>(in_component);
+        Some((previous.component_type, previous.component_sub_type))
+    };
 
-    let is_remote_io = comp_type == kAudioUnitType_Output
-        && comp_sub_type == kAudioUnitSubType_RemoteIO
-        && comp_manufacturer == kAudioUnitManufacturer_Apple;
-
-    let is_3d_mixer = comp_type == kAudioUnitType_Mixer
-        && comp_sub_type == kAudioUnitSubType_3DMixer
-        && comp_manufacturer == kAudioUnitManufacturer_Apple;
-
-    // The MultiChannelMixer uses the same input-bus + render-callback model as
-    // the 3D Mixer, so it flows through our existing `mixer_buses` render path.
-    let is_multichannel_mixer = comp_type == kAudioUnitType_Mixer
-        && comp_sub_type == kAudioUnitSubType_MultiChannelMixer
-        && comp_manufacturer == kAudioUnitManufacturer_Apple;
-
-    // The format converter (AUConverter) is treated as a pass-through unit; it
-    // pulls from its input render callback just like a mixer bus.
-    let is_format_converter = comp_type == kAudioUnitType_FormatConverter
-        && comp_sub_type == kAudioUnitSubType_AUConverter
-        && comp_manufacturer == kAudioUnitManufacturer_Apple;
-
-    if !is_remote_io && !is_3d_mixer && !is_multichannel_mixer && !is_format_converter {
+    let Some((component_type, sub_type)) = find_component_desc(&desc, after) else {
+        let (want_type, want_sub_type, want_manufacturer) = (
+            desc.component_type,
+            desc.component_sub_type,
+            desc.component_manufacturer,
+        );
         log!(
-            "AudioComponentFindNext: unsupported component type={:#010x} sub_type={:#010x} manufacturer={:#010x}, returning null",
-            comp_type,
-            comp_sub_type,
-            comp_manufacturer,
+            "AudioComponentFindNext: no component for type={:#010x} sub_type={:#010x} manufacturer={:#010x}",
+            want_type,
+            want_sub_type,
+            want_manufacturer,
         );
         return MutPtr::null();
-    }
+    };
+    let component_manufacturer = kAudioUnitManufacturer_Apple;
 
     let state = State::get(&mut env.framework_state);
     if state.audio_component.is_null() {
-        state.audio_component = env.mem.alloc_and_write(OpaqueAudioComponent { _pad: 0 });
+        state.audio_component = env.mem.alloc_and_write(OpaqueAudioComponent::default());
     }
+    env.mem.write(
+        state.audio_component,
+        OpaqueAudioComponent {
+            component_type,
+            component_sub_type: sub_type,
+            component_manufacturer,
+        },
+    );
 
     log_dbg!(
-        "AudioComponentFindNext: matched type=0x{:08x} sub_type=0x{:08x} manuf=0x{:08x} -> {:?}",
-        comp_type,
-        comp_sub_type,
-        comp_manufacturer,
+        "AudioComponentFindNext: matched type=0x{:08x} sub_type=0x{:08x} -> {:?}",
+        component_type,
+        sub_type,
         state.audio_component
     );
-    state.pending_component_desc = Some((comp_type, comp_sub_type, comp_manufacturer));
+    state.pending_component_desc = Some((component_type, sub_type, component_manufacturer));
     state.audio_component
 }
 
@@ -379,3 +457,76 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(AudioComponentInstanceNew(_, _)),
     export_c_func!(AudioComponentInstanceDispose(_)),
 ];
+
+#[cfg(test)]
+mod component_search_tests {
+    use super::*;
+
+    fn desc(component_type: u32, sub_type: u32, manufacturer: u32) -> AudioComponentDescription {
+        AudioComponentDescription {
+            component_type,
+            component_sub_type: sub_type,
+            component_manufacturer: manufacturer,
+            component_flags: 0,
+            component_flags_mask: 0,
+        }
+    }
+
+    /// Getting the exact RemoteIO unit apps ask for by name.
+    #[test]
+    fn finds_remote_io_by_name() {
+        let want = desc(
+            fourcc(b"auou"),
+            fourcc(b"rioc"),
+            kAudioUnitManufacturer_Apple,
+        );
+        assert_eq!(
+            find_component_desc(&want, None),
+            Some((fourcc(b"auou"), fourcc(b"rioc")))
+        );
+    }
+
+    /// `AudioComponent.h` says a zero field matches anything, so an app that
+    /// lets the system pick the first output unit gets one:
+    /// "the type, subtype and manufacturer fields can be set to 0, in which
+    /// case they match any value".
+    #[test]
+    fn zero_fields_match_any_value() {
+        let any_output = desc(0, fourcc(b"rioc"), 0);
+        assert_eq!(
+            find_component_desc(&any_output, None),
+            Some((fourcc(b"auou"), fourcc(b"rioc")))
+        );
+        let anything = desc(0, 0, 0);
+        assert_eq!(find_component_desc(&anything, None), AVAILABLE_COMPONENTS.first().copied());
+    }
+
+    /// An app that installs a reverb keeps running because the component
+    /// exists; the effect itself passes audio through untouched.
+    #[test]
+    fn finds_effects() {
+        let reverb = desc(fourcc(b"aufx"), fourcc(b"rvb2"), fourcc(b"appl"));
+        assert_eq!(
+            find_component_desc(&reverb, None),
+            Some((fourcc(b"aufx"), fourcc(b"rvb2")))
+        );
+    }
+
+    /// Sampler units synthesise their own audio, so reporting one would hand
+    /// the app silence instead of its samples.
+    #[test]
+    fn does_not_report_instrument_units() {
+        let sampler = desc(fourcc(b"ausn"), fourcc(b"samp"), fourcc(b"appl"));
+        assert_eq!(find_component_desc(&sampler, None), None);
+    }
+
+    /// Iterating continues after the component the app passed in.
+    #[test]
+    fn continues_after_the_previous_match() {
+        let any_mixer = desc(fourcc(b"aumx"), 0, 0);
+        let first = find_component_desc(&any_mixer, None).unwrap();
+        let second = find_component_desc(&any_mixer, Some(first)).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(second.1, fourcc(b"mcmx"));
+    }
+}
