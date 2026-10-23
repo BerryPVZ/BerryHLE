@@ -110,16 +110,17 @@ pub(super) fn run_access_prompt(
     () = msg![env; mask setUserInteractionEnabled:false];
     () = msg![env; panel addSubview:mask];
 
+    let separator_color = ui_color(env, 0.82, 0.83, 0.85, 1.0);
     let separator = new_view(
         env,
         rect(0.0, 70.0, panel_width, 1.0),
-        ui_color(env, 0.82, 0.83, 0.85, 1.0),
+        separator_color,
     );
     () = msg![env; panel addSubview:separator];
     let vertical_separator = new_view(
         env,
         rect(panel_width / 2.0, 70.0, 1.0, 56.0),
-        ui_color(env, 0.82, 0.83, 0.85, 1.0),
+        separator_color,
     );
     () = msg![env; panel addSubview:vertical_separator];
     let blue = ui_color(env, 0.0, 0.478, 1.0, 1.0);
