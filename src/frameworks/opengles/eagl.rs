@@ -3785,6 +3785,10 @@ fn attach_orphaned_eagl_view_to_root(env: &mut Environment, drawable: id) -> boo
         }
         let root_view_controller: id = msg![env; window rootViewController];
         let root_view: id = if root_view_controller != nil {
+            let loaded: bool = msg![env; root_view_controller isViewLoaded];
+            if !loaded {
+                continue;
+            }
             msg![env; root_view_controller view]
         } else {
             window

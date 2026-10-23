@@ -107,6 +107,17 @@ fn invoke_completion_handler(
     let _: () = invoke.call_from_host(env, (block_arg, response, data, error));
 }
 
+fn responds_to(env: &mut crate::Environment, target: id, selector_name: &str) -> bool {
+    if target == nil {
+        return false;
+    }
+    let sel = env
+        .objc
+        .lookup_selector(selector_name)
+        .unwrap_or_else(|| env.objc.register_host_selector(selector_name.to_string(), &mut env.mem));
+    msg![env; target respondsToSelector:sel]
+}
+
 /// Finish the connection exactly once and deliver the result on the guest
 /// thread. The timer which called this method retains the connection through
 /// the callbacks, even if the app releases its own reference from a callback.
@@ -129,11 +140,19 @@ fn finish_connection(
 
     if delegate != nil {
         if error != nil {
-            () = msg![env; delegate connection:connection didFailWithError:error];
+            if responds_to(env, delegate, "connection:didFailWithError:") {
+                () = msg![env; delegate connection:connection didFailWithError:error];
+            }
         } else {
-            () = msg![env; delegate connection:connection didReceiveResponse:response];
-            () = msg![env; delegate connection:connection didReceiveData:data];
-            () = msg![env; delegate connectionDidFinishLoading:connection];
+            if responds_to(env, delegate, "connection:didReceiveResponse:") {
+                () = msg![env; delegate connection:connection didReceiveResponse:response];
+            }
+            if responds_to(env, delegate, "connection:didReceiveData:") {
+                () = msg![env; delegate connection:connection didReceiveData:data];
+            }
+            if responds_to(env, delegate, "connectionDidFinishLoading:") {
+                () = msg![env; delegate connectionDidFinishLoading:connection];
+            }
         }
     }
     invoke_completion_handler(env, handler, response, data, error);
@@ -148,7 +167,11 @@ fn finish_connection(
 fn schedule_connection_poll(env: &mut crate::Environment, connection: id, delay: f64) {
     let selector = env
         .objc
-        .register_host_selector("_touchHLE_pollNetwork".to_string(), &mut env.mem);
+        .lookup_selector("_touchHLE_pollNetwork")
+        .unwrap_or_else(|| {
+            env.objc
+                .register_host_selector("_touchHLE_pollNetwork".to_string(), &mut env.mem)
+        });
     () = msg![env; connection performSelector:selector withObject:nil afterDelay:delay];
 }
 
@@ -162,10 +185,22 @@ fn start_connection(env: &mut crate::Environment, connection: id) {
         host.request
     };
 
+    if let Some(local_result) = url_loading::try_local_file_request(env, request) {
+        env.objc
+            .borrow_mut::<NSURLConnectionHostObject>(connection)
+            .receiver = Some(url_loading::immediate_async_result(local_result));
+        schedule_connection_poll(env, connection, 0.0);
+        return;
+    }
+
     if fake_network_success_enabled() {
         let selector = env
             .objc
-            .register_host_selector("_touchHLE_deliverSuccess".to_string(), &mut env.mem);
+            .lookup_selector("_touchHLE_deliverSuccess")
+            .unwrap_or_else(|| {
+                env.objc
+                    .register_host_selector("_touchHLE_deliverSuccess".to_string(), &mut env.mem)
+            });
         () = msg![env; connection performSelector:selector withObject:nil afterDelay:0.0_f64];
         return;
     }
@@ -200,25 +235,25 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)sendSynchronousRequest:(id)request
            returningResponse:(MutPtr<id>)response_ptr
                        error:(MutPtr<id>)error_ptr {
-    if fake_network_success_enabled() {
+    let result = if let Some(local_result) = url_loading::try_local_file_request(env, request) {
+        local_result
+    } else if fake_network_success_enabled() {
         log!("NSURLConnection synchronous request: using app-specific fake JSON response");
         if !response_ptr.is_null() {
             let response = make_fake_http_response(env, request);
-            retain(env, response);
             env.mem.write(response_ptr, response);
         }
         return make_fake_success_data(env);
-    }
-
-    let result = url_loading::send(
-        url_loading::request_from_objc(env, request, nil, None),
-        env.options.network_access,
-    );
+    } else {
+        url_loading::send(
+            url_loading::request_from_objc(env, request, nil, None),
+            env.options.network_access,
+        )
+    };
     match result {
         Ok(response) => {
             let (ns_response, data) = url_loading::make_foundation_response(env, &response);
             if !response_ptr.is_null() {
-                retain(env, ns_response);
                 env.mem.write(response_ptr, ns_response);
             }
             data
@@ -229,7 +264,6 @@ pub const CLASSES: ClassExports = objc_classes! {
             }
             if !error_ptr.is_null() {
                 let error = url_loading::make_foundation_error(env, &network_error);
-                retain(env, error);
                 env.mem.write(error_ptr, error);
             }
             nil

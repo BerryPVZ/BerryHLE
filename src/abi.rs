@@ -137,10 +137,12 @@ macro_rules! impl_CallFromGuest {
 
                 let retval = self(env, $(args.$p),*);
                 log_dbg!("CallFromGuest => {:?}", retval);
-                if let Some(retval_ptr) = retval_ptr {
-                    retval.to_mem(retval_ptr, &mut env.mem);
-                } else {
-                    retval.to_regs(env.cpu.regs_mut());
+                if !env.is_guest_control_flow_redirected() {
+                    if let Some(retval_ptr) = retval_ptr {
+                        retval.to_mem(retval_ptr, &mut env.mem);
+                    } else {
+                        retval.to_regs(env.cpu.regs_mut());
+                    }
                 }
             }
         }
@@ -166,10 +168,12 @@ macro_rules! impl_CallFromGuest {
 
                 let retval = self(env, $(args.$p,)* va_list);
                 log_dbg!("CallFromGuest => {:?}", retval);
-                if let Some(retval_ptr) = retval_ptr {
-                    retval.to_mem(retval_ptr, &mut env.mem);
-                } else {
-                    retval.to_regs(env.cpu.regs_mut());
+                if !env.is_guest_control_flow_redirected() {
+                    if let Some(retval_ptr) = retval_ptr {
+                        retval.to_mem(retval_ptr, &mut env.mem);
+                    } else {
+                        retval.to_regs(env.cpu.regs_mut());
+                    }
                 }
             }
         }

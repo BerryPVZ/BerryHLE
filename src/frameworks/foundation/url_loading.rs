@@ -12,8 +12,9 @@
 
 use crate::frameworks::foundation::ns_string::{from_rust_string, to_rust_string};
 use crate::frameworks::foundation::{NSInteger, NSUInteger};
-use crate::mem::{MutPtr, MutVoidPtr};
-use crate::objc::{autorelease, id, msg, msg_class, nil, retain};
+use crate::mem::MutPtr;
+use crate::mem::MutVoidPtr;
+use crate::objc::{autorelease, id, msg, msg_class, nil};
 use crate::Environment;
 use std::io::Read;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -523,10 +524,61 @@ pub fn make_foundation_error(env: &mut Environment, error: &HttpError) -> id {
     autorelease(env, ns_error)
 }
 
-/// Convenience for `NSData`'s `NSError **` URL-loading initializer.
+/// Read a local `file://` `NSURLRequest` on the guest thread without requiring
+/// `--allow-network-access` (used by Unity `WWW` and local asset loaders).
+pub fn try_local_file_request(env: &mut Environment, request: id) -> Option<HttpResult> {
+    if request == nil {
+        return None;
+    }
+    let url_object: id = msg![env; request URL];
+    if url_object == nil {
+        return None;
+    }
+    let is_file: bool = msg![env; url_object isFileURL];
+    if !is_file {
+        return None;
+    }
+    let absolute_string: id = msg![env; url_object absoluteString];
+    let url = if absolute_string == nil {
+        String::new()
+    } else {
+        to_rust_string(env, absolute_string).into_owned()
+    };
+    let path: id = msg![env; url_object path];
+    if path == nil {
+        return Some(Err(http_error(-1100, "The file URL has no path.")));
+    }
+    let path_str = to_rust_string(env, path).into_owned();
+    match env.fs.read(crate::fs::GuestPath::new(&path_str)) {
+        Ok(body) => {
+            let headers = vec![("Content-Length".to_string(), body.len().to_string())];
+            Some(Ok(HttpResponse {
+                url,
+                status_code: 200,
+                headers,
+                body,
+            }))
+        }
+        Err(_) => Some(Err(http_error(
+            -1100,
+            format!("The requested file {:?} could not be read.", path_str),
+        ))),
+    }
+}
+
+/// Wrap an already-computed `HttpResult` into a single-shot channel for async
+/// run-loop callback delivery.
+pub fn immediate_async_result(result: HttpResult) -> HttpReceiver {
+    let (sender, receiver) = mpsc::channel();
+    let _ = sender.send(result);
+    receiver
+}
+
+/// Convenience for `NSError **` URL-loading out-parameters.
 pub fn write_error_out_parameter(env: &mut Environment, error_ptr: MutVoidPtr, error: id) {
     if !error_ptr.is_null() {
-        retain(env, error);
+        // `make_foundation_error` already returns an autoreleased NSError,
+        // matching Objective-C's `__autoreleasing NSError **` convention.
         env.mem.write(error_ptr.cast(), error);
     }
 }

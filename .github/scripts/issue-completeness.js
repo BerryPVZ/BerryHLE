@@ -21,11 +21,18 @@ const LOG_HEADING = /\blog\b/i;
 const DESCRIPTION_HEADING =
   /describe the bug|what is the problem|bug \/ crash|describe the feature or issue/i;
 // The general form is for emulator features, which have no app to attach.
-const FEATURE_HEADING = /describe the feature or issue/i;
+const FEATURE_HEADING =
+  /describe the feature or issue|\b(emulator|launcher|app picker|settings)\s+(bug|crash|issue|feature)\b/i;
+const EMULATOR_TITLE =
+  /^\[(emulator|feature|ui|android)\]|^\s*(emulator|launcher|app picker|settings)\s+(bug|crash|issue|feature)\b/i;
+const GAME_HEADING = /app \/ game name|what is the problem with the app/i;
 
 const URL = /https?:\/\/[^\s<>`"'\]]+/gi;
 const STORE_URL = /^https?:\/\/(apps|itunes)\.apple\.com\//i;
 const IPA_URL = /\.ipa\b/i;
+const TEXT_URL = /\.(txt|log)\b/i;
+const CLOUD_SHARE_URL =
+  /^https?:\/\/([a-z0-9-]+\.)?(drive\.google\.com|mega\.nz|mediafire\.com|1drv\.ms|onedrive\.live\.com|disk\.yandex\.[a-z]+|pixeldrain\.com|dropbox\.com)\//i;
 // Log files dragged into the form, or log lines pasted anywhere.
 const LOG_ATTACHMENT =
   /https:\/\/github\.com\/user-attachments\/files\/\d+\/[^\s)]*\.(txt|log)\b/i;
@@ -72,14 +79,18 @@ function urls(text) {
   });
 }
 
-function checkIssue(body) {
+function checkIssue(body, title = '') {
   body = body || '';
+  title = title || '';
   const parts = sections(body);
   const find = (re) => parts.filter((s) => re.test(s.heading));
   const ipaParts = find(IPA_HEADING);
   const logParts = find(LOG_HEADING);
   const descParts = find(DESCRIPTION_HEADING);
-  const isFeature = find(FEATURE_HEADING).length > 0;
+  const hasGameTemplate = ipaParts.length > 0 || find(GAME_HEADING).length > 0;
+  const isFeature =
+    find(FEATURE_HEADING).length > 0 ||
+    (!hasGameTemplate && EMULATOR_TITLE.test(title));
 
   let description;
   if (descParts.length > 0) {
@@ -103,7 +114,13 @@ function checkIssue(body) {
         urls(answer(s.text)).some((u) => !STORE_URL.test(u)),
       );
   } else {
-    ipa = telegramIpa || urls(body).some((u) => IPA_URL.test(u));
+    ipa =
+      telegramIpa ||
+      urls(body).some(
+        (u) =>
+          IPA_URL.test(u) ||
+          (CLOUD_SHARE_URL.test(u) && !TEXT_URL.test(u)),
+      );
   }
 
   let log = LOG_ATTACHMENT.test(body) || LOG_TEXT.test(body);
@@ -159,7 +176,7 @@ async function run({ github, context, core }) {
     return;
   }
 
-  const { missing, needsLog } = checkIssue(issue.body);
+  const { missing, needsLog } = checkIssue(issue.body, issue.title);
   core.info(`Missing: ${missing.join(', ') || 'nothing'}`);
   core.info(`Log: ${needsLog ? 'missing' : 'present or not needed'}`);
   const params = { owner, repo, issue_number: issue.number };

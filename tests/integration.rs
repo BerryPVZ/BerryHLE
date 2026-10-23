@@ -224,9 +224,7 @@ fn run_test_app(
                 *a != "-ObjC"
                     && *a != "-fno-objc-exceptions"
                     && *a != "-fno-objc-arc"
-                    && *a
-                        != "-fno-objc-arc-e
-          +xceptions"
+                    && *a != "-fno-objc-arc-exceptions"
             })
             .collect();
         cpp_args.push("-c");
