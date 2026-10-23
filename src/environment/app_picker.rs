@@ -1,5 +1,7 @@
 //! App picker GUI.
 
+mod archive_store;
+
 use crate::bundle::Bundle;
 use crate::frameworks::core_graphics::cg_affine_transform::{
     CGAffineTransform, CGAffineTransformIdentity,
@@ -59,6 +61,8 @@ struct AppInfo {
     display_name: String,
     /// `CFBundleIdentifier`, which also names the app's sandbox directory.
     bundle_id: String,
+    /// The built-in archive browser is a picker entry, not an installed app.
+    is_archive_store: bool,
     icon: Option<Image>,
     /// `NSString*`
     display_name_ns_string: Option<id>,
@@ -140,6 +144,7 @@ fn enumerate_apps(apps_dir: &Path) -> Result<Vec<AppInfo>, std::io::Error> {
                     path: app_path,
                     display_name,
                     bundle_id,
+                    is_archive_store: false,
                     icon,
                     display_name_ns_string: None,
                     icon_ui_image: None,
@@ -152,6 +157,24 @@ fn enumerate_apps(apps_dir: &Path) -> Result<Vec<AppInfo>, std::io::Error> {
 
     apps.sort_by_key(|app| app.display_name.to_uppercase());
     Ok(apps)
+}
+
+/// Put the built-in store in the first cell without mixing it into the
+/// on-disk app enumeration. Keeping it as an entry lets the normal paging,
+/// unlock animation and icon rendering code treat it like any other tile.
+fn add_archive_store_entry(apps: &mut Vec<AppInfo>) {
+    apps.insert(
+        0,
+        AppInfo {
+            path: PathBuf::new(),
+            display_name: "IPA Store".to_string(),
+            bundle_id: String::new(),
+            is_archive_store: true,
+            icon: None,
+            display_name_ns_string: None,
+            icon_ui_image: None,
+        },
+    );
 }
 
 fn sqlite_file_belongs_to_bundle(
@@ -342,6 +365,16 @@ struct AppPickerDelegateHostObject {
     // picker needs to wait for a newly copied IPA to settle before reloading.
     add_ipa: bool,
     recent_app_tapped: bool,
+    // Actions used by the built-in Internet Archive store screen.
+    archive_store_close: bool,
+    archive_store_search: bool,
+    archive_store_previous: bool,
+    archive_store_next: bool,
+    archive_store_back: bool,
+    archive_store_retry: bool,
+    archive_store_cancel: bool,
+    archive_store_item: Option<NSInteger>,
+    archive_store_download: Option<NSInteger>,
     settings_show: bool,
     settings_hide: bool,
     scale_hack_default: bool,
@@ -558,6 +591,40 @@ const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).add_ipa = true;
 }
 
+- (())archiveStoreClose {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_close = true;
+}
+- (())archiveStoreSearch {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_search = true;
+}
+- (())archiveStorePrevious {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_previous = true;
+}
+- (())archiveStoreNext {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_next = true;
+}
+- (())archiveStoreBack {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_back = true;
+}
+- (())archiveStoreRetry {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_retry = true;
+}
+- (())archiveStoreCancel {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_cancel = true;
+}
+- (())archiveStoreItem:(id)sender {
+    let tag: NSInteger = msg![env; sender tag];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_item = Some(tag);
+}
+- (())archiveStoreDownload:(id)sender {
+    let tag: NSInteger = msg![env; sender tag];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_download = Some(tag);
+}
+- (())textFieldShouldReturn:(id)sender {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_search = true;
+    let _: bool = msg![env; sender resignFirstResponder];
+}
+
 - (())settingsShow {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).settings_show = true;
 }
@@ -727,6 +794,9 @@ fn app_picker_inner(
     env: &mut Environment,
     mut apps: Result<Vec<AppInfo>, String>,
 ) -> (PathBuf, Vec<String>) {
+    if let Ok(installed_apps) = &mut apps {
+        add_archive_store_entry(installed_apps);
+    }
     let mut option_args = Vec::new();
     // Note that objects are generally not released in this code, because they
     // don't need to be: the entire Environment is thrown away at the end.
@@ -848,7 +918,8 @@ fn app_picker_inner(
     let remembered_app_path = read_last_app_path();
     let recent_app = apps.as_mut().ok().and_then(|apps| {
         let app = apps.iter_mut().find(|app| {
-            remembered_app_path.as_ref().is_some_and(|path| path == &app.path)
+            !app.is_archive_store
+                && remembered_app_path.as_ref().is_some_and(|path| path == &app.path)
         })?;
         let image = if let Some(icon) = app.icon.as_ref() {
             let cg_image = cg_image::from_image(env, icon.clone());
@@ -1190,6 +1261,7 @@ fn app_picker_inner(
                     apps.as_ref()
                         .ok()
                         .and_then(|list| list.get(app_idx))
+                        .filter(|app| !app.is_archive_store)
                         .map(|app| app.display_name.clone())
                 });
                 if let (Some(app_idx), Some(name)) = (app_idx, name) {
@@ -1219,6 +1291,53 @@ fn app_picker_inner(
                 .copied()
             {
                 Some(app_idx) => {
+                    if apps.as_ref().unwrap()[app_idx].is_archive_store {
+                        let downloaded = archive_store::run_archive_store(
+                            env,
+                            main_run_loop,
+                            delegate,
+                            main_view,
+                            app_frame,
+                            &apps_dir,
+                        );
+                        // The store has its own nested event loop. Do not let a
+                        // swipe or touch delivered to its views leak into the
+                        // home screen when it closes.
+                        {
+                            let host_obj = env
+                                .objc
+                                .borrow_mut::<AppPickerDelegateHostObject>(delegate);
+                            host_obj.icon_tapped = nil;
+                            host_obj.icon_touch_down = nil;
+                            host_obj.icon_touch_cancelled = false;
+                            host_obj.swipe_left = false;
+                            host_obj.swipe_right = false;
+                        }
+                        PENDING_ARROW_KEY.store(0, Ordering::Relaxed);
+                        press = None;
+                        long_pressed_icon = None;
+                        if downloaded {
+                            awaited_ipa = None;
+                            if let Some(grid) = icon_grid_stuff.as_mut() {
+                                let page_count = reload_app_grid(
+                                    env,
+                                    grid,
+                                    &mut apps,
+                                    &mut current_page,
+                                    &apps_dir,
+                                );
+                                rebuild_page_dots(
+                                    env,
+                                    main_view,
+                                    app_frame.size,
+                                    &mut page_dots,
+                                    page_count,
+                                );
+                                update_page_dots(env, &page_dots, current_page);
+                            }
+                        }
+                        continue;
+                    }
                     let app_path = apps.as_ref().unwrap()[app_idx].path.clone();
                     remember_last_app_path(&app_path);
                     echo!("Picked: {}", app_path.display());
@@ -1721,6 +1840,7 @@ struct IconGridStuff {
     /// Width of the picker screen, used by the page slide animation.
     screen_width: CGFloat,
     placeholder_icon: Option<id>,
+    archive_store_icon: Option<id>,
     pages: Vec<std::ops::Range<usize>>,
     /// Maps an on-screen icon cell's button to the app it shows.
     icon_map: HashMap<id, usize>,
@@ -1859,6 +1979,7 @@ fn make_icon_grid(
         visible: 0,
         screen_width: app_frame.size.width,
         placeholder_icon: None,
+        archive_store_icon: None,
         pages,
         icon_map: HashMap::new(),
     }
@@ -1992,11 +2113,17 @@ fn update_icon_grid(
             app.icon_ui_image = Some(image);
         }
 
-        let image = app.icon_ui_image.unwrap_or_else(|| {
-            *icon_grid_stuff.placeholder_icon.get_or_insert_with(|| {
-                make_icon_from_text(env, "?", 40.0, 0.0, (0.5, 0.5, 0.5, 1.0))
+        let image = if app.is_archive_store {
+            *icon_grid_stuff
+                .archive_store_icon
+                .get_or_insert_with(|| archive_store::make_archive_store_icon(env))
+        } else {
+            app.icon_ui_image.unwrap_or_else(|| {
+                *icon_grid_stuff.placeholder_icon.get_or_insert_with(|| {
+                    make_icon_from_text(env, "?", 40.0, 0.0, (0.5, 0.5, 0.5, 1.0))
+                })
             })
-        });
+        };
         () = msg![env; icon_button setImage:image forState:UIControlStateNormal];
 
         let text = *app
@@ -4196,6 +4323,7 @@ fn reload_app_grid(
             return grid.pages.len();
         }
     };
+    add_archive_store_entry(&mut new_apps);
     grid.pages = compute_pages(grid.containers[0].cells.len(), new_apps.len());
     if *current_page >= grid.pages.len() {
         *current_page = grid.pages.len() - 1;

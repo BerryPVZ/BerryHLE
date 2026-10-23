@@ -7,11 +7,19 @@ HyperHLE is a high-level emulator for early iPhone OS apps. It reimplements sele
 
 The repository does not distribute commercial apps or iOS firmware. Put an app bundle (`.app`) or IPA (`.ipa`) that you are entitled to use in `touchHLE_apps/`; it will appear in the app picker.
 
+The IPA Store is an unofficial Internet Archive browser, not an Apple service.
+It does not bundle apps or bulk-download the collection; downloads are started
+per file by the user. Only download content you are entitled to use.
+
 ## Platforms and features
 
 - Builds for Android, iOS, Windows, macOS, and Linux. The iOS app comes from [Applesauce](https://github.com/johnny901901901/Applesauce); see [`platform/ios`](platform/ios/README.md).
 - Virtual iPhone and iPad device profiles.
 - Android touch input and fullscreen/orientation handling.
+- Built-in **IPA Store** on the app picker's first tile: search and page through
+  the Internet Archive's [`ipaarchive`](https://archive.org/details/ipaarchive)
+  collection, inspect available versions and file sizes, and download selected
+  IPAs directly into `touchHLE_apps` with progress and cancellation.
 - Ongoing GLES, EAGL, Core Animation, audio, and iOS framework compatibility work.
 - Download build artifacts from the [HyperHLE GitHub Actions workflow](https://github.com/KlugKlugTG/HyperHLE-Reborn/actions/workflows/HyperHLE_release.yml).
 
