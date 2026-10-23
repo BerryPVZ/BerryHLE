@@ -3600,7 +3600,17 @@ impl Environment {
                             }
                             ThreadNextAction::Continue
                         } else {
-                            self.cpu.regs_mut()[cpu::Cpu::PC] = svc_pc;
+                            // Returning None only means "restart" for the lazy
+                            // linker: it rewrote the trapping stub, so the SVC
+                            // must be re-executed. Any other unhandled id is a
+                            // stray `svc` from guest code, and rewinding PC
+                            // would trap on it forever, so skip past it (the
+                            // CPU has already advanced PC past the SVC).
+                            let lazy_link = svc & !dyld::Dyld::SVC_LAZY_LINK_RET_FLAG
+                                == dyld::Dyld::SVC_LAZY_LINK;
+                            if lazy_link {
+                                self.cpu.regs_mut()[cpu::Cpu::PC] = svc_pc;
+                            }
                             ThreadNextAction::Continue
                         }
                     }

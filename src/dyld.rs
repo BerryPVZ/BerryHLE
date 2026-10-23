@@ -461,6 +461,10 @@ pub struct Dyld {
     /// built from *defined* symbols (not just external ones) so that a
     /// non-exported-but-defined `___cxa_throw` still wins over the host stub.
     guest_cxxabi_exports: HashMap<String, u32>,
+    /// Guest-originated SVC traps that don't map to any function we linked,
+    /// keyed by `(svc_pc, svc)`, with the number of times each was reported.
+    /// A stray trap can be hit on every frame, so logging is capped.
+    stray_svc_reports: HashMap<(u32, u32), u32>,
 }
 
 impl Dyld {
@@ -497,6 +501,7 @@ impl Dyld {
             cxxabi_typeinfo_vtable_kinds: HashMap::new(),
             guest_sjlj_runtime_available: false,
             guest_cxxabi_exports: HashMap::new(),
+            stray_svc_reports: HashMap::new(),
         }
     }
 
@@ -1719,10 +1724,28 @@ impl Dyld {
                         as usize,
                 );
                 let Some(&(symbol, f)) = f else {
-                    log!(
-                        "Warning: Unexpected SVC #{} at {:#x}; treating as no-op (returning to caller).",
-                        svc, svc_pc
-                    );
+                    // No stub of ours can encode this id, so the guest itself
+                    // executed the instruction (a raw `svc` in app code, or a
+                    // legacy trap like `svc #0xab` from pre-armv7 stubs).
+                    // There is nothing to call, and re-executing the SVC would
+                    // trap forever, so report it (rate-limited) and let the
+                    // caller skip the instruction.
+                    let count = self.stray_svc_reports.entry((svc_pc, svc)).or_insert(0);
+                    *count += 1;
+                    if *count <= 2 {
+                        log!(
+                            "Warning: unexpected SVC #{} at {:#x} (not a dyld-linked function); skipping it.",
+                            svc,
+                            svc_pc
+                        );
+                        if *count == 2 {
+                            log!(
+                                "(further occurrences of SVC #{} at {:#x} will not be logged)",
+                                svc,
+                                svc_pc
+                            );
+                        }
+                    }
                     return None;
                 };
                 log_dbg!("Call to host function, already linked: {}", symbol);
