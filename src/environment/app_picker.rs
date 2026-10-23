@@ -1,5 +1,8 @@
 //! App picker GUI.
 
+mod access_prompt;
+mod archive_store;
+
 use crate::bundle::Bundle;
 use crate::frameworks::core_graphics::cg_affine_transform::{
     CGAffineTransform, CGAffineTransformIdentity,
@@ -342,6 +345,24 @@ struct AppPickerDelegateHostObject {
     // picker needs to wait for a newly copied IPA to settle before reloading.
     add_ipa: bool,
     recent_app_tapped: bool,
+    status_accessory_tapped: bool,
+    access_prompt_confirm: bool,
+    access_prompt_cancel: bool,
+    access_prompt_submit: bool,
+    // Actions used by the built-in Internet Archive store screen.
+    archive_store_close: bool,
+    archive_store_search: bool,
+    archive_store_previous: bool,
+    archive_store_next: bool,
+    archive_store_back: bool,
+    archive_store_retry: bool,
+    archive_store_cancel: bool,
+    archive_store_item: Option<NSInteger>,
+    archive_store_download: Option<NSInteger>,
+    archive_store_tab: Option<NSInteger>,
+    archive_store_sort: bool,
+    archive_store_queue_action: Option<NSInteger>,
+    archive_store_tap: Option<CGPoint>,
     settings_show: bool,
     settings_hide: bool,
     scale_hack_default: bool,
@@ -556,6 +577,73 @@ const CLASSES: ClassExports = objc_classes! {
 
 - (())addIpa {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).add_ipa = true;
+}
+
+- (())statusAccessoryTapped {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).status_accessory_tapped = true;
+}
+- (())accessPromptConfirm {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).access_prompt_confirm = true;
+}
+- (())accessPromptCancel {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).access_prompt_cancel = true;
+}
+
+- (())archiveStoreClose {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_close = true;
+}
+- (())archiveStoreSearch {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_search = true;
+}
+- (())archiveStorePrevious {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_previous = true;
+}
+- (())archiveStoreNext {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_next = true;
+}
+- (())archiveStoreBack {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_back = true;
+}
+- (())archiveStoreRetry {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_retry = true;
+}
+- (())archiveStoreCancel {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_cancel = true;
+}
+- (())archiveStoreItem:(id)sender {
+    let tag: NSInteger = msg![env; sender tag];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_item = Some(tag);
+}
+- (())archiveStoreDownload:(id)sender {
+    let tag: NSInteger = msg![env; sender tag];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_download = Some(tag);
+}
+- (())archiveStoreTab:(id)sender {
+    let tag: NSInteger = msg![env; sender tag];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_tab = Some(tag);
+}
+- (())archiveStoreSort {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_sort = true;
+}
+- (())archiveStoreQueueAction:(id)sender {
+    let tag: NSInteger = msg![env; sender tag];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_queue_action = Some(tag);
+}
+- (())archiveStoreTap:(id)sender {
+    let view: id = msg![env; sender view];
+    let point: CGPoint = msg![env; sender locationInView:view];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_tap = Some(point);
+}
+- (())textFieldShouldReturn:(id)sender {
+    let tag: NSInteger = msg![env; sender tag];
+    let host = env.objc.borrow_mut::<AppPickerDelegateHostObject>(this);
+    if tag == access_prompt::FIELD_TAG {
+        host.access_prompt_submit = true;
+    } else {
+        host.archive_store_search = true;
+    }
+    drop(host);
+    let _: bool = msg![env; sender resignFirstResponder];
 }
 
 - (())settingsShow {
@@ -813,7 +901,8 @@ fn app_picker_inner(
     // after it: the home screen shows the bar through the main view, but the
     // opaque Settings screen covers it when open.
     let (status_bar, status_time_label, status_charge_view) = if app_frame.origin.y >= 12.0 {
-        let (bar, time, charge) = make_status_bar(env, bounds.size.width, app_frame.origin.y);
+        let (bar, time, charge) =
+            make_status_bar(env, delegate, bounds.size.width, app_frame.origin.y);
         () = msg![env; window addSubview:bar];
         // The level is cached at window creation, so reading it here is safe
         // even on Android (no JNI on this coroutine stack).
@@ -848,7 +937,9 @@ fn app_picker_inner(
     let remembered_app_path = read_last_app_path();
     let recent_app = apps.as_mut().ok().and_then(|apps| {
         let app = apps.iter_mut().find(|app| {
-            remembered_app_path.as_ref().is_some_and(|path| path == &app.path)
+            remembered_app_path
+                .as_ref()
+                .is_some_and(|path| path == &app.path)
         })?;
         let image = if let Some(icon) = app.icon.as_ref() {
             let cg_image = cg_image::from_image(env, icon.clone());
@@ -1241,6 +1332,68 @@ fn app_picker_inner(
             }
             continue;
         }
+        let status_accessory_tapped = {
+            let host = env
+                .objc
+                .borrow_mut::<AppPickerDelegateHostObject>(delegate);
+            std::mem::take(&mut host.status_accessory_tapped)
+        };
+        if status_accessory_tapped {
+            press = None;
+            long_pressed_icon = None;
+            let downloaded = access_prompt::run_access_prompt(
+                env,
+                main_run_loop,
+                delegate,
+                main_view,
+                app_frame,
+            ) && archive_store::run_archive_store(
+                env,
+                main_run_loop,
+                delegate,
+                main_view,
+                app_frame,
+                &apps_dir,
+            );
+            // Both screens use nested event loops. Do not let their touches or
+            // swipes leak back into the home screen.
+            {
+                let host = env
+                    .objc
+                    .borrow_mut::<AppPickerDelegateHostObject>(delegate);
+                host.icon_tapped = nil;
+                host.icon_touch_down = nil;
+                host.icon_touch_cancelled = false;
+                host.swipe_left = false;
+                host.swipe_right = false;
+                host.status_accessory_tapped = false;
+            }
+            PENDING_ARROW_KEY.store(0, Ordering::Relaxed);
+            press = None;
+            long_pressed_icon = None;
+            if downloaded {
+                awaited_ipa = None;
+                if let Some(grid) = icon_grid_stuff.as_mut() {
+                    let page_count = reload_app_grid(
+                        env,
+                        grid,
+                        &mut apps,
+                        &mut current_page,
+                        &apps_dir,
+                    );
+                    rebuild_page_dots(
+                        env,
+                        main_view,
+                        app_frame.size,
+                        &mut page_dots,
+                        page_count,
+                    );
+                    update_page_dots(env, &page_dots, current_page);
+                }
+            }
+            continue;
+        }
+
         let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
         if std::mem::take(&mut host_obj.recent_app_tapped) {
             if let Some((path, _, _)) = recent_app.as_ref() {
@@ -2321,7 +2474,12 @@ fn lock_screen_date_string() -> String {
 /// Builds a fake old-iOS status bar: signal bars, carrier, clock and battery.
 /// Returns the bar itself, the clock label and the battery charge bar, which
 /// the event loop updates.
-fn make_status_bar(env: &mut Environment, width: CGFloat, height: CGFloat) -> (id, id, id) {
+fn make_status_bar(
+    env: &mut Environment,
+    delegate: id,
+    width: CGFloat,
+    height: CGFloat,
+) -> (id, id, id) {
     let clear: id = msg_class![env; UIColor clearColor];
     let bar = new_view(env, rect(0.0, 0.0, width, height), clear);
     let white: id = msg_class![env; UIColor whiteColor];
@@ -2397,6 +2555,7 @@ fn make_status_bar(env: &mut Environment, width: CGFloat, height: CGFloat) -> (i
     () = msg![env; bar addSubview:charge];
     let nub = new_view(env, rect(width - BATTERY_RIGHT_INSET + 24.5, 8.5, 2.0, 4.0), white);
     () = msg![env; bar addSubview:nub];
+    access_prompt::add_status_target(env, delegate, bar, width);
 
     (bar, time, charge)
 }
