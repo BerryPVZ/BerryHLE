@@ -225,6 +225,10 @@ pub fn AudioFileStreamClose(
 /// file (see `audio_file.rs`), so an app that switches from one API to the
 /// other sees the same format.
 fn describe_format(description: &crate::audio::AudioDescription) -> AudioStreamBasicDescription {
+    // `CoreAudioTypes.h`: for linear PCM a packet is one frame, so the frame
+    // and packet byte sizes are the same and neither may be zero. Compressed
+    // formats keep a zero frame size because frames are not byte-aligned.
+    let is_linear_pcm = matches!(description.format, AudioFormat::LinearPcm { .. });
     AudioStreamBasicDescription {
         sample_rate: description.sample_rate,
         format_id: match description.format {
@@ -234,8 +238,16 @@ fn describe_format(description: &crate::audio::AudioDescription) -> AudioStreamB
         },
         format_flags: 0,
         bytes_per_packet: description.bytes_per_packet,
-        frames_per_packet: description.frames_per_packet,
-        bytes_per_frame: 0,
+        frames_per_packet: if is_linear_pcm {
+            1
+        } else {
+            description.frames_per_packet
+        },
+        bytes_per_frame: if is_linear_pcm {
+            description.bytes_per_packet
+        } else {
+            0
+        },
         channels_per_frame: description.channels_per_frame,
         bits_per_channel: description.bits_per_channel,
         _reserved: 0,
@@ -772,8 +784,8 @@ mod stream_format_tests {
 
     #[test]
     fn reports_a_bit_rate_from_the_packet_count_and_frame_size() {
-        // 40 one-byte packets of 1152 frames at 44.1 kHz last about a second,
-        // so the rate is roughly eight bits per second per payload byte.
+        // 40 one-byte packets of 1152 frames at 44.1 kHz last
+        // 40 * 1152 / 44100 = 1.0449 s, so 320 payload bits are 306 bits/s.
         let packets = CompressedPackets {
             sample_rate: 44100.0,
             channels_per_frame: 2,
@@ -788,7 +800,7 @@ mod stream_format_tests {
             reported: ReportedProperties::default(),
             packets,
         };
-        assert_eq!(bit_rate(&parsed), 320);
+        assert_eq!(bit_rate(&parsed), 306);
     }
 
     #[test]
