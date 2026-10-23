@@ -630,6 +630,41 @@ int test_dispatch_async_f_global_queue(void) {
   return check_dispatch_async_global_queue(YES);
 }
 
+// From Apple's dladdr(3) man page: dladdr() returns non-zero and fills in
+// the image path and base, and the nearest lower symbol, for an address in
+// a loaded image, and returns 0 otherwise. Symbol names have no leading
+// underscore. The old SDK has no dlfcn.h; this is its Dl_info layout.
+// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/dladdr.3.html
+typedef struct {
+  const char *dli_fname;
+  void *dli_fbase;
+  const char *dli_sname;
+  void *dli_saddr;
+} TestAppDlInfo;
+extern int dladdr(const void *addr, TestAppDlInfo *info);
+int test_dladdr(void) {
+  TestAppDlInfo info;
+  memset(&info, 0, sizeof(info));
+  if (!dladdr((const void *)&test_dladdr, &info))
+    return -1;
+  if (info.dli_fname == NULL || strstr(info.dli_fname, "TestApp") == NULL)
+    return -2;
+  // An image's base address is its Mach-O header (MH_MAGIC or MH_MAGIC_64).
+  if (info.dli_fbase == NULL)
+    return -3;
+  uint32_t magic = *(const uint32_t *)info.dli_fbase;
+  if (magic != 0xfeedface && magic != 0xfeedfacf)
+    return -3;
+  if (info.dli_sname == NULL || strcmp(info.dli_sname, "test_dladdr") != 0)
+    return -4;
+  if (info.dli_saddr != (void *)&test_dladdr)
+    return -5;
+  // The page at address 0 is not part of any image.
+  if (dladdr((const void *)4, &info) != 0)
+    return -6;
+  return 0;
+}
+
 // Apple: +[AVAsset assetWithURL:] "Returns an asset for inspection of a
 // resource referenced by a given URL" (iOS 5.0+). Talking Ted relies on it
 // to load its animations (HyperHLE-Reborn issue 303).
@@ -7606,6 +7641,7 @@ struct {
     FUNC_DEF(test_dispatch_after_common_mode),
     FUNC_DEF(test_dispatch_async_global_queue),
     FUNC_DEF(test_dispatch_async_f_global_queue),
+    FUNC_DEF(test_dladdr),
     FUNC_DEF(test_AVAsset_assetWithURL),
     FUNC_DEF(test_runloop_audio_queue),
     FUNC_DEF(test_runloop_audio_queue_null),
