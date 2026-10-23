@@ -7,9 +7,7 @@
 //! `ipaarchive` collection. Network and file I/O run on worker threads; the
 //! emulated UIKit views are only touched from the picker/run-loop thread.
 
-use super::{
-    make_icon_from_text, new_label, new_view, rect, ui_color, AppPickerDelegateHostObject,
-};
+use super::{new_label, new_view, rect, ui_color, AppPickerDelegateHostObject};
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_run_loop::run_run_loop_single_iteration;
 use crate::frameworks::foundation::{ns_string, NSInteger};
@@ -33,12 +31,6 @@ const COLLECTION_ID: &str = "ipaarchive";
 const CATALOG_ROWS: usize = 25;
 const ROW_HEIGHT: CGFloat = 62.0;
 const MAX_JSON_RESPONSE_SIZE: usize = 64 * 1024 * 1024;
-
-/// Matches the monochrome dock assets, but uses a blue App Store-like tint so
-/// the first grid tile remains distinguishable from Browse and Settings.
-pub(super) fn make_archive_store_icon(env: &mut Environment) -> id {
-    make_icon_from_text(env, "IPA", 22.0, 0.0, (0.10, 0.35, 0.62, 1.0))
-}
 
 #[derive(Clone, Debug)]
 struct CatalogItem {

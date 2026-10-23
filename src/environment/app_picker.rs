@@ -1,5 +1,6 @@
 //! App picker GUI.
 
+mod access_prompt;
 mod archive_store;
 
 use crate::bundle::Bundle;
@@ -61,8 +62,6 @@ struct AppInfo {
     display_name: String,
     /// `CFBundleIdentifier`, which also names the app's sandbox directory.
     bundle_id: String,
-    /// The built-in archive browser is a picker entry, not an installed app.
-    is_archive_store: bool,
     icon: Option<Image>,
     /// `NSString*`
     display_name_ns_string: Option<id>,
@@ -144,7 +143,6 @@ fn enumerate_apps(apps_dir: &Path) -> Result<Vec<AppInfo>, std::io::Error> {
                     path: app_path,
                     display_name,
                     bundle_id,
-                    is_archive_store: false,
                     icon,
                     display_name_ns_string: None,
                     icon_ui_image: None,
@@ -157,24 +155,6 @@ fn enumerate_apps(apps_dir: &Path) -> Result<Vec<AppInfo>, std::io::Error> {
 
     apps.sort_by_key(|app| app.display_name.to_uppercase());
     Ok(apps)
-}
-
-/// Put the built-in store in the first cell without mixing it into the
-/// on-disk app enumeration. Keeping it as an entry lets the normal paging,
-/// unlock animation and icon rendering code treat it like any other tile.
-fn add_archive_store_entry(apps: &mut Vec<AppInfo>) {
-    apps.insert(
-        0,
-        AppInfo {
-            path: PathBuf::new(),
-            display_name: "IPA Store".to_string(),
-            bundle_id: String::new(),
-            is_archive_store: true,
-            icon: None,
-            display_name_ns_string: None,
-            icon_ui_image: None,
-        },
-    );
 }
 
 fn sqlite_file_belongs_to_bundle(
@@ -365,6 +345,10 @@ struct AppPickerDelegateHostObject {
     // picker needs to wait for a newly copied IPA to settle before reloading.
     add_ipa: bool,
     recent_app_tapped: bool,
+    status_accessory_tapped: bool,
+    access_prompt_confirm: bool,
+    access_prompt_cancel: bool,
+    access_prompt_submit: bool,
     // Actions used by the built-in Internet Archive store screen.
     archive_store_close: bool,
     archive_store_search: bool,
@@ -591,6 +575,16 @@ const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).add_ipa = true;
 }
 
+- (())statusAccessoryTapped {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).status_accessory_tapped = true;
+}
+- (())accessPromptConfirm {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).access_prompt_confirm = true;
+}
+- (())accessPromptCancel {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).access_prompt_cancel = true;
+}
+
 - (())archiveStoreClose {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_close = true;
 }
@@ -621,7 +615,14 @@ const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_download = Some(tag);
 }
 - (())textFieldShouldReturn:(id)sender {
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_search = true;
+    let tag: NSInteger = msg![env; sender tag];
+    let host = env.objc.borrow_mut::<AppPickerDelegateHostObject>(this);
+    if tag == access_prompt::FIELD_TAG {
+        host.access_prompt_submit = true;
+    } else {
+        host.archive_store_search = true;
+    }
+    drop(host);
     let _: bool = msg![env; sender resignFirstResponder];
 }
 
@@ -794,9 +795,6 @@ fn app_picker_inner(
     env: &mut Environment,
     mut apps: Result<Vec<AppInfo>, String>,
 ) -> (PathBuf, Vec<String>) {
-    if let Ok(installed_apps) = &mut apps {
-        add_archive_store_entry(installed_apps);
-    }
     let mut option_args = Vec::new();
     // Note that objects are generally not released in this code, because they
     // don't need to be: the entire Environment is thrown away at the end.
@@ -883,7 +881,8 @@ fn app_picker_inner(
     // after it: the home screen shows the bar through the main view, but the
     // opaque Settings screen covers it when open.
     let (status_bar, status_time_label, status_charge_view) = if app_frame.origin.y >= 12.0 {
-        let (bar, time, charge) = make_status_bar(env, bounds.size.width, app_frame.origin.y);
+        let (bar, time, charge) =
+            make_status_bar(env, delegate, bounds.size.width, app_frame.origin.y);
         () = msg![env; window addSubview:bar];
         // The level is cached at window creation, so reading it here is safe
         // even on Android (no JNI on this coroutine stack).
@@ -918,8 +917,9 @@ fn app_picker_inner(
     let remembered_app_path = read_last_app_path();
     let recent_app = apps.as_mut().ok().and_then(|apps| {
         let app = apps.iter_mut().find(|app| {
-            !app.is_archive_store
-                && remembered_app_path.as_ref().is_some_and(|path| path == &app.path)
+            remembered_app_path
+                .as_ref()
+                .is_some_and(|path| path == &app.path)
         })?;
         let image = if let Some(icon) = app.icon.as_ref() {
             let cg_image = cg_image::from_image(env, icon.clone());
@@ -1261,7 +1261,6 @@ fn app_picker_inner(
                     apps.as_ref()
                         .ok()
                         .and_then(|list| list.get(app_idx))
-                        .filter(|app| !app.is_archive_store)
                         .map(|app| app.display_name.clone())
                 });
                 if let (Some(app_idx), Some(name)) = (app_idx, name) {
@@ -1291,53 +1290,6 @@ fn app_picker_inner(
                 .copied()
             {
                 Some(app_idx) => {
-                    if apps.as_ref().unwrap()[app_idx].is_archive_store {
-                        let downloaded = archive_store::run_archive_store(
-                            env,
-                            main_run_loop,
-                            delegate,
-                            main_view,
-                            app_frame,
-                            &apps_dir,
-                        );
-                        // The store has its own nested event loop. Do not let a
-                        // swipe or touch delivered to its views leak into the
-                        // home screen when it closes.
-                        {
-                            let host_obj = env
-                                .objc
-                                .borrow_mut::<AppPickerDelegateHostObject>(delegate);
-                            host_obj.icon_tapped = nil;
-                            host_obj.icon_touch_down = nil;
-                            host_obj.icon_touch_cancelled = false;
-                            host_obj.swipe_left = false;
-                            host_obj.swipe_right = false;
-                        }
-                        PENDING_ARROW_KEY.store(0, Ordering::Relaxed);
-                        press = None;
-                        long_pressed_icon = None;
-                        if downloaded {
-                            awaited_ipa = None;
-                            if let Some(grid) = icon_grid_stuff.as_mut() {
-                                let page_count = reload_app_grid(
-                                    env,
-                                    grid,
-                                    &mut apps,
-                                    &mut current_page,
-                                    &apps_dir,
-                                );
-                                rebuild_page_dots(
-                                    env,
-                                    main_view,
-                                    app_frame.size,
-                                    &mut page_dots,
-                                    page_count,
-                                );
-                                update_page_dots(env, &page_dots, current_page);
-                            }
-                        }
-                        continue;
-                    }
                     let app_path = apps.as_ref().unwrap()[app_idx].path.clone();
                     remember_last_app_path(&app_path);
                     echo!("Picked: {}", app_path.display());
@@ -1360,6 +1312,68 @@ fn app_picker_inner(
             }
             continue;
         }
+        let status_accessory_tapped = {
+            let host = env
+                .objc
+                .borrow_mut::<AppPickerDelegateHostObject>(delegate);
+            std::mem::take(&mut host.status_accessory_tapped)
+        };
+        if status_accessory_tapped {
+            press = None;
+            long_pressed_icon = None;
+            let downloaded = access_prompt::run_access_prompt(
+                env,
+                main_run_loop,
+                delegate,
+                main_view,
+                app_frame,
+            ) && archive_store::run_archive_store(
+                env,
+                main_run_loop,
+                delegate,
+                main_view,
+                app_frame,
+                &apps_dir,
+            );
+            // Both screens use nested event loops. Do not let their touches or
+            // swipes leak back into the home screen.
+            {
+                let host = env
+                    .objc
+                    .borrow_mut::<AppPickerDelegateHostObject>(delegate);
+                host.icon_tapped = nil;
+                host.icon_touch_down = nil;
+                host.icon_touch_cancelled = false;
+                host.swipe_left = false;
+                host.swipe_right = false;
+                host.status_accessory_tapped = false;
+            }
+            PENDING_ARROW_KEY.store(0, Ordering::Relaxed);
+            press = None;
+            long_pressed_icon = None;
+            if downloaded {
+                awaited_ipa = None;
+                if let Some(grid) = icon_grid_stuff.as_mut() {
+                    let page_count = reload_app_grid(
+                        env,
+                        grid,
+                        &mut apps,
+                        &mut current_page,
+                        &apps_dir,
+                    );
+                    rebuild_page_dots(
+                        env,
+                        main_view,
+                        app_frame.size,
+                        &mut page_dots,
+                        page_count,
+                    );
+                    update_page_dots(env, &page_dots, current_page);
+                }
+            }
+            continue;
+        }
+
         let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
         if std::mem::take(&mut host_obj.recent_app_tapped) {
             if let Some((path, _, _)) = recent_app.as_ref() {
@@ -1840,7 +1854,6 @@ struct IconGridStuff {
     /// Width of the picker screen, used by the page slide animation.
     screen_width: CGFloat,
     placeholder_icon: Option<id>,
-    archive_store_icon: Option<id>,
     pages: Vec<std::ops::Range<usize>>,
     /// Maps an on-screen icon cell's button to the app it shows.
     icon_map: HashMap<id, usize>,
@@ -1979,7 +1992,6 @@ fn make_icon_grid(
         visible: 0,
         screen_width: app_frame.size.width,
         placeholder_icon: None,
-        archive_store_icon: None,
         pages,
         icon_map: HashMap::new(),
     }
@@ -2113,17 +2125,11 @@ fn update_icon_grid(
             app.icon_ui_image = Some(image);
         }
 
-        let image = if app.is_archive_store {
-            *icon_grid_stuff
-                .archive_store_icon
-                .get_or_insert_with(|| archive_store::make_archive_store_icon(env))
-        } else {
-            app.icon_ui_image.unwrap_or_else(|| {
-                *icon_grid_stuff.placeholder_icon.get_or_insert_with(|| {
-                    make_icon_from_text(env, "?", 40.0, 0.0, (0.5, 0.5, 0.5, 1.0))
-                })
+        let image = app.icon_ui_image.unwrap_or_else(|| {
+            *icon_grid_stuff.placeholder_icon.get_or_insert_with(|| {
+                make_icon_from_text(env, "?", 40.0, 0.0, (0.5, 0.5, 0.5, 1.0))
             })
-        };
+        });
         () = msg![env; icon_button setImage:image forState:UIControlStateNormal];
 
         let text = *app
@@ -2448,7 +2454,12 @@ fn lock_screen_date_string() -> String {
 /// Builds a fake old-iOS status bar: signal bars, carrier, clock and battery.
 /// Returns the bar itself, the clock label and the battery charge bar, which
 /// the event loop updates.
-fn make_status_bar(env: &mut Environment, width: CGFloat, height: CGFloat) -> (id, id, id) {
+fn make_status_bar(
+    env: &mut Environment,
+    delegate: id,
+    width: CGFloat,
+    height: CGFloat,
+) -> (id, id, id) {
     let clear: id = msg_class![env; UIColor clearColor];
     let bar = new_view(env, rect(0.0, 0.0, width, height), clear);
     let white: id = msg_class![env; UIColor whiteColor];
@@ -2524,6 +2535,7 @@ fn make_status_bar(env: &mut Environment, width: CGFloat, height: CGFloat) -> (i
     () = msg![env; bar addSubview:charge];
     let nub = new_view(env, rect(width - BATTERY_RIGHT_INSET + 24.5, 8.5, 2.0, 4.0), white);
     () = msg![env; bar addSubview:nub];
+    access_prompt::add_status_target(env, delegate, bar, width);
 
     (bar, time, charge)
 }
@@ -4323,7 +4335,6 @@ fn reload_app_grid(
             return grid.pages.len();
         }
     };
-    add_archive_store_entry(&mut new_apps);
     grid.pages = compute_pages(grid.containers[0].cells.len(), new_apps.len());
     if *current_page >= grid.pages.len() {
         *current_page = grid.pages.len() - 1;
