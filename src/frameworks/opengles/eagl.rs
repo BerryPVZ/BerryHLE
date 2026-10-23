@@ -8,8 +8,8 @@
 use super::software_vao::VertexArrayState;
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
 use crate::frameworks::core_animation::ca_eagl_layer::{
-    find_fullscreen_eagl_layer, get_pixels_vec_for_presenting, mark_presented_directly,
-    present_pixels,
+    find_fullscreen_eagl_layer, get_pixels_vec_for_presenting, layer_screen_rotation,
+    mark_presented_directly, present_pixels,
 };
 use crate::frameworks::core_graphics::{CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::get_static_str;
@@ -46,6 +46,11 @@ struct EaglPresentOptions {
     /// direct presenter (see `--ios-es2-direct-present`), whose frames are
     /// already in display orientation.
     skip_rotation: bool,
+    /// Rotation, in radians, that Core Animation would have applied to the
+    /// presented layer before it reached the screen (its `affineTransform`
+    /// plus those of its ancestors). Zero when the layer is not transformed or
+    /// when the drawable is not the layer that is being presented as fullscreen.
+    layer_rotation: f32,
 }
 
 // These are used by the EAGLDrawable protocol implemented by CAEAGLayer.
@@ -1205,6 +1210,11 @@ pub const CLASSES: ClassExports = objc_classes! {
                     .borrow::<EAGLContextHostObject>(this)
                     .drawable_framebuffer,
                 skip_rotation: use_ios_es2_direct_path,
+                layer_rotation: if drawable == fullscreen_layer {
+                    layer_screen_rotation(env, drawable)
+                } else {
+                    0.0
+                },
             };
             // Tell the Core Animation compositor this layer is live, so it
             // takes its CAEAGLLayer fast path instead of compositing (and
@@ -2700,6 +2710,11 @@ unsafe fn present_renderbuffer(
     // `--rotation-fix` path instead checks whether UIKit actually applied the
     // autorotation transform, avoiding an extra 180-degree turn for apps that
     // do not rotate their root view.
+    //
+    // This is only a fallback: `layer_rotation` is the rotation Core Animation
+    // itself would apply, measured from the layer tree. An extra 180 degrees
+    // cannot stand in for it, because the tree can be rotated by a quarter turn
+    // (and the two answers differ by 90 degrees, not 0 or 180).
     let rotation_compensation_trigger = if env.options.rotation_fix {
         env.framework_state.uikit.autorotation_transform_applied
     } else {
@@ -2709,7 +2724,8 @@ unsafe fn present_renderbuffer(
         && !matches!(
             device_orientation,
             crate::window::DeviceOrientation::Portrait
-        );
+        )
+        && options.layer_rotation == 0.0;
     // PERF: cached read-once flag; present_renderbuffer runs every frame.
     let rotation_matrix = if crate::env_flag_cached!("TOUCHHLE_DISABLE_PRESENT_ROTATION") {
         log_once!(
@@ -2745,6 +2761,11 @@ unsafe fn present_renderbuffer(
     // drawn in display orientation, so rotating again would turn it sideways.
     let rotation_matrix = if options.skip_rotation && rotate_override.is_none() {
         crate::matrix::Matrix::<2>::identity()
+    } else if options.layer_rotation != 0.0 && rotate_override.is_none() {
+        // The layer transform is what Core Animation would have applied, so
+        // compose it with the window's rotation instead of guessing.
+        // An explicit --present-rotate already specifies the final rotation.
+        rotation_matrix.multiply(&crate::matrix::Matrix::z_rotation(options.layer_rotation))
     } else {
         rotation_matrix
     };
@@ -2754,11 +2775,12 @@ unsafe fn present_renderbuffer(
         static GEOM_LOGGED: std::sync::Once = std::sync::Once::new();
         GEOM_LOGGED.call_once(|| {
             log!(
-                "PRESENT-GEOM viewport={:?} device_family_ipad={} orientation={:?} needs_autorot={}",
+                "PRESENT-GEOM viewport={:?} device_family_ipad={} orientation={:?} needs_autorot={} layer_rotation={}",
                 viewport,
                 device_family.is_ipad(),
                 device_orientation,
-                needs_autorotation_compensation
+                needs_autorotation_compensation,
+                options.layer_rotation
             );
         });
     }
@@ -3915,6 +3937,10 @@ fn attach_orphaned_eagl_view_to_root(env: &mut Environment, drawable: id) -> boo
         }
         let root_view_controller: id = msg![env; window rootViewController];
         let root_view: id = if root_view_controller != nil {
+            let loaded: bool = msg![env; root_view_controller isViewLoaded];
+            if !loaded {
+                continue;
+            }
             msg![env; root_view_controller view]
         } else {
             window

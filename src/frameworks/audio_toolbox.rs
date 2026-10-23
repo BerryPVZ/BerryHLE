@@ -29,6 +29,7 @@ pub mod au_graph;
 pub mod audio_components;
 pub mod audio_converter;
 pub mod audio_file;
+pub mod audio_file_stream;
 pub mod audio_queue;
 pub mod audio_services;
 pub mod audio_session;
@@ -45,6 +46,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         audio_components::FUNCTIONS,
         audio_converter::FUNCTIONS,
         audio_file::FUNCTIONS,
+        audio_file_stream::FUNCTIONS,
         audio_queue::FUNCTIONS,
         audio_services::FUNCTIONS,
         audio_session::FUNCTIONS,
@@ -56,6 +58,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
 #[derive(Default)]
 pub struct State {
     audio_file: audio_file::State,
+    audio_file_stream: audio_file_stream::State,
     audio_queue: audio_queue::State,
     audio_components: audio_components::State,
     audio_services: audio_services::State,

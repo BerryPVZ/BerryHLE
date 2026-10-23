@@ -6,12 +6,11 @@ These rules come from bugs that reached trunk. They apply to every agent and env
 
 1. **Run the full test suite.** Run `cargo test` with `test_app` before you open a PR. TestApp needs LLVM 12 in `tests/llvm` and the common-3.0 SDK in `tests/common-3.0.sdk`; the macOS job in `.github/workflows/HyperHLE_release.yml` shows where to get them. If you cannot run TestApp, write "TestApp not run" in the PR. Never delete, skip or weaken a failing test or CI step to get a green run: fix the cause, or leave it failing and report it.
 2. **Do not change shared behavior for one game.** A change that affects every app must match real iOS. If one game needs different behavior, add a general option in `src/options.rs` and enable it for that bundle ID in `touchHLE_default_options.txt`. Do not add new `bundle_identifier()` checks in code.
-3. **When a game crashes, find the cause instead of resuming it.** This covers `abort`, an unexpected `exit`, uncaught exceptions, invalid instructions and bad memory accesses.
-   - Do not add code that continues after the error: skipping the instruction, returning zero, unwinding the stack or returning to a caller. The session must end as it would on iOS.
-   - Find what the emulator did wrong before the error. Start with the last emulated API calls in the log and check their results against Apple's documentation and touchHLE. The cause can also be in the loader, CPU, memory or graphics code, or in the game itself.
-   - If the emulator is wrong, fix it and add a test that fails without the fix: a TestApp test where possible, otherwise a Rust test.
-   - If you cannot find the cause, leave the game crashing and report the log, the last API calls and what you checked. A crash with a clear log is easier to fix than a game that continues with corrupted state.
-   - If iOS itself lets the app continue (a signal handler, `@try`/`@catch`), implement that iOS mechanism instead.
+3. **When a game crashes, find and fix the root cause first.**
+   - Investigate the last emulated API calls, loader, CPU, memory, audio or graphics state against Apple's documentation before considering any fallback.
+   - If the emulator is wrong, fix the underlying API or subsystem and add a regression test (`TestApp` where possible, otherwise a Rust unit test).
+   - Keep `--headless` (and `TestApp`) strict: headless runs must never mask guest `exit`, `abort`, uncaught exceptions or fatal signals, so automated tests always surface regressions immediately.
+   - GUI compatibility fallbacks (such as surviving legacy DRM/anti-tamper `exit()`/`abort()` checks or ignoring unhandled `SIGPIPE` from old ad SDKs) must remain scoped to non-headless sessions and must never replace fixing an actual HLE bug.
 4. **Match iOS and cite the source.** Before you implement or change an API, check Apple's documentation (old references are on web.archive.org) and touchHLE. Link the source in the commit message or the test.
 5. **Search before adding.** Before you add a class, method, function or constant, search for an existing one. The `no_duplicate_*` tests fail on duplicates.
 

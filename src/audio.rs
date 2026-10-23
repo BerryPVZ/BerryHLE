@@ -107,8 +107,48 @@ impl Clone for AudioFile {
     fn clone(&self) -> Self {
         let inner = match self.inner {
             AudioFileInner::Mp3(ref mp3) => AudioFileInner::Mp3(mp3.clone()),
+            AudioFileInner::Aac(ref aac) => AudioFileInner::Aac(aac.clone()),
             AudioFileInner::Symphonia(ref pcm) => AudioFileInner::Symphonia(pcm.clone()),
-            _ => Self::parse_inner(self.raw_data.as_ref().clone()).unwrap(),
+            AudioFileInner::Wave(_) => Self::parse_inner(self.raw_data.as_ref().clone()).unwrap(),
+        };
+        AudioFile {
+            raw_data: self.raw_data.clone(),
+            inner,
+        }
+    }
+}
+
+impl AudioFile {
+    /// Clone this `AudioFile` for PCM-expecting consumers such as
+    /// `ExtAudioFileWrapAudioFileID` and `ExtAudioFileOpenURL`. Compressed
+    /// `Mp3` and `Aac` packet streams are decoded to 16-bit LPCM via Symphonia
+    /// so `ExtAudioFileRead` serves PCM frames instead of seeing VBR
+    /// `packet_size_fixed() == 0`.
+    pub fn clone_decoded_to_pcm(&self) -> Self {
+        let inner = match self.inner {
+            AudioFileInner::Mp3(ref mp3) => {
+                match symphonia_formats::decode_symphonia_to_pcm(Cursor::new(
+                    self.raw_data.as_ref().clone(),
+                )) {
+                    Ok(pcm) => AudioFileInner::Symphonia(pcm),
+                    Err(_) => AudioFileInner::Mp3(mp3.clone()),
+                }
+            }
+            AudioFileInner::Aac(ref aac) => {
+                if let Ok(pcm) =
+                    symphonia_formats::decode_symphonia_to_pcm(Cursor::new(aac.packet_bytes.clone()))
+                {
+                    AudioFileInner::Symphonia(pcm)
+                } else if let Ok(pcm) = symphonia_formats::decode_symphonia_to_pcm(Cursor::new(
+                    self.raw_data.as_ref().clone(),
+                )) {
+                    AudioFileInner::Symphonia(pcm)
+                } else {
+                    AudioFileInner::Aac(aac.clone())
+                }
+            }
+            AudioFileInner::Symphonia(ref pcm) => AudioFileInner::Symphonia(pcm.clone()),
+            AudioFileInner::Wave(_) => Self::parse_inner(self.raw_data.as_ref().clone()).unwrap(),
         };
         AudioFile {
             raw_data: self.raw_data.clone(),
@@ -201,17 +241,15 @@ impl AudioFile {
     /// Decode packet-based formats for Extended Audio File Services, leaving
     /// the original compressed packets available to Audio File Services.
     pub fn decoded_packet_file(&self) -> Result<Option<Self>, ()> {
-        let packets = match &self.inner {
-            AudioFileInner::Aac(packets) | AudioFileInner::Mp3(packets) => packets,
-            _ => return Ok(None),
-        };
-        let pcm = symphonia_formats::decode_symphonia_to_pcm(Cursor::new(
-            packets.packet_bytes.clone(),
-        ))?;
-        Ok(Some(Self {
-            raw_data: self.raw_data.clone(),
-            inner: AudioFileInner::Symphonia(pcm),
-        }))
+        if !matches!(&self.inner, AudioFileInner::Aac(_) | AudioFileInner::Mp3(_)) {
+            return Ok(None);
+        }
+        let decoded = self.clone_decoded_to_pcm();
+        if matches!(&decoded.inner, AudioFileInner::Symphonia(_)) {
+            Ok(Some(decoded))
+        } else {
+            Err(())
+        }
     }
 
     // Extracted parse_inner to fix E0599 and removed duplicate read_from_vec

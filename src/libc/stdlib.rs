@@ -802,6 +802,62 @@ fn unsetenv(env: &mut Environment, name: ConstPtr<u8>) -> i32 {
     }
 }
 
+/// Try to turn a guest-only termination request into a non-local guest return.
+pub(crate) fn recover_guest_termination(env: &mut Environment, termination: &str) -> bool {
+    // Headless CLI runs (including TestApp) must preserve exact exit statuses
+    // and fail immediately on assertions or aborts.
+    if env.options.headless {
+        return false;
+    }
+
+    if let Some(path) = env.missing_unity_player_archive() {
+        echo!(
+            "Guest {} follows unavailable Unity player archive {:?}; refusing \
+             unsafe frame recovery.",
+            termination,
+            path
+        );
+        return false;
+    }
+
+    if env.guest_trap_bypass_still_on_stack() {
+        echo!(
+            "Guest {} happens inside a call chain that already hit a \
+             deliberate trap instruction; refusing frame recovery and ending \
+             the guest session cleanly.",
+            termination
+        );
+        return false;
+    }
+
+    log!(
+        "Guest {} on emulated thread {}; attempting validated frame recovery.",
+        termination,
+        env.current_thread
+    );
+    env.stack_trace_current();
+
+    if env.libc_state.signal.fatal_delivered {
+        echo!(
+            "Guest {} follows an earlier fatal hardware signal; refusing \
+             frame recovery and ending the guest session.",
+            termination
+        );
+        return false;
+    }
+
+    let Some(continuation) = crate::libc::cxxabi::unwind_to_app_frame(env) else {
+        return false;
+    };
+
+    echo!(
+        "Guest {} was recovered by unwinding to app frame {:#010x}.",
+        termination,
+        continuation.addr_with_thumb_bit()
+    );
+    true
+}
+
 /// End the guest process without terminating the host process.
 ///
 /// This only requests a return through the active host boundary; it never exits
@@ -819,12 +875,22 @@ pub(crate) fn end_guest_termination(
     env.request_guest_termination(result);
 }
 
-/// Normal process exit runs its registered handlers before ending the session.
-pub(crate) fn exit(env: &mut Environment, exit_code: i32) {
+/// Resume a validated app caller when possible, otherwise end only the guest.
+pub(crate) fn recover_or_end_guest_termination(
+    env: &mut Environment,
+    termination: &str,
+    result: GuestTermination,
+) {
+    if !recover_guest_termination(env, termination) {
+        end_guest_termination(env, termination, result);
+    }
+}
+
+/// End the session cleanly (after `main` returns or the last thread exits),
+/// running `atexit` handlers without attempting DRM-style frame recovery.
+pub(crate) fn exit_session(env: &mut Environment, exit_code: i32) {
     set_errno(env, 0);
     let termination = format!("exit({exit_code})");
-    // Take the handlers before calling guest code so recursively invoked exit
-    // handlers cannot execute the same registrations more than once.
     let handlers = std::mem::take(&mut env.libc_state.stdlib.atexit_handlers);
     for func in handlers.into_iter().rev() {
         log_dbg!("Executing atexit handler: {:?}", func);
@@ -838,12 +904,34 @@ pub(crate) fn exit(env: &mut Environment, exit_code: i32) {
     end_guest_termination(env, &termination, GuestTermination::Exit(exit_code));
 }
 
+/// Recover from nested DRM/SDK `exit` calls in GUI sessions when possible;
+/// otherwise run registered `atexit` handlers and end the guest session.
+pub(crate) fn exit(env: &mut Environment, exit_code: i32) {
+    set_errno(env, 0);
+    let termination = format!("exit({exit_code})");
+    if let Some(path) = env.missing_unity_player_archive().map(str::to_owned) {
+        echo!(
+            "Guest {} follows unavailable Unity player archive {:?}; ending \
+             the guest session without running atexit handlers.",
+            termination,
+            path
+        );
+        end_guest_termination(env, &termination, GuestTermination::Exit(exit_code));
+        return;
+    }
+    if recover_guest_termination(env, &termination) {
+        return;
+    }
+
+    exit_session(env, exit_code);
+}
+
 /// Shared implementation for termination functions that do not run `atexit`
 /// handlers (`_exit`, `_Exit` and `quick_exit`).
 fn immediate_exit(env: &mut Environment, name: &str, exit_code: i32) {
     set_errno(env, 0);
     let termination = format!("{name}({exit_code})");
-    end_guest_termination(env, &termination, GuestTermination::Exit(exit_code));
+    recover_or_end_guest_termination(env, &termination, GuestTermination::Exit(exit_code));
 }
 
 fn _exit(env: &mut Environment, exit_code: i32) {
@@ -859,14 +947,14 @@ fn quick_exit(env: &mut Environment, exit_code: i32) {
 }
 
 fn abort(env: &mut Environment) {
-    // A handler may take over without returning (for example via longjmp).
-    // Returning from it, or ignoring SIGABRT, cannot make abort return.
     let outcome = raise_signal(env, SIGABRT);
-    if outcome == RaiseOutcome::DefaultActionPerformed || env.is_guest_termination_requested()
+    if outcome == RaiseOutcome::DefaultActionPerformed
+        || env.is_guest_termination_requested()
+        || env.is_guest_control_flow_redirected()
     {
         return;
     }
-    end_guest_termination(env, "abort()", GuestTermination::Signal(SIGABRT));
+    recover_or_end_guest_termination(env, "abort()", GuestTermination::Signal(SIGABRT));
 }
 
 fn bsearch(

@@ -196,6 +196,9 @@ pub struct Environment {
     /// pointer. See `debug_cpu_error`.
     cpu_error_bypass_last_lr: Option<u32>,
     cpu_error_bypass_lr_count: u32,
+    /// Thread and stack pointer of the most recent deliberate guest trap
+    /// (`udf`/`trap`/`bkpt`) that was bypassed.
+    last_deliberate_trap_bypass: Option<(ThreadId, u32)>,
     /// Per-site counters for instructions dynarmic could not decode inside a
     /// code section and that were skipped as no-ops (keyed on the fault PC).
     /// Only used to rate-limit logging. See `debug_cpu_error`.
@@ -983,7 +986,7 @@ impl Environment {
                             // passes its return value to exit(), including
                             // the registered atexit handlers.
                             let code = env.cpu.regs()[0] as i32;
-                            crate::libc::stdlib::exit(env, code);
+                            crate::libc::stdlib::exit_session(env, code);
                         }
 
                         if env.guest_termination_requested.is_some() {
@@ -1045,6 +1048,7 @@ impl Environment {
             cpu_error_bypass_total: 0,
             cpu_error_bypass_last_lr: None,
             cpu_error_bypass_lr_count: 0,
+            last_deliberate_trap_bypass: None,
             cpu_skipped_instruction_sites: HashMap::new(),
             guest_termination_requested: None,
             missing_unity_player_archive: None,
@@ -1232,6 +1236,7 @@ impl Environment {
             cpu_error_bypass_total: 0,
             cpu_error_bypass_last_lr: None,
             cpu_error_bypass_lr_count: 0,
+            last_deliberate_trap_bypass: None,
             cpu_skipped_instruction_sites: HashMap::new(),
             guest_termination_requested: None,
             missing_unity_player_archive: None,
@@ -1303,6 +1308,7 @@ impl Environment {
             cpu_error_bypass_total: 0,
             cpu_error_bypass_last_lr: None,
             cpu_error_bypass_lr_count: 0,
+            last_deliberate_trap_bypass: None,
             cpu_skipped_instruction_sites: HashMap::new(),
             guest_termination_requested: None,
             missing_unity_player_archive: None,
@@ -2185,7 +2191,7 @@ impl Environment {
                 .enumerate()
                 .any(|(id, thread)| id != self.current_thread && thread.active)
         {
-            crate::libc::stdlib::exit(self, 0);
+            crate::libc::stdlib::exit_session(self, 0);
         }
     }
 
@@ -2201,6 +2207,22 @@ impl Environment {
     /// Whether a linked guest termination function has requested session end.
     pub(crate) fn is_guest_termination_requested(&self) -> bool {
         self.guest_termination_requested.is_some()
+    }
+
+    /// Whether the current thread is still inside the call chain in which a
+    /// deliberate guest trap (`udf`/`trap`/`bkpt`) was bypassed.
+    pub(crate) fn guest_trap_bypass_still_on_stack(&mut self) -> bool {
+        let Some((thread, trap_sp)) = self.last_deliberate_trap_bypass else {
+            return false;
+        };
+        if thread != self.current_thread {
+            return false;
+        }
+        if self.cpu.regs()[cpu::Cpu::SP] > trap_sp {
+            self.last_deliberate_trap_bypass = None;
+            return false;
+        }
+        true
     }
 
     /// Remember that Unity's mandatory serialized player archive is unavailable.
@@ -2245,9 +2267,19 @@ impl Environment {
         );
     }
 
+    /// The unavailable Unity player archive, if a resource probe found one.
+    pub(crate) fn missing_unity_player_archive(&self) -> Option<&str> {
+        self.missing_unity_player_archive.as_deref()
+    }
+
     /// Preserve a deliberate guest-PC redirect across linked-stub dispatch.
     pub(crate) fn note_guest_control_flow_redirect(&mut self) {
         self.guest_control_flow_redirected = true;
+    }
+
+    /// Whether the active linked host function redirected guest control flow.
+    pub(crate) fn is_guest_control_flow_redirected(&self) -> bool {
+        self.guest_control_flow_redirected
     }
 
     /// Mark a synthetic frame installed for a host-to-guest call.
@@ -3252,6 +3284,10 @@ impl Environment {
                 // so only the dynamic escalation applies on top of the legacy
                 // branch-to-LR.
                 const UNWIND_AFTER_REPEATS: u32 = 4;
+                if let GuestTrapKind::DeliberateTrap { .. } = trap_kind {
+                    let sp = self.cpu.regs()[cpu::Cpu::SP];
+                    self.last_deliberate_trap_bypass = Some((self.current_thread, sp));
+                }
                 // Number of wild-PC bypasses after which "fake return to LR"
                 // is assumed to be the thing keeping the guest stuck.
                 const WILD_PC_UNWIND_AFTER: u32 = 32;
@@ -3600,7 +3636,17 @@ impl Environment {
                             }
                             ThreadNextAction::Continue
                         } else {
-                            self.cpu.regs_mut()[cpu::Cpu::PC] = svc_pc;
+                            // Returning None only means "restart" for the lazy
+                            // linker: it rewrote the trapping stub, so the SVC
+                            // must be re-executed. Any other unhandled id is a
+                            // stray `svc` from guest code, and rewinding PC
+                            // would trap on it forever, so skip past it (the
+                            // CPU has already advanced PC past the SVC).
+                            let lazy_link = svc & !dyld::Dyld::SVC_LAZY_LINK_RET_FLAG
+                                == dyld::Dyld::SVC_LAZY_LINK;
+                            if lazy_link {
+                                self.cpu.regs_mut()[cpu::Cpu::PC] = svc_pc;
+                            }
                             ThreadNextAction::Continue
                         }
                     }

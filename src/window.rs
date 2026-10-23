@@ -102,6 +102,7 @@ pub enum DeviceFamily {
     iPhone4s,
     iPhone5,
     iPhone5c,
+    iPhone6,
     iPad,
     iPad2,
     iPad3,
@@ -131,6 +132,7 @@ impl DeviceFamily {
             DeviceFamily::iPhone4s => "iPhone 4s",
             DeviceFamily::iPhone5 => "iPhone 5",
             DeviceFamily::iPhone5c => "iPhone 5c",
+            DeviceFamily::iPhone6 => "iPhone 6",
             DeviceFamily::iPad => "iPad",
             DeviceFamily::iPad2 => "iPad 2",
             DeviceFamily::iPad3 => "iPad 3",
@@ -179,6 +181,12 @@ impl DeviceFamily {
         )
     }
 
+    /// 4.7-inch phones (375x667 points), the first of which was the iPhone 6.
+    /// Their launch image is the `-667h` variant.
+    pub fn is_phone_667(&self) -> bool {
+        matches!(self, DeviceFamily::iPhone6)
+    }
+
     pub fn is_retina(&self) -> bool {
         matches!(
             self,
@@ -186,6 +194,7 @@ impl DeviceFamily {
                 | DeviceFamily::iPhone4s
                 | DeviceFamily::iPhone5
                 | DeviceFamily::iPhone5c
+                | DeviceFamily::iPhone6
                 | DeviceFamily::iPodTouch4
                 | DeviceFamily::iPodTouch5
                 | DeviceFamily::iPad3
@@ -200,6 +209,8 @@ impl DeviceFamily {
     pub fn portrait_size(&self) -> (u32, u32) {
         if self.is_ipad() {
             (768, 1024)
+        } else if self.is_phone_667() {
+            (375, 667)
         } else if self.is_phone_568() {
             (320, 568)
         } else {
@@ -226,6 +237,7 @@ impl DeviceFamily {
             DeviceFamily::iPhone4s => "iPhone4,1",
             DeviceFamily::iPhone5 => "iPhone5,1",
             DeviceFamily::iPhone5c => "iPhone5,3",
+            DeviceFamily::iPhone6 => "iPhone7,2",
             DeviceFamily::iPad => "iPad1,1",
             DeviceFamily::iPad2 => "iPad2,1",
             DeviceFamily::iPad3 => "iPad3,1",
@@ -278,11 +290,14 @@ impl DeviceFamily {
             | DeviceFamily::iPad4
             | DeviceFamily::iPadMini
             | DeviceFamily::iPodTouch5 => 512 * MIB,
-            // iPad 5 (2017) and the Retina iPad minis shipped with 1 GiB. We
+            // iPhone 6 and the Retina iPad minis shipped with 1 GiB. We
             // intentionally cap this at 1 GiB even though the address space is
             // 4 GiB, leaving headroom for the guest heap, stacks and mapped
             // libraries.
-            DeviceFamily::iPad5 | DeviceFamily::iPadMini2 | DeviceFamily::iPadMini3 => 1024 * MIB,
+            DeviceFamily::iPhone6
+            | DeviceFamily::iPad5
+            | DeviceFamily::iPadMini2
+            | DeviceFamily::iPadMini3 => 1024 * MIB,
         }
     }
 
@@ -330,6 +345,7 @@ impl DeviceFamily {
             DeviceFamily::iPhone4s => "iphone-4s",
             DeviceFamily::iPhone5 => "iphone-5",
             DeviceFamily::iPhone5c => "iphone-5c",
+            DeviceFamily::iPhone6 => "iphone-6",
             DeviceFamily::iPad => "ipad-1",
             DeviceFamily::iPad2 => "ipad-2",
             DeviceFamily::iPad3 => "ipad-3",
@@ -356,6 +372,7 @@ impl DeviceFamily {
         DeviceFamily::iPhone4s,
         DeviceFamily::iPhone5,
         DeviceFamily::iPhone5c,
+        DeviceFamily::iPhone6,
         DeviceFamily::iPad,
         DeviceFamily::iPad2,
         DeviceFamily::iPad3,
@@ -370,6 +387,44 @@ impl DeviceFamily {
         DeviceFamily::iPodTouch4,
         DeviceFamily::iPodTouch5,
     ];
+
+    /// The same models numbered the way the app picker tags them, which is also
+    /// how it saves the selection. New models are appended here so that a saved
+    /// tag keeps pointing at the same device; the display order is
+    /// [Self::ALL_SELECTABLE].
+    const ALL_BY_TAG: &'static [DeviceFamily] = &[
+        DeviceFamily::iPhone,
+        DeviceFamily::iPhone3G,
+        DeviceFamily::iPhone3GS,
+        DeviceFamily::iPhone4,
+        DeviceFamily::iPhone4s,
+        DeviceFamily::iPhone5,
+        DeviceFamily::iPhone5c,
+        DeviceFamily::iPad,
+        DeviceFamily::iPad2,
+        DeviceFamily::iPad3,
+        DeviceFamily::iPad4,
+        DeviceFamily::iPad5,
+        DeviceFamily::iPadMini,
+        DeviceFamily::iPadMini2,
+        DeviceFamily::iPadMini3,
+        DeviceFamily::iPodTouch,
+        DeviceFamily::iPodTouch2,
+        DeviceFamily::iPodTouch3,
+        DeviceFamily::iPodTouch4,
+        DeviceFamily::iPodTouch5,
+        DeviceFamily::iPhone6,
+    ];
+
+    /// The picker tag of this model, or `None` if it is not selectable.
+    pub fn tag(&self) -> Option<usize> {
+        Self::ALL_BY_TAG.iter().position(|family| family == self)
+    }
+
+    /// The model for a picker tag, or `None` if the tag is out of range.
+    pub fn for_tag(tag: usize) -> Option<DeviceFamily> {
+        Self::ALL_BY_TAG.get(tag).copied()
+    }
 }
 impl TryFrom<u64> for DeviceFamily {
     type Error = ();
@@ -393,6 +448,7 @@ impl TryFrom<&str> for DeviceFamily {
             "iphone-4s" | "iphone4,1" => Ok(DeviceFamily::iPhone4s),
             "iphone-5" | "iphone5,1" => Ok(DeviceFamily::iPhone5),
             "iphone-5c" | "iphone5,3" => Ok(DeviceFamily::iPhone5c),
+            "iphone-6" | "iphone7,2" => Ok(DeviceFamily::iPhone6),
             "ipad" => Ok(DeviceFamily::iPad2),
             "ipad-1" | "ipad1,1" => Ok(DeviceFamily::iPad),
             "ipad-2" | "ipad2,1" => Ok(DeviceFamily::iPad2),
@@ -3218,4 +3274,66 @@ pub fn show_alert_dialog(
             _ => 0,
         }
     })
+}
+
+
+#[cfg(test)]
+mod device_family_tests {
+    use super::DeviceFamily;
+
+    /// Apple iPhone 6 Tech Specs: 4.7-inch 1334x750 display (375x667 points at
+    /// scale 2), 1 GiB of RAM, hw.machine iPhone7,2.
+    /// <https://support.apple.com/kb/SP705>
+    #[test]
+    fn iphone_6_reports_iphone_6_specs() {
+        let family = DeviceFamily::try_from("iphone7,2").unwrap();
+        assert_eq!(family, DeviceFamily::iPhone6);
+        assert_eq!(family.display_name(), "iPhone 6");
+        assert_eq!(family.option_name(), "iphone-6");
+        assert_eq!(family.machine_name(), "iPhone7,2");
+        assert_eq!(family.portrait_size(), (375, 667));
+        assert_eq!(family.scale_factor(), 2.0);
+        assert_eq!(family.physical_memory(), 1024 * 1024 * 1024u64);
+        assert!(family.is_retina());
+        assert!(family.is_phone_667());
+        assert!(!family.is_phone_568());
+        assert!(!family.is_ipad());
+        assert!(!family.is_ipod_touch());
+    }
+
+    #[test]
+    fn every_selectable_model_round_trips_through_its_option_name() {
+        for family in DeviceFamily::ALL_SELECTABLE {
+            assert_eq!(DeviceFamily::try_from(family.option_name()).unwrap(), *family);
+        }
+    }
+
+    #[test]
+    fn iphone_6_is_listed_right_after_iphone_5c() {
+        let all = DeviceFamily::ALL_SELECTABLE;
+        assert_eq!(all.len(), 21);
+        assert_eq!(all[6], DeviceFamily::iPhone5c);
+        assert_eq!(all[7], DeviceFamily::iPhone6);
+        assert_eq!(all[8], DeviceFamily::iPad);
+    }
+
+    /// The app picker saves the chosen model as its tag, so tags must not
+    /// renumber when the display order changes.
+    #[test]
+    fn selectable_tags_stay_stable() {
+        assert_eq!(DeviceFamily::for_tag(0), Some(DeviceFamily::iPhone));
+        assert_eq!(DeviceFamily::for_tag(5), Some(DeviceFamily::iPhone5));
+        assert_eq!(DeviceFamily::for_tag(6), Some(DeviceFamily::iPhone5c));
+        assert_eq!(DeviceFamily::for_tag(7), Some(DeviceFamily::iPad));
+        assert_eq!(
+            DeviceFamily::for_tag(19),
+            Some(DeviceFamily::iPodTouch5)
+        );
+        assert_eq!(DeviceFamily::for_tag(20), Some(DeviceFamily::iPhone6));
+        assert_eq!(DeviceFamily::iPhone6.tag(), Some(20));
+        assert_eq!(DeviceFamily::for_tag(21), None);
+        for family in DeviceFamily::ALL_SELECTABLE {
+            assert_eq!(DeviceFamily::for_tag(family.tag().unwrap()), Some(*family));
+        }
+    }
 }

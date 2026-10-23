@@ -255,11 +255,20 @@ fn classify_fullscreen_layer_transform(
     let angle = match orientation {
         crate::window::DeviceOrientation::Portrait => return None,
         crate::window::DeviceOrientation::PortraitUpsideDown => std::f32::consts::PI,
-        crate::window::DeviceOrientation::LandscapeLeft => -std::f32::consts::FRAC_PI_2,
-        crate::window::DeviceOrientation::LandscapeRight => std::f32::consts::FRAC_PI_2,
+        // A landscape app can show up with either quarter turn: UIKit
+        // interface orientations and device orientations use opposite
+        // handedness, so an app that autorotates its root view for
+        // `UIInterfaceOrientationLandscapeRight` produces a +90 degree matrix
+        // while the device reports `LandscapeLeft`, and vice versa. Both are
+        // just quarter turns of an otherwise full-screen layer, and the
+        // presenter ignores the transform (it applies its own orientation
+        // compensation), so accept either direction.
+        crate::window::DeviceOrientation::LandscapeLeft
+        | crate::window::DeviceOrientation::LandscapeRight => std::f32::consts::FRAC_PI_2,
     };
-    nearly_equal_transform(transform, CGAffineTransform::make_rotation(angle))
-        .then_some(FullscreenLayerTransform::DeviceRotation)
+    (nearly_equal_transform(transform, CGAffineTransform::make_rotation(angle))
+        || nearly_equal_transform(transform, CGAffineTransform::make_rotation(-angle)))
+    .then_some(FullscreenLayerTransform::DeviceRotation)
 }
 
 fn fullscreen_frame_matches_screen(frame: CGRect, screen: CGRect) -> bool {
@@ -340,24 +349,7 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
                 host.opacity,
             )
         };
-        let transform_kind = classify_fullscreen_layer_transform(affine_transform, orientation)
-            .or_else(|| {
-                // Buddyman draws a landscape buffer and manually rotates its
-                // layer opposite to UIKit autorotation. Its zero-rotation
-                // presentation profile can display that buffer directly.
-                if env.bundle.bundle_identifier() != "com.crazylion.buddyman.tm.kick2"
-                    || env.options.present_rotate != Some(0)
-                {
-                    return None;
-                }
-                use crate::window::DeviceOrientation;
-                let inverse = match orientation {
-                    DeviceOrientation::LandscapeLeft => DeviceOrientation::LandscapeRight,
-                    DeviceOrientation::LandscapeRight => DeviceOrientation::LandscapeLeft,
-                    _ => return None,
-                };
-                classify_fullscreen_layer_transform(affine_transform, inverse)
-            });
+        let transform_kind = classify_fullscreen_layer_transform(affine_transform, orientation);
         let layer_to_screen = superlayer_to_layer_transform.concat(parent_to_screen);
         let layer_frame = layer_to_screen.apply_to_rect(CGRect {
             origin: layer_bounds.origin,
@@ -391,18 +383,21 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
         {
             if crate::env_flag_cached!("TOUCHHLE_TRACE_PRESENT") {
                 log!(
-                    "FULLSCREEN-DIAG layer {:?} rejected: frame={:?} screen={:?} frame_match={} bounds_origin={:?} anchor={:?} hidden={} opacity={} transform_kind={:?} transform_usable={} affine={:?}",
+                    "FULLSCREEN-DIAG layer {:?} rejected: frame={:?} screen={:?} frame_match={} bounds={:?} bounds_origin={:?} anchor={:?} hidden={} opacity={} transform={:?} sl2l={:?} orientation={:?} transform_kind={:?} transform_usable={}",
                     layer,
                     layer_frame,
                     screen_bounds,
                     fullscreen_frame_matches_screen(layer_frame, screen_bounds),
+                    layer_bounds,
                     layer_bounds.origin,
                     anchor_point,
                     hidden,
                     opacity,
+                    affine_transform,
+                    superlayer_to_layer_transform,
+                    orientation,
                     transform_kind,
-                    transform_is_usable,
-                    affine_transform
+                    transform_is_usable
                 );
             }
             return nil;
@@ -464,7 +459,7 @@ mod fullscreen_layer_tests {
     use crate::window::DeviceOrientation;
 
     #[test]
-    fn accepts_identity_and_the_current_device_rotation_only() {
+    fn accepts_identity_and_landscape_quarter_turns() {
         assert_eq!(
             classify_fullscreen_layer_transform(
                 CGAffineTransformIdentity,
@@ -472,24 +467,40 @@ mod fullscreen_layer_tests {
             ),
             Some(FullscreenLayerTransform::Identity),
         );
-        assert_eq!(
-            classify_fullscreen_layer_transform(
-                CGAffineTransform::make_rotation(-std::f32::consts::FRAC_PI_2),
-                DeviceOrientation::LandscapeLeft,
-            ),
-            Some(FullscreenLayerTransform::DeviceRotation),
-        );
+        // `UIInterfaceOrientation` and `UIDeviceOrientation` are mirror images,
+        // so an app can arrive with either quarter turn for a given device
+        // orientation.
+        for orientation in [
+            DeviceOrientation::LandscapeLeft,
+            DeviceOrientation::LandscapeRight,
+        ] {
+            for angle in [std::f32::consts::FRAC_PI_2, -std::f32::consts::FRAC_PI_2] {
+                assert_eq!(
+                    classify_fullscreen_layer_transform(
+                        CGAffineTransform::make_rotation(angle),
+                        orientation,
+                    ),
+                    Some(FullscreenLayerTransform::DeviceRotation),
+                    "{orientation:?} should accept a {} degree layer rotation",
+                    angle.to_degrees(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn portrait_only_accepts_identity() {
         assert_eq!(
             classify_fullscreen_layer_transform(
                 CGAffineTransform::make_rotation(std::f32::consts::FRAC_PI_2),
-                DeviceOrientation::LandscapeLeft,
+                DeviceOrientation::Portrait,
             ),
             None,
         );
         assert_eq!(
             classify_fullscreen_layer_transform(
-                CGAffineTransform::make_rotation(std::f32::consts::FRAC_PI_2),
-                DeviceOrientation::LandscapeRight,
+                CGAffineTransform::make_rotation(std::f32::consts::PI),
+                DeviceOrientation::PortraitUpsideDown,
             ),
             Some(FullscreenLayerTransform::DeviceRotation),
         );
@@ -639,6 +650,64 @@ mod layer_visibility_tests {
         assert!(!layer_has_visible_area(true, 1.0, fullscreen));
         assert!(!layer_has_visible_area(false, 0.0, fullscreen));
         assert!(layer_has_visible_area(false, 1.0, fullscreen));
+    }
+}
+
+/// Rotation, in radians, that Core Animation applies to `layer` on its way to
+/// the screen: the `affineTransform` rotations of the layer itself and of every
+/// ancestor up to the window, added together.
+///
+/// `presentRenderbuffer:` normally hands the frame to the compositor, which
+/// applies these transforms for us. The GPU presenter bypasses the compositor
+/// and draws the renderbuffer straight into the window, so it has to apply the
+/// same rotation; without it, an app that lets UIKit autorotate its root view
+/// (all iOS 5-style landscape games) is presented a quarter turn out.
+pub fn layer_screen_rotation(env: &mut Environment, layer: id) -> f32 {
+    let mut rotation = 0.0;
+    let mut current = layer;
+    while current != nil {
+        let (transform, superlayer) = {
+            let host = env.objc.borrow::<CALayerHostObject>(current);
+            (host.affine_transform, host.superlayer)
+        };
+        rotation += transform.b.atan2(transform.a);
+        current = superlayer;
+    }
+    snap_to_quarter_turn(rotation)
+}
+
+/// Snaps float noise onto the nearest quarter turn. Autorotation produces
+/// matrices like `{ a: -4.371139e-8, b: 1.0 }`, whose `atan2` is 1.5707965
+/// rather than exactly PI/2; presenting with that residue resamples the frame
+/// and makes it soft.
+fn snap_to_quarter_turn(rotation: f32) -> f32 {
+    let quarter = std::f32::consts::FRAC_PI_2;
+    let snapped = (rotation / quarter).round() * quarter;
+    if (rotation - snapped).abs() < 1e-3 {
+        snapped
+    } else {
+        rotation
+    }
+}
+
+#[cfg(test)]
+mod layer_rotation_tests {
+    use super::*;
+
+    #[test]
+    fn snaps_quarter_turn_float_noise() {
+        let quarter = std::f32::consts::FRAC_PI_2;
+        // Autorotation leaves a little noise in the transform, so the
+        // accumulated angle lands just beside a quarter turn.
+        assert_eq!(snap_to_quarter_turn(quarter + 1e-6), quarter);
+        assert_eq!(snap_to_quarter_turn(-quarter - 1e-6), -quarter);
+        assert_eq!(
+            snap_to_quarter_turn(std::f32::consts::PI + 1e-6),
+            std::f32::consts::PI
+        );
+        assert_eq!(snap_to_quarter_turn(0.0), 0.0);
+        // A rotation that is not a quarter turn is passed through untouched.
+        assert_eq!(snap_to_quarter_turn(0.3), 0.3);
     }
 }
 

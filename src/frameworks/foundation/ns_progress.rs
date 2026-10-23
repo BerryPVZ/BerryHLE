@@ -14,8 +14,6 @@ use crate::objc::{
     id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
 };
 
-type NSInteger = i32;
-
 #[derive(Default)]
 struct NSProgressHostObject {
     total_unit_count: i64,
@@ -24,7 +22,6 @@ struct NSProgressHostObject {
     paused: bool,
     pausable: bool,
     cancellable: bool,
-    indeterminate: bool,
     kind: id,
     localized_description: id,
     user_info: id,
@@ -53,7 +50,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 @implementation NSProgress: NSObject
 
 + (id)allocWithZone:(crate::objc::NSZonePtr)_zone {
-    let host = Box::<NSProgressHostObject>::default();
+    let host = Box::new(NSProgressHostObject {
+        cancellable: true,
+        ..Default::default()
+    });
     env.objc.alloc_object(this, host, &mut env.mem)
 }
 
@@ -64,12 +64,25 @@ pub const CLASSES: ClassExports = objc_classes! {
     crate::objc::autorelease(env, progress)
 }
 
-- (id)initWithParent:(id)parent userInfo:(id)user_info {
+- (id)init {
+    msg![env; this initWithParent:nil userInfo:nil]
+}
+
+- (id)initWithParent:(id)_parent userInfo:(id)user_info {
     let this: id = crate::objc::msg_super![env; this init];
-    retain(env, user_info);
+    let mutable_info: id = if user_info == nil {
+        nil
+    } else {
+        msg![env; user_info mutableCopy]
+    };
+    let old = env
+        .objc
+        .borrow_mut::<NSProgressHostObject>(this)
+        .user_info;
     env.objc
         .borrow_mut::<NSProgressHostObject>(this)
-        .user_info = user_info;
+        .user_info = mutable_info;
+    release(env, old);
     this
 }
 
@@ -100,7 +113,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 }
 - (bool)isIndeterminate {
-    env.objc.borrow::<NSProgressHostObject>(this).indeterminate
+    let host = env.objc.borrow::<NSProgressHostObject>(this);
+    (host.total_unit_count < 0 && host.completed_unit_count < 0)
+        || (host.total_unit_count == 0 && host.completed_unit_count == 0)
 }
 - (bool)isCancelled {
     env.objc.borrow::<NSProgressHostObject>(this).cancelled
@@ -180,24 +195,33 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)userInfo {
-    env.objc.borrow::<NSProgressHostObject>(this).user_info
+    let info = env.objc.borrow::<NSProgressHostObject>(this).user_info;
+    if info == nil {
+        msg_class![env; NSDictionary dictionary]
+    } else {
+        let snapshot: id = msg![env; info copy];
+        crate::objc::autorelease(env, snapshot)
+    }
 }
 - (())setUserInfoObject:(id)object forKey:(id)key {
     if key == nil {
         return;
     }
     let info = env.objc.borrow::<NSProgressHostObject>(this).user_info;
+    if object == nil {
+        if info != nil {
+            () = msg![env; info removeObjectForKey:key];
+        }
+        return;
+    }
     if info == nil {
-        let dict: id = msg_class![env; NSMutableDictionary dictionary];
-        let dict: id = msg![env; dict copy];
+        let dict: id = msg_class![env; NSMutableDictionary new];
         env.objc
             .borrow_mut::<NSProgressHostObject>(this)
             .user_info = dict;
-        retain(env, object);
         () = msg![env; dict setObject:object forKey:key];
         return;
     }
-    retain(env, object);
     () = msg![env; info setObject:object forKey:key];
 }
 
@@ -216,12 +240,12 @@ pub const CLASSES: ClassExports = objc_classes! {
     let cancelled = source.cancelled;
     let paused = source.paused;
     let pausable = source.pausable;
-    let indeterminate = source.indeterminate;
+    let cancellable = source.cancellable;
     let kind = source.kind;
     let description = source.localized_description;
     let user_info = source.user_info;
     drop(source);
-    let copy: id = msg![env; this alloc];
+    let copy: id = msg_class![env; NSProgress alloc];
     let copy: id = msg![env; copy initWithParent:nil userInfo:user_info];
     {
         let host = env.objc.borrow_mut::<NSProgressHostObject>(copy);
@@ -230,7 +254,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         host.cancelled = cancelled;
         host.paused = paused;
         host.pausable = pausable;
-        host.indeterminate = indeterminate;
+        host.cancellable = cancellable;
         host.kind = kind;
         host.localized_description = description;
     }

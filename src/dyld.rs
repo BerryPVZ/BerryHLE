@@ -461,6 +461,10 @@ pub struct Dyld {
     /// built from *defined* symbols (not just external ones) so that a
     /// non-exported-but-defined `___cxa_throw` still wins over the host stub.
     guest_cxxabi_exports: HashMap<String, u32>,
+    /// Guest-originated SVC traps that don't map to any function we linked,
+    /// keyed by `(svc_pc, svc)`, with the number of times each was reported.
+    /// A stray trap can be hit on every frame, so logging is capped.
+    stray_svc_reports: HashMap<(u32, u32), u32>,
 }
 
 impl Dyld {
@@ -497,6 +501,7 @@ impl Dyld {
             cxxabi_typeinfo_vtable_kinds: HashMap::new(),
             guest_sjlj_runtime_available: false,
             guest_cxxabi_exports: HashMap::new(),
+            stray_svc_reports: HashMap::new(),
         }
     }
 
@@ -663,28 +668,16 @@ impl Dyld {
                         patch_count
                     );
                 }
-
-                // `std::string(const char*)` with a NULL argument is constructed
-                // via `_S_construct(NULL, NULL + npos)`. libstdc++ detects the NULL
-                // pointer and calls `std::__throw_logic_error("basic_string::
-                // _S_construct null not valid")`. With the `__throw_*` helpers
-                // neutered to `BX LR` above, that throw becomes a no-op and
-                // execution falls through to the *normal* construction path, which
-                // does `memcpy(rep_data, NULL, npos)` and sets the string length to
-                // `npos`. The over-sized copy is skipped by `Mem::memmove`, but the
-                // resulting corrupt (length == npos) string sends some apps into an
-                // effectively infinite loop (e.g. Turbo Dismount's startup builds
-                // std::strings from a table that contains a NULL entry under
-                // touchHLE).
-                //
-                // The documented intent of the throw-neutering is for `std::
-                // string(NULL)` to behave like an *empty* string. We make that
-                // actually happen by retargeting the NULL-pointer branch inside
-                // `_S_construct` so it jumps to the function's existing
-                // "empty string" path (which returns `_S_empty_rep()._M_refdata()`)
-                // instead of the throw / over-sized-copy path.
-                patch_string_s_construct_null(dylib, mem);
             }
+        }
+
+        // Always redirect `std::string((const char*)NULL)` in bundled libstdc++
+        // to the empty-string representation, even when the guest SjLj runtime
+        // is active. Games such as Geometry Dash 1.0 and Turbo Dismount pass
+        // NULL to `std::string(const char*)` during startup without catching
+        // `std::logic_error`.
+        for dylib in bins.iter().skip(1) {
+            patch_string_s_construct_null(dylib, mem);
         }
     }
 
@@ -1721,10 +1714,28 @@ impl Dyld {
                         as usize,
                 );
                 let Some(&(symbol, f)) = f else {
-                    log!(
-                        "Warning: Unexpected SVC #{} at {:#x}; treating as no-op (returning to caller).",
-                        svc, svc_pc
-                    );
+                    // No stub of ours can encode this id, so the guest itself
+                    // executed the instruction (a raw `svc` in app code, or a
+                    // legacy trap like `svc #0xab` from pre-armv7 stubs).
+                    // There is nothing to call, and re-executing the SVC would
+                    // trap forever, so report it (rate-limited) and let the
+                    // caller skip the instruction.
+                    let count = self.stray_svc_reports.entry((svc_pc, svc)).or_insert(0);
+                    *count += 1;
+                    if *count <= 2 {
+                        log!(
+                            "Warning: unexpected SVC #{} at {:#x} (not a dyld-linked function); skipping it.",
+                            svc,
+                            svc_pc
+                        );
+                        if *count == 2 {
+                            log!(
+                                "(further occurrences of SVC #{} at {:#x} will not be logged)",
+                                svc,
+                                svc_pc
+                            );
+                        }
+                    }
                     return None;
                 };
                 log_dbg!("Call to host function, already linked: {}", symbol);

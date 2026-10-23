@@ -50,7 +50,7 @@ pub(crate) struct CALayerHostObject {
     /// Retained model for a detached presentation snapshot; nil for model layers.
     presentation_model: id,
     pub(super) sublayers: Vec<id>,
-    superlayer: id,
+    pub(super) superlayer: id,
     pub(super) bounds: CGRect,
     pub(super) position: CGPoint,
     pub(super) z_position: CGFloat, // <-- ДОБАВЛЕНО СВОЙСТВО Z-POSITION

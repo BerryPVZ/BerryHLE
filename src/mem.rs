@@ -387,15 +387,22 @@ pub struct Mem {
     /// See [crate::Environment] for more info.
     pub(super) zero_memory_on_free: bool,
 
-    /// HACK: backing page for null-page accesses, shared by reads and writes.
-    /// Zero-filled, so reading `*(void**)NULL` still returns NULL. Reads and
-    /// writes must use the *same* page: with separate pages, a guest that
-    /// writes through NULL and then reads the address back gets zeros instead
-    /// of what it just stored, which silently corrupts it. (Asphalt 8's drift
-    /// event writes a 256-byte table through NULL on the main thread and
-    /// later walks off into a data section.)
+    /// HACK: 64 KiB backing region for null-page / OOB stub accesses, shared
+    /// by reads and writes. Zero-filled, so reading `*(void**)NULL` returns
+    /// NULL, and large enough that page-straddling `read<T>` / `write<T>` /
+    /// `bytes_at` calls near `0xfff` never truncate or overrun the buffer.
     null_page: *mut u8,
+    /// Pinned read-only fallback buffers `(ptr_addr, len)` for rare null/OOB
+    /// slices larger than `NULL_STUB_SIZE`. Once allocated, each buffer is
+    /// immutable until `Drop for Mem`, avoiding any aliasing or retag hazard.
+    oversize_null_reads: std::sync::Mutex<Vec<(usize, usize)>>,
+    /// Exclusive fallback buffer for mutable null/OOB slices larger than
+    /// `NULL_STUB_SIZE`.
+    oversize_null_write: Vec<u8>,
 }
+
+const NULL_STUB_SIZE: usize = 64 * 1024;
+const MAX_OVERSIZE_NULL_STUB: usize = 64 * 1024 * 1024;
 
 impl Drop for Mem {
     fn drop(&mut self) {
@@ -403,7 +410,14 @@ impl Drop for Mem {
             crate::mem::host::free_guest_memory(self.bytes.cast(), std::mem::size_of::<Bytes>())
                 .unwrap();
             if !self.null_page.is_null() {
-                crate::mem::host::free_memory(self.null_page.cast(), PAGE_SIZE as usize).unwrap();
+                crate::mem::host::free_memory(self.null_page.cast(), NULL_STUB_SIZE).unwrap();
+            }
+            if let Ok(mut buffers) = self.oversize_null_reads.lock() {
+                for (ptr_addr, cap) in buffers.drain(..) {
+                    if let Ok(layout) = std::alloc::Layout::from_size_align(cap, 16) {
+                        std::alloc::dealloc(ptr_addr as *mut u8, layout);
+                    }
+                }
             }
         }
     }
@@ -461,8 +475,8 @@ impl Mem {
         // writes through NULL are kept here so that reading the same address
         // back returns what was written rather than a zero.
         let null_page = unsafe {
-            let page = crate::mem::host::allocate_memory(PAGE_SIZE as usize).unwrap();
-            let page_slice = std::slice::from_raw_parts_mut(page as *mut u8, PAGE_SIZE as usize);
+            let page = crate::mem::host::allocate_memory(NULL_STUB_SIZE).unwrap();
+            let page_slice = std::slice::from_raw_parts_mut(page as *mut u8, NULL_STUB_SIZE);
             page_slice.fill(0);
             page as *mut u8
         };
@@ -474,6 +488,8 @@ impl Mem {
             allocator,
             zero_memory_on_free: true,
             null_page,
+            oversize_null_reads: std::sync::Mutex::new(Vec::new()),
+            oversize_null_write: Vec::new(),
         }
     }
 
@@ -698,18 +714,57 @@ impl Mem {
         out
     }
 
+    #[inline]
+    fn null_stub_slice(&self, addr: u32, count: GuestUSize) -> &[u8] {
+        let offset = (addr % PAGE_SIZE) as usize;
+        let count_usize = count as usize;
+        if offset.saturating_add(count_usize) <= NULL_STUB_SIZE {
+            return unsafe { std::slice::from_raw_parts(self.null_page.add(offset), count_usize) };
+        }
+        let alloc_len = count_usize.min(MAX_OVERSIZE_NULL_STUB);
+        if alloc_len == 0 {
+            return &[];
+        }
+        let mut buffers = self.oversize_null_reads.lock().unwrap();
+        if let Some(&(ptr_addr, _)) = buffers.iter().find(|&&(_, cap)| cap >= alloc_len) {
+            return unsafe { std::slice::from_raw_parts(ptr_addr as *const u8, alloc_len) };
+        }
+        let cap = alloc_len.next_power_of_two().max(NULL_STUB_SIZE * 2);
+        let layout = std::alloc::Layout::from_size_align(cap, 16).unwrap();
+        let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+        if raw.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        let prefix = (NULL_STUB_SIZE - offset).min(cap);
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.null_page.add(offset), raw, prefix);
+        }
+        buffers.push((raw as usize, cap));
+        unsafe { std::slice::from_raw_parts(raw as *const u8, alloc_len) }
+    }
+
+    #[inline]
+    fn null_stub_slice_mut(&mut self, addr: u32, count: GuestUSize) -> &mut [u8] {
+        let offset = (addr % PAGE_SIZE) as usize;
+        let count_usize = count as usize;
+        if offset.saturating_add(count_usize) <= NULL_STUB_SIZE {
+            return unsafe {
+                std::slice::from_raw_parts_mut(self.null_page.add(offset), count_usize)
+            };
+        }
+        let alloc_len = count_usize.min(MAX_OVERSIZE_NULL_STUB);
+        if self.oversize_null_write.len() < alloc_len {
+            self.oversize_null_write.resize(alloc_len, 0);
+        }
+        &mut self.oversize_null_write[..alloc_len]
+    }
+
     /// Special version of [Self::bytes_at] that returns [None] rather than
     /// panicking on failure.
     /// Only for use by [crate::gdb::GdbServer].
     pub fn get_bytes_fallible(&self, addr: ConstVoidPtr, count: GuestUSize) -> Option<&[u8]> {
         if addr.to_bits() < self.null_segment_size {
-            // Для GDB возвращаем stub-страницу
-            let offset = (addr.to_bits() % PAGE_SIZE) as usize;
-            let count_usize = count as usize;
-            let stub_slice = unsafe {
-                std::slice::from_raw_parts(self.null_page.add(offset), PAGE_SIZE as usize - offset)
-            };
-            return Some(&stub_slice[..count_usize.min(stub_slice.len())]);
+            return Some(self.null_stub_slice(addr.to_bits(), count));
         }
         let start = addr.to_bits() as usize;
         let end = start.checked_add(count as usize)?;
@@ -730,7 +785,6 @@ impl Mem {
     ) -> Option<&mut [u8]> {
         if addr.to_bits() < self.null_segment_size {
             return None;
-            // GDB не должен писать в null-page
         }
         let start = addr.to_bits() as usize;
         let end = start.checked_add(count as usize)?;
@@ -745,38 +799,17 @@ impl Mem {
     /// Get a slice for reading `count` bytes.
     /// This is the basic primitive for
     /// safe read-only memory access.
-    ///
-    /// This will panic when `ptr` is within the null page, even if `count` is
-    /// 0. This may be inconvenient in some cases, but it makes the behavior
-    /// when deriving a pointer from the slice consistent (though you should use
-    /// [Self::ptr_at] for that).
     #[inline]
     pub fn bytes_at<const MUT: bool>(&self, ptr: Ptr<u8, MUT>, count: GuestUSize) -> &[u8] {
-        // ХАК: Вместо паники логируем и возвращаем данные из stub-страницы
         if ptr.to_bits() < self.null_segment_size {
             Self::null_check_fail(ptr.to_bits(), count, false, "bytes_at", self);
-            // Возвращаем данные из stub-страницы вместо реальной памяти
-            // Это предотвращает UndefinedInstruction когда игра использует
-            // прочитанные значения как указатели на функции
-            let offset = (ptr.to_bits() % PAGE_SIZE) as usize;
-            let count_usize = count as usize;
-            let available = PAGE_SIZE as usize - offset;
-            let actual_count = count_usize.min(available);
-            return unsafe { std::slice::from_raw_parts(self.null_page.add(offset), actual_count) };
+            return self.null_stub_slice(ptr.to_bits(), count);
         }
-        // Guard against out-of-bounds reads near the top of the 32-bit address
-        // space. If `ptr + count` wraps around or exceeds the backing array,
-        // return the stub page. This prevents panics when a game uses -1 or
-        // another near-max address as a pointer (corrupted pointer arithmetic).
         let addr = ptr.to_bits() as usize;
         let end = addr.saturating_add(count as usize);
         if end > GUEST_MEMORY_SIZE || end < addr {
             Self::null_check_fail(ptr.to_bits(), count, false, "bytes_at(OOB)", self);
-            let offset = (ptr.to_bits() % PAGE_SIZE) as usize;
-            let count_usize = count as usize;
-            let available = PAGE_SIZE as usize - offset;
-            let actual_count = count_usize.min(available);
-            return unsafe { std::slice::from_raw_parts(self.null_page.add(offset), actual_count) };
+            return self.null_stub_slice(ptr.to_bits(), count);
         }
         unsafe { std::slice::from_raw_parts(self.bytes.cast::<u8>().add(addr), count as usize) }
     }
@@ -792,60 +825,29 @@ impl Mem {
     ) -> &[u8] {
         let addr = ptr.to_bits() as usize;
         if ptr.to_bits() < self.null_segment_size {
-            let offset = (ptr.to_bits() % PAGE_SIZE) as usize;
-            let count_usize = count as usize;
-            let available = PAGE_SIZE as usize - offset;
-            let actual_count = count_usize.min(available);
-            return unsafe { std::slice::from_raw_parts(self.null_page.add(offset), actual_count) };
+            return self.null_stub_slice(ptr.to_bits(), count);
         }
         let end = addr.saturating_add(count as usize);
         if end > GUEST_MEMORY_SIZE || end < addr {
             Self::null_check_fail(ptr.to_bits(), count, false, "unchecked_bytes_at(OOB)", self);
-            let offset = (ptr.to_bits() % PAGE_SIZE) as usize;
-            let count_usize = count as usize;
-            let available = PAGE_SIZE as usize - offset;
-            let actual_count = count_usize.min(available);
-            return unsafe { std::slice::from_raw_parts(self.null_page.add(offset), actual_count) };
+            return self.null_stub_slice(ptr.to_bits(), count);
         }
         unsafe { std::slice::from_raw_parts(self.bytes.cast::<u8>().add(addr), count as usize) }
     }
     /// Get a slice for reading or writing `count` bytes.
     /// This is the basic
     /// primitive for safe read-write memory access.
-    ///
-    /// This will panic when `ptr` is within the null page, even if `count` is
-    /// 0. This may be inconvenient in some cases, but it makes the behavior
-    /// when deriving a pointer from the slice consistent (though you should use
-    /// [Self::ptr_at_mut] for that).
     #[inline]
     pub fn bytes_at_mut(&mut self, ptr: MutPtr<u8>, count: GuestUSize) -> &mut [u8] {
-        // ХАК: Вместо паники логируем и возвращаем данные из stub-страницы
         if ptr.to_bits() < self.null_segment_size {
             Self::null_check_fail(ptr.to_bits(), count, true, "bytes_at_mut", self);
-            // Writes land on the same page reads come from, so a guest that
-            // writes through NULL and reads the address back gets its own
-            // value instead of a zero.
-            let offset = (ptr.to_bits() % PAGE_SIZE) as usize;
-            let count_usize = count as usize;
-            let available = PAGE_SIZE as usize - offset;
-            let actual_count = count_usize.min(available);
-            return unsafe {
-                std::slice::from_raw_parts_mut(self.null_page.add(offset), actual_count)
-            };
+            return self.null_stub_slice_mut(ptr.to_bits(), count);
         }
-        // Guard against out-of-bounds writes near the top of the 32-bit
-        // address space (e.g. corrupted pointer = 0xFFFFFFFF).
         let addr = ptr.to_bits() as usize;
         let end = addr.saturating_add(count as usize);
         if end > GUEST_MEMORY_SIZE || end < addr {
             Self::null_check_fail(ptr.to_bits(), count, true, "bytes_at_mut(OOB)", self);
-            let offset = (ptr.to_bits() % PAGE_SIZE) as usize;
-            let count_usize = count as usize;
-            let available = PAGE_SIZE as usize - offset;
-            let actual_count = count_usize.min(available);
-            return unsafe {
-                std::slice::from_raw_parts_mut(self.null_page.add(offset), actual_count)
-            };
+            return self.null_stub_slice_mut(ptr.to_bits(), count);
         }
         unsafe { std::slice::from_raw_parts_mut(self.bytes.cast::<u8>().add(addr), count as usize) }
     }
@@ -1291,6 +1293,19 @@ impl Mem {
         let bytes = self.cstr_at(ptr);
         std::str::from_utf8(bytes).map_err(|_| bytes)
     }
+
+    /// Get a C string (null-terminated) as a string, replacing invalid UTF-8
+    /// sequences with U+FFFD instead of failing.
+    ///
+    /// POSIX paths and most guest C strings are byte strings, so callers that
+    /// must accept arbitrary bytes (e.g. `open(2)`, which the kernel never
+    /// validates as UTF-8) use this instead of [Self::cstr_at_utf8].
+    pub fn cstr_at_utf8_lossy<const MUT: bool>(&self, ptr: Ptr<u8, MUT>) -> std::borrow::Cow<'_, str> {
+        match self.cstr_at_utf8(ptr) {
+            Ok(s) => std::borrow::Cow::Borrowed(s),
+            Err(bytes) => String::from_utf8_lossy(bytes),
+        }
+    }
     /// Compare a null-terminated guest C string against an expected byte
     /// string, returning true iff they are exactly equal. `expected` must not
     /// contain an interior NUL.
@@ -1498,6 +1513,28 @@ mod mem_tests {
     }
 
     #[test]
+    fn cstr_at_utf8_lossy_keeps_non_utf8_paths_usable() {
+        // Unity's shader cache opens paths whose name ends in uninitialised
+        // bytes. POSIX paths are byte strings, so the helper must return a
+        // string (with replacement characters) rather than failing.
+        let mut mem = Mem::new();
+        let p: MutPtr<u8> = Ptr::from_bits(0x1000);
+        mem.bytes_at_mut(p, 6)
+            .copy_from_slice(&[b'/', b'a', 0xA5, b'b', 0xAA, 0]);
+
+        assert!(mem.cstr_at_utf8(p).is_err());
+        assert_eq!(
+            mem.cstr_at_utf8_lossy(p).as_ref(),
+            "/a\u{FFFD}b\u{FFFD}"
+        );
+        // '/', 'a', U+FFFD, 'b', U+FFFD: each bad byte becomes one
+        // replacement character, and the name stays stable across calls so
+        // repeated opens of one cache entry still hit the same file.
+        assert_eq!(mem.cstr_at_utf8_lossy(p).chars().count(), 5);
+        assert_eq!(mem.cstr_at_utf8_lossy(p), mem.cstr_at_utf8_lossy(p));
+    }
+
+    #[test]
     fn ptr_arithmetic_wraps_modulo_2_32() {
         // Real 32-bit ARM computes addresses modulo 2^32 and never traps on
         // the arithmetic itself. These cases previously panicked the host via
@@ -1512,5 +1549,27 @@ mod mem_tests {
         // overflow when the multiplied offset exceeds the address space.
         let p: Ptr<u32, true> = Ptr::from_bits(0xFFFF_FFF0);
         assert_eq!((p + 0x8).to_bits(), 0x0000_0010);
+    }
+
+    #[test]
+    fn null_stub_never_truncates_or_overruns_across_page_boundary() {
+        let mut mem = Mem::new();
+        mem.set_null_segment_size(super::PAGE_SIZE);
+
+        let straddle: MutPtr<u64> = Ptr::from_bits(super::PAGE_SIZE - 4);
+        mem.write(straddle, 0x0123_4567_89ab_cdef);
+        assert_eq!(mem.read(straddle), 0x0123_4567_89ab_cdef);
+
+        let oversize_len = (super::NULL_STUB_SIZE + 4096) as u32;
+        assert_eq!(
+            mem.bytes_at(Ptr::<u8, false>::from_bits(0), oversize_len)
+                .len(),
+            oversize_len as usize
+        );
+        assert_eq!(
+            mem.bytes_at_mut(Ptr::<u8, true>::from_bits(0), oversize_len)
+                .len(),
+            oversize_len as usize
+        );
     }
 }

@@ -2090,18 +2090,6 @@ pub fn AudioFileOptimize(env: &mut Environment, in_audio_file: AudioFileID) -> O
 // MARK: - AudioFileStreamOpen (Устаревшее / Streaming)
 // =========================================================================
 
-fn AudioFileStreamOpen(
-    _env: &mut Environment,
-    _in_client_data: MutVoidPtr,
-    _in_property_listener_proc: MutVoidPtr,
-    _in_packets_proc: MutVoidPtr,
-    _in_file_type_hint: AudioFileTypeID,
-    _out_audio_file_stream: MutVoidPtr,
-) -> OSStatus {
-    log!("TODO: AudioFileStreamOpen stubbed");
-    kAudioFileUnspecifiedError
-}
-
 pub fn AudioFormatGetPropertyInfo(
     env: &mut Environment,
     property_id: AudioFilePropertyID,
@@ -2189,7 +2177,6 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(AudioFileGetGlobalInfoSize(_, _, _, _)),
     export_c_func!(AudioFileGetGlobalInfo(_, _, _, _, _)),
     export_c_func!(AudioFileOptimize(_)),
-    export_c_func!(AudioFileStreamOpen(_, _, _, _, _)),
     export_c_func!(AudioFormatGetPropertyInfo(_, _, _, _)),
     export_c_func!(AudioFormatGetProperty(_, _, _, _, _)),
 ];

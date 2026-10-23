@@ -48,6 +48,7 @@ pub struct AudioBufferList {
 unsafe impl SafeRead for AudioBufferList {}
 
 #[repr(C, packed)]
+#[derive(Clone, Copy, Debug)]
 pub struct AudioStreamPacketDescription {
     pub mStartOffset: i64,
     pub mVariableFramesInPacket: u32,

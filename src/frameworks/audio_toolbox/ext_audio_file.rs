@@ -221,10 +221,16 @@ pub fn ExtAudioFileWrapAudioFileID(
     return_if_null!(in_audio_file);
 
     let audio_file = {
-        let host_obj = AudioFileState::get(&mut env.framework_state)
+        let Some(host_obj) = AudioFileState::get(&mut env.framework_state)
             .audio_files
             .get(&in_audio_file)
-            .expect("ExtAudioFileWrapAudioFileID: unknown AudioFileID");
+        else {
+            log!(
+                "Warning: ExtAudioFileWrapAudioFileID: unknown AudioFileID {:?}",
+                in_audio_file
+            );
+            return kExtAudioFileError_InvalidOperationOrder;
+        };
 
         match host_obj {
             AudioFileHostObject::Real(af) => AudioFileHostObject::Real(af.clone()),
@@ -342,10 +348,16 @@ pub fn ExtAudioFileGetProperty(
         return kExtAudioFileError_InvalidPropertySize;
     }
 
-    let host_object = State::get(&mut env.framework_state)
+    let Some(host_object) = State::get(&mut env.framework_state)
         .ext_audio_files
         .get(&in_ext_audio_file)
-        .expect("ExtAudioFileGetProperty: unknown ExtAudioFileRef");
+    else {
+        log!(
+            "Warning: ExtAudioFileGetProperty(): unknown ExtAudioFileRef {:?}",
+            in_ext_audio_file
+        );
+        return kExtAudioFileError_InvalidOperationOrder;
+    };
 
     match in_property_id {
         kExtAudioFileProperty_FileDataFormat => {
@@ -393,8 +405,10 @@ pub fn ExtAudioFileGetProperty(
             env.mem.write(out_property_data.cast(), total_frames);
         }
         kExtAudioFileProperty_AudioFile => {
-            let null_id: u32 = 0;
-            env.mem.write(out_property_data.cast(), null_id);
+            let audio_file_id: AudioFileID = host_object
+                .wrapped_audio_file_id
+                .unwrap_or_else(crate::mem::Ptr::null);
+            env.mem.write(out_property_data.cast(), audio_file_id);
         }
         kExtAudioFileProperty_AudioConverter => {
             return kExtAudioFileError_InvalidProperty;

@@ -154,10 +154,28 @@ fn enumerate_apps(apps_dir: &Path) -> Result<Vec<AppInfo>, std::io::Error> {
     Ok(apps)
 }
 
+fn sqlite_file_belongs_to_bundle(
+    file_name: &str,
+    bundle_id: &str,
+    other_bundle_ids: &[&str],
+) -> bool {
+    let target_prefix = format!("{}_", sqlite_namespace(bundle_id));
+    if !file_name.starts_with(target_prefix.as_str()) {
+        return false;
+    }
+    !other_bundle_ids.iter().any(|other_id| {
+        if *other_id == bundle_id {
+            return false;
+        }
+        let other_prefix = format!("{}_", sqlite_namespace(other_id));
+        other_prefix.len() > target_prefix.len() && file_name.starts_with(other_prefix.as_str())
+    })
+}
+
 /// Deletes an app completely, like iOS does when an app and its data are
 /// removed: the `.app` folder or `.ipa` file in the apps directory, the
 /// sandbox folder (`Documents`, `Library`, ...) and the SQLite databases.
-fn delete_app(app: &AppInfo) -> Result<(), String> {
+fn delete_app(app: &AppInfo, all_apps: &[AppInfo]) -> Result<(), String> {
     // The app goes first. If that fails, its data is kept.
     let removed = if app.path.is_dir() {
         std::fs::remove_dir_all(&app.path)
@@ -166,6 +184,19 @@ fn delete_app(app: &AppInfo) -> Result<(), String> {
     };
     removed.map_err(|e| format!("couldn't delete {}: {}", app.path.display(), e))?;
     echo!("Deleted app: {}", app.path.display());
+
+    // If another installed bundle/IPA shares the exact same bundle identifier,
+    // keep the shared sandbox and SQLite databases intact.
+    if all_apps
+        .iter()
+        .any(|other| other.path != app.path && other.bundle_id == app.bundle_id)
+    {
+        log!(
+            "Keeping shared app data for {:?} because another bundle with the same ID remains installed",
+            app.bundle_id
+        );
+        return Ok(());
+    }
 
     // The app is already gone, so failures from here on are only logged.
     if is_plain_name(&app.bundle_id) {
@@ -185,14 +216,21 @@ fn delete_app(app: &AppInfo) -> Result<(), String> {
         );
     }
 
-    // touchHLE names each database `{namespace}_{file name}`.
+    // touchHLE names each database `{namespace}_{file name}`. Exclude longer
+    // sibling namespaces (`com.foo.game_hd_` when deleting `com.foo.game`).
+    let other_bundle_ids: Vec<&str> = all_apps
+        .iter()
+        .filter(|other| other.path != app.path)
+        .map(|other| other.bundle_id.as_str())
+        .collect();
     let sqlite_dir = paths::user_data_base_path().join(paths::SQLITE_DIR);
-    let prefix = format!("{}_", sqlite_namespace(&app.bundle_id));
     if let Ok(entries) = std::fs::read_dir(&sqlite_dir) {
         for entry in entries.flatten() {
             let file_name = entry.file_name().to_string_lossy().into_owned();
             let path = entry.path();
-            if file_name.starts_with(prefix.as_str()) && path.is_file() {
+            if sqlite_file_belongs_to_bundle(&file_name, &app.bundle_id, &other_bundle_ids)
+                && path.is_file()
+            {
                 if let Err(e) = std::fs::remove_file(&path) {
                     log!("Warning: couldn't delete {}: {}", path.display(), e);
                 }
@@ -242,6 +280,21 @@ mod delete_app_tests {
         assert!(!is_plain_name(".."));
         assert!(!is_plain_name("a/b"));
         assert!(!is_plain_name("a\\b"));
+    }
+
+    #[test]
+    fn sqlite_prefix_excludes_longer_sibling_bundle_id() {
+        let others = ["com.foo.game_hd", "com.bar.other"];
+        assert!(sqlite_file_belongs_to_bundle(
+            "com.foo.game_save.sqlite",
+            "com.foo.game",
+            &others
+        ));
+        assert!(!sqlite_file_belongs_to_bundle(
+            "com.foo.game_hd_save.sqlite",
+            "com.foo.game",
+            &others
+        ));
     }
 }
 
@@ -789,7 +842,7 @@ fn app_picker_inner(
     // Old-iOS status bar, drawn in the strip above the application frame. It
     // sits above the wallpaper, while the (transparent) main view is added
     // after it: the home screen shows the bar through the main view, but the
-    // opaque Settings screen slides over it.
+    // opaque Settings screen covers it when open.
     let (status_bar, status_time_label, status_charge_view) = if app_frame.origin.y >= 12.0 {
         let (bar, time, charge) = make_status_bar(env, bounds.size.width, app_frame.origin.y);
         () = msg![env; window addSubview:bar];
@@ -1242,23 +1295,27 @@ fn app_picker_inner(
                 echo!("Couldn't open IPA picker: {}", e);
             }
         } else if std::mem::take(&mut host_obj.settings_show) {
-            slide_settings_screen(
-                env,
-                main_run_loop,
-                delegate,
-                settings.main_view,
-                app_frame.size.width,
-                true,
-            );
+            show_settings_screen(env, main_run_loop, delegate, &settings);
         } else if std::mem::take(&mut host_obj.settings_hide) {
-            slide_settings_screen(
-                env,
-                main_run_loop,
-                delegate,
-                settings.main_view,
-                app_frame.size.width,
-                false,
-            );
+            if device_state.open {
+                device_state.open = false;
+                refresh_dropdown(
+                    env,
+                    &settings.device_dropdown,
+                    &device_model_label_for_tag(device_state.selected),
+                    &device_state,
+                );
+            }
+            if language_state.open {
+                language_state.open = false;
+                refresh_dropdown(
+                    env,
+                    &settings.language_dropdown,
+                    &language_label_for_tag(language_state.selected),
+                    &language_state,
+                );
+            }
+            hide_settings_screen(env, main_run_loop, delegate, &settings);
         } else if std::mem::take(&mut host_obj.scale_hack_default) {
             quick_options_scale_hack = None;
             update_scale_hack_buttons(env, &settings.scale_hack_buttons, quick_options_scale_hack);
@@ -1376,8 +1433,10 @@ fn app_picker_inner(
         } else if std::mem::take(&mut host_obj.delete_confirm) {
             if let Some(app_idx) = pending_delete.take() {
                 hide_delete_dialog(env, main_run_loop, delegate, &delete_dialog);
-                let result = match apps.as_ref().ok().and_then(|list| list.get(app_idx)) {
-                    Some(app) => delete_app(app),
+                let result = match apps.as_ref().ok().and_then(|list| {
+                    list.get(app_idx).map(|app| delete_app(app, list.as_slice()))
+                }) {
+                    Some(res) => res,
                     None => Err("the app is no longer in the list".to_string()),
                 };
                 match result {
@@ -1547,7 +1606,7 @@ fn app_picker_inner(
             // No override — fall back to the app bundle / built-in default.
         } else if tag == DEVICE_TAG_AUTO {
             option_args.push("--device-family=auto".to_string());
-        } else if let Some(family) = crate::window::DeviceFamily::ALL_SELECTABLE.get(tag as usize) {
+        } else if let Some(family) = crate::window::DeviceFamily::for_tag(tag as usize) {
             option_args.push(format!("--device-family={}", family.option_name()));
         }
     }
@@ -2775,8 +2834,6 @@ const APP_LAUNCH_DISSOLVE_DURATION: Duration = Duration::from_millis(500);
 const APP_LAUNCH_BLACK_HOLD_DURATION: Duration = Duration::from_millis(250);
 /// Side length of the app icon at the centre of the launch animation.
 const APP_LAUNCH_ICON_SIZE: CGFloat = 120.0;
-/// Duration of the slower, centered Settings pop animation.
-const SETTINGS_SLIDE_DURATION: Duration = Duration::from_millis(760);
 /// How long an app icon must be held down before its delete dialog opens.
 const APP_LONG_PRESS_DURATION: Duration = Duration::from_millis(500);
 
@@ -3103,37 +3160,139 @@ fn slide_to_page(
     grid.visible = back;
 }
 
-/// Scales the Settings screen in and out from the centre, like an iOS app.
-fn slide_settings_screen(
+/// Returns `(scale, alpha)` at progress `t` (`0.0..=1.0`) for the centered
+/// pop-in (`open == true`) or pop-out (`open == false`) animation shared by
+/// the Delete dialog and the Settings screen.
+fn pop_dialog_state_at(t: f64, open: bool) -> (CGFloat, CGFloat) {
+    let t = t.clamp(0.0, 1.0);
+    let visible = if open {
+        ease_out_cubic(t)
+    } else {
+        1.0 - ease_out_cubic(t)
+    };
+    let scale = DELETE_DIALOG_START_SCALE + (1.0 - DELETE_DIALOG_START_SCALE) * visible;
+    (scale as CGFloat, visible as CGFloat)
+}
+
+/// Hides or restores Settings scroll rows that sit outside `main_view` while
+/// `main_view` is scaled below full size, since the compositor does not clip
+/// `UIScrollView` children to its bounds.
+fn set_offscreen_scroll_items_hidden(
+    env: &mut Environment,
+    settings: &SettingsStuff,
+    hide_offscreen: bool,
+) {
+    if !hide_offscreen {
+        for &(view, _, _) in &settings.scroll_items {
+            () = msg![env; view setHidden:false];
+        }
+        return;
+    }
+    let scroll_view = settings.scroll_view;
+    let offset: CGPoint = msg![env; scroll_view contentOffset];
+    let offset_y = offset.y;
+    let top_limit = settings.scroll_origin_y;
+    let bottom_limit = settings.full_height - 20.0;
+    for &(view, top_y, bottom_y) in &settings.scroll_items {
+        let top_in_settings = settings.scroll_origin_y + top_y - offset_y;
+        let bottom_in_settings = settings.scroll_origin_y + bottom_y - offset_y;
+        let offscreen = bottom_in_settings <= top_limit || top_in_settings >= bottom_limit;
+        () = msg![env; view setHidden:offscreen];
+    }
+}
+
+/// Opens the Settings screen with the same centered pop-in animation as
+/// [show_delete_dialog]: the screen dims while the view grows from the center
+/// and fades in over [DELETE_DIALOG_APPEAR_DURATION].
+fn show_settings_screen(
     env: &mut Environment,
     run_loop: id,
     delegate: id,
-    settings_view: id,
-    _width: CGFloat,
-    open: bool,
+    settings: &SettingsStuff,
 ) {
-    const START_SCALE: CGFloat = 0.80;
-    if open {
-        // iOS-style zoom from the center of the screen, without movement from
-        // the dock or any other direction.
-        let initial_transform = CGAffineTransform::make_scale(START_SCALE, START_SCALE);
-        () = msg![env; settings_view setTransform:initial_transform];
-        () = msg![env; settings_view setAlpha:(0.0 as CGFloat)];
-        () = msg![env; settings_view setHidden:false];
+    let dimmer = settings.dimmer;
+    let settings_view = settings.main_view;
+    let (start_scale, _) = pop_dialog_state_at(0.0, true);
+    let initial_transform = CGAffineTransform::make_scale(start_scale, start_scale);
+    () = msg![env; dimmer setAlpha:(0.0 as CGFloat)];
+    () = msg![env; dimmer setHidden:false];
+    () = msg![env; settings_view setTransform:initial_transform];
+    () = msg![env; settings_view setAlpha:(0.0 as CGFloat)];
+    () = msg![env; settings_view setHidden:false];
+
+    // Render one invisible frame before starting the timer so first-time
+    // texture creation for Settings rows doesn't eat into the pop-in duration.
+    run_run_loop_single_iteration(env, run_loop);
+    {
+        let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
+        host_obj.icon_tapped = nil;
+        host_obj.icon_touch_down = nil;
+        host_obj.settings_show = false;
+        host_obj.settings_hide = false;
     }
-    animate_for(env, run_loop, delegate, SETTINGS_SLIDE_DURATION, |env, t| {
-        // Use the same centered pop-and-fade profile as the Delete alert, but
-        // retain the slower Settings timing requested for this full screen.
-        let eased = ease_out_cubic(t) as CGFloat;
-        let progress = if open { eased } else { 1.0 - eased };
-        let scale = START_SCALE + (1.0 - START_SCALE) * progress;
-        let transform = CGAffineTransform::make_scale(scale, scale);
-        () = msg![env; settings_view setTransform:transform];
-        () = msg![env; settings_view setAlpha:progress];
-    });
+
+    set_offscreen_scroll_items_hidden(env, settings, true);
+    animate_for(
+        env,
+        run_loop,
+        delegate,
+        DELETE_DIALOG_APPEAR_DURATION,
+        |env, t| {
+            let (scale, alpha) = pop_dialog_state_at(t, true);
+            let transform = CGAffineTransform::make_scale(scale, scale);
+            () = msg![env; settings_view setTransform:transform];
+            () = msg![env; settings_view setAlpha:alpha];
+            () = msg![env; dimmer setAlpha:alpha];
+        },
+    );
     () = msg![env; settings_view setTransform:CGAffineTransformIdentity];
     () = msg![env; settings_view setAlpha:(1.0 as CGFloat)];
-    if !open { () = msg![env; settings_view setHidden:true]; }
+    () = msg![env; dimmer setHidden:true];
+    set_offscreen_scroll_items_hidden(env, settings, false);
+    {
+        let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
+        host_obj.settings_show = false;
+        host_obj.settings_hide = false;
+    }
+}
+
+/// Closes the Settings screen with the same centered pop-out animation as
+/// [hide_delete_dialog].
+fn hide_settings_screen(
+    env: &mut Environment,
+    run_loop: id,
+    delegate: id,
+    settings: &SettingsStuff,
+) {
+    let dimmer = settings.dimmer;
+    let settings_view = settings.main_view;
+    () = msg![env; dimmer setAlpha:(1.0 as CGFloat)];
+    () = msg![env; dimmer setHidden:false];
+    set_offscreen_scroll_items_hidden(env, settings, true);
+
+    animate_for(
+        env,
+        run_loop,
+        delegate,
+        DELETE_DIALOG_DISAPPEAR_DURATION,
+        |env, t| {
+            let (scale, alpha) = pop_dialog_state_at(t, false);
+            let transform = CGAffineTransform::make_scale(scale, scale);
+            () = msg![env; settings_view setTransform:transform];
+            () = msg![env; settings_view setAlpha:alpha];
+            () = msg![env; dimmer setAlpha:alpha];
+        },
+    );
+    () = msg![env; dimmer setHidden:true];
+    () = msg![env; settings_view setHidden:true];
+    () = msg![env; settings_view setTransform:CGAffineTransformIdentity];
+    () = msg![env; settings_view setAlpha:(1.0 as CGFloat)];
+    set_offscreen_scroll_items_hidden(env, settings, false);
+    {
+        let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
+        host_obj.settings_show = false;
+        host_obj.settings_hide = false;
+    }
 }
 
 /// Loads a flat monochrome dock icon, applying the same rounded mask and
@@ -3270,8 +3429,19 @@ fn settings_row_height(row: &SettingsRow) -> CGFloat {
 
 /// The views of the Settings screen that the event loop needs to update.
 struct SettingsStuff {
+    /// Dims the picker behind the Settings screen while it pops in or out.
+    dimmer: id,
     /// Full-screen settings view (hidden until the Settings tile is tapped).
     main_view: id,
+    /// Scrollable list of grouped rows below the navigation bar.
+    scroll_view: id,
+    /// `(view, top_y, bottom_y)` for each child added directly to
+    /// `scroll_view`, used to hide off-screen rows while scaled.
+    scroll_items: Vec<(id, CGFloat, CGFloat)>,
+    /// Total height of `main_view`, including the status bar strip.
+    full_height: CGFloat,
+    /// Vertical origin of `scroll_view` inside `main_view`.
+    scroll_origin_y: CGFloat,
     scale_hack_buttons: [id; 5],
     orientation_buttons: [id; 4],
     /// The "Device model" dropdown.
@@ -3366,13 +3536,16 @@ fn setup_settings(
     // strip above the application frame. Nothing is clipped by the emulator,
     // so scrolled content must not be able to show up in that strip.
     let status_offset = app_frame.origin.y;
+    let full_height = height + status_offset;
+    let full_frame = rect(0.0, -status_offset, width, full_height);
+
+    let dim_color = ui_color(env, 0.0, 0.0, 0.0, 0.4);
+    let dimmer = new_view(env, full_frame, dim_color);
+    () = msg![env; dimmer setHidden:true];
+    () = msg![env; super_view addSubview:dimmer];
 
     let grouped_bg = ui_color(env, 0.79, 0.82, 0.85, 1.0);
-    let settings_view = new_view(
-        env,
-        rect(0.0, -status_offset, width, height + status_offset),
-        grouped_bg,
-    );
+    let settings_view = new_view(env, full_frame, grouped_bg);
     () = msg![env; settings_view setHidden:true];
     () = msg![env; super_view addSubview:settings_view];
     let stripe = ui_color(env, 0.55, 0.58, 0.62, 0.10);
@@ -3554,6 +3727,7 @@ fn setup_settings(
     let mut orientation_buttons: Vec<id> = Vec::new();
     let mut device_dropdown: Option<SettingsDropdown> = None;
     let mut language_dropdown: Option<SettingsDropdown> = None;
+    let mut scroll_items: Vec<(id, CGFloat, CGFloat)> = Vec::new();
     // Where the lists of both dropdowns open: just under the navigation bar.
     let menu_origin = CGPoint {
         x: (width - SETTINGS_DROPDOWN_MENU_WIDTH) / 2.0,
@@ -3571,6 +3745,7 @@ fn setup_settings(
             gray_text,
         );
         () = msg![env; scroll addSubview:header_label];
+        scroll_items.push((header_label, y, y + 18.0));
         y += SETTINGS_HEADER_HEIGHT;
 
         let group_height: CGFloat = rows.iter().map(settings_row_height).sum();
@@ -3579,6 +3754,7 @@ fn setup_settings(
         let outline_layer: id = msg![env; outline layer];
         () = msg![env; outline_layer setCornerRadius:(11.0 as CGFloat)];
         () = msg![env; scroll addSubview:outline];
+        scroll_items.push((outline, y, y + group_height));
         let group = new_view(
             env,
             rect(SETTINGS_GROUP_INSET, y, inner_width, group_height),
@@ -3587,6 +3763,7 @@ fn setup_settings(
         let group_layer: id = msg![env; group layer];
         () = msg![env; group_layer setCornerRadius:(10.0 as CGFloat)];
         () = msg![env; scroll addSubview:group];
+        scroll_items.push((group, y, y + group_height));
 
         let row_count = rows.len();
         let mut row_y: CGFloat = 0.0;
@@ -3717,12 +3894,18 @@ fn setup_settings(
     );
     () = msg![env; footer setTextAlignment:UITextAlignmentCenter];
     () = msg![env; scroll addSubview:footer];
+    scroll_items.push((footer, y, y + 18.0));
     y += 30.0;
 
     () = msg![env; scroll setContentSize:(CGSize { width, height: y + 24.0 })];
 
     SettingsStuff {
+        dimmer,
         main_view: settings_view,
+        scroll_view: scroll,
+        scroll_items,
+        full_height,
+        scroll_origin_y: SETTINGS_NAV_BAR_HEIGHT + status_offset,
         scale_hack_buttons: scale_hack_buttons.try_into().unwrap(),
         orientation_buttons: orientation_buttons.try_into().unwrap(),
         device_dropdown: device_dropdown
@@ -3733,8 +3916,8 @@ fn setup_settings(
 }
 
 /// Sentinel button tags for the device-model dropdown. Model buttons use their
-/// index into `DeviceFamily::ALL_SELECTABLE` (0..=19) as their tag, so the
-/// sentinels are placed well above that range.
+/// picker tag (`DeviceFamily::tag`, at most 20) as their tag, so the sentinels
+/// are placed well above that range.
 const DEVICE_TAG_DEFAULT: NSInteger = 1000;
 const DEVICE_TAG_AUTO: NSInteger = 1001;
 
@@ -3746,15 +3929,19 @@ const DEVICE_MENU_ITEM_HEIGHT: CGFloat = 30.0;
 
 /// The choices shown in the device-model dropdown, in display order, as
 /// `(title, tag)` pairs: "Default" (no override), "Auto" (match host screen),
-/// then one entry per [crate::window::DeviceFamily] in `ALL_SELECTABLE` order
-/// tagged with its index.
+/// then one entry per [crate::window::DeviceFamily] in `ALL_SELECTABLE` order,
+/// tagged with the model's own picker tag rather than its position, so that
+/// saved settings survive changes to the display order.
 fn device_model_entries() -> Vec<(String, NSInteger)> {
     use crate::window::DeviceFamily;
     let mut entries: Vec<(String, NSInteger)> = Vec::new();
     entries.push(("Default".to_string(), DEVICE_TAG_DEFAULT));
     entries.push(("Auto".to_string(), DEVICE_TAG_AUTO));
-    for (idx, family) in DeviceFamily::ALL_SELECTABLE.iter().enumerate() {
-        entries.push((family.display_name().to_string(), idx as NSInteger));
+    for family in DeviceFamily::ALL_SELECTABLE {
+        let Some(tag) = family.tag() else {
+            continue;
+        };
+        entries.push((family.display_name().to_string(), tag as NSInteger));
     }
     entries
 }
@@ -3832,8 +4019,7 @@ fn device_model_label_for_tag(tag: Option<i32>) -> String {
     match tag.map(|t| t as NSInteger) {
         None | Some(DEVICE_TAG_DEFAULT) => "Default".to_string(),
         Some(DEVICE_TAG_AUTO) => "Auto".to_string(),
-        Some(idx) => DeviceFamily::ALL_SELECTABLE
-            .get(idx as usize)
+        Some(idx) => DeviceFamily::for_tag(idx as usize)
             .map(|f| f.display_name().to_string())
             .unwrap_or_else(|| "Default".to_string()),
     }
@@ -4298,13 +4484,11 @@ fn show_delete_dialog(
         delegate,
         DELETE_DIALOG_APPEAR_DURATION,
         |env, t| {
-            let p = ease_out_cubic(t);
-            let scale = DELETE_DIALOG_START_SCALE + (1.0 - DELETE_DIALOG_START_SCALE) * p;
-            let scale = scale as CGFloat;
+            let (scale, alpha) = pop_dialog_state_at(t, true);
             let transform = CGAffineTransform::make_scale(scale, scale);
             () = msg![env; (dialog.panel) setTransform:transform];
-            () = msg![env; (dialog.panel) setAlpha:(p as CGFloat)];
-            () = msg![env; (dialog.dimmer) setAlpha:(p as CGFloat)];
+            () = msg![env; (dialog.panel) setAlpha:alpha];
+            () = msg![env; (dialog.dimmer) setAlpha:alpha];
         },
     );
 }
@@ -4327,14 +4511,11 @@ fn hide_delete_dialog(
         delegate,
         DELETE_DIALOG_DISAPPEAR_DURATION,
         |env, t| {
-            let visible = 1.0 - ease_out_cubic(t);
-            let scale = DELETE_DIALOG_START_SCALE
-                + (1.0 - DELETE_DIALOG_START_SCALE) * visible;
-            let scale = scale as CGFloat;
+            let (scale, alpha) = pop_dialog_state_at(t, false);
             let transform = CGAffineTransform::make_scale(scale, scale);
             () = msg![env; (dialog.panel) setTransform:transform];
-            () = msg![env; (dialog.panel) setAlpha:(visible as CGFloat)];
-            () = msg![env; (dialog.dimmer) setAlpha:(visible as CGFloat)];
+            () = msg![env; (dialog.panel) setAlpha:alpha];
+            () = msg![env; (dialog.dimmer) setAlpha:alpha];
         },
     );
     () = msg![env; (dialog.dimmer) setHidden:true];
@@ -4507,5 +4688,38 @@ mod unlock_animation_tests {
 
         // Corner cells are staggered behind inner cells.
         assert!(targets[0].norm_dist > targets[4].norm_dist);
+    }
+}
+
+#[cfg(test)]
+mod pop_dialog_animation_tests {
+    use super::*;
+
+    #[test]
+    fn settings_and_delete_share_centered_pop_profile_and_timing() {
+        assert_eq!(DELETE_DIALOG_APPEAR_DURATION, Duration::from_millis(200));
+        assert_eq!(DELETE_DIALOG_DISAPPEAR_DURATION, Duration::from_millis(150));
+
+        let (open_scale_0, open_alpha_0) = pop_dialog_state_at(0.0, true);
+        assert!((open_scale_0 - DELETE_DIALOG_START_SCALE as CGFloat).abs() < 1e-5);
+        assert_eq!(open_alpha_0, 0.0);
+
+        let (open_scale_1, open_alpha_1) = pop_dialog_state_at(1.0, true);
+        assert!((open_scale_1 - 1.0).abs() < 1e-5);
+        assert!((open_alpha_1 - 1.0).abs() < 1e-5);
+
+        let (close_scale_0, close_alpha_0) = pop_dialog_state_at(0.0, false);
+        assert!((close_scale_0 - 1.0).abs() < 1e-5);
+        assert!((close_alpha_0 - 1.0).abs() < 1e-5);
+
+        let (close_scale_1, close_alpha_1) = pop_dialog_state_at(1.0, false);
+        assert!((close_scale_1 - DELETE_DIALOG_START_SCALE as CGFloat).abs() < 1e-5);
+        assert_eq!(close_alpha_1, 0.0);
+
+        let (mid_open_scale, mid_open_alpha) = pop_dialog_state_at(0.5, true);
+        let (mid_close_scale, mid_close_alpha) = pop_dialog_state_at(0.5, false);
+        assert!(mid_open_scale > 0.95 && mid_open_alpha > 0.85);
+        assert!((mid_open_alpha + mid_close_alpha - 1.0).abs() < 1e-5);
+        assert!(mid_close_scale < 0.85);
     }
 }

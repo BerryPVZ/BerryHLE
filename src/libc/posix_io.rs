@@ -455,17 +455,14 @@ pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> Fil
         options.truncate();
     }
 
-    let path_string = match env.mem.cstr_at_utf8(path) {
-        Ok(path_str) => path_str.to_owned(),
-        Err(err) => {
-            log!(
-                "open() error, unable to treat {:?} as utf8 str: {:?}",
-                path,
-                err
-            );
-            return -1;
-        }
-    };
+    // POSIX paths are byte strings: neither the kernel nor libc rejects a name
+    // because it is not valid UTF-8, so open() must not fail here either.
+    // Unity's shader cache appends an uninitialised tail to a cache path, and
+    // treating that as "invalid UTF-8" made every such open() fail with a log
+    // line. The emulated filesystem is keyed by strings, so the name is
+    // carried with replacement characters; the same bytes always map to the
+    // same name, which keeps repeated opens of one cache entry consistent.
+    let path_string = env.mem.cstr_at_utf8_lossy(path).into_owned();
 
     if flags & O_NOFOLLOW != 0 {
         log!("Ignoring O_NOFOLLOW when opening {:?}", path_string);
