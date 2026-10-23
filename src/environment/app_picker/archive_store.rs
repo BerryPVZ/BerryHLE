@@ -9,7 +9,7 @@
 mod network;
 
 use super::{make_icon_from_text, new_label, new_view, rect, ui_color, AppPickerDelegateHostObject};
-use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
+use crate::frameworks::core_graphics::{cg_image, CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_run_loop::run_run_loop_single_iteration;
 use crate::frameworks::foundation::{ns_string, NSInteger};
 use crate::frameworks::uikit::ui_font::{UITextAlignmentCenter, UITextAlignmentLeft};
@@ -17,9 +17,11 @@ use crate::frameworks::uikit::ui_view::ui_control::ui_button::UIButtonTypeCustom
 use crate::frameworks::uikit::ui_view::ui_control::{
     UIControlEventTouchUpInside, UIControlStateNormal,
 };
+use crate::image::Image;
 use crate::objc::{id, msg, msg_class, nil, release};
 use crate::Environment;
 use network::{display_file_name, download_key, format_size};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -127,10 +129,28 @@ enum StoreMessage {
         generation: u64,
         result: Result<ItemDetails, String>,
     },
+    Artwork {
+        identifier: String,
+        result: Result<Vec<u8>, String>,
+    },
     Download {
         generation: u64,
         event: DownloadEvent,
     },
+}
+
+#[derive(Default)]
+struct ArtworkCache {
+    requested: HashSet<String>,
+    images: HashMap<String, id>,
+}
+
+impl ArtworkCache {
+    fn request(&mut self, sender: &Sender<StoreMessage>, identifier: &str) {
+        if self.requested.insert(identifier.to_string()) {
+            request_artwork(sender, identifier.to_string());
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -348,6 +368,7 @@ struct StoreActions {
     retry: bool,
     cancel: bool,
     sort: bool,
+    tap: Option<CGPoint>,
     item: Option<NSInteger>,
     download: Option<NSInteger>,
     tab: Option<NSInteger>,
@@ -367,6 +388,7 @@ fn take_actions(env: &mut Environment, delegate: id) -> StoreActions {
         retry: std::mem::take(&mut host.archive_store_retry),
         cancel: std::mem::take(&mut host.archive_store_cancel),
         sort: std::mem::take(&mut host.archive_store_sort),
+        tap: std::mem::take(&mut host.archive_store_tap),
         item: std::mem::take(&mut host.archive_store_item),
         download: std::mem::take(&mut host.archive_store_download),
         tab: std::mem::take(&mut host.archive_store_tab),
@@ -379,6 +401,12 @@ enum Screen {
     Browse,
     Details,
     Downloads,
+}
+
+enum ScrollTap {
+    Item(usize),
+    Download(usize),
+    Queue(u64),
 }
 
 struct CatalogState {
@@ -473,6 +501,7 @@ struct StoreViews {
     toolbar: id,
     search_field: id,
     sort_button: id,
+    status_panel: id,
     status_label: id,
     scroll_view: id,
     pager: id,
@@ -486,6 +515,7 @@ struct StoreViews {
     nav_height: CGFloat,
     rows: Vec<id>,
     download_progress: Vec<DownloadProgressViews>,
+    artwork_views: Vec<(String, id)>,
 }
 
 /// Open the store as a modal picker screen. The return value tells the home
@@ -504,6 +534,7 @@ pub(super) fn run_archive_store(
     let mut catalog = CatalogState::new();
     let mut details = DetailsState::new();
     let mut downloads = DownloadManager::new();
+    let mut artwork = ArtworkCache::default();
     let mut closing = false;
     let mut finished = false;
     let mut dirty = true;
@@ -513,12 +544,14 @@ pub(super) fn run_archive_store(
         run_run_loop_single_iteration(env, run_loop);
         drain_messages(
             env,
+            &sender,
             &receiver,
             &mut views,
             screen,
             &mut catalog,
             &mut details,
             &mut downloads,
+            &mut artwork,
             &mut dirty,
         );
 
@@ -576,6 +609,41 @@ pub(super) fn run_archive_store(
             catalog.sort = catalog.sort.next();
             catalog.load(&sender, 1);
             dirty = true;
+        } else if let Some(point) = actions.tap {
+            let target = scroll_tap_target(
+                &views, screen, point, &catalog, &details, &downloads,
+            );
+            if let Some(target) = target {
+                match target {
+                    ScrollTap::Item(index) => {
+                        let item = catalog
+                            .current
+                            .as_ref()
+                            .and_then(|page| page.items.get(index))
+                            .cloned();
+                        if let Some(item) = item {
+                            screen = Screen::Details;
+                            details.load(&sender, item);
+                        }
+                    }
+                    ScrollTap::Download(index) => {
+                        if let Some(item_details) = &details.details {
+                            let file = item_details.files.get(index).cloned();
+                            if let Some(file) = file {
+                                downloads.enqueue(
+                                    &item_details.identifier,
+                                    &item_details.title,
+                                    &file,
+                                );
+                            }
+                        }
+                    }
+                    ScrollTap::Queue(id) => {
+                        downloads.toggle(id);
+                    }
+                }
+                dirty = true;
+            }
         } else if actions.retry {
             match screen {
                 Screen::Browse => catalog.load(&sender, catalog.page),
@@ -627,7 +695,13 @@ pub(super) fn run_archive_store(
         }
         if dirty && !finished {
             render(
-                env, &mut views, screen, &catalog, &details, &downloads,
+                env,
+                &mut views,
+                screen,
+                &catalog,
+                &details,
+                &downloads,
+                &artwork,
             );
             dirty = false;
         }
@@ -650,18 +724,21 @@ pub(super) fn run_archive_store(
     host.archive_store_download = None;
     host.archive_store_tab = None;
     host.archive_store_queue_action = None;
+    host.archive_store_tap = None;
     downloads.downloaded_any
 }
 
 #[allow(clippy::too_many_arguments)]
 fn drain_messages(
     env: &mut Environment,
+    sender: &Sender<StoreMessage>,
     receiver: &Receiver<StoreMessage>,
     views: &mut StoreViews,
     screen: Screen,
     catalog: &mut CatalogState,
     details: &mut DetailsState,
     downloads: &mut DownloadManager,
+    artwork: &mut ArtworkCache,
     dirty: &mut bool,
 ) {
     while let Ok(message) = receiver.try_recv() {
@@ -673,6 +750,9 @@ fn drain_messages(
                 catalog.loading = false;
                 match result {
                     Ok(page) => {
+                        for item in &page.items {
+                            artwork.request(sender, &item.identifier);
+                        }
                         catalog.total = page.num_found;
                         catalog.page = page.page;
                         catalog.current = Some(page);
@@ -692,6 +772,7 @@ fn drain_messages(
                 details.loading = false;
                 match result {
                     Ok(item_details) => {
+                        artwork.request(sender, &item_details.identifier);
                         details.details = Some(item_details);
                         details.error = None;
                     }
@@ -701,6 +782,23 @@ fn drain_messages(
                     }
                 }
                 *dirty = true;
+            }
+            StoreMessage::Artwork { identifier, result } => {
+                let Ok(bytes) = result else {
+                    continue;
+                };
+                let Ok(mut image) = Image::from_bytes(&bytes) else {
+                    continue;
+                };
+                image.round_icon_corners(/* add_sheen: */ true);
+                let cg = cg_image::from_image(env, image);
+                let image: id = msg_class![env; UIImage imageWithCGImage:cg];
+                artwork.images.insert(identifier.clone(), image);
+                for (key, image_view) in &views.artwork_views {
+                    if key == &identifier {
+                        () = msg![env; (*image_view) setImage:image];
+                    }
+                }
             }
             StoreMessage::Download { generation, event } => match event {
                 DownloadEvent::Progress { downloaded, total } => {
@@ -805,7 +903,7 @@ fn build_store_views(
         white,
     );
     () = msg![env; back_button setHidden:true];
-    make_button(
+    let done_button = make_button(
         env,
         delegate,
         root,
@@ -875,9 +973,15 @@ fn build_store_views(
     );
 
     let gray = ui_color(env, 0.32, 0.37, 0.44, 1.0);
+    let status_panel = new_view(
+        env,
+        rect(0.0, nav_height + TOOLBAR_HEIGHT, width, STATUS_HEIGHT),
+        background,
+    );
+    () = msg![env; root addSubview:status_panel];
     let status_label = new_label(
         env,
-        rect(10.0, nav_height + TOOLBAR_HEIGHT, width - 20.0, STATUS_HEIGHT),
+        rect(10.0, 0.0, width - 20.0, STATUS_HEIGHT),
         "",
         11.0,
         false,
@@ -885,7 +989,7 @@ fn build_store_views(
     );
     () = msg![env; status_label setNumberOfLines:2];
     () = msg![env; status_label setTextAlignment:UITextAlignmentLeft];
-    () = msg![env; root addSubview:status_label];
+    () = msg![env; status_panel addSubview:status_label];
 
     let scroll_y = nav_height + TOOLBAR_HEIGHT + STATUS_HEIGHT;
     let scroll_view: id = msg_class![env; UIScrollView alloc];
@@ -899,6 +1003,11 @@ fn build_store_views(
     () = msg![env; scroll_view setClipsToBounds:true];
     () = msg![env; scroll_view setShowsHorizontalScrollIndicator:false];
     () = msg![env; root addSubview:scroll_view];
+    let tap_selector = env.objc.lookup_selector("archiveStoreTap:").unwrap();
+    let tap: id = msg_class![env; UITapGestureRecognizer alloc];
+    let tap: id = msg![env; tap initWithTarget:delegate action:tap_selector];
+    () = msg![env; tap setCancelsTouchesInView:false];
+    () = msg![env; scroll_view addGestureRecognizer:tap];
 
     let pager = new_view(
         env,
@@ -975,6 +1084,20 @@ fn build_store_views(
         blue,
     );
 
+    // UIScrollView clips hit-testing but the host compositor does not clip
+    // every descendant. Keep opaque chrome above overflowing content.
+    for view in [
+        nav,
+        toolbar,
+        status_panel,
+        nav_title,
+        nav_subtitle,
+        back_button,
+        done_button,
+    ] {
+        () = msg![env; root bringSubviewToFront:view];
+    }
+
     StoreViews {
         root,
         delegate,
@@ -984,6 +1107,7 @@ fn build_store_views(
         toolbar,
         search_field,
         sort_button,
+        status_panel,
         status_label,
         scroll_view,
         pager,
@@ -997,6 +1121,7 @@ fn build_store_views(
         nav_height,
         rows: Vec::new(),
         download_progress: Vec::new(),
+        artwork_views: Vec::new(),
     }
 }
 
@@ -1057,12 +1182,13 @@ fn render(
     catalog: &CatalogState,
     details: &DetailsState,
     downloads: &DownloadManager,
+    artwork: &ArtworkCache,
 ) {
     update_chrome(env, views, screen, catalog, details, downloads);
     clear_rows(env, views);
     let content_height = match screen {
-        Screen::Browse => render_catalog(env, views, catalog),
-        Screen::Details => render_details(env, views, details, downloads),
+        Screen::Browse => render_catalog(env, views, catalog, artwork),
+        Screen::Details => render_details(env, views, details, downloads, artwork),
         Screen::Downloads => render_downloads(env, views, downloads),
     };
     reset_scroll(env, views, content_height);
@@ -1093,10 +1219,10 @@ fn update_chrome(
 
     let toolbar_height = if browsing { TOOLBAR_HEIGHT } else { 0.0 };
     let status_y = views.nav_height + toolbar_height;
-    () = msg![env; (views.status_label) setFrame:(rect(
-        10.0,
+    () = msg![env; (views.status_panel) setFrame:(rect(
+        0.0,
         status_y,
-        views.width - 20.0,
+        views.width,
         STATUS_HEIGHT
     ))];
     let scroll_y = status_y + STATUS_HEIGHT;
@@ -1247,11 +1373,68 @@ fn downloads_status(downloads: &DownloadManager) -> String {
     )
 }
 
+fn scroll_tap_target(
+    views: &StoreViews,
+    screen: Screen,
+    point: CGPoint,
+    catalog: &CatalogState,
+    details: &DetailsState,
+    downloads: &DownloadManager,
+) -> Option<ScrollTap> {
+    if point.x < 8.0 || point.x > views.width - 8.0 || point.y < 0.0 {
+        return None;
+    }
+    let action_x = point.x >= views.width - 88.0 && point.x <= views.width - 20.0;
+    match screen {
+        Screen::Browse => {
+            let page = catalog.current.as_ref()?;
+            let relative = point.y - 4.0;
+            if relative < 0.0 {
+                return None;
+            }
+            let index = (relative / CATALOG_ROW_HEIGHT).floor() as usize;
+            let within_row = relative - index as CGFloat * CATALOG_ROW_HEIGHT;
+            (within_row <= 80.0 && index < page.items.len()).then_some(ScrollTap::Item(index))
+        }
+        Screen::Details => {
+            if !action_x {
+                return None;
+            }
+            let loaded = details.details.as_ref()?;
+            let relative = point.y - 228.0;
+            if relative < 0.0 {
+                return None;
+            }
+            let index = (relative / FILE_ROW_HEIGHT).floor() as usize;
+            let within_row = relative - index as CGFloat * FILE_ROW_HEIGHT;
+            (within_row >= 21.0 && within_row <= 53.0 && index < loaded.files.len())
+                .then_some(ScrollTap::Download(index))
+        }
+        Screen::Downloads => {
+            if !action_x {
+                return None;
+            }
+            let relative = point.y - 4.0;
+            if relative < 0.0 {
+                return None;
+            }
+            let index = (relative / DOWNLOAD_ROW_HEIGHT).floor() as usize;
+            let within_row = relative - index as CGFloat * DOWNLOAD_ROW_HEIGHT;
+            if within_row < 12.0 || within_row > 42.0 {
+                return None;
+            }
+            let task = downloads.tasks.iter().rev().nth(index)?;
+            (task.state != TaskState::Installed).then_some(ScrollTap::Queue(task.id))
+        }
+    }
+}
+
 fn clear_rows(env: &mut Environment, views: &mut StoreViews) {
     for row in views.rows.drain(..) {
         () = msg![env; row removeFromSuperview];
     }
     views.download_progress.clear();
+    views.artwork_views.clear();
 }
 
 fn reset_scroll(env: &mut Environment, views: &StoreViews, content_height: CGFloat) {
@@ -1263,7 +1446,12 @@ fn reset_scroll(env: &mut Environment, views: &StoreViews, content_height: CGFlo
     () = msg![env; (views.scroll_view) setContentOffset:(CGPoint { x: 0.0, y: 0.0 })];
 }
 
-fn render_catalog(env: &mut Environment, views: &mut StoreViews, catalog: &CatalogState) -> CGFloat {
+fn render_catalog(
+    env: &mut Environment,
+    views: &mut StoreViews,
+    catalog: &CatalogState,
+    artwork: &ArtworkCache,
+) -> CGFloat {
     if catalog.loading {
         add_message(env, views, "Loading the latest catalog…", false);
         return 210.0;
@@ -1287,24 +1475,19 @@ fn render_catalog(env: &mut Environment, views: &mut StoreViews, catalog: &Catal
     let gray = ui_color(env, 0.38, 0.43, 0.50, 1.0);
     for (index, item) in page.items.iter().enumerate() {
         let y = 4.0 + index as CGFloat * CATALOG_ROW_HEIGHT;
-        let row: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
-        () = msg![env; row setFrame:(rect(8.0, y, row_width, 80.0))];
-        () = msg![env; row setBackgroundColor:white];
-        () = msg![env; row setTag:(index as NSInteger)];
+        let row = new_view(env, rect(8.0, y, row_width, 80.0), white);
+        () = msg![env; row setUserInteractionEnabled:false];
         let row_layer: id = msg![env; row layer];
         () = msg![env; row_layer setCornerRadius:(10.0 as CGFloat)];
-        let selector = env.objc.lookup_selector("archiveStoreItem:").unwrap();
-        let delegate = views.delegate;
-        () = msg![env; row addTarget:delegate
-                          action:selector
-                forControlEvents:UIControlEventTouchUpInside];
         () = msg![env; (views.scroll_view) addSubview:row];
         add_item_icon(
             env,
+            views,
             row,
             &item.identifier,
             &item.title,
             rect(10.0, 12.0, 56.0, 56.0),
+            artwork,
         );
         let title = new_label(
             env,
@@ -1346,6 +1529,7 @@ fn render_details(
     views: &mut StoreViews,
     details: &DetailsState,
     downloads: &DownloadManager,
+    artwork: &ArtworkCache,
 ) -> CGFloat {
     let Some(item) = &details.item else {
         add_message(env, views, "Choose an app from the catalog.", false);
@@ -1356,6 +1540,7 @@ fn render_details(
     let dark: id = msg_class![env; UIColor blackColor];
     let gray = ui_color(env, 0.38, 0.43, 0.50, 1.0);
     let header = new_view(env, rect(8.0, 4.0, row_width, 188.0), white);
+    () = msg![env; header setUserInteractionEnabled:false];
     let header_layer: id = msg![env; header layer];
     () = msg![env; header_layer setCornerRadius:(10.0 as CGFloat)];
     () = msg![env; (views.scroll_view) addSubview:header];
@@ -1368,10 +1553,12 @@ fn render_details(
         .unwrap_or(&item.identifier);
     add_item_icon(
         env,
+        views,
         header,
         identifier,
         title,
         rect(12.0, 12.0, 64.0, 64.0),
+        artwork,
     );
     let title_label = new_label(
         env,
@@ -1448,6 +1635,7 @@ fn render_details(
     for (index, file) in loaded.files.iter().enumerate() {
         let y = 228.0 + index as CGFloat * FILE_ROW_HEIGHT;
         let row = new_view(env, rect(8.0, y, row_width, 74.0), white);
+        () = msg![env; row setUserInteractionEnabled:false];
         let row_layer: id = msg![env; row layer];
         () = msg![env; row_layer setCornerRadius:(10.0 as CGFloat)];
         () = msg![env; (views.scroll_view) addSubview:row];
@@ -1480,18 +1668,15 @@ fn render_details(
             Some(TaskState::Failed | TaskState::Cancelled) => ("Retry", true, blue),
             None => ("GET", true, blue),
         };
-        let button = make_button(
+        add_action_pill(
             env,
-            views.delegate,
             row,
             rect(row_width - 80.0, 21.0, 68.0, 32.0),
             title,
-            "archiveStoreDownload:",
-            index as NSInteger,
             color,
             white,
+            enabled,
         );
-        set_button_enabled(env, button, enabled);
         views.rows.push(row);
     }
     236.0 + loaded.files.len() as CGFloat * FILE_ROW_HEIGHT
@@ -1524,6 +1709,7 @@ fn render_downloads(
     for (index, task) in downloads.tasks.iter().rev().enumerate() {
         let y = 4.0 + index as CGFloat * DOWNLOAD_ROW_HEIGHT;
         let row = new_view(env, rect(8.0, y, row_width, 104.0), white);
+        () = msg![env; row setUserInteractionEnabled:false];
         let row_layer: id = msg![env; row layer];
         () = msg![env; row_layer setCornerRadius:(10.0 as CGFloat)];
         () = msg![env; (views.scroll_view) addSubview:row];
@@ -1572,16 +1758,14 @@ fn render_downloads(
                 TaskState::Failed | TaskState::Cancelled => ("Retry", blue),
                 _ => ("Cancel", red),
             };
-            make_button(
+            add_action_pill(
                 env,
-                views.delegate,
                 row,
                 rect(row_width - 80.0, 12.0, 68.0, 30.0),
                 title,
-                "archiveStoreQueueAction:",
-                task.id as NSInteger,
                 background,
                 white,
+                true,
             );
         }
 
@@ -1722,31 +1906,73 @@ fn add_message_at(
     }
 }
 
+fn add_action_pill(
+    env: &mut Environment,
+    parent: id,
+    frame: CGRect,
+    title: &str,
+    background: id,
+    title_color: id,
+    enabled: bool,
+) {
+    let pill = new_view(env, frame, background);
+    () = msg![env; pill setUserInteractionEnabled:false];
+    let layer: id = msg![env; pill layer];
+    () = msg![env; layer setCornerRadius:(7.0 as CGFloat)];
+    if !enabled {
+        () = msg![env; pill setAlpha:(0.48 as CGFloat)];
+    }
+    let label = new_label(
+        env,
+        rect(0.0, 0.0, frame.size.width, frame.size.height),
+        title,
+        12.0,
+        true,
+        title_color,
+    );
+    () = msg![env; label setTextAlignment:UITextAlignmentCenter];
+    () = msg![env; pill addSubview:label];
+    () = msg![env; parent addSubview:pill];
+}
+
 fn add_item_icon(
     env: &mut Environment,
+    views: &mut StoreViews,
     parent: id,
     identifier: &str,
     title: &str,
     frame: CGRect,
+    artwork: &ArtworkCache,
 ) {
-    let palette = [
-        (0.10, 0.40, 0.78, 1.0),
-        (0.48, 0.24, 0.72, 1.0),
-        (0.08, 0.56, 0.48, 1.0),
-        (0.82, 0.36, 0.12, 1.0),
-        (0.72, 0.20, 0.38, 1.0),
-        (0.20, 0.32, 0.52, 1.0),
-    ];
-    let hash = identifier.bytes().fold(0u32, |hash, byte| {
-        hash.wrapping_mul(33).wrapping_add(byte as u32)
-    });
-    let color = palette[hash as usize % palette.len()];
-    let image = make_icon_from_text(env, &item_initials(title), 22.0, 0.0, color);
+    let cached = artwork.images.get(identifier).copied();
+    let image = if let Some(image) = cached {
+        image
+    } else {
+        let palette = [
+            (0.10, 0.40, 0.78, 1.0),
+            (0.48, 0.24, 0.72, 1.0),
+            (0.08, 0.56, 0.48, 1.0),
+            (0.82, 0.36, 0.12, 1.0),
+            (0.72, 0.20, 0.38, 1.0),
+            (0.20, 0.32, 0.52, 1.0),
+        ];
+        let hash = identifier.bytes().fold(0u32, |hash, byte| {
+            hash.wrapping_mul(33).wrapping_add(byte as u32)
+        });
+        let color = palette[hash as usize % palette.len()];
+        make_icon_from_text(env, &item_initials(title), 22.0, 0.0, color)
+    };
     let icon: id = msg_class![env; UIImageView alloc];
     let icon: id = msg![env; icon initWithImage:image];
     () = msg![env; icon setFrame:frame];
     () = msg![env; icon setUserInteractionEnabled:false];
+    let layer: id = msg![env; icon layer];
+    let gravity = ns_string::get_static_str(env, "resizeAspect");
+    () = msg![env; layer setContentsGravity:gravity];
     () = msg![env; parent addSubview:icon];
+    if cached.is_none() {
+        views.artwork_views.push((identifier.to_string(), icon));
+    }
 }
 
 fn item_initials(title: &str) -> String {
@@ -1845,6 +2071,23 @@ fn request_catalog(
         let _ = sender.send(StoreMessage::Catalog {
             generation,
             result: Err(format!("Could not start the catalog request: {error}")),
+        });
+    }
+}
+
+fn request_artwork(sender: &Sender<StoreMessage>, identifier: String) {
+    let worker_sender = sender.clone();
+    let request_identifier = identifier.clone();
+    let spawn = std::thread::Builder::new()
+        .name("HyperHLE archive artwork".to_string())
+        .spawn(move || {
+            let result = network::fetch_artwork(&request_identifier);
+            let _ = worker_sender.send(StoreMessage::Artwork { identifier, result });
+        });
+    if let Err(error) = spawn {
+        let _ = sender.send(StoreMessage::Artwork {
+            identifier: String::new(),
+            result: Err(format!("Could not start the artwork request: {error}")),
         });
     }
 }

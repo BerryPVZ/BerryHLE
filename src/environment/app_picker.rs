@@ -362,6 +362,7 @@ struct AppPickerDelegateHostObject {
     archive_store_tab: Option<NSInteger>,
     archive_store_sort: bool,
     archive_store_queue_action: Option<NSInteger>,
+    archive_store_tap: Option<CGPoint>,
     settings_show: bool,
     settings_hide: bool,
     scale_hack_default: bool,
@@ -627,6 +628,11 @@ const CLASSES: ClassExports = objc_classes! {
 - (())archiveStoreQueueAction:(id)sender {
     let tag: NSInteger = msg![env; sender tag];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_queue_action = Some(tag);
+}
+- (())archiveStoreTap:(id)sender {
+    let view: id = msg![env; sender view];
+    let point: CGPoint = msg![env; sender locationInView:view];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_tap = Some(point);
 }
 - (())textFieldShouldReturn:(id)sender {
     let tag: NSInteger = msg![env; sender tag];

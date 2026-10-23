@@ -13,6 +13,7 @@ use std::time::Duration;
 
 const COLLECTION_ID: &str = "ipaarchive";
 const MAX_JSON_RESPONSE_SIZE: usize = 64 * 1024 * 1024;
+const MAX_ARTWORK_RESPONSE_SIZE: usize = 8 * 1024 * 1024;
 
 pub(super) fn fetch_catalog(
     query: &str,
@@ -110,6 +111,31 @@ fn parse_catalog(json: &Value, requested_page: usize) -> Result<CatalogPage, Str
         num_found,
         page: requested_page,
     })
+}
+
+pub(super) fn fetch_artwork(identifier: &str) -> Result<Vec<u8>, String> {
+    let url = format!(
+        "https://archive.org/services/img/{}",
+        percent_encode(identifier)
+    );
+    let response = archive_agent()
+        .get(&url)
+        .set(
+            "User-Agent",
+            concat!("HyperHLE-Reborn/", env!("CARGO_PKG_VERSION")),
+        )
+        .call();
+    let response = check_response(response)?;
+    let mut body = Vec::new();
+    response
+        .into_reader()
+        .take((MAX_ARTWORK_RESPONSE_SIZE + 1) as u64)
+        .read_to_end(&mut body)
+        .map_err(|error| format!("Could not read the archive artwork: {error}"))?;
+    if body.is_empty() || body.len() > MAX_ARTWORK_RESPONSE_SIZE {
+        return Err("The archive artwork is empty or too large.".to_string());
+    }
+    Ok(body)
 }
 
 pub(super) fn fetch_details(identifier: &str) -> Result<ItemDetails, String> {
