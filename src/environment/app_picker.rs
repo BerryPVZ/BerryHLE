@@ -1516,7 +1516,7 @@ fn app_picker_inner(
             // No override — fall back to the app bundle / built-in default.
         } else if tag == DEVICE_TAG_AUTO {
             option_args.push("--device-family=auto".to_string());
-        } else if let Some(family) = crate::window::DeviceFamily::ALL_SELECTABLE.get(tag as usize) {
+        } else if let Some(family) = crate::window::DeviceFamily::for_tag(tag as usize) {
             option_args.push(format!("--device-family={}", family.option_name()));
         }
     }
@@ -3642,8 +3642,8 @@ fn setup_settings(
 }
 
 /// Sentinel button tags for the device-model dropdown. Model buttons use their
-/// index into `DeviceFamily::ALL_SELECTABLE` (0..=19) as their tag, so the
-/// sentinels are placed well above that range.
+/// picker tag (`DeviceFamily::tag`, at most 20) as their tag, so the sentinels
+/// are placed well above that range.
 const DEVICE_TAG_DEFAULT: NSInteger = 1000;
 const DEVICE_TAG_AUTO: NSInteger = 1001;
 
@@ -3655,15 +3655,19 @@ const DEVICE_MENU_ITEM_HEIGHT: CGFloat = 30.0;
 
 /// The choices shown in the device-model dropdown, in display order, as
 /// `(title, tag)` pairs: "Default" (no override), "Auto" (match host screen),
-/// then one entry per [crate::window::DeviceFamily] in `ALL_SELECTABLE` order
-/// tagged with its index.
+/// then one entry per [crate::window::DeviceFamily] in `ALL_SELECTABLE` order,
+/// tagged with the model's own picker tag rather than its position, so that
+/// saved settings survive changes to the display order.
 fn device_model_entries() -> Vec<(String, NSInteger)> {
     use crate::window::DeviceFamily;
     let mut entries: Vec<(String, NSInteger)> = Vec::new();
     entries.push(("Default".to_string(), DEVICE_TAG_DEFAULT));
     entries.push(("Auto".to_string(), DEVICE_TAG_AUTO));
-    for (idx, family) in DeviceFamily::ALL_SELECTABLE.iter().enumerate() {
-        entries.push((family.display_name().to_string(), idx as NSInteger));
+    for family in DeviceFamily::ALL_SELECTABLE {
+        let Some(tag) = family.tag() else {
+            continue;
+        };
+        entries.push((family.display_name().to_string(), tag as NSInteger));
     }
     entries
 }
@@ -3741,8 +3745,7 @@ fn device_model_label_for_tag(tag: Option<i32>) -> String {
     match tag.map(|t| t as NSInteger) {
         None | Some(DEVICE_TAG_DEFAULT) => "Default".to_string(),
         Some(DEVICE_TAG_AUTO) => "Auto".to_string(),
-        Some(idx) => DeviceFamily::ALL_SELECTABLE
-            .get(idx as usize)
+        Some(idx) => DeviceFamily::for_tag(idx as usize)
             .map(|f| f.display_name().to_string())
             .unwrap_or_else(|| "Default".to_string()),
     }

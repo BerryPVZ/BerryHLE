@@ -372,6 +372,7 @@ impl DeviceFamily {
         DeviceFamily::iPhone4s,
         DeviceFamily::iPhone5,
         DeviceFamily::iPhone5c,
+        DeviceFamily::iPhone6,
         DeviceFamily::iPad,
         DeviceFamily::iPad2,
         DeviceFamily::iPad3,
@@ -385,11 +386,45 @@ impl DeviceFamily {
         DeviceFamily::iPodTouch3,
         DeviceFamily::iPodTouch4,
         DeviceFamily::iPodTouch5,
-        // Appended rather than slotted in after the other iPhones: the app
-        // picker persists the selection as an index into this list, so a model
-        // added later must not renumber the existing entries.
+    ];
+
+    /// The same models numbered the way the app picker tags them, which is also
+    /// how it saves the selection. New models are appended here so that a saved
+    /// tag keeps pointing at the same device; the display order is
+    /// [Self::ALL_SELECTABLE].
+    const ALL_BY_TAG: &'static [DeviceFamily] = &[
+        DeviceFamily::iPhone,
+        DeviceFamily::iPhone3G,
+        DeviceFamily::iPhone3GS,
+        DeviceFamily::iPhone4,
+        DeviceFamily::iPhone4s,
+        DeviceFamily::iPhone5,
+        DeviceFamily::iPhone5c,
+        DeviceFamily::iPad,
+        DeviceFamily::iPad2,
+        DeviceFamily::iPad3,
+        DeviceFamily::iPad4,
+        DeviceFamily::iPad5,
+        DeviceFamily::iPadMini,
+        DeviceFamily::iPadMini2,
+        DeviceFamily::iPadMini3,
+        DeviceFamily::iPodTouch,
+        DeviceFamily::iPodTouch2,
+        DeviceFamily::iPodTouch3,
+        DeviceFamily::iPodTouch4,
+        DeviceFamily::iPodTouch5,
         DeviceFamily::iPhone6,
     ];
+
+    /// The picker tag of this model, or `None` if it is not selectable.
+    pub fn tag(&self) -> Option<usize> {
+        Self::ALL_BY_TAG.iter().position(|family| family == self)
+    }
+
+    /// The model for a picker tag, or `None` if the tag is out of range.
+    pub fn for_tag(tag: usize) -> Option<DeviceFamily> {
+        Self::ALL_BY_TAG.get(tag).copied()
+    }
 }
 impl TryFrom<u64> for DeviceFamily {
     type Error = ();
@@ -3264,17 +3299,32 @@ mod device_family_tests {
         }
     }
 
-    /// The app picker persists the chosen model as an index into this list, so
-    /// saved settings must keep pointing at the same device.
     #[test]
-    fn selectable_indices_stay_stable() {
+    fn iphone_6_is_listed_right_after_iphone_5c() {
         let all = DeviceFamily::ALL_SELECTABLE;
         assert_eq!(all.len(), 21);
-        assert_eq!(all[0], DeviceFamily::iPhone);
-        assert_eq!(all[5], DeviceFamily::iPhone5);
         assert_eq!(all[6], DeviceFamily::iPhone5c);
-        assert_eq!(all[7], DeviceFamily::iPad);
-        assert_eq!(all[19], DeviceFamily::iPodTouch5);
-        assert_eq!(all[20], DeviceFamily::iPhone6);
+        assert_eq!(all[7], DeviceFamily::iPhone6);
+        assert_eq!(all[8], DeviceFamily::iPad);
+    }
+
+    /// The app picker saves the chosen model as its tag, so tags must not
+    /// renumber when the display order changes.
+    #[test]
+    fn selectable_tags_stay_stable() {
+        assert_eq!(DeviceFamily::for_tag(0), Some(DeviceFamily::iPhone));
+        assert_eq!(DeviceFamily::for_tag(5), Some(DeviceFamily::iPhone5));
+        assert_eq!(DeviceFamily::for_tag(6), Some(DeviceFamily::iPhone5c));
+        assert_eq!(DeviceFamily::for_tag(7), Some(DeviceFamily::iPad));
+        assert_eq!(
+            DeviceFamily::for_tag(19),
+            Some(DeviceFamily::iPodTouch5)
+        );
+        assert_eq!(DeviceFamily::for_tag(20), Some(DeviceFamily::iPhone6));
+        assert_eq!(DeviceFamily::iPhone6.tag(), Some(20));
+        assert_eq!(DeviceFamily::for_tag(21), None);
+        for family in DeviceFamily::ALL_SELECTABLE {
+            assert_eq!(DeviceFamily::for_tag(family.tag().unwrap()), Some(*family));
+        }
     }
 }
