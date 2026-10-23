@@ -1,0 +1,310 @@
+================================================================================
+ПОЛНЫЙ ТЕХНИЧЕСКИЙ АУДИТ СТОРОННИХ PR В HYPERHLE-REBORN
+Репозиторий: KlugKlugTG/HyperHLE-Reborn
+Дата проверки: 2026-10-23
+Охват: все влитые и открытые PR сторонних авторов (все кроме @KlugKlugTG:
+       @mcmimik, @goodvids56, @j92580498-max, @lw404-ai, @DzmingLi и др.)
+================================================================================
+
+1. ПРОВЕРКА НА ВРЕДОНОСНОСТЬ И БЭКДОРЫ
+--------------------------------------------------------------------------------
+Проверены .github/workflows/*, .github/scripts/*, dev-scripts/*, src/*, tests/*,
+appdb/* и telegram_bot/*.
+
+Вывод:
+  Вредоносного кода, бэкдоров, скрытых сетевых вызовов, майнеров, кражи токенов
+  или подмены ссылок в CI НЕ ОБНАРУЖЕНО. Все загрузки в GitHub Actions ведут на
+  официальные релизы (llvm/llvm-project, touchHLE/common-3.0-sdk, boost.io,
+  innosetup), а прогон TestApp изолирован через macOS sandbox-exec.
+
+  Однако в ряде влитых PR обнаружены СЕРЬЁЗНЫЕ РЕГРЕССИИ СОВМЕСТИМОСТИ с играми
+  и технические ошибки. Главная причина — перенос жёсткой философии upstream
+  touchHLE («никакого восстановления после exit/abort/сигналов/исключений и
+  никаких игровых обходов») поверх кодовой базы HyperHLE-Reborn, а также
+  недостаточно изолированные глобальные эвристики в UIKit и аудио.
+
+
+================================================================================
+2. КРИТИЧЕСКИЕ РЕГРЕССИИ В УЖЕ ВЛИТЫХ PR (ЛОМАЮТ ИГРЫ В TRUNK)
+================================================================================
+
+[РЕГРЕССИЯ #1] Полностью отключились обходы std::string(NULL) и перехват
+               неперехваченных C++ исключений во ВСЕХ C++ играх
+PR: #288 (@goodvids56) в комбинации с #298 (@mcmimik)
+Файлы:
+  - src/dyld.rs:540-543, 613-686, 2162, 2304-2327
+  - src/environment.rs:756
+  - touchHLE_dylibs/libgcc_s.1.dylib, libstdc++.6.0.9.dylib, libc++abi.dylib
+
+Техническая суть:
+  В PR #288 добавлено определение гостевого SjLj-рантайма (src/dyld.rs:540-543):
+  флаг `guest_sjlj_runtime_available` становится `true`, если среди загруженных
+  бинарников (`bins`) присутствуют внешние символы:
+    ___cxa_throw, ___gxx_personality_sj0,
+    __Unwind_SjLj_RaiseException, __Unwind_SjLj_Register.
+
+  Проверка таблиц символов (LC_SYMTAB) в touchHLE_dylibs/ показывает:
+    * libgcc_s.1.dylib экспортирует (N_EXT) __Unwind_SjLj_RaiseException и
+      __Unwind_SjLj_Register;
+    * libstdc++.6.0.9.dylib и libc++abi.dylib экспортируют (N_EXT) ___cxa_throw
+      и ___gxx_personality_sj0.
+
+  Так как `load_transitive_dependencies` (src/environment.rs:756) автоматически
+  подгружает эти бандленные dylib для ЛЮБОЙ C++ игры, флаг
+  `guest_sjlj_runtime_available` теперь ВСЕГДА равен `true` для всех C++ игр!
+
+  Из-за этого весь блок `if !self.guest_sjlj_runtime_available` (src/dyld.rs:613)
+  и перехват в src/dyld.rs:2323-2324 превратились в МЁРТВЫЙ КОД:
+    1) Больше не патчатся в `BX LR` функции `std::__throw_*` (src/dyld.rs:616 —
+       фикс падения Geometry Dash 1.0 при std::string(NULL)).
+    2) Больше не вызывается `patch_string_s_construct_null` (src/dyld.rs:684 —
+       фикс вечного цикла на старте Turbo Dismount при std::string(NULL)).
+    3) Отключён `cxxabi_throw_intercept` (src/dyld.rs:2162 — фикс вылета
+       CSR Racing из-за неперехваченного исключения PlayHaven при запуске).
+
+  Когда любая из этих игр бросает неперехваченное C++ исключение, unwinder в
+  libstdc++/libc++abi вызывает `std::terminate()` -> `abort()`, а PR #298
+  мгновенно убивает игру.
+
+--------------------------------------------------------------------------------
+
+[РЕГРЕССИЯ #2] Безусловное закрытие игры при гостевых exit(), abort() и сигналах
+PR: #298 (@mcmimik — "Preserve guest exit codes and stop recovering from
+    termination")
+Файлы:
+  - src/libc/stdlib.rs:808-869
+  - src/libc/signal.rs:333-345
+  - src/environment.rs:208, 2206-2247
+
+Техническая суть:
+  Полностью удалено восстановление после гостевых `exit()`, `_exit()`, `_Exit()`,
+  `quick_exit()`, `abort()` и фатальных сигналов в `default_signal_action`
+  (SIGABRT, SIGILL, SIGTRAP, SIGBUS, SIGFPE, SIGSEGV, SIGPIPE, SIGTERM).
+
+  Прямое подтверждение в коде: в src/environment.rs:208, 2206-2247 осталось
+  осиротевшее поле `missing_unity_player_archive` — в него пишут 6 мест в VFS и
+  POSIX I/O, но его больше НИГДЕ НЕ ЧИТАЮТ. Его комментарий прямо указывает, что
+  раньше HyperHLE-Reborn отличал битый архив Unity от «recoverable DRM-style
+  exit» и позволял играм продолжать работу.
+
+  Что сломано:
+    * Игры с проверками DRM / FairPlay / джейлбрейка / отладчика (SIGTRAP),
+      вызывающие exit(0), exit(1) или abort() на эмуляторе, теперь сразу
+      закрываются.
+    * Старые рекламные и сетевые SDK (OpenFeint, Tapjoy, Flurry), получающие
+      SIGPIPE без установленного SIG_IGN, закрывают игру.
+    * Любой нефатальный `assert()` -> `abort()` во второстепенном потоке роняет
+      всю сессию.
+
+--------------------------------------------------------------------------------
+
+[РЕГРЕССИЯ #3] Сломано чтение MP3 через AudioFileOpenWithCallbacks +
+               ExtAudioFileWrapAudioFileID
+PR: #204 (@goodvids56)
+Файлы:
+  - src/frameworks/audio_toolbox/audio_file.rs:634-637
+  - src/audio.rs:175-186
+  - src/frameworks/audio_toolbox/ext_audio_file.rs:202, 500-517
+
+Техническая суть:
+  Ради Real Racing 3 в `AudioFileOpenWithCallbacks` все MP3-потоки безусловно
+  переведены на `AudioFile::read_mp3_packets_from_vec` (сжатые MP3-фреймы с
+  переменным размером пакета: `bytes_per_packet == 0`, `packet_size_fixed() == 0`).
+
+  При этом сам автор в src/audio.rs:175-176 оставил комментарий:
+    "This is opt-in because a lot of our audio code (ExtAudioFile wrapping an
+     AudioFileID, AudioConverter) can only consume PCM"
+
+  Однако в `AudioFileOpenWithCallbacks` это включили без проверки потребителя!
+  Если игра открывает MP3 из памяти/собственного архива через
+  `AudioFileOpenWithCallbacks`, а затем оборачивает дескриптор через
+  `ExtAudioFileWrapAudioFileID` и читает PCM через `ExtAudioFileRead`, проверка
+  в src/frameworks/audio_toolbox/ext_audio_file.rs:512
+  (`if frames_per_packet == 0 || packet_size == 0`) срабатывает сразу и
+  возвращает 0 кадров (мгновенный EOF / полная тишина).
+
+--------------------------------------------------------------------------------
+
+[РЕГРЕССИЯ #4] Все UIImageView из XIB/NIB/Storyboard потеряли интерактивность
+PR: #191 (@j92580498-max — Doodle Jump)
+Файлы:
+  - src/frameworks/uikit/ui_view/ui_image_view.rs:85-97
+  - src/frameworks/uikit/ui_view.rs:887-888
+
+Техническая суть:
+  В `UIImageView -initWithCoder:` сначала вызывается `[super initWithCoder:coder]`
+  (который в `UIView` уже декодирует флаг `UIUserInteractionDisabled` из NIB), а
+  затем на строке 95 БЕЗУСЛОВНО выполняется:
+    `() = msg![env; this setUserInteractionEnabled:false];`
+
+  Даже если разработчик игры специально включил "User Interaction Enabled" у
+  `UIImageView` в Interface Builder (например, панель/подложка окна с вложенными
+  кнопками `UIButton`), флаг принудительно сбрасывается в `false`. В UIKit у
+  родителя с `userInteractionEnabled == false` метод `hitTest:` возвращает `nil`
+  для всего поддерева — все дочерние кнопки внутри таких `UIImageView` мертвы.
+
+--------------------------------------------------------------------------------
+
+[РЕГРЕССИЯ #5] Опасные глобальные эвристики касаний в UIKit
+PR: #191 (@j92580498-max — Doodle Jump)
+Файлы:
+  - src/frameworks/uikit/ui_touch.rs:744-755, 766-807, 940-952, 992-997
+  - src/frameworks/uikit/ui_view.rs:1419-1424
+  - src/frameworks/uikit/ui_view_controller.rs:663
+
+Техническая суть:
+  1) `touchhle_window_has_content` (ui_touch.rs:744-755) требует, чтобы у
+     корневой вьюхи окна были собственные дочерние subviews (`root_count > 0`).
+     Если у игры есть второе `UIWindow` с подвьюхами, а поверх него — главное
+     игровое `UIWindow` с одиночным `EAGLView` (у которого 0 subviews), верхнее
+     игровое окно признаётся «пустым», и все касания уходят мимо `EAGLView`!
+  2) `touchhle_is_empty_overlay` (ui_touch.rs:766-774) считает «пустым прозрачным
+     оверлеем» любой экземпляр точного класса `UIView` без subviews, НЕ ПРОВЕРЯЯ
+     ни `backgroundColor`, ни `layer.contents`, ни `gestureRecognizers`.
+     Из-за этого:
+       * модальные затемняющие щиты прокликиваются насквозь по фоновым кнопкам;
+       * пустые `UIView`-зоны с `UITapGestureRecognizer`/`UIPanGestureRecognizer`
+         теряют жесты.
+  3) Авто-закрытие `ImagePopUpView` (ui_view.rs:1423) хранит состояние в
+     глобальном `static DISMISSED: AtomicBool` на весь процесс, а `AgeGateView`
+     (ui_view_controller.rs:663) перехватывается глобально без проверки bundle ID.
+
+
+================================================================================
+3. СРЕДНИЕ ТЕХНИЧЕСКИЕ И ИНФРАСТРУКТУРНЫЕ ПРОБЛЕМЫ (ВЛИТЫЕ PR)
+================================================================================
+
+1) Затирание обработчика SIGSEGV Dynarmic Fastmem при повторном входе в main()
+   PR: #296 (@j92580498-max) + #298 (@mcmimik)
+   Файлы: src/lib.rs:221, src/crash_handler.rs:435-445, src/mem.rs:513-540
+   В PR #296 на Linux/Android включён Dynarmic Fastmem с защитой нулевой
+   страницы через `mprotect(..., PROT_NONE)`. Чтение гостем из NULL теперь бьёт
+   хозяйским SIGSEGV, который перехватывает статический обработчик Dynarmic.
+   Но `crash_handler::install()` вызывается при каждом входе в `touchHLE::main`
+   и перезаписывает `sigaction(SIGSEGV)` без сохранения предыдущего обработчика.
+   При повторном запуске `main()` в рамках одного процесса (iOS/Android) первый
+   же гостевой NULL-доступ убьёт процесс эмулятора.
+
+2) Порванный строковый литерал в тесте интеграции
+   PR: #300 (@mcmimik)
+   Файл: tests/integration.rs:226-228
+   В код попал перенос строки с `+` из диффа:
+   `arg != "-fno-objc-arc-e\n             +xceptions"`, поэтому фильтрация этого
+   флага при компиляции `.cpp` файлов в TestApp не срабатывает.
+
+3) Недочёты в +[UIImage imageNamed:] и dispatch_after
+   PR: #191 (@j92580498-max)
+   Файлы: src/frameworks/uikit/ui_image.rs:108-121, src/libc/dispatch.rs:384-435
+   * В `+[UIImage imageNamed:]` перебираются `~iphone`, `@2x~iphone`,
+     `@3x~iphone`, `@2x`, `@3x`, но не проверяются `~ipad` и `@2x~ipad` для
+     iPad-приложений.
+   * В `dispatch_after` задержка более 60 секунд (включая `DISPATCH_TIME_FOREVER`)
+     принудительно обрезается до 60 секунд вместо бесконечного ожидания, а
+     таймеры планируются только в `NSDefaultRunLoopMode` (замирают при скролле в
+     `UITrackingRunLoopMode`).
+
+4) Прямой borrow в -[NSData base64EncodedDataWithOptions:]
+   PR: #285 (@mcmimik)
+   Файл: src/frameworks/foundation/ns_data.rs:344-354
+   Используется `env.objc.borrow::<NSDataHostObject>(this)` вместо вызовов
+   `[this bytes]` и `[this length]` (вызовет panic на кастомных подклассах
+   NSData), а аргумент `options` игнорируется.
+
+5) Слишком агрессивное авто-закрытие ишью ботом
+   PR: #254, #272 (@goodvids56)
+   Файл: .github/scripts/issue-completeness.js:24-28, 100-119
+   Бот автоматически закрывает ишью пользователей как `not_planned`, если баг
+   касается самого эмулятора (интерфейс, настройки, Android) и оформлен не через
+   general.yml (бот требует ссылку на IPA), либо если ссылка на облако
+   (Google Drive / Mega / MediaFire) подана без шаблона и не оканчивается на
+   `.ipa`.
+
+6) Жёсткие запреты в AGENTS.md
+   PR: #300 (@mcmimik)
+   Файл: AGENTS.md:8-14
+   Правила запрещают ИИ-агентам использовать `bundle_identifier()` и любые
+   восстановления после `exit`/`abort`/ошибок памяти/трапов, что мешает агентам
+   чинить коммерческие игры с DRM и багами сторонних SDK.
+
+
+================================================================================
+4. ПРОВЕРКА ОТКРЫТЫХ (ЕЩЁ НЕ ВЛИТЫХ) ЧУЖИХ PR
+================================================================================
+
+* PR #308 [OPEN] (@goodvids56 — "Fix Noblemen: 1896 deadlock and Talking Ted
+  animations; implement dladdr"):
+  ВНИМАНИЕ: переделывает `dispatch_async` на глобальные очереди так, что КАЖДЫЙ
+  вызов `dispatch_async(dispatch_get_global_queue(...), block)` создаёт новый
+  detached `pthread` (новый стек в гостевой памяти + новая корутина) вместо
+  пула рабочих потоков. На играх, кидающих сотни мелких задач в global queue,
+  это приведёт к исчерпанию гостевого адресного пространства и тормозам. Перед
+  слиянием требуется пул потоков или переиспользование воркера.
+
+* PR #269 [OPEN] (@masterfanaedoodledash-cmd — "Lost Yeti class and functions"):
+  Добавляет нестандартные методы словаря (`objectForKey:` / `setObject:forKey:`)
+  прямо в `NSMutableSet` для всех приложений (нарушает проверки `respondsToSelector:`
+  в других играх, которые отличают `NSDictionary` от `NSSet` через
+  `respondsToSelector:@selector(objectForKey:)`!). Вливать в таком виде нельзя.
+
+* PR #211 [OPEN] (@okara3233-collab — "Just a fork try"):
+  Тестовый PR автора форка, нужно просто закрыть.
+
+
+================================================================================
+5. КАКИЕ ЧУЖИЕ ВЛИТЫЕ PR ПОЛЕЗНЫ (ОТКАТЫВАТЬ НЕ НУЖНО)
+================================================================================
+Следующие PR проверены и реально улучшают совместимость, скорость и стабильность:
+  * #294 (@goodvids56): установщик Inno Setup для Windows в CI.
+  * #291 (@j92580498-max): поддержка GL_OES_texture_3D для шейдеров Unity.
+  * #288 (@goodvids56): фиксы AAC в Fruit Ninja, звука в PvZ HD и копирования
+    стековых блоков в objc_retainBlock (сохранить, исправив условие в dyld.rs).
+  * #285 (@mcmimik): retain в кэше суб-бандлов NSBundle, копирование NSHashTable,
+    UITrackingRunLoopMode в common modes, свои URL-схемы в canOpenURL:.
+  * #280 (@mcmimik): проверка микрофона на macOS/iOS без открытия захвата.
+  * #279, #264 (@lw404-ai): пропорции окна на десктопе, сохранение настроек,
+    маппинг глифов китайских шрифтов.
+  * #256, #246, #228, #217, #209, #200 (@goodvids56): фиксы выравнивания realloc,
+    mmap(MAP_FIXED) для Mono GC, канарейка PLANE_SLACK_CANARY для буфера
+    AudioUnit в Resident Evil 4, GL_OES_vertex_array_object, BGRA в
+    CGBitmapContext, fcvt/gcvt/ecvt, vDSP, CGRectFromString без пробелов.
+  * #226 (@j92580498-max): блокирующий UDP recvfrom для серверов MCPE.
+  * #192 (@j92580498-max): перевод спам-логов горячего пути в log_dbg! и быстрый
+    SEL::name_eq.
+  * #145, #159, #162 (@j92580498-max): встроенный декодер H.264 (OpenH264) в
+    MPMoviePlayerController.
+
+
+================================================================================
+6. РЕКОМЕНДУЕМЫЙ ПЛАН ИСПРАВЛЕНИЙ В TRUNK
+================================================================================
+1) src/dyld.rs:
+   Вынести `patch_string_s_construct_null` из-под `!guest_sjlj_runtime_available`
+   и перехватывать падение неперехваченных C++ исключений в `std::terminate` /
+   `abort`, чтобы игры (CSR Racing, Turbo Dismount, GD 1.0) не закрывались.
+
+2) src/libc/stdlib.rs, src/libc/signal.rs, src/environment.rs:
+   Оставить возврат `GuestTermination` для CLI/TestApp и реальной потери архива
+   Unity (`missing_unity_player_archive`), но вернуть по умолчанию переживание
+   DRM-вызовов `exit()`/`abort()` и игнорирование `SIGPIPE` в играх (с опцией
+   `--strict-exit` для тестов).
+
+3) src/frameworks/audio_toolbox/ext_audio_file.rs:
+   В `ExtAudioFileWrapAudioFileID` при оборачивании `AudioFileInner::Mp3`
+   декодировать байты из `raw_data` в PCM, чтобы `ExtAudioFileRead` возвращал
+   корректный звук.
+
+4) src/frameworks/uikit/ui_view/ui_image_view.rs:
+   В `initWithCoder:` сбрасывать `userInteractionEnabled` в `false` только если
+   в `coder` НЕ задан ключ `UIUserInteractionDisabled`.
+
+5) src/frameworks/uikit/ui_touch.rs и ui_image.rs:
+   В `touchhle_window_has_content` учитывать `CAEAGLLayer` / `layer.contents`;
+   в `touchhle_is_empty_overlay` не пропускать вьюхи с `gestureRecognizers`,
+   непрозрачным `backgroundColor` или `layer.contents`; добавить `~ipad` и
+   `@2x~ipad` в `+[UIImage imageNamed:]`.
+
+6) src/crash_handler.rs, tests/integration.rs, AGENTS.md, issue-completeness.js:
+   Сделать `crash_handler::install()` однократным (`Once`), починить строку
+   `"-fno-objc-arc-exceptions"`, обновить правила `AGENTS.md` и смягчить
+   фильтр авто-закрытия ишью.
+================================================================================
