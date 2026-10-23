@@ -128,7 +128,18 @@ impl AudioStreamBasicDescription {
                     _reserved: 0,
                 }
             }
-            AudioFormat::MpegLayer3 => AudioStreamBasicDescription {
+            AudioFormat::AppleIma4 => AudioStreamBasicDescription {
+                sample_rate,
+                format_id: kAudioFormatAppleIMA4,
+                format_flags: 0,
+                bytes_per_packet,
+                frames_per_packet,
+                bytes_per_frame: 0,
+                channels_per_frame,
+                bits_per_channel,
+                _reserved: 0,
+            },
+AudioFormat::MpegLayer3 => AudioStreamBasicDescription {
                 sample_rate,
                 format_id: kAudioFormatMPEGLayer3,
                 format_flags: 0,

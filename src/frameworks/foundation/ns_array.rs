@@ -1344,22 +1344,21 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())removeObject:(id)object {
-    // Single pass: partition out every element that -isEqual:s the argument.
-    // Note this is O(n) — sending -isEqual: while rebuilding the Vec, not
-    // removing indices one by one (which was O(n^2)).
-    let mut host_object: ArrayHostObject = std::mem::take(env.objc.borrow_mut(this));
-    let mut old_array = std::mem::take(&mut host_object.array);
-    let mut new_array = Vec::with_capacity(old_array.len());
-    for curr_object in old_array.drain(..) {
-        let equal: bool = msg![env; object isEqual:curr_object];
-        if equal {
-            release(env, curr_object);
-        } else {
-            new_array.push(curr_object);
-        }
+    // Complete equality checks while every element is still owned by the
+    // array. Releasing a match during this scan can destroy `object` before
+    // later comparisons; hiding the array also breaks re-entrant observers.
+    let count: NSUInteger = msg![env; this count];
+    let mut indices = Vec::new();
+    for index in 0..count {
+        let current: id = msg![env; this objectAtIndex:index];
+        let equal = current == object || msg![env; current isEqual:object];
+        if equal { indices.push(index); }
     }
-    host_object.array = new_array;
-    *env.objc.borrow_mut(this) = host_object;
+    // Dispatch through the primitive so CFArray's non-retaining subclass
+    // keeps its ownership policy. Descending indices preserve duplicates.
+    for index in indices.into_iter().rev() {
+        () = msg![env; this removeObjectAtIndex:index];
+    }
 }
 
 - (())removeObjectAtIndex:(NSUInteger)index {
@@ -1432,7 +1431,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         release(env, object);
     }
 
-    env.objc.borrow_mut::<ArrayHostObject>(this).array = Vec::new()
+    // Deallocation callbacks may have registered new objects in this array.
+    // The original contents were already detached before releasing them.
 }
 
 // Apple docs: Returns an array that lists the receiving array's elements in
@@ -1488,6 +1488,10 @@ pub const CLASSES: ClassExports = objc_classes! {
         return;
     }
     env.objc.borrow_mut::<ArrayHostObject>(this).array.remove(index as usize);
+}
+
+- (())removeAllObjects {
+    env.objc.borrow_mut::<ArrayHostObject>(this).array.clear();
 }
 
 - (())removeLastObject {
@@ -1592,4 +1596,103 @@ fn mutable_copy_inner(env: &mut Environment, arr: id) -> id {
     }
     env.objc.borrow_mut::<ArrayHostObject>(mut_arr).array = array;
     mut_arr
+}
+
+#[cfg(test)]
+mod removal_regression_tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_keeps_array_visible_during_comparison_and_honors_ownership() {
+        // Removing a defeated game object must finish comparisons before any
+        // matching object can be deallocated. Equality methods may inspect
+        // the array; CF-backed non-retaining arrays must not release entries.
+        // https://developer.apple.com/documentation/foundation/nsmutablearray/remove(_:)
+        let mut environment = Environment::new_for_framework_tests().unwrap();
+        let env = &mut environment;
+        let array: id = msg_class![env; NSMutableArray new];
+        let object: id = msg_class![env; NSObject new];
+        let before: id = msg_class![env; NSObject new];
+        let after: id = msg_class![env; NSObject new];
+        for value in [before, object, after] {
+            () = msg![env; array addObject:value];
+            release(env, value);
+        }
+        let count_sel = env.objc.register_host_selector("count".to_owned(), &mut env.mem);
+        let equal_sel = env.objc.register_host_selector("isEqual:".to_owned(), &mut env.mem);
+        let class = env.objc.get_known_class("NSObject", &mut env.mem);
+        let trampoline = env.dyld.create_proc_address(&mut env.mem, &mut env.cpu, "_objc_msgSend").unwrap();
+        let observed = env.mem.alloc_and_write(0u32);
+        // A small ARM equality method records [array count], then compares
+        // self and the argument. This exercises the actual ObjC dispatch and
+        // lifetime paths without launching a game or requiring an iOS SDK.
+        let words = [
+            0xe92d4070u32, 0xe1a04000, 0xe1a05002, 0xe59f0020,
+            0xe59f1020, 0xe59fc020, 0xe12fff3c, 0xe59fc01c,
+            0xe58c0000, 0xe1540005, 0x03a00001, 0x13a00000, 0xe8bd8070,
+            array.to_bits(), count_sel.to_bits(), trampoline.addr_with_thumb_bit(), observed.to_bits(),
+        ];
+        let code = env.mem.alloc((words.len() * 4) as u32).cast::<u32>();
+        for (i, word) in words.into_iter().enumerate() { env.mem.write(code + i as u32, word); }
+        env.cpu.invalidate_cache_range(code.to_bits(), (words.len() * 4) as u32);
+        let types = env.mem.alloc_and_write_cstr(b"c12@0:4@8");
+        let old = crate::objc::class_replaceMethod(env, class, equal_sel, code.cast_const().cast(), types.cast_const());
+        () = msg![env; array removeObject:object];
+        assert_eq!(env.mem.read(observed), 3, "the array was hidden while comparing its elements");
+        let count: u32 = msg![env; array count];
+        assert_eq!(count, 2);
+        crate::objc::class_replaceMethod(env, class, equal_sel, old, types.cast_const());
+        release(env, array);
+        env.mem.free(code.cast());
+        env.mem.free(types.cast());
+        env.mem.free(observed.cast());
+
+        // A deallocation callback can register another object in the same
+        // array (for example, a replacement scheduler/cleanup task). That
+        // registration must survive the removal that triggered the callback.
+        for remove_all in [false, true] {
+        let array: id = msg_class![env; NSMutableArray new];
+        let object: id = msg_class![env; NSObject new];
+        let marker: id = msg_class![env; NSObject new];
+        () = msg![env; array addObject:object];
+        release(env, object);
+        let add = env.objc.register_host_selector("addObject:".to_owned(), &mut env.mem);
+        let dealloc = env.objc.register_host_selector("dealloc".to_owned(), &mut env.mem);
+        let words = [0xe92d4010u32, 0xe59f0010, 0xe59f1010, 0xe59f2010,
+            0xe59fc010, 0xe12fff3c, 0xe8bd8010, array.to_bits(), add.to_bits(),
+            marker.to_bits(), trampoline.addr_with_thumb_bit()];
+        let code = env.mem.alloc((words.len() * 4) as u32).cast::<u32>();
+        for (i, word) in words.into_iter().enumerate() { env.mem.write(code + i as u32, word); }
+        env.cpu.invalidate_cache_range(code.to_bits(), (words.len() * 4) as u32);
+        let types = env.mem.alloc_and_write_cstr(b"v8@0:4");
+        let old = crate::objc::class_replaceMethod(env, class, dealloc, code.cast_const().cast(), types.cast_const());
+        if remove_all { () = msg![env; array removeAllObjects]; }
+        else { () = msg![env; array removeObject:object]; }
+        let count: u32 = msg![env; array count];
+        assert_eq!(count, 1, "re-entrant cleanup registration was overwritten");
+        let remaining: id = msg![env; array objectAtIndex:0u32];
+        assert_eq!(remaining, marker);
+        crate::objc::class_replaceMethod(env, class, dealloc, old, types.cast_const());
+        // The fixture's dealloc IMP only performs its observable callback.
+        // Finish its destruction explicitly once the real IMP is restored.
+        env.objc.dealloc_object(object, &mut env.mem);
+        release(env, array);
+        release(env, marker);
+        env.mem.free(code.cast());
+        env.mem.free(types.cast());
+
+        }
+
+        let raw = id::from_bits(0x12345678);
+        let array: id = msg_class![env; _touchHLE_NSMutableArray_non_retaining new];
+        () = msg![env; array addObject:raw];
+        () = msg![env; array removeObject:raw];
+        let count: u32 = msg![env; array count];
+        assert_eq!(count, 0);
+        () = msg![env; array addObject:raw];
+        () = msg![env; array removeAllObjects];
+        let count: u32 = msg![env; array count];
+        assert_eq!(count, 0);
+        release(env, array);
+    }
 }

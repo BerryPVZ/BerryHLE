@@ -234,6 +234,7 @@ fn describe_format(description: &crate::audio::AudioDescription) -> AudioStreamB
         format_id: match description.format {
             AudioFormat::Mpeg4Aac => fourcc(b"aac "),
             AudioFormat::MpegLayer3 => fourcc(b".mp3"),
+            AudioFormat::AppleIma4 => fourcc(b"ima4"),
             AudioFormat::LinearPcm { .. } => fourcc(b"lpcm"),
         },
         format_flags: 0,
@@ -397,6 +398,7 @@ pub fn AudioFileStreamParseBytes(
     let file_type = match description.format {
         AudioFormat::Mpeg4Aac => fourcc(b"aac "),
         AudioFormat::MpegLayer3 => fourcc(b".mp3"),
+            AudioFormat::AppleIma4 => fourcc(b"ima4"),
         AudioFormat::LinearPcm { .. } => fourcc(b"lpcm"),
     };
 

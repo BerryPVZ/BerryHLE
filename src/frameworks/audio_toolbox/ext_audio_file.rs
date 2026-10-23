@@ -810,7 +810,18 @@ fn build_asbd(audio_file: &AudioFileHostObject) -> AudioStreamBasicDescription {
                     bits_per_channel,
                     _reserved: 0,
                 },
-                audio::AudioFormat::MpegLayer3 => AudioStreamBasicDescription {
+                audio::AudioFormat::AppleIma4 => AudioStreamBasicDescription {
+                    sample_rate,
+                    format_id: fourcc(b"ima4"),
+                    format_flags: 0,
+                    bytes_per_packet,
+                    frames_per_packet,
+                    bytes_per_frame: 0,
+                    channels_per_frame,
+                    bits_per_channel,
+                    _reserved: 0,
+                },
+audio::AudioFormat::MpegLayer3 => AudioStreamBasicDescription {
                     sample_rate,
                     format_id: fourcc(b".mp3"),
                     format_flags: 0,

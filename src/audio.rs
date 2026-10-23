@@ -38,6 +38,8 @@ pub enum AudioFormat {
     Mpeg4Aac,
     /// MPEG-1/2 Audio Layer III. Each packet is one frame, header included.
     MpegLayer3,
+    /// Native Apple IMA4 packets, 64 frames per 34-byte channel block.
+    AppleIma4,
 }
 
 #[derive(Debug)]
@@ -108,6 +110,7 @@ impl Clone for AudioFile {
         let inner = match self.inner {
             AudioFileInner::Mp3(ref mp3) => AudioFileInner::Mp3(mp3.clone()),
             AudioFileInner::Aac(ref aac) => AudioFileInner::Aac(aac.clone()),
+            AudioFileInner::Ima4(ref packets) => AudioFileInner::Ima4(packets.clone()),
             AudioFileInner::Symphonia(ref pcm) => AudioFileInner::Symphonia(pcm.clone()),
             AudioFileInner::Wave(_) => Self::parse_inner(self.raw_data.as_ref().clone()).unwrap(),
         };
@@ -147,6 +150,12 @@ impl AudioFile {
                     AudioFileInner::Aac(aac.clone())
                 }
             }
+            AudioFileInner::Ima4(ref packets) => AudioFileInner::Symphonia(
+                symphonia_formats::SymphoniaDecodedToPcm {
+                    bytes: decode_ima4_packets(&packets.packet_bytes, packets.channels_per_frame).unwrap(),
+                    sample_rate: packets.sample_rate as u32,
+                    channels: packets.channels_per_frame,
+                }),
             AudioFileInner::Symphonia(ref pcm) => AudioFileInner::Symphonia(pcm.clone()),
             AudioFileInner::Wave(_) => Self::parse_inner(self.raw_data.as_ref().clone()).unwrap(),
         };
@@ -161,6 +170,7 @@ enum AudioFileInner {
     Wave(hound::WavReader<Cursor<Vec<u8>>>),
     Symphonia(symphonia_formats::SymphoniaDecodedToPcm),
     Aac(CompressedPackets),
+    Ima4(CompressedPackets),
     /// Only produced by [AudioFile::read_mp3_packets_from_vec].
     Mp3(CompressedPackets),
 }
@@ -241,7 +251,7 @@ impl AudioFile {
     /// Decode packet-based formats for Extended Audio File Services, leaving
     /// the original compressed packets available to Audio File Services.
     pub fn decoded_packet_file(&self) -> Result<Option<Self>, ()> {
-        if !matches!(&self.inner, AudioFileInner::Aac(_) | AudioFileInner::Mp3(_)) {
+        if !matches!(&self.inner, AudioFileInner::Aac(_) | AudioFileInner::Mp3(_) | AudioFileInner::Ima4(_)) {
             return Ok(None);
         }
         let decoded = self.clone_decoded_to_pcm();
@@ -327,6 +337,9 @@ impl AudioFile {
         //    ExtAudioFile / AudioServices / AudioQueue `decode_buffer`'s
         //    LPCM branch) handles them uniformly.
         if bytes.len() >= 4 && &bytes[..4] == b"caff" {
+            if let Some(packets) = try_parse_caf_ima4(&bytes) {
+                return Ok(AudioFileInner::Ima4(packets));
+            }
             if let Some(aac) = try_parse_caf_aac(&bytes) {
                 return Ok(AudioFileInner::Aac(aac));
             }
@@ -422,6 +435,14 @@ impl AudioFile {
                 channels_per_frame: aac.channels_per_frame,
                 bits_per_channel: 0,
             },
+            AudioFileInner::Ima4(ref packets) => AudioDescription {
+                sample_rate: packets.sample_rate,
+                format: AudioFormat::AppleIma4,
+                bytes_per_packet: 34 * packets.channels_per_frame,
+                frames_per_packet: 64,
+                channels_per_frame: packets.channels_per_frame,
+                bits_per_channel: 0,
+            },
             AudioFileInner::Mp3(ref mp3) => AudioDescription {
                 sample_rate: mp3.sample_rate,
                 format: AudioFormat::MpegLayer3,
@@ -436,7 +457,7 @@ impl AudioFile {
     /// The packets of this file, if it is in a compressed format.
     pub fn compressed_packets(&self) -> Option<&CompressedPackets> {
         match self.inner {
-            AudioFileInner::Aac(ref packets) | AudioFileInner::Mp3(ref packets) => Some(packets),
+            AudioFileInner::Aac(ref packets) | AudioFileInner::Mp3(ref packets) | AudioFileInner::Ima4(ref packets) => Some(packets),
             _ => None,
         }
     }
@@ -483,7 +504,7 @@ impl AudioFile {
                 ref bytes,
                 ..
             }) => bytes.len() as u64,
-            AudioFileInner::Aac(ref packets) | AudioFileInner::Mp3(ref packets) => {
+            AudioFileInner::Aac(ref packets) | AudioFileInner::Mp3(ref packets) | AudioFileInner::Ima4(ref packets) => {
                 packets.byte_count()
             }
         }
@@ -495,10 +516,16 @@ impl AudioFile {
             | AudioFileInner::Symphonia(symphonia_formats::SymphoniaDecodedToPcm { .. }) => {
                 self.byte_count() / u64::from(self.packet_size_fixed())
             }
-            AudioFileInner::Aac(ref packets) | AudioFileInner::Mp3(ref packets) => {
+            AudioFileInner::Aac(ref packets) | AudioFileInner::Mp3(ref packets) | AudioFileInner::Ima4(ref packets) => {
                 packets.packet_count()
             }
         }
+    }
+
+    /// Raw-file offset for native CAF IMA4 packet reads through guest I/O.
+    pub fn native_ima4_data_offset(&self) -> Option<u64> {
+        if !matches!(self.inner, AudioFileInner::Ima4(_)) { return None; }
+        Some(caf_audio_data_range(&self.raw_data)?.start as u64)
     }
 
     pub fn packet_size_fixed(&self) -> u32 {
@@ -511,7 +538,7 @@ impl AudioFile {
     pub fn packet_size_upper_bound(&self) -> u32 {
         match self.inner {
             // Variable packet size: report the largest actual packet.
-            AudioFileInner::Aac(ref packets) | AudioFileInner::Mp3(ref packets) => {
+            AudioFileInner::Aac(ref packets) | AudioFileInner::Mp3(ref packets) | AudioFileInner::Ima4(ref packets) => {
                 packets.packet_size_upper_bound()
             }
             _ => self.packet_size_fixed(),
@@ -574,7 +601,7 @@ impl AudioFile {
                 buffer[..bytes_to_read].copy_from_slice(bytes);
                 Ok(bytes_to_read)
             }
-            AudioFileInner::Aac(ref packets) | AudioFileInner::Mp3(ref packets) => {
+            AudioFileInner::Aac(ref packets) | AudioFileInner::Mp3(ref packets) | AudioFileInner::Ima4(ref packets) => {
                 packets.read_bytes(offset, buffer)
             }
         }
@@ -1299,5 +1326,104 @@ mod compressed_pcm_tests {
             file.audio_description().format,
             AudioFormat::Mpeg4Aac
         ));
+    }
+}
+
+/// Decode complete Apple IMA4 packets into interleaved signed 16-bit PCM.
+/// CAF specification, Table 2-5:
+/// https://developer.apple.com/library/archive/documentation/MusicAudio/Reference/CAFSpec/CAF_chunks/CAF_chunks.html
+pub fn decode_ima4_packets(bytes: &[u8], channels: u32) -> Option<Vec<u8>> {
+    if !(1..=2).contains(&channels) || bytes.len() % (34 * channels as usize) != 0 {
+        return None;
+    }
+    let mut pcm = Vec::new();
+    for packet in bytes.chunks_exact(34 * channels as usize) {
+        let planes: Vec<_> = packet.chunks_exact(34)
+            .map(|block| decode_ima4(block.try_into().unwrap())).collect();
+        for frame in 0..64 {
+            for plane in &planes { pcm.extend_from_slice(&plane[frame].to_le_bytes()); }
+        }
+    }
+    Some(pcm)
+}
+
+fn try_parse_caf_ima4(bytes: &[u8]) -> Option<CompressedPackets> {
+    let reader = caf::CafPacketReader::new(Cursor::new(bytes.to_vec()), vec![]).ok()?;
+    let desc = reader.audio_desc.clone();
+    if desc.format_id != caf::FormatType::AppleIma4 || !(1..=2).contains(&desc.channels_per_frame)
+        || desc.frames_per_packet != 64 || !desc.sample_rate.is_finite() || desc.sample_rate <= 0.0
+        || desc.bytes_per_packet != 34 * desc.channels_per_frame { return None; }
+    let packet_size = desc.bytes_per_packet as usize;
+    let mut packet_bytes = bytes.get(caf_audio_data_range(bytes)?)?.to_vec();
+    packet_bytes.truncate(packet_bytes.len() / packet_size * packet_size);
+    let packet_offsets = (0..=packet_bytes.len() / packet_size).map(|i| i * packet_size).collect();
+    Some(CompressedPackets { sample_rate: desc.sample_rate, channels_per_frame: desc.channels_per_frame,
+        frames_per_packet: 64, packet_bytes, packet_offsets, magic_cookie: Vec::new() })
+}
+
+fn caf_audio_data_range(bytes: &[u8]) -> Option<std::ops::Range<usize>> {
+    if bytes.get(..4)? != b"caff" { return None; }
+    let mut offset = 8usize;
+    while offset.checked_add(12)? <= bytes.len() {
+        let kind = bytes.get(offset..offset + 4)?;
+        let size = i64::from_be_bytes(bytes.get(offset + 4..offset + 12)?.try_into().ok()?);
+        let start = offset + 12;
+        let end = if size == -1 && kind == b"data" { bytes.len() }
+            else { start.checked_add(usize::try_from(size).ok()?)? };
+        if end > bytes.len() { return None; }
+        if kind == b"data" { return (end >= start + 4).then_some(start + 4..end); }
+        offset = end;
+    }
+    None
+}
+
+#[cfg(test)]
+mod native_ima4_tests {
+    use super::*;
+
+    #[test]
+    fn caf_packet_metadata_and_raw_callback_offsets_match_original_memory() {
+        // PopCap aliases its guest-backed CAF after a one-packet read. The
+        // description, packet count and packet bytes must describe that CAF,
+        // while ExtAudioFile still exposes decoded PCM for its reads.
+        // https://developer.apple.com/library/archive/documentation/MusicAudio/Reference/CAFSpec/CAF_chunks/CAF_chunks.html
+        for channels in [1, 2] {
+            for unknown_size in [false, true] {
+                let mut packets = Vec::new();
+                for channel in 0..channels {
+                    let samples = std::array::from_fn(|i| ((i as i32 - 32) * (200 + channel * 100)) as i16);
+                    packets.extend_from_slice(&encode_ima4(&samples));
+                }
+                let mut caf = b"caff\0\x01\0\0desc".to_vec();
+                caf.extend_from_slice(&32i64.to_be_bytes());
+                caf.extend_from_slice(&22000f64.to_be_bytes());
+                caf.extend_from_slice(b"ima4");
+                for n in [0u32, 34 * channels as u32, 64, channels as u32, 0] { caf.extend_from_slice(&n.to_be_bytes()); }
+                caf.extend_from_slice(b"free");
+                caf.extend_from_slice(&3i64.to_be_bytes());
+                caf.extend_from_slice(&[0, 0, 0]);
+                caf.extend_from_slice(b"data");
+                caf.extend_from_slice(&(if unknown_size { -1i64 } else { packets.len() as i64 + 4 }).to_be_bytes());
+                caf.extend_from_slice(&0u32.to_be_bytes());
+                let offset = caf.len();
+                caf.extend_from_slice(&packets);
+                let mut file = AudioFile::read_from_vec(caf.clone()).unwrap();
+                let desc = file.audio_description();
+                assert!(matches!(desc.format, AudioFormat::AppleIma4));
+                assert_eq!(desc.frames_per_packet, 64);
+                assert_eq!(file.packet_count(), 1);
+                assert_eq!(file.byte_count(), packets.len() as u64);
+                assert_eq!(file.native_ima4_data_offset(), Some(offset as u64));
+                let mut read = vec![0; packets.len()];
+                assert_eq!(file.read_bytes(0, &mut read), Ok(packets.len()));
+                assert_eq!(read, caf[offset..]);
+                let mut decoded = file.decoded_packet_file().unwrap().unwrap();
+                let expected = decode_ima4_packets(&packets, channels as u32).unwrap();
+                let mut actual = vec![0; expected.len()];
+                assert_eq!(decoded.read_bytes(0, &mut actual), Ok(expected.len()));
+                assert_eq!(actual, expected);
+                assert_eq!(decoded.packet_count(), 64);
+            }
+        }
     }
 }

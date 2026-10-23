@@ -28,6 +28,7 @@ use std::collections::HashMap;
 #[derive(Default)]
 pub struct State {
     pub audio_files: HashMap<AudioFileID, AudioFileHostObject>,
+    read_callbacks: HashMap<AudioFileID, (GuestFunction, MutVoidPtr)>,
 }
 impl State {
     pub fn get(framework_state: &mut crate::frameworks::State) -> &mut Self {
@@ -670,6 +671,7 @@ pub fn AudioFileOpenWithCallbacks(
     State::get(&mut env.framework_state)
         .audio_files
         .insert(guest_audio_file, host_object);
+    State::get(&mut env.framework_state).read_callbacks.insert(guest_audio_file, (read_callback, client_data));
     if !out_audio_file.is_null() {
         env.mem.write(out_audio_file, guest_audio_file);
     }
@@ -678,6 +680,7 @@ pub fn AudioFileOpenWithCallbacks(
 }
 
 pub fn AudioFileClose(env: &mut Environment, in_audio_file: AudioFileID) -> OSStatus {
+    State::get(&mut env.framework_state).read_callbacks.remove(&in_audio_file);
     return_if_null!(in_audio_file);
 
     let Some(host_object) = State::get(&mut env.framework_state)
@@ -881,6 +884,43 @@ fn read_packets(
     return_if_null!(in_audio_file);
     if io_num_packets.is_null() {
         return paramErr;
+    }
+
+    // Keep guest-backed native packet reads observable. Some loaders borrow
+    // their original CAF memory after inspecting the read callback's position.
+    // Serving predecoded PCM while leaving that position unchanged makes them
+    // treat container headers/ADPCM as PCM samples.
+    let native_read = {
+        let state = State::get(&mut env.framework_state);
+        state.read_callbacks.get(&in_audio_file).copied().and_then(|callback| {
+            let AudioFileHostObject::Real(file) = state.audio_files.get(&in_audio_file)? else { return None; };
+            Some((callback, file.native_ima4_data_offset()?, file.packet_size_fixed()))
+        })
+    };
+    if let Some(((callback, client), data_offset, packet_size)) = native_read {
+        if in_starting_packet < 0 { return kAudioFileInvalidPacketOffsetError; }
+        let mut packets = env.mem.read(io_num_packets);
+        if let Some(capacity) = byte_capacity { packets = packets.min(capacity / packet_size); }
+        let Some(bytes) = packets.checked_mul(packet_size) else { return kAudioFileBadPropertySizeError; };
+        if bytes == 0 { env.mem.write(io_num_packets, 0); if !out_num_bytes.is_null() { env.mem.write(out_num_bytes, 0); } return 0; }
+        if out_buffer.is_null() { return paramErr; }
+        let Some(offset) = (in_starting_packet as u64).checked_mul(packet_size as u64).and_then(|x| x.checked_add(data_offset)).and_then(|x| i64::try_from(x).ok()) else { return kAudioFileInvalidPacketOffsetError; };
+        let actual = env.mem.alloc_and_write(0u32);
+        let status: OSStatus = callback.call_from_host(env, (client, offset, bytes, out_buffer, actual));
+        let read: u32 = env.mem.read(actual);
+        env.mem.free(actual.cast());
+        let read = read.min(bytes) / packet_size * packet_size;
+        env.mem.write(io_num_packets, read / packet_size);
+        if !out_num_bytes.is_null() { env.mem.write(out_num_bytes, read); }
+        if !out_packet_descriptions.is_null() {
+            let descriptions = out_packet_descriptions.cast::<AudioStreamPacketDescription>();
+            for i in 0..read / packet_size {
+                env.mem.write(descriptions + i, AudioStreamPacketDescription {
+                    mStartOffset: (i * packet_size) as i64, mVariableFramesInPacket: 0, mDataByteSize: packet_size,
+                });
+            }
+        }
+        return if status != 0 { status } else if read < bytes { eofErr } else { 0 };
     }
 
     // Food Fight's AudioPlayback callback checks OSStatus before the packet
@@ -1360,7 +1400,18 @@ pub fn AudioFileGetProperty(
                             bits_per_channel,
                             _reserved: 0,
                         },
-                        audio::AudioFormat::MpegLayer3 => AudioStreamBasicDescription {
+                        audio::AudioFormat::AppleIma4 => AudioStreamBasicDescription {
+                            sample_rate,
+                            format_id: fourcc(b"ima4"),
+                            format_flags: 0,
+                            bytes_per_packet,
+                            frames_per_packet,
+                            bytes_per_frame: 0,
+                            channels_per_frame,
+                            bits_per_channel,
+                            _reserved: 0,
+                        },
+audio::AudioFormat::MpegLayer3 => AudioStreamBasicDescription {
                             sample_rate,
                             format_id: fourcc(b".mp3"),
                             format_flags: 0,

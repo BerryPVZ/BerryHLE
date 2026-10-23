@@ -28,6 +28,13 @@ use crate::frameworks::core_audio_types::{
 use crate::mem::{ConstPtr, MutPtr, MutVoidPtr, SafeRead};
 use crate::Environment;
 
+mod ima4_converter;
+
+#[derive(Default)]
+pub struct State {
+    ima4: std::collections::HashMap<u32, ima4_converter::Stream>,
+}
+
 const kAudioConverterErr_InvalidInputSize: OSStatus = -50;
 const kAudioConverterErr_FormatNotSupported: OSStatus = fourcc(b"!cnv") as i32;
 
@@ -389,11 +396,13 @@ fn AudioConverterDispose(env: &mut Environment, in_audio_converter: AudioConvert
     if in_audio_converter.is_null() {
         return kAudioConverterErr_InvalidInputSize;
     }
+    env.framework_state.audio_toolbox.audio_converter.ima4.remove(&in_audio_converter.to_bits());
     env.mem.free(in_audio_converter.cast());
     0
 }
 
-fn AudioConverterReset(_env: &mut Environment, _in_audio_converter: AudioConverterRef) -> OSStatus {
+fn AudioConverterReset(env: &mut Environment, in_audio_converter: AudioConverterRef) -> OSStatus {
+    env.framework_state.audio_toolbox.audio_converter.ima4.remove(&in_audio_converter.to_bits());
     0
 }
 
@@ -621,6 +630,11 @@ fn AudioConverterFillComplexBuffer(
     }
 
     let converter: OpaqueAudioConverter = env.mem.read(in_audio_converter);
+    if converter.source_format.format_id == crate::frameworks::core_audio_types::kAudioFormatAppleIMA4 {
+        return ima4_converter::fill(env, in_audio_converter, &converter,
+            in_input_data_proc, in_input_data_proc_user_data,
+            io_output_data_packet_size, out_output_data);
+    }
     let src_shape = pcm_shape_from_asbd(&converter.source_format);
     let dst_shape = pcm_shape_from_asbd(&converter.dest_format);
 

@@ -1267,6 +1267,104 @@ impl Environment {
         Ok(env)
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_framework_tests() -> Result<Environment, String> {
+        let mut options = options::Options::default();
+        options.headless = true;
+        let bundle = bundle::Bundle::new_fake_bundle();
+        let fs = fs::Fs::new_fake_fs();
+
+        let startup_time = Instant::now();
+
+
+        let window = None;
+
+        let mut mem = mem::Mem::new();
+
+        let bins = Vec::new();
+
+        let mut objc = objc::ObjC::new();
+
+        let mut dyld = dyld::Dyld::new();
+
+        dyld.do_initial_linking_with_no_bins(&mut mem, &mut objc);
+
+        let cpu = cpu::Cpu::new(match options.direct_memory_access {
+            true => Some(&mut mem),
+            false => None,
+        });
+
+        let main_thread = Thread {
+            active: true,
+            blocked_by: ThreadBlock::NotBlocked,
+            return_value: None,
+            guest_context: None,
+            host_context: None,
+            stack: Some(mem::Mem::MAIN_THREAD_STACK_LOW_END..=mem::Mem::MAIN_THREAD_STACK_HIGH_END),
+            thread_local_framework_state: Default::default(),
+        };
+
+        let mut env = Environment {
+            startup_time,
+            guest_clock: crate::guest_clock::GuestClock::new(),
+            bundle: NullableBox::new(bundle),
+            fs: NullableBox::new(fs),
+            window,
+            openal_manager: NullableBox::new(OpenALManager::new()?),
+            mem: NullableBox::new(mem),
+            bins,
+            objc: NullableBox::new(objc),
+            dyld: NullableBox::new(dyld),
+            cpu: NullableBox::new(cpu),
+            current_thread: 0,
+            threads: vec![main_thread],
+            libc_state: Default::default(),
+            mutex_state: Default::default(),
+            framework_state: Default::default(),
+            options: NullableBox::new(options),
+            gdb_server: None,
+            env_vars: Default::default(),
+            dump_file: None,
+            is_app_picker: true,
+            yielder: std::ptr::null(),
+            remaining_ticks: None,
+            panic_cell: Rc::new(Cell::new(None)),
+            cpu_error_bypass_last: None,
+            cpu_error_bypass_count: 0,
+            cpu_error_bypass_total: 0,
+            cpu_error_bypass_last_lr: None,
+            cpu_error_bypass_lr_count: 0,
+            last_deliberate_trap_bypass: None,
+            cpu_skipped_instruction_sites: HashMap::new(),
+            guest_termination_requested: None,
+            missing_unity_player_archive: None,
+            guest_control_flow_redirected: false,
+            host_to_guest_stack_frames: Vec::new(),
+            trainer: crate::trainer::Trainer::new(false),
+        };
+
+        env.set_up_initial_env_vars();
+
+        // Dyld::do_late_linking() would be called here, but it doesn't do
+        // anything relevant here, so it's skipped.
+
+        {
+            let argv = &[];
+            let envp = &[];
+            let apple = &[];
+            stack::prep_stack_for_start(&mut env.mem, &mut env.cpu, argv, envp, apple, false);
+        }
+
+        env.cpu.set_cpsr(cpu::Cpu::CPSR_USER_MODE);
+
+        // GDB server setup would be done here, but there's no need for it.
+
+        // "CPU emulation begins now" would happen here, but there's nothing
+        // to emulate. :)
+
+        Ok(env)
+    }
+
     /// Create a new Environment to swap with.
     ///
     /// SAFETY: You must *NEVER, IN ANY CIRCUMSTANCE* dereference any fields or

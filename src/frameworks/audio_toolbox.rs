@@ -58,6 +58,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
 #[derive(Default)]
 pub struct State {
     audio_file: audio_file::State,
+    audio_converter: audio_converter::State,
     audio_file_stream: audio_file_stream::State,
     audio_queue: audio_queue::State,
     audio_components: audio_components::State,
