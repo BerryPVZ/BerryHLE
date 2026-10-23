@@ -561,6 +561,74 @@ int test_dispatch_after_f_default_mode(void) {
 int test_dispatch_after_common_mode(void) {
   return check_dispatch_after_source(NO, YES);
 }
+
+// Apple: global queues run work concurrently, and dispatch_async "returns
+// immediately after the block has been submitted and never waits for the
+// block to be invoked". The work below waits for its submitter to move on
+// after dispatch_async returns, as Noblemen: 1896 does (HyperHLE-Reborn
+// issue 307), so it deadlocks if the work runs on the submitting thread.
+// https://developer.apple.com/documentation/dispatch/1453057-dispatch_async
+extern dispatch_queue_t dispatch_get_global_queue(long identifier,
+                                                  unsigned long flags);
+extern void dispatch_async(dispatch_queue_t queue, void (^block)(void));
+extern void dispatch_async_f(dispatch_queue_t queue, void *context,
+                             void (*work)(void *));
+static pthread_mutex_t global_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t global_queue_cond = PTHREAD_COND_INITIALIZER;
+static int global_queue_state;
+static pthread_t global_queue_submitter;
+static int global_queue_work_thread; // 1: worker thread, -1: submitter
+static int global_queue_main_block;  // 1: main thread, -1: another thread
+static void global_queue_work(void *context) {
+  global_queue_work_thread =
+      pthread_equal(pthread_self(), global_queue_submitter) ? -1 : 1;
+  pthread_mutex_lock(&global_queue_mutex);
+  while (global_queue_state == 0)
+    pthread_cond_wait(&global_queue_cond, &global_queue_mutex);
+  global_queue_state = 2;
+  pthread_cond_broadcast(&global_queue_cond);
+  pthread_mutex_unlock(&global_queue_mutex);
+  // Main queue work submitted from a worker runs on the main thread.
+  dispatch_async(dispatch_get_main_queue(), ^{
+    global_queue_main_block =
+        pthread_equal(pthread_self(), global_queue_submitter) ? 1 : -1;
+  });
+}
+static int check_dispatch_async_global_queue(BOOL function) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  global_queue_state = 0;
+  global_queue_work_thread = 0;
+  global_queue_main_block = 0;
+  global_queue_submitter = pthread_self();
+  dispatch_queue_t queue = dispatch_get_global_queue(0, 0);
+  if (function)
+    dispatch_async_f(queue, NULL, global_queue_work);
+  else
+    dispatch_async(queue, ^{
+      global_queue_work(NULL);
+    });
+  pthread_mutex_lock(&global_queue_mutex);
+  global_queue_state = 1;
+  pthread_cond_broadcast(&global_queue_cond);
+  while (global_queue_state != 2)
+    pthread_cond_wait(&global_queue_cond, &global_queue_mutex);
+  pthread_mutex_unlock(&global_queue_mutex);
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
+  while (global_queue_main_block == 0 && [deadline timeIntervalSinceNow] > 0)
+    [[NSRunLoop mainRunLoop]
+           runMode:NSDefaultRunLoopMode
+        beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+  [pool drain];
+  if (global_queue_work_thread != 1)
+    return -1;
+  return global_queue_main_block == 1 ? 0 : -2;
+}
+int test_dispatch_async_global_queue(void) {
+  return check_dispatch_async_global_queue(NO);
+}
+int test_dispatch_async_f_global_queue(void) {
+  return check_dispatch_async_global_queue(YES);
+}
 extern int test_runloop_audio_queue(void);
 extern int test_runloop_audio_queue_null(void);
 extern int test_runloop_audio_unit_independent(void);
@@ -7507,6 +7575,8 @@ struct {
     FUNC_DEF(test_dispatch_after_default_mode),
     FUNC_DEF(test_dispatch_after_f_default_mode),
     FUNC_DEF(test_dispatch_after_common_mode),
+    FUNC_DEF(test_dispatch_async_global_queue),
+    FUNC_DEF(test_dispatch_async_f_global_queue),
     FUNC_DEF(test_runloop_audio_queue),
     FUNC_DEF(test_runloop_audio_queue_null),
     FUNC_DEF(test_runloop_audio_unit_independent),
