@@ -3,11 +3,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-//! A small, host-side App Store-style browser for the Internet Archive's
-//! `ipaarchive` collection. Network and file I/O run on worker threads; the
-//! emulated UIKit views are only touched from the picker/run-loop thread.
+//! Host-side App Store-style browser for the Internet Archive. Network and
+//! file I/O run on worker threads; UIKit objects stay on the picker thread.
 
-use super::{new_label, new_view, rect, ui_color, AppPickerDelegateHostObject};
+mod network;
+
+use super::{make_icon_from_text, new_label, new_view, rect, ui_color, AppPickerDelegateHostObject};
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_run_loop::run_run_loop_single_iteration;
 use crate::frameworks::foundation::{ns_string, NSInteger};
@@ -18,19 +19,54 @@ use crate::frameworks::uikit::ui_view::ui_control::{
 };
 use crate::objc::{id, msg, msg_class, nil, release};
 use crate::Environment;
-use serde_json::Value;
-use std::collections::HashSet;
-use std::io::{Read, Write};
+use network::{display_file_name, download_key, format_size};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-const COLLECTION_ID: &str = "ipaarchive";
-const CATALOG_ROWS: usize = 25;
-const ROW_HEIGHT: CGFloat = 62.0;
-const MAX_JSON_RESPONSE_SIZE: usize = 64 * 1024 * 1024;
+const CATALOG_ROWS: usize = 20;
+const CATALOG_ROW_HEIGHT: CGFloat = 86.0;
+const FILE_ROW_HEIGHT: CGFloat = 80.0;
+const DOWNLOAD_ROW_HEIGHT: CGFloat = 110.0;
+const TOOLBAR_HEIGHT: CGFloat = 48.0;
+const STATUS_HEIGHT: CGFloat = 30.0;
+const PAGER_HEIGHT: CGFloat = 36.0;
+const TAB_HEIGHT: CGFloat = 48.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CatalogSort {
+    Title,
+    Newest,
+    Oldest,
+}
+
+impl CatalogSort {
+    fn next(self) -> Self {
+        match self {
+            Self::Title => Self::Newest,
+            Self::Newest => Self::Oldest,
+            Self::Oldest => Self::Title,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Title => "A–Z",
+            Self::Newest => "Newest",
+            Self::Oldest => "Oldest",
+        }
+    }
+
+    fn query_value(self) -> &'static str {
+        match self {
+            Self::Title => "title asc",
+            Self::Newest => "publicdate desc",
+            Self::Oldest => "publicdate asc",
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 struct CatalogItem {
@@ -59,6 +95,10 @@ struct ArchiveFile {
 struct ItemDetails {
     identifier: String,
     title: String,
+    version: Option<String>,
+    creator: Option<String>,
+    date: Option<String>,
+    description: Option<String>,
     files: Vec<ArchiveFile>,
 }
 
@@ -93,12 +133,209 @@ enum StoreMessage {
     },
 }
 
-struct ActiveDownload {
-    generation: u64,
-    file_index: usize,
-    identifier: String,
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TaskState {
+    Queued,
+    Downloading,
+    Installed,
+    Failed,
+    Cancelled,
+}
+
+struct DownloadTask {
+    id: u64,
     key: String,
+    identifier: String,
+    title: String,
+    file: ArchiveFile,
+    state: TaskState,
+    downloaded: u64,
+    total: Option<u64>,
+    started: Option<Instant>,
+    path: Option<PathBuf>,
+    already_present: bool,
+    error: Option<String>,
     cancel: Arc<AtomicBool>,
+}
+
+impl DownloadTask {
+    fn new(id: u64, identifier: &str, title: &str, file: &ArchiveFile) -> Self {
+        Self {
+            id,
+            key: download_key(identifier, &file.name),
+            identifier: identifier.to_string(),
+            title: title.to_string(),
+            file: file.clone(),
+            state: TaskState::Queued,
+            downloaded: 0,
+            total: file.size,
+            started: None,
+            path: None,
+            already_present: false,
+            error: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn retry(&mut self) {
+        self.state = TaskState::Queued;
+        self.downloaded = 0;
+        self.total = self.file.size;
+        self.started = None;
+        self.path = None;
+        self.already_present = false;
+        self.error = None;
+        self.cancel.store(false, Ordering::Release);
+    }
+
+    fn fraction(&self) -> f64 {
+        if self.state == TaskState::Installed {
+            return 1.0;
+        }
+        self.total
+            .filter(|total| *total > 0)
+            .map(|total| self.downloaded as f64 / total as f64)
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0)
+    }
+}
+
+struct DownloadManager {
+    tasks: Vec<DownloadTask>,
+    active: Option<u64>,
+    next_id: u64,
+    downloaded_any: bool,
+}
+
+impl DownloadManager {
+    fn new() -> Self {
+        Self {
+            tasks: Vec::new(),
+            active: None,
+            next_id: 1,
+            downloaded_any: false,
+        }
+    }
+
+    fn task(&self, id: u64) -> Option<&DownloadTask> {
+        self.tasks.iter().find(|task| task.id == id)
+    }
+
+    fn task_mut(&mut self, id: u64) -> Option<&mut DownloadTask> {
+        self.tasks.iter_mut().find(|task| task.id == id)
+    }
+
+    fn active_task(&self) -> Option<&DownloadTask> {
+        self.active.and_then(|id| self.task(id))
+    }
+
+    fn state_for_key(&self, key: &str) -> Option<TaskState> {
+        self.tasks
+            .iter()
+            .find(|task| task.key == key)
+            .map(|task| task.state)
+    }
+
+    fn enqueue(&mut self, identifier: &str, title: &str, file: &ArchiveFile) -> bool {
+        let key = download_key(identifier, &file.name);
+        if let Some(task) = self.tasks.iter_mut().find(|task| task.key == key) {
+            match task.state {
+                TaskState::Queued | TaskState::Downloading | TaskState::Installed => return false,
+                TaskState::Failed | TaskState::Cancelled => {
+                    task.retry();
+                    return true;
+                }
+            }
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.tasks.push(DownloadTask::new(id, identifier, title, file));
+        true
+    }
+
+    fn start_next(&mut self, sender: &Sender<StoreMessage>, apps_dir: &Path) -> bool {
+        if self.active.is_some() {
+            return false;
+        }
+        let Some(task) = self
+            .tasks
+            .iter_mut()
+            .find(|task| task.state == TaskState::Queued)
+        else {
+            return false;
+        };
+        task.state = TaskState::Downloading;
+        task.started = Some(Instant::now());
+        let id = task.id;
+        let identifier = task.identifier.clone();
+        let file = task.file.clone();
+        let cancel = task.cancel.clone();
+        self.active = Some(id);
+        request_download(
+            sender,
+            id,
+            apps_dir.to_path_buf(),
+            identifier,
+            file,
+            cancel,
+        );
+        true
+    }
+
+    fn toggle(&mut self, id: u64) -> bool {
+        let Some(task) = self.task_mut(id) else {
+            return false;
+        };
+        match task.state {
+            TaskState::Downloading => task.cancel.store(true, Ordering::Release),
+            TaskState::Queued => task.state = TaskState::Cancelled,
+            TaskState::Failed | TaskState::Cancelled => task.retry(),
+            TaskState::Installed => return false,
+        }
+        true
+    }
+
+    fn retry_all(&mut self) -> bool {
+        let mut changed = false;
+        for task in &mut self.tasks {
+            if matches!(task.state, TaskState::Failed | TaskState::Cancelled) {
+                task.retry();
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn cancel_all(&mut self) {
+        for task in &mut self.tasks {
+            match task.state {
+                TaskState::Queued => task.state = TaskState::Cancelled,
+                TaskState::Downloading => task.cancel.store(true, Ordering::Release),
+                _ => (),
+            }
+        }
+    }
+
+    fn pending_count(&self) -> usize {
+        self.tasks
+            .iter()
+            .filter(|task| matches!(task.state, TaskState::Queued | TaskState::Downloading))
+            .count()
+    }
+
+    fn installed_count(&self) -> usize {
+        self.tasks
+            .iter()
+            .filter(|task| task.state == TaskState::Installed)
+            .count()
+    }
+
+    fn failed_count(&self) -> usize {
+        self.tasks
+            .iter()
+            .filter(|task| matches!(task.state, TaskState::Failed | TaskState::Cancelled))
+            .count()
+    }
 }
 
 #[derive(Default)]
@@ -110,8 +347,11 @@ struct StoreActions {
     back: bool,
     retry: bool,
     cancel: bool,
+    sort: bool,
     item: Option<NSInteger>,
     download: Option<NSInteger>,
+    tab: Option<NSInteger>,
+    queue_action: Option<NSInteger>,
 }
 
 fn take_actions(env: &mut Environment, delegate: id) -> StoreActions {
@@ -126,40 +366,24 @@ fn take_actions(env: &mut Environment, delegate: id) -> StoreActions {
         back: std::mem::take(&mut host.archive_store_back),
         retry: std::mem::take(&mut host.archive_store_retry),
         cancel: std::mem::take(&mut host.archive_store_cancel),
+        sort: std::mem::take(&mut host.archive_store_sort),
         item: std::mem::take(&mut host.archive_store_item),
         download: std::mem::take(&mut host.archive_store_download),
+        tab: std::mem::take(&mut host.archive_store_tab),
+        queue_action: std::mem::take(&mut host.archive_store_queue_action),
     }
-}
-
-struct StoreViews {
-    root: id,
-    delegate: id,
-    nav_title: id,
-    back_button: id,
-    search_field: id,
-    search_button: id,
-    status_label: id,
-    scroll_view: id,
-    previous_button: id,
-    next_button: id,
-    page_label: id,
-    retry_button: id,
-    progress_label: id,
-    progress_fill: id,
-    progress_width: CGFloat,
-    cancel_button: id,
-    rows: Vec<id>,
-    download_buttons: Vec<(usize, id)>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Screen {
-    Catalog,
+    Browse,
     Details,
+    Downloads,
 }
 
 struct CatalogState {
     query: String,
+    sort: CatalogSort,
     page: usize,
     total: u64,
     loading: bool,
@@ -172,6 +396,7 @@ impl CatalogState {
     fn new() -> Self {
         Self {
             query: String::new(),
+            sort: CatalogSort::Title,
             page: 1,
             total: 0,
             loading: false,
@@ -181,64 +406,33 @@ impl CatalogState {
         }
     }
 
-    fn load(
-        &mut self,
-        env: &mut Environment,
-        views: &mut StoreViews,
-        sender: &Sender<StoreMessage>,
-        page: usize,
-    ) {
+    fn load(&mut self, sender: &Sender<StoreMessage>, page: usize) {
         self.page = page.max(1);
         self.loading = true;
         self.error = None;
+        self.current = None;
         self.generation += 1;
-        clear_rows(env, views);
-        () = msg![env; (views.retry_button) setHidden:true];
-        let status = if self.query.is_empty() {
-            "Loading IPA archives…".to_string()
-        } else {
-            format!("Searching for “{}”…", self.query)
-        };
-        set_label(env, views.status_label, &status);
-        update_catalog_footer(env, views, self);
         request_catalog(
             sender,
             self.generation,
             self.query.clone(),
             self.page,
             CATALOG_ROWS,
+            self.sort,
         );
     }
 
-    fn show(&self, env: &mut Environment, views: &mut StoreViews) {
-        show_catalog_chrome(env, views);
-        clear_rows(env, views);
-        if let Some(page) = &self.current {
-            rebuild_catalog_rows(env, views, &page.items);
-            let status = if self.query.is_empty() {
-                format!(
-                    "{} archives • title A–Z • tap an entry to view IPA files",
-                    self.total
-                )
-            } else {
-                format!("{} results for “{}”", self.total, self.query)
-            };
-            set_label(env, views.status_label, &status);
-            () = msg![env; (views.retry_button) setHidden:true];
-        } else if let Some(error) = &self.error {
-            set_label(env, views.status_label, error);
-            () = msg![env; (views.retry_button) setHidden:false];
-        } else if self.loading {
-            set_label(env, views.status_label, "Loading IPA archives…");
-        }
-        update_catalog_footer(env, views, self);
+    fn page_count(&self) -> usize {
+        ((self.total as usize + CATALOG_ROWS - 1) / CATALOG_ROWS).max(1)
     }
 }
 
 struct DetailsState {
     item: Option<CatalogItem>,
     details: Option<ItemDetails>,
+    loading: bool,
     generation: u64,
+    error: Option<String>,
 }
 
 impl DetailsState {
@@ -246,35 +440,52 @@ impl DetailsState {
         Self {
             item: None,
             details: None,
+            loading: false,
             generation: 0,
+            error: None,
         }
     }
 
-    fn load(
-        &mut self,
-        env: &mut Environment,
-        views: &mut StoreViews,
-        sender: &Sender<StoreMessage>,
-        item: CatalogItem,
-    ) {
+    fn load(&mut self, sender: &Sender<StoreMessage>, item: CatalogItem) {
         self.generation += 1;
         self.details = None;
+        self.loading = true;
+        self.error = None;
         let identifier = item.identifier.clone();
-        let title = item.title.clone();
         self.item = Some(item);
-        show_details_chrome(env, views, &title);
-        clear_rows(env, views);
-        set_label(env, views.status_label, "Looking for downloadable IPA files…");
-        () = msg![env; (views.retry_button) setHidden:true];
         request_details(sender, self.generation, identifier);
     }
+}
 
-    fn show_error(&mut self, env: &mut Environment, views: &mut StoreViews, error: String) {
-        self.details = None;
-        clear_rows(env, views);
-        set_label(env, views.status_label, &error);
-        () = msg![env; (views.retry_button) setHidden:false];
-    }
+struct DownloadProgressViews {
+    id: u64,
+    label: id,
+    fill: id,
+    width: CGFloat,
+}
+
+struct StoreViews {
+    root: id,
+    delegate: id,
+    nav_title: id,
+    nav_subtitle: id,
+    back_button: id,
+    toolbar: id,
+    search_field: id,
+    sort_button: id,
+    status_label: id,
+    scroll_view: id,
+    pager: id,
+    previous_button: id,
+    next_button: id,
+    page_label: id,
+    browse_tab: id,
+    downloads_tab: id,
+    width: CGFloat,
+    full_height: CGFloat,
+    nav_height: CGFloat,
+    rows: Vec<id>,
+    download_progress: Vec<DownloadProgressViews>,
 }
 
 /// Open the store as a modal picker screen. The return value tells the home
@@ -289,62 +500,46 @@ pub(super) fn run_archive_store(
 ) -> bool {
     let mut views = build_store_views(env, delegate, parent, app_frame);
     let (sender, receiver) = mpsc::channel();
-    let mut screen = Screen::Catalog;
+    let mut screen = Screen::Browse;
     let mut catalog = CatalogState::new();
     let mut details = DetailsState::new();
-    let mut active_download: Option<ActiveDownload> = None;
-    let mut download_generation = 0u64;
-    let mut downloaded_keys = HashSet::new();
-    let mut downloaded_any = false;
-    let mut close_after_download = false;
+    let mut downloads = DownloadManager::new();
+    let mut closing = false;
     let mut finished = false;
+    let mut dirty = true;
 
-    catalog.load(env, &mut views, &sender, 1);
-
+    catalog.load(&sender, 1);
     while !finished {
         run_run_loop_single_iteration(env, run_loop);
         drain_messages(
             env,
             &receiver,
             &mut views,
-            &mut screen,
+            screen,
             &mut catalog,
             &mut details,
-            &mut active_download,
-            &mut downloaded_keys,
-            &mut downloaded_any,
-            &mut close_after_download,
-            &mut finished,
+            &mut downloads,
+            &mut dirty,
         );
 
-        if finished {
-            break;
-        }
         let actions = take_actions(env, delegate);
-
-        if actions.close {
-            if let Some(active) = &active_download {
-                active.cancel.store(true, Ordering::Release);
-                close_after_download = true;
-                set_label(env, views.progress_label, "Cancelling download…");
-                set_button_enabled(env, views.cancel_button, false);
-            } else {
+        if closing {
+            if downloads.active.is_none() {
                 finished = true;
             }
-        }
-        if close_after_download || finished {
-            continue;
-        }
-
-        if actions.cancel {
-            if let Some(active) = &active_download {
-                active.cancel.store(true, Ordering::Release);
-                set_label(env, views.progress_label, "Cancelling download…");
-                set_button_enabled(env, views.cancel_button, false);
+        } else if actions.close {
+            closing = true;
+            downloads.cancel_all();
+            dirty = true;
+            if downloads.active.is_none() {
+                finished = true;
             }
-        }
-
-        if actions.search {
+        } else if actions.cancel {
+            if let Some(active) = downloads.active_task() {
+                active.cancel.store(true, Ordering::Release);
+                dirty = true;
+            }
+        } else if actions.search {
             let text: id = msg![env; (views.search_field) text];
             let query = if text == nil {
                 String::new()
@@ -353,36 +548,49 @@ pub(super) fn run_archive_store(
             };
             let _: bool = msg![env; (views.search_field) resignFirstResponder];
             catalog.query = query.trim().to_string();
-            screen = Screen::Catalog;
-            details.generation += 1;
-            catalog.load(env, &mut views, &sender, 1);
-        } else if actions.previous && screen == Screen::Catalog {
+            screen = Screen::Browse;
+            catalog.load(&sender, 1);
+            dirty = true;
+        } else if actions.previous && screen == Screen::Browse {
             if !catalog.loading && catalog.page > 1 {
-                catalog.load(env, &mut views, &sender, catalog.page - 1);
+                catalog.load(&sender, catalog.page - 1);
+                dirty = true;
             }
-        } else if actions.next && screen == Screen::Catalog {
-            if !catalog.loading && catalog_page_count(&catalog) > catalog.page {
-                catalog.load(env, &mut views, &sender, catalog.page + 1);
+        } else if actions.next && screen == Screen::Browse {
+            if !catalog.loading && catalog.page_count() > catalog.page {
+                catalog.load(&sender, catalog.page + 1);
+                dirty = true;
             }
         } else if actions.back && screen == Screen::Details {
+            screen = Screen::Browse;
+            dirty = true;
+        } else if let Some(tab) = actions.tab {
             let _: bool = msg![env; (views.search_field) resignFirstResponder];
-            details.generation += 1;
-            screen = Screen::Catalog;
-            catalog.show(env, &mut views);
+            screen = if tab == 1 {
+                Screen::Downloads
+            } else {
+                Screen::Browse
+            };
+            dirty = true;
+        } else if actions.sort && screen == Screen::Browse {
+            catalog.sort = catalog.sort.next();
+            catalog.load(&sender, 1);
+            dirty = true;
         } else if actions.retry {
             match screen {
-                Screen::Catalog => {
-                    let page = catalog.page;
-                    catalog.load(env, &mut views, &sender, page);
-                }
+                Screen::Browse => catalog.load(&sender, catalog.page),
                 Screen::Details => {
                     if let Some(item) = details.item.clone() {
-                        details.load(env, &mut views, &sender, item);
+                        details.load(&sender, item);
                     }
                 }
+                Screen::Downloads => {
+                    downloads.retry_all();
+                }
             }
+            dirty = true;
         } else if let Some(index) = actions.item {
-            if screen == Screen::Catalog && !catalog.loading {
+            if screen == Screen::Browse && !catalog.loading {
                 let item = catalog
                     .current
                     .as_ref()
@@ -390,49 +598,38 @@ pub(super) fn run_archive_store(
                     .cloned();
                 if let Some(item) = item {
                     screen = Screen::Details;
-                    details.load(env, &mut views, &sender, item);
+                    details.load(&sender, item);
+                    dirty = true;
                 }
             }
         } else if let Some(index) = actions.download {
             if screen == Screen::Details {
-                if active_download.is_some() {
-                    set_label(
-                        env,
-                        views.progress_label,
-                        "Please wait for the current download to finish.",
-                    );
-                } else if let Some(item_details) = &details.details {
+                if let Some(item_details) = &details.details {
                     let file = item_details.files.get(index.max(0) as usize).cloned();
                     if let Some(file) = file {
-                        download_generation += 1;
-                        let key = download_key(&item_details.identifier, &file.name);
-                        let cancel = Arc::new(AtomicBool::new(false));
-                        active_download = Some(ActiveDownload {
-                            generation: download_generation,
-                            file_index: index.max(0) as usize,
-                            identifier: item_details.identifier.clone(),
-                            key,
-                            cancel: cancel.clone(),
-                        });
-                        () = msg![env; (views.cancel_button) setHidden:false];
-                        set_button_enabled(env, views.cancel_button, true);
-                        set_download_progress(env, &views, 0, file.size);
-                        set_label(
-                            env,
-                            views.progress_label,
-                            &format!("Starting {}…", display_file_name(&file.name)),
-                        );
-                        request_download(
-                            &sender,
-                            download_generation,
-                            apps_dir.to_path_buf(),
-                            item_details.identifier.clone(),
-                            file,
-                            cancel,
-                        );
+                        downloads.enqueue(&item_details.identifier, &item_details.title, &file);
+                        dirty = true;
                     }
                 }
             }
+        } else if let Some(id) = actions.queue_action {
+            if id >= 0 {
+                downloads.toggle(id as u64);
+                dirty = true;
+            }
+        }
+
+        if !closing && downloads.start_next(&sender, apps_dir) {
+            dirty = true;
+        }
+        if closing && downloads.active.is_none() {
+            finished = true;
+        }
+        if dirty && !finished {
+            render(
+                env, &mut views, screen, &catalog, &details, &downloads,
+            );
+            dirty = false;
         }
     }
 
@@ -448,9 +645,12 @@ pub(super) fn run_archive_store(
     host.archive_store_back = false;
     host.archive_store_retry = false;
     host.archive_store_cancel = false;
+    host.archive_store_sort = false;
     host.archive_store_item = None;
     host.archive_store_download = None;
-    downloaded_any
+    host.archive_store_tab = None;
+    host.archive_store_queue_action = None;
+    downloads.downloaded_any
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -458,21 +658,15 @@ fn drain_messages(
     env: &mut Environment,
     receiver: &Receiver<StoreMessage>,
     views: &mut StoreViews,
-    screen: &mut Screen,
+    screen: Screen,
     catalog: &mut CatalogState,
     details: &mut DetailsState,
-    active_download: &mut Option<ActiveDownload>,
-    downloaded_keys: &mut HashSet<String>,
-    downloaded_any: &mut bool,
-    close_after_download: &mut bool,
-    finished: &mut bool,
+    downloads: &mut DownloadManager,
+    dirty: &mut bool,
 ) {
     while let Ok(message) = receiver.try_recv() {
         match message {
-            StoreMessage::Catalog {
-                generation,
-                result,
-            } => {
+            StoreMessage::Catalog { generation, result } => {
                 if generation != catalog.generation {
                     continue;
                 }
@@ -483,115 +677,73 @@ fn drain_messages(
                         catalog.page = page.page;
                         catalog.current = Some(page);
                         catalog.error = None;
-                        if *screen == Screen::Catalog {
-                            catalog.show(env, views);
-                        }
                     }
                     Err(error) => {
                         catalog.current = None;
                         catalog.error = Some(error);
-                        if *screen == Screen::Catalog {
-                            catalog.show(env, views);
-                        }
                     }
                 }
+                *dirty = true;
             }
-            StoreMessage::Details {
-                generation,
-                result,
-            } => {
+            StoreMessage::Details { generation, result } => {
                 if generation != details.generation {
                     continue;
                 }
+                details.loading = false;
                 match result {
                     Ok(item_details) => {
-                        set_label(
-                            env,
-                            views.nav_title,
-                            &item_details.title,
-                        );
-                        let status = if item_details.files.is_empty() {
-                            format!(
-                                "No direct .ipa files in {}. Try another archive entry.",
-                                item_details.identifier
-                            )
-                        } else {
-                            format!(
-                                "{} IPA file{} • choose GET to download",
-                                item_details.files.len(),
-                                if item_details.files.len() == 1 { "" } else { "s" }
-                            )
-                        };
-                        set_label(env, views.status_label, &status);
-                        rebuild_detail_rows(env, views, &item_details, downloaded_keys);
                         details.details = Some(item_details);
-                        () = msg![env; (views.retry_button) setHidden:true];
+                        details.error = None;
                     }
                     Err(error) => {
-                        details.show_error(env, views, error);
+                        details.details = None;
+                        details.error = Some(error);
                     }
                 }
+                *dirty = true;
             }
-            StoreMessage::Download { generation, event } => {
-                if active_download
-                    .as_ref()
-                    .is_none_or(|active| active.generation != generation)
-                {
-                    continue;
-                }
-                match event {
-                    DownloadEvent::Progress { downloaded, total } => {
-                        set_download_progress(env, views, downloaded, total);
+            StoreMessage::Download { generation, event } => match event {
+                DownloadEvent::Progress { downloaded, total } => {
+                    if downloads.active == Some(generation) {
+                        if let Some(task) = downloads.task_mut(generation) {
+                            task.downloaded = downloaded;
+                            task.total = total;
+                        }
+                        update_download_progress(env, views, screen, downloads);
                     }
-                    DownloadEvent::Finished { result } => {
-                        let active = active_download.take().unwrap();
-                        () = msg![env; (views.cancel_button) setHidden:true];
+                }
+                DownloadEvent::Finished { result } => {
+                    if downloads.active != Some(generation) {
+                        continue;
+                    }
+                    downloads.active = None;
+                    let mut installed = false;
+                    if let Some(task) = downloads.task_mut(generation) {
                         match result {
                             Ok(outcome) => {
-                                *downloaded_any = true;
-                                downloaded_keys.insert(active.key);
-                                let file_name = outcome
-                                    .path
-                                    .file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy();
-                                let text = if outcome.already_present {
-                                    format!("Already saved: {file_name}")
-                                } else {
-                                    format!("Saved to touchHLE_apps: {file_name}")
-                                };
-                                set_label(env, views.progress_label, &text);
-                                set_progress_fraction(env, views, 1.0);
-                                let showing_downloaded_item = details
-                                    .details
-                                    .as_ref()
-                                    .is_some_and(|item| item.identifier == active.identifier);
-                                if showing_downloaded_item {
-                                    for (index, button) in &views.download_buttons {
-                                        if *index == active.file_index {
-                                            set_button_title(env, *button, "Saved");
-                                            set_button_enabled(env, *button, false);
-                                        }
-                                    }
-                                }
+                                task.state = TaskState::Installed;
+                                task.path = Some(outcome.path);
+                                task.already_present = outcome.already_present;
+                                task.error = None;
+                                installed = true;
                             }
                             Err(error) => {
-                                set_progress_fraction(env, views, 0.0);
                                 if error == "Download cancelled." {
-                                    set_label(env, views.progress_label, "Download cancelled.");
+                                    task.state = TaskState::Cancelled;
+                                    task.error = None;
                                 } else {
-                                    set_label(env, views.progress_label, "Download failed.");
-                                    set_label(env, views.status_label, &error);
+                                    task.state = TaskState::Failed;
+                                    task.error = Some(error);
                                 }
                             }
                         }
-                        if *close_after_download {
-                            *close_after_download = false;
-                            *finished = true;
-                        }
                     }
+                    if installed {
+                        downloads.downloaded_any = true;
+                    }
+                    *dirty = true;
                 }
-            }
+            },
         }
     }
 }
@@ -605,7 +757,8 @@ fn build_store_views(
     let width = app_frame.size.width;
     let status_offset = app_frame.origin.y;
     let full_height = app_frame.size.height + status_offset;
-    let background = ui_color(env, 0.90, 0.92, 0.95, 1.0);
+    let nav_height = 52.0 + status_offset;
+    let background = ui_color(env, 0.94, 0.95, 0.98, 1.0);
     let root = new_view(
         env,
         rect(0.0, -status_offset, width, full_height),
@@ -613,29 +766,38 @@ fn build_store_views(
     );
     () = msg![env; parent addSubview:root];
 
-    let nav_height = 44.0 + status_offset;
-    let nav_color = ui_color(env, 0.12, 0.29, 0.48, 1.0);
+    let nav_color = ui_color(env, 0.035, 0.10, 0.20, 1.0);
     let nav = new_view(env, rect(0.0, 0.0, width, nav_height), nav_color);
     () = msg![env; root addSubview:nav];
     let white: id = msg_class![env; UIColor whiteColor];
     let clear: id = msg_class![env; UIColor clearColor];
     let nav_title = new_label(
         env,
-        rect(66.0, status_offset, width - 132.0, 44.0),
-        "IPA Archive",
-        16.0,
+        rect(60.0, status_offset + 3.0, width - 120.0, 24.0),
+        "IPA Store",
+        17.0,
         true,
         white,
     );
     () = msg![env; nav_title setTextAlignment:UITextAlignmentCenter];
     () = msg![env; root addSubview:nav_title];
+    let subtitle_color = ui_color(env, 0.67, 0.77, 0.88, 1.0);
+    let nav_subtitle = new_label(
+        env,
+        rect(60.0, status_offset + 28.0, width - 120.0, 17.0),
+        "Internet Archive",
+        10.0,
+        false,
+        subtitle_color,
+    );
+    () = msg![env; nav_subtitle setTextAlignment:UITextAlignmentCenter];
+    () = msg![env; root addSubview:nav_subtitle];
 
-    let button_blue = ui_color(env, 0.0, 0.40, 0.82, 1.0);
     let back_button = make_button(
         env,
         delegate,
         root,
-        rect(6.0, status_offset + 7.0, 58.0, 30.0),
+        rect(5.0, status_offset + 10.0, 56.0, 32.0),
         "< Back",
         "archiveStoreBack",
         0,
@@ -643,11 +805,11 @@ fn build_store_views(
         white,
     );
     () = msg![env; back_button setHidden:true];
-    let _done_button = make_button(
+    make_button(
         env,
         delegate,
         root,
-        rect(width - 64.0, status_offset + 7.0, 58.0, 30.0),
+        rect(width - 59.0, status_offset + 10.0, 54.0, 32.0),
         "Done",
         "archiveStoreClose",
         0,
@@ -655,46 +817,67 @@ fn build_store_views(
         white,
     );
 
-    let search_y = nav_height + 7.0;
+    let toolbar = new_view(
+        env,
+        rect(0.0, nav_height, width, TOOLBAR_HEIGHT),
+        background,
+    );
+    () = msg![env; root addSubview:toolbar];
+    let field_width = width - 144.0;
     let search_field: id = msg_class![env; UITextField alloc];
     let search_field: id = msg![env; search_field initWithFrame:(rect(
         8.0,
-        search_y,
-        width - 88.0,
-        32.0
+        7.0,
+        field_width,
+        34.0
     ))];
     let field_font: id = msg_class![env; UIFont systemFontOfSize:(13.0 as CGFloat)];
     () = msg![env; search_field setFont:field_font];
     () = msg![env; search_field setDelegate:delegate];
-    () = msg![env; search_field setReturnKeyType:(6 as NSInteger)]; // Search
+    () = msg![env; search_field setReturnKeyType:(6 as NSInteger)];
     () = msg![env; search_field setAutocapitalizationType:(0 as NSInteger)];
     () = msg![env; search_field setAutocorrectionType:(1 as NSInteger)];
-    let placeholder = ns_string::from_rust_string(env, "Search titles and identifiers".to_string());
+    () = msg![env; search_field setBackgroundColor:white];
+    let placeholder = ns_string::from_rust_string(env, "Search apps, IDs, developers".to_string());
     () = msg![env; search_field setPlaceholder:placeholder];
     release(env, placeholder);
     let field_layer: id = msg![env; search_field layer];
-    let field_border = ui_color(env, 0.65, 0.68, 0.72, 1.0);
+    let field_border = ui_color(env, 0.78, 0.82, 0.88, 1.0);
     let field_border_cg: id = msg![env; field_border CGColor];
     () = msg![env; field_layer setBorderColor:field_border_cg];
     () = msg![env; field_layer setBorderWidth:(1.0 as CGFloat)];
-    () = msg![env; field_layer setCornerRadius:(5.0 as CGFloat)];
-    () = msg![env; root addSubview:search_field];
-    let search_button = make_button(
+    () = msg![env; field_layer setCornerRadius:(8.0 as CGFloat)];
+    () = msg![env; toolbar addSubview:search_field];
+
+    let blue = ui_color(env, 0.0, 0.40, 0.82, 1.0);
+    make_button(
         env,
         delegate,
-        root,
-        rect(width - 76.0, search_y, 68.0, 32.0),
-        "Search",
+        toolbar,
+        rect(width - 130.0, 7.0, 48.0, 34.0),
+        "Go",
         "archiveStoreSearch",
         0,
-        button_blue,
+        blue,
         white,
     );
+    let sort_background = ui_color(env, 0.86, 0.91, 0.98, 1.0);
+    let sort_button = make_button(
+        env,
+        delegate,
+        toolbar,
+        rect(width - 74.0, 7.0, 66.0, 34.0),
+        "A–Z",
+        "archiveStoreSort",
+        0,
+        sort_background,
+        blue,
+    );
 
-    let gray = ui_color(env, 0.30, 0.33, 0.38, 1.0);
+    let gray = ui_color(env, 0.32, 0.37, 0.44, 1.0);
     let status_label = new_label(
         env,
-        rect(10.0, search_y + 36.0, width - 20.0, 30.0),
+        rect(10.0, nav_height + TOOLBAR_HEIGHT, width - 20.0, STATUS_HEIGHT),
         "",
         11.0,
         false,
@@ -704,129 +887,116 @@ fn build_store_views(
     () = msg![env; status_label setTextAlignment:UITextAlignmentLeft];
     () = msg![env; root addSubview:status_label];
 
-    let page_y = full_height - 64.0;
-    let scroll_y = search_y + 69.0;
-    let scroll_height = (page_y - scroll_y - 3.0).max(40.0);
+    let scroll_y = nav_height + TOOLBAR_HEIGHT + STATUS_HEIGHT;
     let scroll_view: id = msg_class![env; UIScrollView alloc];
     let scroll_view: id = msg![env; scroll_view initWithFrame:(rect(
         0.0,
         scroll_y,
         width,
-        scroll_height
+        full_height - scroll_y - PAGER_HEIGHT - TAB_HEIGHT
     ))];
-    () = msg![env; scroll_view setBackgroundColor:white];
+    () = msg![env; scroll_view setBackgroundColor:clear];
     () = msg![env; scroll_view setClipsToBounds:true];
     () = msg![env; scroll_view setShowsHorizontalScrollIndicator:false];
     () = msg![env; root addSubview:scroll_view];
 
+    let pager = new_view(
+        env,
+        rect(0.0, full_height - TAB_HEIGHT - PAGER_HEIGHT, width, PAGER_HEIGHT),
+        background,
+    );
+    () = msg![env; root addSubview:pager];
     let previous_button = make_button(
         env,
         delegate,
-        root,
-        rect(8.0, page_y, 62.0, 30.0),
+        pager,
+        rect(8.0, 3.0, 70.0, 30.0),
         "< Prev",
         "archiveStorePrevious",
         0,
-        button_blue,
-        white,
+        sort_background,
+        blue,
     );
     let next_button = make_button(
         env,
         delegate,
-        root,
-        rect(width - 70.0, page_y, 62.0, 30.0),
+        pager,
+        rect(width - 78.0, 3.0, 70.0, 30.0),
         "Next >",
         "archiveStoreNext",
         0,
-        button_blue,
-        white,
+        sort_background,
+        blue,
     );
     let page_label = new_label(
         env,
-        rect(74.0, page_y, width - 148.0, 30.0),
+        rect(80.0, 3.0, width - 160.0, 30.0),
         "Page 1",
-        12.0,
+        11.0,
         false,
         gray,
     );
     () = msg![env; page_label setTextAlignment:UITextAlignmentCenter];
-    () = msg![env; root addSubview:page_label];
+    () = msg![env; pager addSubview:page_label];
 
-    let retry_button = make_button(
+    let tab_bar = new_view(
         env,
-        delegate,
-        root,
-        rect(
-            (width - 120.0) / 2.0,
-            scroll_y + (scroll_height - 34.0) / 2.0,
-            120.0,
-            34.0,
-        ),
-        "Retry",
-        "archiveStoreRetry",
-        0,
-        button_blue,
+        rect(0.0, full_height - TAB_HEIGHT, width, TAB_HEIGHT),
         white,
     );
-    () = msg![env; retry_button setHidden:true];
-
-    let progress_label = new_label(
+    () = msg![env; root addSubview:tab_bar];
+    let tab_separator_color = ui_color(env, 0.80, 0.83, 0.88, 1.0);
+    let tab_separator = new_view(
         env,
-        rect(8.0, full_height - 30.0, width - 82.0, 17.0),
-        "Downloads are saved in touchHLE_apps",
-        10.0,
-        false,
-        gray,
+        rect(0.0, 0.0, width, 1.0),
+        tab_separator_color,
     );
-    () = msg![env; root addSubview:progress_label];
-    let cancel_red = ui_color(env, 0.78, 0.18, 0.20, 1.0);
-    let cancel_button = make_button(
+    () = msg![env; tab_bar addSubview:tab_separator];
+    let browse_tab = make_button(
         env,
         delegate,
-        root,
-        rect(width - 70.0, full_height - 32.0, 62.0, 22.0),
-        "Cancel",
-        "archiveStoreCancel",
+        tab_bar,
+        rect(0.0, 1.0, width / 2.0, TAB_HEIGHT - 1.0),
+        "Browse",
+        "archiveStoreTab:",
         0,
-        cancel_red,
-        white,
+        clear,
+        blue,
     );
-    () = msg![env; cancel_button setHidden:true];
-
-    let progress_width = width - 16.0;
-    let track_color = ui_color(env, 0.72, 0.75, 0.79, 1.0);
-    let track = new_view(
+    let downloads_tab = make_button(
         env,
-        rect(8.0, full_height - 10.0, progress_width, 4.0),
-        track_color,
+        delegate,
+        tab_bar,
+        rect(width / 2.0, 1.0, width / 2.0, TAB_HEIGHT - 1.0),
+        "Downloads",
+        "archiveStoreTab:",
+        1,
+        clear,
+        blue,
     );
-    () = msg![env; root addSubview:track];
-    let progress_fill = new_view(
-        env,
-        rect(8.0, full_height - 10.0, 0.0, 4.0),
-        button_blue,
-    );
-    () = msg![env; root addSubview:progress_fill];
 
     StoreViews {
         root,
         delegate,
         nav_title,
+        nav_subtitle,
         back_button,
+        toolbar,
         search_field,
-        search_button,
+        sort_button,
         status_label,
         scroll_view,
+        pager,
         previous_button,
         next_button,
         page_label,
-        retry_button,
-        progress_label,
-        progress_fill,
-        progress_width,
-        cancel_button,
+        browse_tab,
+        downloads_tab,
+        width,
+        full_height,
+        nav_height,
         rows: Vec::new(),
-        download_buttons: Vec::new(),
+        download_progress: Vec::new(),
     }
 }
 
@@ -845,9 +1015,7 @@ fn make_button(
     let button: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
     () = msg![env; button setFrame:frame];
     () = msg![env; button setBackgroundColor:background];
-    let title = ns_string::from_rust_string(env, title.to_string());
-    () = msg![env; button setTitle:title forState:UIControlStateNormal];
-    release(env, title);
+    set_button_title(env, button, title);
     () = msg![env; button setTitleColor:title_color forState:UIControlStateNormal];
     () = msg![env; button setTag:tag];
     () = msg![env; button layoutSubviews];
@@ -855,7 +1023,7 @@ fn make_button(
     let font: id = msg_class![env; UIFont boldSystemFontOfSize:(12.0 as CGFloat)];
     () = msg![env; label setFont:font];
     let layer: id = msg![env; button layer];
-    () = msg![env; layer setCornerRadius:(5.0 as CGFloat)];
+    () = msg![env; layer setCornerRadius:(7.0 as CGFloat)];
     let selector = env.objc.lookup_selector(action).unwrap();
     () = msg![env; button addTarget:delegate
                               action:selector
@@ -878,40 +1046,78 @@ fn set_button_title(env: &mut Environment, button: id, title: &str) {
 
 fn set_button_enabled(env: &mut Environment, button: id, enabled: bool) {
     () = msg![env; button setEnabled:enabled];
-    let alpha: CGFloat = if enabled { 1.0 } else { 0.42 };
+    let alpha: CGFloat = if enabled { 1.0 } else { 0.48 };
     () = msg![env; button setAlpha:alpha];
 }
 
-fn show_catalog_chrome(env: &mut Environment, views: &StoreViews) {
-    set_label(env, views.nav_title, "IPA Archive");
-    () = msg![env; (views.back_button) setHidden:true];
-    () = msg![env; (views.search_field) setHidden:false];
-    () = msg![env; (views.search_button) setHidden:false];
-    () = msg![env; (views.previous_button) setHidden:false];
-    () = msg![env; (views.next_button) setHidden:false];
-    () = msg![env; (views.page_label) setHidden:false];
+fn render(
+    env: &mut Environment,
+    views: &mut StoreViews,
+    screen: Screen,
+    catalog: &CatalogState,
+    details: &DetailsState,
+    downloads: &DownloadManager,
+) {
+    update_chrome(env, views, screen, catalog, details, downloads);
+    clear_rows(env, views);
+    let content_height = match screen {
+        Screen::Browse => render_catalog(env, views, catalog),
+        Screen::Details => render_details(env, views, details, downloads),
+        Screen::Downloads => render_downloads(env, views, downloads),
+    };
+    reset_scroll(env, views, content_height);
 }
 
-fn show_details_chrome(env: &mut Environment, views: &StoreViews, title: &str) {
+fn update_chrome(
+    env: &mut Environment,
+    views: &StoreViews,
+    screen: Screen,
+    catalog: &CatalogState,
+    details: &DetailsState,
+    downloads: &DownloadManager,
+) {
+    let browsing = screen == Screen::Browse;
+    () = msg![env; (views.toolbar) setHidden:(!browsing)];
+    () = msg![env; (views.pager) setHidden:(!browsing)];
+    () = msg![env; (views.back_button) setHidden:(screen != Screen::Details)];
+    let title = match screen {
+        Screen::Details => details
+            .item
+            .as_ref()
+            .map(|item| item.title.as_str())
+            .unwrap_or("App details"),
+        _ => "IPA Store",
+    };
     set_label(env, views.nav_title, title);
-    () = msg![env; (views.back_button) setHidden:false];
-    () = msg![env; (views.search_field) setHidden:true];
-    () = msg![env; (views.search_button) setHidden:true];
-    () = msg![env; (views.previous_button) setHidden:true];
-    () = msg![env; (views.next_button) setHidden:true];
-    () = msg![env; (views.page_label) setHidden:true];
-}
+    set_button_title(env, views.sort_button, catalog.sort.label());
 
-fn catalog_page_count(catalog: &CatalogState) -> usize {
-    ((catalog.total as usize + CATALOG_ROWS - 1) / CATALOG_ROWS).max(1)
-}
+    let toolbar_height = if browsing { TOOLBAR_HEIGHT } else { 0.0 };
+    let status_y = views.nav_height + toolbar_height;
+    () = msg![env; (views.status_label) setFrame:(rect(
+        10.0,
+        status_y,
+        views.width - 20.0,
+        STATUS_HEIGHT
+    ))];
+    let scroll_y = status_y + STATUS_HEIGHT;
+    let bottom = TAB_HEIGHT + if browsing { PAGER_HEIGHT } else { 0.0 };
+    () = msg![env; (views.scroll_view) setFrame:(rect(
+        0.0,
+        scroll_y,
+        views.width,
+        (views.full_height - scroll_y - bottom).max(40.0)
+    ))];
 
-fn update_catalog_footer(env: &mut Environment, views: &StoreViews, catalog: &CatalogState) {
-    let pages = catalog_page_count(catalog);
+    let status = match screen {
+        Screen::Browse => catalog_status(catalog),
+        Screen::Details => details_status(details),
+        Screen::Downloads => downloads_status(downloads),
+    };
+    set_label(env, views.status_label, &status);
     set_label(
         env,
         views.page_label,
-        &format!("Page {} / {}", catalog.page.min(pages), pages),
+        &format!("Page {} / {}", catalog.page.min(catalog.page_count()), catalog.page_count()),
     );
     set_button_enabled(
         env,
@@ -921,15 +1127,131 @@ fn update_catalog_footer(env: &mut Environment, views: &StoreViews, catalog: &Ca
     set_button_enabled(
         env,
         views.next_button,
-        !catalog.loading && catalog.page < pages,
+        !catalog.loading && catalog.page < catalog.page_count(),
     );
+
+    let pending = downloads.pending_count();
+    let downloads_title = if pending == 0 {
+        "Downloads".to_string()
+    } else {
+        format!("Downloads ({pending})")
+    };
+    set_button_title(env, views.downloads_tab, &downloads_title);
+    let selected = ui_color(env, 0.86, 0.91, 0.98, 1.0);
+    let clear: id = msg_class![env; UIColor clearColor];
+    let browse_background = if screen == Screen::Downloads {
+        clear
+    } else {
+        selected
+    };
+    let downloads_background = if screen == Screen::Downloads {
+        selected
+    } else {
+        clear
+    };
+    () = msg![env; (views.browse_tab) setBackgroundColor:browse_background];
+    () = msg![env; (views.downloads_tab) setBackgroundColor:downloads_background];
+    update_nav_subtitle(env, views, screen, downloads);
+}
+
+fn update_nav_subtitle(
+    env: &mut Environment,
+    views: &StoreViews,
+    screen: Screen,
+    downloads: &DownloadManager,
+) {
+    let text = if let Some(task) = downloads.active_task() {
+        if task.cancel.load(Ordering::Acquire) {
+            "Cancelling download…".to_string()
+        } else if task.total.is_some_and(|total| total > 0) {
+            format!(
+                "Downloading • {:.0}% • {} in queue",
+                task.fraction() * 100.0,
+                downloads.pending_count().saturating_sub(1)
+            )
+        } else {
+            format!("Downloading {}…", format_size(task.downloaded))
+        }
+    } else {
+        match screen {
+            Screen::Browse => "Internet Archive • ipaarchive".to_string(),
+            Screen::Details => "App information and available versions".to_string(),
+            Screen::Downloads => "Queue, progress and installation".to_string(),
+        }
+    };
+    set_label(env, views.nav_subtitle, &text);
+}
+
+fn catalog_status(catalog: &CatalogState) -> String {
+    if catalog.loading {
+        return if catalog.query.is_empty() {
+            "Loading catalog…".to_string()
+        } else {
+            format!("Searching for “{}”…", catalog.query)
+        };
+    }
+    if catalog.error.is_some() {
+        return "Couldn't load the catalog.".to_string();
+    }
+    let Some(page) = &catalog.current else {
+        return "Browse the Internet Archive collection.".to_string();
+    };
+    if page.items.is_empty() {
+        return format!("No results for “{}”.", catalog.query);
+    }
+    let first = (page.page - 1) * CATALOG_ROWS + 1;
+    let last = first + page.items.len() - 1;
+    let query = if catalog.query.is_empty() {
+        "apps".to_string()
+    } else {
+        format!("results for “{}”", catalog.query)
+    };
+    format!(
+        "{first}–{last} of {} {query} • {}",
+        catalog.total,
+        catalog.sort.label()
+    )
+}
+
+fn details_status(details: &DetailsState) -> String {
+    if details.loading {
+        return "Loading app details and IPA files…".to_string();
+    }
+    if details.error.is_some() {
+        return "Couldn't load app details.".to_string();
+    }
+    let Some(details) = &details.details else {
+        return "App information.".to_string();
+    };
+    let total_size: u64 = details.files.iter().filter_map(|file| file.size).sum();
+    let mut text = format!(
+        "{} IPA version{}",
+        details.files.len(),
+        if details.files.len() == 1 { "" } else { "s" }
+    );
+    if total_size > 0 {
+        text.push_str(&format!(" • {} combined", format_size(total_size)));
+    }
+    text
+}
+
+fn downloads_status(downloads: &DownloadManager) -> String {
+    if downloads.tasks.is_empty() {
+        return "No downloads yet. Choose GET on an app version.".to_string();
+    }
+    format!(
+        "{} in queue • {} installed • {} to retry",
+        downloads.pending_count(),
+        downloads.installed_count(),
+        downloads.failed_count()
+    )
 }
 
 fn clear_rows(env: &mut Environment, views: &mut StoreViews) {
     for row in views.rows.drain(..) {
         () = msg![env; row removeFromSuperview];
     }
-    views.download_buttons.clear();
+    views.download_progress.clear();
 }
 
 fn reset_scroll(env: &mut Environment, views: &StoreViews, content_height: CGFloat) {
@@ -941,35 +1263,52 @@ fn reset_scroll(env: &mut Environment, views: &StoreViews, content_height: CGFlo
     () = msg![env; (views.scroll_view) setContentOffset:(CGPoint { x: 0.0, y: 0.0 })];
 }
 
-fn rebuild_catalog_rows(env: &mut Environment, views: &mut StoreViews, items: &[CatalogItem]) {
-    clear_rows(env, views);
-    let scroll_frame: CGRect = msg![env; (views.scroll_view) frame];
-    let width = scroll_frame.size.width;
-    let dark: id = msg_class![env; UIColor blackColor];
-    let gray = ui_color(env, 0.38, 0.40, 0.44, 1.0);
-    for (index, item) in items.iter().enumerate() {
-        let row: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
-        () = msg![env; row setFrame:(rect(
-            0.0,
-            index as CGFloat * ROW_HEIGHT,
-            width,
-            ROW_HEIGHT
-        ))];
-        let row_color = if index % 2 == 0 {
-            ui_color(env, 1.0, 1.0, 1.0, 1.0)
-        } else {
-            ui_color(env, 0.96, 0.97, 0.98, 1.0)
-        };
-        () = msg![env; row setBackgroundColor:row_color];
-        () = msg![env; row setTag:(index as NSInteger)];
-        let selector = env.objc.lookup_selector("archiveStoreItem:").unwrap();
-        // The delegate is attached when the row is created below. Keeping all
-        // row subviews inside the button makes the entire entry tappable.
-        () = msg![env; (views.scroll_view) addSubview:row];
+fn render_catalog(env: &mut Environment, views: &mut StoreViews, catalog: &CatalogState) -> CGFloat {
+    if catalog.loading {
+        add_message(env, views, "Loading the latest catalog…", false);
+        return 210.0;
+    }
+    if let Some(error) = &catalog.error {
+        add_message(env, views, error, true);
+        return 240.0;
+    }
+    let Some(page) = &catalog.current else {
+        add_message(env, views, "The catalog will appear here.", false);
+        return 210.0;
+    };
+    if page.items.is_empty() {
+        add_message(env, views, "No apps matched this search. Try a different title, identifier or developer.", false);
+        return 210.0;
+    }
 
+    let row_width = views.width - 16.0;
+    let dark: id = msg_class![env; UIColor blackColor];
+    let white: id = msg_class![env; UIColor whiteColor];
+    let gray = ui_color(env, 0.38, 0.43, 0.50, 1.0);
+    for (index, item) in page.items.iter().enumerate() {
+        let y = 4.0 + index as CGFloat * CATALOG_ROW_HEIGHT;
+        let row: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+        () = msg![env; row setFrame:(rect(8.0, y, row_width, 80.0))];
+        () = msg![env; row setBackgroundColor:white];
+        () = msg![env; row setTag:(index as NSInteger)];
+        let row_layer: id = msg![env; row layer];
+        () = msg![env; row_layer setCornerRadius:(10.0 as CGFloat)];
+        let selector = env.objc.lookup_selector("archiveStoreItem:").unwrap();
+        let delegate = views.delegate;
+        () = msg![env; row addTarget:delegate
+                          action:selector
+                forControlEvents:UIControlEventTouchUpInside];
+        () = msg![env; (views.scroll_view) addSubview:row];
+        add_item_icon(
+            env,
+            row,
+            &item.identifier,
+            &item.title,
+            rect(10.0, 12.0, 56.0, 56.0),
+        );
         let title = new_label(
             env,
-            rect(10.0, 5.0, width - 20.0, 34.0),
+            rect(76.0, 8.0, row_width - 102.0, 40.0),
             &item.title,
             14.0,
             true,
@@ -979,123 +1318,488 @@ fn rebuild_catalog_rows(env: &mut Environment, views: &mut StoreViews, items: &[
         () = msg![env; row addSubview:title];
         let subtitle = new_label(
             env,
-            rect(10.0, 41.0, width - 20.0, 15.0),
+            rect(76.0, 50.0, row_width - 102.0, 24.0),
             &catalog_subtitle(item),
-            11.0,
+            10.0,
             false,
             gray,
         );
+        () = msg![env; subtitle setNumberOfLines:2];
         () = msg![env; row addSubview:subtitle];
-        let separator_color = ui_color(env, 0.82, 0.84, 0.87, 1.0);
-        let separator = new_view(
+        let chevron = new_label(
             env,
-            rect(8.0, ROW_HEIGHT - 1.0, width - 16.0, 1.0),
-            separator_color,
+            rect(row_width - 24.0, 25.0, 14.0, 30.0),
+            ">",
+            20.0,
+            false,
+            gray,
         );
-        () = msg![env; row addSubview:separator];
-
-        // Store the delegate on the button after all visual subviews exist.
-        // `make_button` cannot be used here because a catalog row has a custom
-        // title layout rather than a centered UIButton title.
-        let delegate = views.delegate;
-        () = msg![env; row addTarget:delegate
-                              action:selector
-                    forControlEvents:UIControlEventTouchUpInside];
+        () = msg![env; chevron setTextAlignment:UITextAlignmentCenter];
+        () = msg![env; row addSubview:chevron];
         views.rows.push(row);
     }
-    reset_scroll(env, views, items.len() as CGFloat * ROW_HEIGHT);
+    8.0 + page.items.len() as CGFloat * CATALOG_ROW_HEIGHT
 }
 
-fn rebuild_detail_rows(
+fn render_details(
     env: &mut Environment,
     views: &mut StoreViews,
-    details: &ItemDetails,
-    downloaded_keys: &HashSet<String>,
-) {
-    clear_rows(env, views);
-    let scroll_frame: CGRect = msg![env; (views.scroll_view) frame];
-    let width = scroll_frame.size.width;
-    let dark: id = msg_class![env; UIColor blackColor];
+    details: &DetailsState,
+    downloads: &DownloadManager,
+) -> CGFloat {
+    let Some(item) = &details.item else {
+        add_message(env, views, "Choose an app from the catalog.", false);
+        return 210.0;
+    };
+    let row_width = views.width - 16.0;
     let white: id = msg_class![env; UIColor whiteColor];
-    let gray = ui_color(env, 0.38, 0.40, 0.44, 1.0);
-    let blue = ui_color(env, 0.0, 0.40, 0.82, 1.0);
-    let delegate = views.delegate;
-    for (index, file) in details.files.iter().enumerate() {
-        let row_color = if index % 2 == 0 {
-            ui_color(env, 1.0, 1.0, 1.0, 1.0)
-        } else {
-            ui_color(env, 0.96, 0.97, 0.98, 1.0)
-        };
-        let row = new_view(
+    let dark: id = msg_class![env; UIColor blackColor];
+    let gray = ui_color(env, 0.38, 0.43, 0.50, 1.0);
+    let header = new_view(env, rect(8.0, 4.0, row_width, 188.0), white);
+    let header_layer: id = msg![env; header layer];
+    () = msg![env; header_layer setCornerRadius:(10.0 as CGFloat)];
+    () = msg![env; (views.scroll_view) addSubview:header];
+    views.rows.push(header);
+
+    let loaded = details.details.as_ref();
+    let title = loaded.map(|loaded| loaded.title.as_str()).unwrap_or(&item.title);
+    let identifier = loaded
+        .map(|loaded| loaded.identifier.as_str())
+        .unwrap_or(&item.identifier);
+    add_item_icon(
+        env,
+        header,
+        identifier,
+        title,
+        rect(12.0, 12.0, 64.0, 64.0),
+    );
+    let title_label = new_label(
+        env,
+        rect(86.0, 10.0, row_width - 98.0, 44.0),
+        title,
+        15.0,
+        true,
+        dark,
+    );
+    () = msg![env; title_label setNumberOfLines:2];
+    () = msg![env; header addSubview:title_label];
+    let metadata = loaded.map(details_metadata).unwrap_or_else(|| catalog_subtitle(item));
+    let metadata_label = new_label(
+        env,
+        rect(86.0, 56.0, row_width - 98.0, 46.0),
+        &metadata,
+        10.0,
+        false,
+        gray,
+    );
+    () = msg![env; metadata_label setNumberOfLines:3];
+    () = msg![env; header addSubview:metadata_label];
+    let description = loaded
+        .and_then(|loaded| loaded.description.as_deref())
+        .unwrap_or("No description is available for this archive entry.");
+    let description = truncate_chars(description, 360);
+    let description_label = new_label(
+        env,
+        rect(12.0, 108.0, row_width - 24.0, 70.0),
+        &description,
+        11.0,
+        false,
+        gray,
+    );
+    () = msg![env; description_label setNumberOfLines:4];
+    () = msg![env; header addSubview:description_label];
+
+    let section = new_label(
+        env,
+        rect(14.0, 200.0, views.width - 28.0, 22.0),
+        "AVAILABLE IPA VERSIONS",
+        11.0,
+        true,
+        gray,
+    );
+    () = msg![env; (views.scroll_view) addSubview:section];
+    views.rows.push(section);
+
+    if details.loading {
+        add_message_at(env, views, 230.0, "Looking for public IPA files…", false);
+        return 430.0;
+    }
+    if let Some(error) = &details.error {
+        add_message_at(env, views, 226.0, error, true);
+        return 470.0;
+    }
+    let Some(loaded) = loaded else {
+        return 230.0;
+    };
+    if loaded.files.is_empty() {
+        add_message_at(
             env,
-            rect(0.0, index as CGFloat * ROW_HEIGHT, width, ROW_HEIGHT),
-            row_color,
+            views,
+            230.0,
+            "This entry has no public IPA files. Choose another archive entry.",
+            false,
         );
+        return 430.0;
+    }
+
+    let blue = ui_color(env, 0.0, 0.40, 0.82, 1.0);
+    let green = ui_color(env, 0.12, 0.58, 0.32, 1.0);
+    let disabled = ui_color(env, 0.68, 0.73, 0.80, 1.0);
+    for (index, file) in loaded.files.iter().enumerate() {
+        let y = 228.0 + index as CGFloat * FILE_ROW_HEIGHT;
+        let row = new_view(env, rect(8.0, y, row_width, 74.0), white);
+        let row_layer: id = msg![env; row layer];
+        () = msg![env; row_layer setCornerRadius:(10.0 as CGFloat)];
         () = msg![env; (views.scroll_view) addSubview:row];
-        let title = new_label(
+        let file_title = new_label(
             env,
-            rect(10.0, 5.0, width - 94.0, 34.0),
-            &file.name,
+            rect(12.0, 7.0, row_width - 104.0, 36.0),
+            display_file_name(&file.name),
             12.0,
             true,
             dark,
         );
-        () = msg![env; title setNumberOfLines:2];
-        () = msg![env; row addSubview:title];
+        () = msg![env; file_title setNumberOfLines:2];
+        () = msg![env; row addSubview:file_title];
         let subtitle = new_label(
             env,
-            rect(10.0, 41.0, width - 94.0, 15.0),
+            rect(12.0, 45.0, row_width - 104.0, 20.0),
             &file_subtitle(file),
-            11.0,
+            10.0,
             false,
             gray,
         );
         () = msg![env; row addSubview:subtitle];
 
-        let button: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
-        () = msg![env; button setFrame:(rect(width - 76.0, 16.0, 66.0, 30.0))];
-        () = msg![env; button setBackgroundColor:blue];
-        let already_downloaded = downloaded_keys.contains(&download_key(
-            &details.identifier,
-            &file.name,
-        ));
-        set_button_title(env, button, if already_downloaded { "Saved" } else { "GET" });
-        () = msg![env; button setTitleColor:white forState:UIControlStateNormal];
-        () = msg![env; button setTag:(index as NSInteger)];
-        () = msg![env; button layoutSubviews];
-        let button_label: id = msg![env; button titleLabel];
-        let font: id = msg_class![env; UIFont boldSystemFontOfSize:(12.0 as CGFloat)];
-        () = msg![env; button_label setFont:font];
-        let layer: id = msg![env; button layer];
-        () = msg![env; layer setCornerRadius:(5.0 as CGFloat)];
-        let selector = env.objc.lookup_selector("archiveStoreDownload:").unwrap();
-        () = msg![env; button addTarget:delegate
-                                  action:selector
-                        forControlEvents:UIControlEventTouchUpInside];
-        () = msg![env; row addSubview:button];
-        set_button_enabled(env, button, !already_downloaded);
-        views.download_buttons.push((index, button));
+        let key = download_key(&loaded.identifier, &file.name);
+        let state = downloads.state_for_key(&key);
+        let (title, enabled, color) = match state {
+            Some(TaskState::Installed) => ("Installed", false, green),
+            Some(TaskState::Downloading) => ("Active", false, disabled),
+            Some(TaskState::Queued) => ("Queued", false, disabled),
+            Some(TaskState::Failed | TaskState::Cancelled) => ("Retry", true, blue),
+            None => ("GET", true, blue),
+        };
+        let button = make_button(
+            env,
+            views.delegate,
+            row,
+            rect(row_width - 80.0, 21.0, 68.0, 32.0),
+            title,
+            "archiveStoreDownload:",
+            index as NSInteger,
+            color,
+            white,
+        );
+        set_button_enabled(env, button, enabled);
         views.rows.push(row);
     }
-    reset_scroll(env, views, details.files.len() as CGFloat * ROW_HEIGHT);
+    236.0 + loaded.files.len() as CGFloat * FILE_ROW_HEIGHT
+}
+
+fn render_downloads(
+    env: &mut Environment,
+    views: &mut StoreViews,
+    downloads: &DownloadManager,
+) -> CGFloat {
+    if downloads.tasks.is_empty() {
+        add_message(
+            env,
+            views,
+            "Your queue and installed packages will appear here. You can queue several versions and return to Browse.",
+            false,
+        );
+        return 220.0;
+    }
+
+    let row_width = views.width - 16.0;
+    let white: id = msg_class![env; UIColor whiteColor];
+    let dark: id = msg_class![env; UIColor blackColor];
+    let gray = ui_color(env, 0.38, 0.43, 0.50, 1.0);
+    let blue = ui_color(env, 0.0, 0.40, 0.82, 1.0);
+    let red = ui_color(env, 0.82, 0.20, 0.24, 1.0);
+    let green = ui_color(env, 0.12, 0.58, 0.32, 1.0);
+    let track_color = ui_color(env, 0.84, 0.87, 0.91, 1.0);
+
+    for (index, task) in downloads.tasks.iter().rev().enumerate() {
+        let y = 4.0 + index as CGFloat * DOWNLOAD_ROW_HEIGHT;
+        let row = new_view(env, rect(8.0, y, row_width, 104.0), white);
+        let row_layer: id = msg![env; row layer];
+        () = msg![env; row_layer setCornerRadius:(10.0 as CGFloat)];
+        () = msg![env; (views.scroll_view) addSubview:row];
+        let title_width = if task.state == TaskState::Installed {
+            row_width - 24.0
+        } else {
+            row_width - 102.0
+        };
+        let title = new_label(
+            env,
+            rect(12.0, 7.0, title_width, 21.0),
+            &task.title,
+            13.0,
+            true,
+            dark,
+        );
+        () = msg![env; row addSubview:title];
+        let file_label = new_label(
+            env,
+            rect(12.0, 29.0, title_width, 29.0),
+            display_file_name(&task.file.name),
+            10.0,
+            false,
+            gray,
+        );
+        () = msg![env; file_label setNumberOfLines:2];
+        () = msg![env; row addSubview:file_label];
+        let status_color = match task.state {
+            TaskState::Installed => green,
+            TaskState::Failed => red,
+            _ => gray,
+        };
+        let status = new_label(
+            env,
+            rect(12.0, 59.0, row_width - 24.0, 29.0),
+            &download_task_status(task),
+            10.0,
+            false,
+            status_color,
+        );
+        () = msg![env; status setNumberOfLines:2];
+        () = msg![env; row addSubview:status];
+
+        if task.state != TaskState::Installed {
+            let (title, background) = match task.state {
+                TaskState::Failed | TaskState::Cancelled => ("Retry", blue),
+                _ => ("Cancel", red),
+            };
+            make_button(
+                env,
+                views.delegate,
+                row,
+                rect(row_width - 80.0, 12.0, 68.0, 30.0),
+                title,
+                "archiveStoreQueueAction:",
+                task.id as NSInteger,
+                background,
+                white,
+            );
+        }
+
+        let track = new_view(
+            env,
+            rect(12.0, 94.0, row_width - 24.0, 4.0),
+            track_color,
+        );
+        () = msg![env; row addSubview:track];
+        let fill_color = if task.state == TaskState::Installed {
+            green
+        } else {
+            blue
+        };
+        let progress_width = row_width - 24.0;
+        let fill = new_view(
+            env,
+            rect(12.0, 94.0, progress_width * task.fraction() as CGFloat, 4.0),
+            fill_color,
+        );
+        () = msg![env; row addSubview:fill];
+        views.download_progress.push(DownloadProgressViews {
+            id: task.id,
+            label: status,
+            fill,
+            width: progress_width,
+        });
+        views.rows.push(row);
+    }
+    8.0 + downloads.tasks.len() as CGFloat * DOWNLOAD_ROW_HEIGHT
+}
+
+fn update_download_progress(
+    env: &mut Environment,
+    views: &StoreViews,
+    screen: Screen,
+    downloads: &DownloadManager,
+) {
+    for progress in &views.download_progress {
+        let Some(task) = downloads.task(progress.id) else {
+            continue;
+        };
+        set_label(env, progress.label, &download_task_status(task));
+        let mut frame: CGRect = msg![env; (progress.fill) frame];
+        frame.size.width = progress.width * task.fraction() as CGFloat;
+        () = msg![env; (progress.fill) setFrame:frame];
+    }
+    update_nav_subtitle(env, views, screen, downloads);
+}
+
+fn download_task_status(task: &DownloadTask) -> String {
+    match task.state {
+        TaskState::Queued => "Waiting in queue".to_string(),
+        TaskState::Downloading => {
+            if task.cancel.load(Ordering::Acquire) {
+                return "Cancelling…".to_string();
+            }
+            let mut text = if let Some(total) = task.total.filter(|total| *total > 0) {
+                format!(
+                    "{} / {} • {:.0}%",
+                    format_size(task.downloaded),
+                    format_size(total),
+                    task.fraction() * 100.0
+                )
+            } else {
+                format!("{} downloaded", format_size(task.downloaded))
+            };
+            if let Some(started) = task.started {
+                let seconds = started.elapsed().as_secs_f64();
+                if seconds >= 0.5 && task.downloaded > 0 {
+                    let speed = (task.downloaded as f64 / seconds) as u64;
+                    text.push_str(&format!(" • {}/s", format_size(speed)));
+                }
+            }
+            text
+        }
+        TaskState::Installed => {
+            let name = task
+                .path
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .unwrap_or_default()
+                .to_string_lossy();
+            if task.already_present {
+                format!("Already installed • {name}")
+            } else {
+                format!("Installed in touchHLE_apps • {name}")
+            }
+        }
+        TaskState::Failed => task
+            .error
+            .as_deref()
+            .map(|error| truncate_chars(error, 180))
+            .unwrap_or_else(|| "Download failed. Tap Retry.".to_string()),
+        TaskState::Cancelled => "Cancelled • tap Retry to start again".to_string(),
+    }
+}
+
+fn add_message(env: &mut Environment, views: &mut StoreViews, text: &str, retry: bool) {
+    add_message_at(env, views, 24.0, text, retry);
+}
+
+fn add_message_at(
+    env: &mut Environment,
+    views: &mut StoreViews,
+    y: CGFloat,
+    text: &str,
+    retry: bool,
+) {
+    let gray = ui_color(env, 0.34, 0.39, 0.46, 1.0);
+    let label = new_label(
+        env,
+        rect(20.0, y, views.width - 40.0, 86.0),
+        text,
+        13.0,
+        false,
+        gray,
+    );
+    () = msg![env; label setNumberOfLines:4];
+    () = msg![env; label setTextAlignment:UITextAlignmentCenter];
+    () = msg![env; (views.scroll_view) addSubview:label];
+    views.rows.push(label);
+    if retry {
+        let blue = ui_color(env, 0.0, 0.40, 0.82, 1.0);
+        let white: id = msg_class![env; UIColor whiteColor];
+        let button = make_button(
+            env,
+            views.delegate,
+            views.scroll_view,
+            rect((views.width - 130.0) / 2.0, y + 98.0, 130.0, 36.0),
+            "Retry",
+            "archiveStoreRetry",
+            0,
+            blue,
+            white,
+        );
+        views.rows.push(button);
+    }
+}
+
+fn add_item_icon(
+    env: &mut Environment,
+    parent: id,
+    identifier: &str,
+    title: &str,
+    frame: CGRect,
+) {
+    let palette = [
+        (0.10, 0.40, 0.78, 1.0),
+        (0.48, 0.24, 0.72, 1.0),
+        (0.08, 0.56, 0.48, 1.0),
+        (0.82, 0.36, 0.12, 1.0),
+        (0.72, 0.20, 0.38, 1.0),
+        (0.20, 0.32, 0.52, 1.0),
+    ];
+    let hash = identifier.bytes().fold(0u32, |hash, byte| {
+        hash.wrapping_mul(33).wrapping_add(byte as u32)
+    });
+    let color = palette[hash as usize % palette.len()];
+    let image = make_icon_from_text(env, &item_initials(title), 22.0, 0.0, color);
+    let icon: id = msg_class![env; UIImageView alloc];
+    let icon: id = msg![env; icon initWithImage:image];
+    () = msg![env; icon setFrame:frame];
+    () = msg![env; icon setUserInteractionEnabled:false];
+    () = msg![env; parent addSubview:icon];
+}
+
+fn item_initials(title: &str) -> String {
+    let words: Vec<&str> = title.split_whitespace().take(2).collect();
+    let mut initials = String::new();
+    if words.len() >= 2 {
+        for word in words {
+            if let Some(character) = word.chars().find(|character| character.is_alphanumeric()) {
+                initials.extend(character.to_uppercase());
+            }
+        }
+    } else if let Some(word) = words.first() {
+        for character in word.chars().filter(|character| character.is_alphanumeric()).take(2) {
+            initials.extend(character.to_uppercase());
+        }
+    }
+    if initials.is_empty() {
+        "IPA".to_string()
+    } else {
+        initials
+    }
 }
 
 fn catalog_subtitle(item: &CatalogItem) -> String {
     let mut parts = Vec::new();
     if let Some(version) = &item.version {
-        parts.push(format!("Version {version}"));
-    }
-    if let Some(date) = &item.date {
-        parts.push(date.clone());
+        parts.push(format!("v{version}"));
     }
     if let Some(creator) = &item.creator {
         parts.push(creator.clone());
     }
+    if let Some(date) = &item.date {
+        parts.push(date.clone());
+    }
     if parts.is_empty() {
         item.identifier.clone()
     } else {
-        parts.join(" • ")
+        truncate_chars(&parts.join(" • "), 120)
     }
+}
+
+fn details_metadata(details: &ItemDetails) -> String {
+    let mut parts = vec![details.identifier.clone()];
+    if let Some(creator) = &details.creator {
+        parts.push(creator.clone());
+    }
+    if let Some(version) = &details.version {
+        parts.push(format!("Version {version}"));
+    }
+    if let Some(date) = &details.date {
+        parts.push(date.clone());
+    }
+    truncate_chars(&parts.join(" • "), 180)
 }
 
 fn file_subtitle(file: &ArchiveFile) -> String {
@@ -1107,61 +1811,19 @@ fn file_subtitle(file: &ArchiveFile) -> String {
         parts.push(format_size(size));
     }
     if parts.is_empty() {
-        "IPA archive".to_string()
+        "IPA package".to_string()
     } else {
         parts.join(" • ")
     }
 }
 
-fn set_download_progress(env: &mut Environment, views: &StoreViews, downloaded: u64, total: Option<u64>) {
-    let fraction = total
-        .filter(|total| *total > 0)
-        .map(|total| downloaded as f64 / total as f64)
-        .unwrap_or(0.0);
-    set_progress_fraction(env, views, fraction);
-    let text = if let Some(total) = total.filter(|total| *total > 0) {
-        format!(
-            "{} / {} • {:.0}%",
-            format_size(downloaded),
-            format_size(total),
-            fraction.clamp(0.0, 1.0) * 100.0
-        )
-    } else {
-        format!("{} downloaded", format_size(downloaded))
-    };
-    set_label(env, views.progress_label, &text);
-}
-
-fn set_progress_fraction(env: &mut Environment, views: &StoreViews, fraction: f64) {
-    let mut frame: CGRect = msg![env; (views.progress_fill) frame];
-    frame.size.width = views.progress_width * fraction.clamp(0.0, 1.0) as CGFloat;
-    () = msg![env; (views.progress_fill) setFrame:frame];
-}
-
-fn format_size(bytes: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = KIB * 1024.0;
-    const GIB: f64 = MIB * 1024.0;
-    let bytes_f = bytes as f64;
-    if bytes_f >= GIB {
-        format!("{:.2} GB", bytes_f / GIB)
-    } else if bytes_f >= MIB {
-        format!("{:.1} MB", bytes_f / MIB)
-    } else if bytes_f >= KIB {
-        format!("{:.0} KB", bytes_f / KIB)
-    } else {
-        format!("{bytes} B")
+fn truncate_chars(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_string();
     }
-}
-
-fn download_key(identifier: &str, file_name: &str) -> String {
-    format!("{identifier}\n{file_name}")
-}
-
-fn display_file_name(name: &str) -> &str {
-    name.rsplit(|character| character == '/' || character == '\\')
-        .next()
-        .unwrap_or(name)
+    let mut text: String = value.chars().take(limit.saturating_sub(1)).collect();
+    text.push('…');
+    text
 }
 
 fn request_catalog(
@@ -1170,12 +1832,13 @@ fn request_catalog(
     query: String,
     page: usize,
     rows: usize,
+    sort: CatalogSort,
 ) {
     let worker_sender = sender.clone();
     let spawn = std::thread::Builder::new()
         .name("HyperHLE archive catalog".to_string())
         .spawn(move || {
-            let result = fetch_catalog(&query, page, rows);
+            let result = network::fetch_catalog(&query, page, rows, sort);
             let _ = worker_sender.send(StoreMessage::Catalog { generation, result });
         });
     if let Err(error) = spawn {
@@ -1191,7 +1854,7 @@ fn request_details(sender: &Sender<StoreMessage>, generation: u64, identifier: S
     let spawn = std::thread::Builder::new()
         .name("HyperHLE archive metadata".to_string())
         .spawn(move || {
-            let result = fetch_details(&identifier);
+            let result = network::fetch_details(&identifier);
             let _ = worker_sender.send(StoreMessage::Details { generation, result });
         });
     if let Err(error) = spawn {
@@ -1215,13 +1878,17 @@ fn request_download(
     let spawn = std::thread::Builder::new()
         .name("HyperHLE IPA download".to_string())
         .spawn(move || {
-            let result = download_ipa(
+            let result = network::download_ipa(
                 &apps_dir,
                 &identifier,
                 &file,
                 &cancel,
-                &progress_sender,
-                generation,
+                |downloaded, total| {
+                    let _ = progress_sender.send(StoreMessage::Download {
+                        generation,
+                        event: DownloadEvent::Progress { downloaded, total },
+                    });
+                },
             );
             let _ = worker_sender.send(StoreMessage::Download {
                 generation,
@@ -1238,595 +1905,42 @@ fn request_download(
     }
 }
 
-fn archive_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(20))
-        .timeout_read(Duration::from_secs(60))
-        .timeout_write(Duration::from_secs(60))
-        .redirects(10)
-        .build()
-}
-
-fn check_response(result: Result<ureq::Response, ureq::Error>) -> Result<ureq::Response, String> {
-    match result {
-        Ok(response) => Ok(response),
-        Err(ureq::Error::Status(status, response)) => Err(format!(
-            "Internet Archive returned HTTP {} {}.",
-            status,
-            response.status_text()
-        )),
-        Err(ureq::Error::Transport(error)) => Err(format!(
-            "Could not connect to Internet Archive: {error}. Check the network connection and try again."
-        )),
-    }
-}
-
-fn fetch_json(url: &str) -> Result<Value, String> {
-    let response = archive_agent()
-        .get(url)
-        .set("Accept", "application/json")
-        .set(
-            "User-Agent",
-            concat!("HyperHLE-Reborn/", env!("CARGO_PKG_VERSION")),
-        )
-        .call();
-    let response = check_response(response)?;
-    let mut body = Vec::new();
-    response
-        .into_reader()
-        .take((MAX_JSON_RESPONSE_SIZE + 1) as u64)
-        .read_to_end(&mut body)
-        .map_err(|error| format!("Could not read Internet Archive's response: {error}"))?;
-    if body.len() > MAX_JSON_RESPONSE_SIZE {
-        return Err("Internet Archive's metadata response is too large.".to_string());
-    }
-    serde_json::from_slice(&body)
-        .map_err(|error| format!("Internet Archive returned invalid JSON: {error}"))
-}
-
-fn fetch_catalog(query: &str, page: usize, rows: usize) -> Result<CatalogPage, String> {
-    let page = page.max(1);
-    let rows = rows.clamp(1, 50);
-    let url = catalog_url(query, page, rows);
-    let json = fetch_json(&url)?;
-    parse_catalog(&json, page)
-}
-
-fn catalog_url(query: &str, page: usize, rows: usize) -> String {
-    let mut archive_query = format!("collection:{COLLECTION_ID}");
-    for term in query.split_whitespace().take(8) {
-        let term: String = term.chars().take(80).collect();
-        let term = escape_lucene_term(&term);
-        if !term.is_empty() {
-            archive_query.push_str(&format!(
-                " AND (title:{term}* OR identifier:{term}*)"
-            ));
-        }
-    }
-    let fields = [
-        "identifier",
-        "title",
-        "date",
-        "year",
-        "creator",
-        "version",
-    ];
-    let mut url = format!(
-        "https://archive.org/advancedsearch.php?q={}",
-        percent_encode(&archive_query)
-    );
-    for field in fields {
-        url.push_str("&fl%5B%5D=");
-        url.push_str(field);
-    }
-    url.push_str(&format!(
-        "&sort%5B%5D={}&rows={rows}&page={page}&output=json",
-        percent_encode("title asc")
-    ));
-    url
-}
-
-fn parse_catalog(json: &Value, requested_page: usize) -> Result<CatalogPage, String> {
-    let response = json
-        .get("response")
-        .ok_or_else(|| "The catalog response has no response object.".to_string())?;
-    let num_found = response
-        .get("numFound")
-        .and_then(json_u64)
-        .ok_or_else(|| "The catalog response has no result count.".to_string())?;
-    let documents = response
-        .get("docs")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "The catalog response has no document list.".to_string())?;
-    let mut items = Vec::new();
-    for document in documents {
-        let Some(identifier) = document.get("identifier").and_then(json_text) else {
-            continue;
-        };
-        if identifier.is_empty() {
-            continue;
-        }
-        let title = document
-            .get("title")
-            .and_then(json_text)
-            .unwrap_or_else(|| identifier.clone());
-        let explicit_version = document.get("version").and_then(json_text);
-        let version = infer_version(&title, &identifier, explicit_version);
-        let date = document
-            .get("date")
-            .and_then(json_text)
-            .or_else(|| document.get("year").and_then(json_text))
-            .map(|date| short_date(&date));
-        let creator = document.get("creator").and_then(json_text);
-        items.push(CatalogItem {
-            identifier,
-            title,
-            version,
-            date,
-            creator,
-        });
-    }
-    Ok(CatalogPage {
-        items,
-        num_found,
-        page: requested_page,
-    })
-}
-
-fn fetch_details(identifier: &str) -> Result<ItemDetails, String> {
-    let url = format!(
-        "https://archive.org/metadata/{}",
-        percent_encode(identifier)
-    );
-    let json = fetch_json(&url)?;
-    parse_details(&json, identifier)
-}
-
-fn parse_details(json: &Value, requested_identifier: &str) -> Result<ItemDetails, String> {
-    let metadata = json.get("metadata");
-    let identifier = metadata
-        .and_then(|metadata| metadata.get("identifier"))
-        .and_then(json_text)
-        .unwrap_or_else(|| requested_identifier.to_string());
-    let title = metadata
-        .and_then(|metadata| metadata.get("title"))
-        .and_then(json_text)
-        .unwrap_or_else(|| identifier.clone());
-    let item_version = metadata
-        .and_then(|metadata| metadata.get("version"))
-        .and_then(json_text)
-        .or_else(|| infer_version(&title, &identifier, None));
-    let empty_files = Vec::new();
-    let files = json
-        .get("files")
-        .and_then(Value::as_array)
-        .unwrap_or(&empty_files);
-    let mut ipa_files = Vec::new();
-    for file in files {
-        let Some(name) = file.get("name").and_then(json_text) else {
-            continue;
-        };
-        if !name.to_ascii_lowercase().ends_with(".ipa") || json_is_private(file.get("private")) {
-            continue;
-        }
-        let size = file.get("size").and_then(json_u64);
-        // A multi-version item often has a generic title but precise file
-        // names, so the file's own version wins over the item-level guess.
-        let file_version = extract_version(&name).or_else(|| item_version.clone());
-        let version = infer_version(&name, &identifier, file_version);
-        ipa_files.push(ArchiveFile { name, size, version });
-    }
-    ipa_files.sort_by_key(|file| file.name.to_ascii_lowercase());
-    Ok(ItemDetails {
-        identifier,
-        title,
-        files: ipa_files,
-    })
-}
-
-fn download_ipa(
-    apps_dir: &Path,
-    identifier: &str,
-    file: &ArchiveFile,
-    cancel: &AtomicBool,
-    sender: &Sender<StoreMessage>,
-    generation: u64,
-) -> Result<DownloadOutcome, String> {
-    std::fs::create_dir_all(apps_dir)
-        .map_err(|error| format!("Could not create the apps directory: {error}"))?;
-    let (destination, already_present) =
-        choose_destination(apps_dir, identifier, &file.name, file.size);
-    if already_present {
-        return Ok(DownloadOutcome {
-            path: destination,
-            already_present: true,
-        });
-    }
-
-    let partial = destination.with_extension("ipa.part");
-    if partial.exists() {
-        std::fs::remove_file(&partial)
-            .map_err(|error| format!("Could not remove an old partial download: {error}"))?;
-    }
-
-    let result = (|| -> Result<(), String> {
-        if cancel.load(Ordering::Acquire) {
-            return Err("Download cancelled.".to_string());
-        }
-        let url = download_url(identifier, &file.name);
-        let response = archive_agent()
-            .get(&url)
-            .set(
-                "User-Agent",
-                concat!("HyperHLE-Reborn/", env!("CARGO_PKG_VERSION")),
-            )
-            .call();
-        let response = check_response(response)?;
-        let total = response
-            .header("Content-Length")
-            .and_then(|length| length.parse::<u64>().ok())
-            .or(file.size);
-        let mut reader = response.into_reader();
-        let mut output = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&partial)
-            .map_err(|error| format!("Could not create {}: {error}", partial.display()))?;
-        let mut buffer = [0u8; 64 * 1024];
-        let mut downloaded = 0u64;
-        let mut last_report = Instant::now();
-        let mut last_reported_bytes = 0u64;
-        loop {
-            if cancel.load(Ordering::Acquire) {
-                return Err("Download cancelled.".to_string());
-            }
-            let count = reader
-                .read(&mut buffer)
-                .map_err(|error| format!("The download was interrupted: {error}"))?;
-            if count == 0 {
-                break;
-            }
-            output
-                .write_all(&buffer[..count])
-                .map_err(|error| format!("Could not save the IPA: {error}"))?;
-            downloaded += count as u64;
-            if downloaded - last_reported_bytes >= 1024 * 1024
-                || last_report.elapsed() >= Duration::from_millis(150)
-            {
-                let _ = sender.send(StoreMessage::Download {
-                    generation,
-                    event: DownloadEvent::Progress {
-                        downloaded,
-                        total,
-                    },
-                });
-                last_report = Instant::now();
-                last_reported_bytes = downloaded;
-            }
-        }
-        output
-            .sync_all()
-            .map_err(|error| format!("Could not finish saving the IPA: {error}"))?;
-        drop(output);
-        if let Some(expected) = file.size.filter(|size| *size > 0) {
-            if downloaded != expected {
-                return Err(format!(
-                    "The download is incomplete: expected {expected} bytes, received {downloaded}."
-                ));
-            }
-        }
-        // An IPA is a ZIP package. Checking its central directory keeps HTTP
-        // error pages and truncated files out of the picker even when the
-        // archive metadata did not include a size.
-        let package = std::fs::File::open(&partial)
-            .map_err(|error| format!("Could not verify the downloaded IPA: {error}"))?;
-        drop(zip::ZipArchive::new(package).map_err(|error| {
-            format!("The downloaded file is not a valid IPA/ZIP archive: {error}")
-        })?);
-        let _ = sender.send(StoreMessage::Download {
-            generation,
-            event: DownloadEvent::Progress {
-                downloaded,
-                total: Some(downloaded),
-            },
-        });
-        if cancel.load(Ordering::Acquire) {
-            return Err("Download cancelled.".to_string());
-        }
-        std::fs::rename(&partial, &destination).map_err(|error| {
-            format!(
-                "Could not move the completed IPA into {}: {error}",
-                apps_dir.display()
-            )
-        })?;
-        Ok(())
-    })();
-
-    if let Err(error) = result {
-        let _ = std::fs::remove_file(&partial);
-        return Err(error);
-    }
-    Ok(DownloadOutcome {
-        path: destination,
-        already_present: false,
-    })
-}
-
-fn choose_destination(
-    apps_dir: &Path,
-    identifier: &str,
-    archive_name: &str,
-    expected_size: Option<u64>,
-) -> (PathBuf, bool) {
-    let original_name = safe_file_component(display_file_name(archive_name));
-    let original = apps_dir.join(&original_name);
-    if existing_file_matches(&original, expected_size) {
-        return (original, true);
-    }
-    if !original.exists() {
-        return (original, false);
-    }
-
-    let stem = original_name
-        .get(..original_name.len().saturating_sub(4))
-        .unwrap_or("app");
-    let suffix = safe_file_component(identifier);
-    for counter in 1..1000usize {
-        let suffix = if counter == 1 {
-            suffix.clone()
-        } else {
-            format!("{suffix}-{counter}")
-        };
-        let name: String = format!(
-            "{} [{}].ipa",
-            stem.chars().take(100).collect::<String>(),
-            suffix.chars().take(48).collect::<String>()
-        );
-        let candidate = apps_dir.join(name);
-        if existing_file_matches(&candidate, expected_size) {
-            return (candidate, true);
-        }
-        if !candidate.exists() {
-            return (candidate, false);
-        }
-    }
-    (original, false)
-}
-
-fn existing_file_matches(path: &Path, expected_size: Option<u64>) -> bool {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
-    };
-    metadata.is_file()
-        && expected_size
-            .filter(|size| *size > 0)
-            .is_none_or(|size| metadata.len() == size)
-}
-
-fn safe_file_component(name: &str) -> String {
-    let mut result: String = name
-        .chars()
-        .map(|character| {
-            if character.is_control() || "<>:\"/\\|?*".contains(character) {
-                '_'
-            } else {
-                character
-            }
-        })
-        .take(160)
-        .collect();
-    result = result.trim().trim_matches('.').to_string();
-    if result.is_empty() || result == "." || result == ".." {
-        "app.ipa".to_string()
-    } else {
-        result
-    }
-}
-
-fn download_url(identifier: &str, file_name: &str) -> String {
-    let encoded_path = file_name
-        .split('/')
-        .map(percent_encode)
-        .collect::<Vec<_>>()
-        .join("/");
-    format!(
-        "https://archive.org/download/{}/{}",
-        percent_encode(identifier),
-        encoded_path
-    )
-}
-
-fn percent_encode(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            encoded.push(byte as char);
-        } else {
-            encoded.push('%');
-            encoded.push_str(&format!("{byte:02X}"));
-        }
-    }
-    encoded
-}
-
-fn escape_lucene_term(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        if "+-=&|><!(){}[]^\"~*?:\\/".contains(character) {
-            escaped.push('\\');
-        }
-        escaped.push(character);
-    }
-    escaped
-}
-
-fn json_text(value: &Value) -> Option<String> {
-    match value {
-        Value::String(text) => {
-            let text = text.trim();
-            (!text.is_empty()).then_some(text.to_string())
-        }
-        Value::Number(number) => Some(number.to_string()),
-        Value::Array(values) => {
-            let text = values.iter().filter_map(json_text).collect::<Vec<_>>().join(", ");
-            (!text.is_empty()).then_some(text)
-        }
-        _ => None,
-    }
-}
-
-fn json_u64(value: &Value) -> Option<u64> {
-    match value {
-        Value::Number(number) => number.as_u64(),
-        Value::String(text) => text.parse().ok(),
-        _ => None,
-    }
-}
-
-fn json_is_private(value: Option<&Value>) -> bool {
-    match value {
-        Some(Value::Bool(value)) => *value,
-        Some(Value::String(value)) => value.eq_ignore_ascii_case("true") || value == "1",
-        Some(Value::Number(value)) => value.as_u64() == Some(1),
-        _ => false,
-    }
-}
-
-fn short_date(value: &str) -> String {
-    value.chars().take(10).collect()
-}
-
-fn infer_version(title: &str, identifier: &str, explicit: Option<String>) -> Option<String> {
-    explicit
-        .and_then(|version| {
-            let version = version.trim().trim_start_matches(['v', 'V']).to_string();
-            (!version.is_empty()).then_some(version)
-        })
-        .or_else(|| extract_version(title))
-        .or_else(|| extract_version(identifier))
-}
-
-fn extract_version(text: &str) -> Option<String> {
-    // Do not mistake the package extension for another version component.
-    let text = text
-        .get(text.len().saturating_sub(4)..)
-        .filter(|extension| extension.eq_ignore_ascii_case(".ipa"))
-        .map(|_| &text[..text.len() - 4])
-        .unwrap_or(text);
-    for token in text.split(|character: char| {
-        character.is_whitespace() || "(),[]{}<>".contains(character)
-    }) {
-        let token = token.trim_matches(|character: char| {
-            matches!(character, ':' | ';' | '!' | '?' | '"' | '\'')
-        });
-        let explicit_v = token.as_bytes().get(..2).is_some_and(|prefix| {
-            matches!(prefix[0], b'v' | b'V') && prefix[1].is_ascii_digit()
-        });
-        for (start, character) in token.char_indices() {
-            if !character.is_ascii_digit() {
-                continue;
-            }
-            let mut end = start + character.len_utf8();
-            for (index, next) in token.char_indices().skip_while(|(index, _)| *index <= start) {
-                if next.is_ascii_digit() || next == '.' {
-                    end = index + next.len_utf8();
-                } else {
-                    break;
-                }
-            }
-            let candidate = token[start..end].trim_end_matches('.');
-            let dotted = candidate.contains('.');
-            if !dotted && !(explicit_v && start == 1) {
-                continue;
-            }
-            if candidate.len() <= 40
-                && candidate
-                    .split('.')
-                    .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
-            {
-                return Some(candidate.to_string());
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
-    #[test]
-    fn catalog_keeps_every_collection_media_type_and_reads_versions() {
-        let json = json!({"response": {"numFound": 2, "docs": [
-            {"identifier": "example-game", "title": "Example Game 1.2.3", "mediatype": "movies"},
-            {"identifier": "other", "title": "Other", "version": "v4.5"}
-        ]}});
-        let page = parse_catalog(&json, 3).unwrap();
-        assert_eq!(page.num_found, 2);
-        assert_eq!(page.page, 3);
-        assert_eq!(page.items.len(), 2);
-        assert_eq!(page.items[0].version.as_deref(), Some("1.2.3"));
-        assert_eq!(page.items[1].version.as_deref(), Some("4.5"));
+    fn file() -> ArchiveFile {
+        ArchiveFile {
+            name: "Game 1.0.ipa".to_string(),
+            size: Some(1024),
+            version: Some("1.0".to_string()),
+        }
     }
 
     #[test]
-    fn details_only_expose_public_ipa_files() {
-        let json = json!({
-            "metadata": {"identifier": "item", "title": "Game 2.0"},
-            "files": [
-                {"name": "Game 2.0.ipa", "size": "1024"},
-                {"name": "Other.IPA", "size": 2048},
-                {"name": "notes.txt"},
-                {"name": "secret.ipa", "private": "true"}
-            ]
-        });
-        let details = parse_details(&json, "item").unwrap();
-        assert_eq!(details.files.len(), 2);
-        assert_eq!(details.files[0].size, Some(1024));
-        assert_eq!(details.files[1].size, Some(2048));
-        assert_eq!(details.files[0].version.as_deref(), Some("2.0"));
+    fn queue_deduplicates_and_retries_tasks() {
+        let mut manager = DownloadManager::new();
+        assert!(manager.enqueue("game", "Game", &file()));
+        assert!(!manager.enqueue("game", "Game", &file()));
+        assert_eq!(manager.pending_count(), 1);
+        let id = manager.tasks[0].id;
+        assert!(manager.toggle(id));
+        assert_eq!(manager.tasks[0].state, TaskState::Cancelled);
+        assert!(manager.toggle(id));
+        assert_eq!(manager.tasks[0].state, TaskState::Queued);
+        manager.cancel_all();
+        assert_eq!(manager.tasks[0].state, TaskState::Cancelled);
+        assert!(manager.retry_all());
+        assert_eq!(manager.tasks[0].state, TaskState::Queued);
     }
 
     #[test]
-    fn version_inference_handles_common_archive_titles() {
-        assert_eq!(extract_version("Video Star 11.2.8 1675756235"), Some("11.2.8".to_string()));
-        assert_eq!(extract_version("[ Temple Run ][ 1.6.1 ]"), Some("1.6.1".to_string()));
-        assert_eq!(extract_version("Talking Tom v2.7 IPA"), Some("2.7".to_string()));
-        assert_eq!(extract_version("Game 2.0.ipa"), Some("2.0".to_string()));
-        assert_eq!(extract_version("Game-1.2.3.ipa"), Some("1.2.3".to_string()));
-        assert_eq!(extract_version("iPhone4-1.2.3.ipa"), Some("1.2.3".to_string()));
-        assert_eq!(extract_version("Minecraft Pocket Edition"), None);
-        assert_eq!(extract_version("é1"), None);
-    }
-
-    #[test]
-    fn archive_urls_are_encoded_without_flattening_file_paths() {
-        assert_eq!(
-            download_url("item id", "folder/Game & More.ipa"),
-            "https://archive.org/download/item%20id/folder/Game%20%26%20More.ipa"
-        );
-        let url = catalog_url("", 1, 25);
-        assert!(url.contains("collection%3Aipaarchive"));
-        assert!(!url.contains("mediatype"));
-    }
-
-    #[test]
-    fn file_names_cannot_escape_the_apps_directory() {
-        assert_eq!(
-            safe_file_component(display_file_name("../Game.ipa")),
-            "Game.ipa"
-        );
-        assert_eq!(safe_file_component(".."), "app.ipa");
-        assert_eq!(display_file_name("folder/subfolder/Game.ipa"), "Game.ipa");
-    }
-
-    #[test]
-    fn search_terms_are_literal_and_paginated() {
-        let url = catalog_url("need:for speed*", 4, 25);
-        assert!(url.contains("page=4"));
-        assert!(url.contains("rows=25"));
-        assert!(url.contains("need%5C%3Afor"));
-        assert!(url.contains("speed%5C%2A"));
+    fn sorting_cycles_and_icons_have_stable_initials() {
+        assert_eq!(CatalogSort::Title.next(), CatalogSort::Newest);
+        assert_eq!(CatalogSort::Newest.next(), CatalogSort::Oldest);
+        assert_eq!(CatalogSort::Oldest.next(), CatalogSort::Title);
+        assert_eq!(item_initials("Temple Run"), "TR");
+        assert_eq!(item_initials("Minecraft"), "MI");
+        assert_eq!(item_initials(""), "IPA");
     }
 }

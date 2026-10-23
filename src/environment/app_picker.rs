@@ -359,6 +359,9 @@ struct AppPickerDelegateHostObject {
     archive_store_cancel: bool,
     archive_store_item: Option<NSInteger>,
     archive_store_download: Option<NSInteger>,
+    archive_store_tab: Option<NSInteger>,
+    archive_store_sort: bool,
+    archive_store_queue_action: Option<NSInteger>,
     settings_show: bool,
     settings_hide: bool,
     scale_hack_default: bool,
@@ -613,6 +616,17 @@ const CLASSES: ClassExports = objc_classes! {
 - (())archiveStoreDownload:(id)sender {
     let tag: NSInteger = msg![env; sender tag];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_download = Some(tag);
+}
+- (())archiveStoreTab:(id)sender {
+    let tag: NSInteger = msg![env; sender tag];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_tab = Some(tag);
+}
+- (())archiveStoreSort {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_sort = true;
+}
+- (())archiveStoreQueueAction:(id)sender {
+    let tag: NSInteger = msg![env; sender tag];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_queue_action = Some(tag);
 }
 - (())textFieldShouldReturn:(id)sender {
     let tag: NSInteger = msg![env; sender tag];
