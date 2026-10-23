@@ -24,7 +24,6 @@ The titles below have been tested with HyperHLE-Reborn and are known to run. Com
 - N.O.V.A. 3 (Playable)
 - Gangstar Vegas (Unplayable on adreno)
 - Geometry Dash (Playable)
-- Terraria (Playable)
 - Modern Combat 3 (Playable)
 - Asphalt 7 (Playable)
 - Turbo Dismount (Playable)
