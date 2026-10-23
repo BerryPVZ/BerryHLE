@@ -629,6 +629,35 @@ int test_dispatch_async_global_queue(void) {
 int test_dispatch_async_f_global_queue(void) {
   return check_dispatch_async_global_queue(YES);
 }
+
+// Apple: +[AVAsset assetWithURL:] "Returns an asset for inspection of a
+// resource referenced by a given URL" (iOS 5.0+). Talking Ted relies on it
+// to load its animations (HyperHLE-Reborn issue 303).
+// https://developer.apple.com/documentation/avfoundation/avasset/1389943-assetwithurl
+@interface AVAsset : NSObject
++ (id)assetWithURL:(NSURL *)url;
+@end
+@interface AVURLAsset : AVAsset
+- (NSURL *)URL;
+@end
+@interface NSObject (AVAssetTest)
+- (BOOL)isKindOfClass:(Class)cls;
+- (BOOL)isEqual:(id)object;
+@end
+int test_AVAsset_assetWithURL(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  NSURL *url = [NSURL URLWithString:@"file:///nonexistent/movie.m4v"];
+  id asset = [AVAsset assetWithURL:url];
+  int result = 0;
+  if (asset == nil)
+    result = -1;
+  else if (![asset isKindOfClass:[AVURLAsset class]])
+    result = -2;
+  else if (![[asset URL] isEqual:url])
+    result = -3;
+  [pool drain];
+  return result;
+}
 extern int test_runloop_audio_queue(void);
 extern int test_runloop_audio_queue_null(void);
 extern int test_runloop_audio_unit_independent(void);
@@ -7577,6 +7606,7 @@ struct {
     FUNC_DEF(test_dispatch_after_common_mode),
     FUNC_DEF(test_dispatch_async_global_queue),
     FUNC_DEF(test_dispatch_async_f_global_queue),
+    FUNC_DEF(test_AVAsset_assetWithURL),
     FUNC_DEF(test_runloop_audio_queue),
     FUNC_DEF(test_runloop_audio_queue_null),
     FUNC_DEF(test_runloop_audio_unit_independent),
