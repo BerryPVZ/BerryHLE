@@ -113,10 +113,6 @@ pub struct State {
     pub(crate) fatal_delivered: bool,
 }
 
-fn is_fault_signal(signum: i32) -> bool {
-    matches!(signum, SIGILL | SIGBUS | SIGFPE | SIGSEGV | SIGSYS)
-}
-
 // Guest-visible sizes from Darwin's `sys/signal.h` and `mach/arm/_structs.h`
 // for 32-bit ARM. Only the fields crash reporters actually read are filled in;
 // the rest is zeroed, which is a valid `siginfo_t`/`ucontext_t` as far as the
@@ -411,7 +407,7 @@ pub(crate) fn raise_signal(env: &mut Environment, signum: i32) -> RaiseOutcome {
                 handler,
                 signum
             );
-            if is_fault_signal(signum) {
+            if matches!(signum, SIGILL | SIGBUS | SIGFPE | SIGSEGV | SIGSYS) {
                 env.libc_state.signal.fatal_delivered = true;
             }
             env.libc_state.signal.handling.push(signum);

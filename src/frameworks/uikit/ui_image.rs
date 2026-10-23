@@ -291,15 +291,17 @@ pub const CLASSES: ClassExports = objc_classes! {
         1.0
     };
     if data == nil {
+        let dummy = get_dummy_cg_image(env);
         let host = env.objc.borrow_mut::<UIImageHostObject>(this);
-        host.cg_image = get_dummy_cg_image(env);
+        host.cg_image = dummy;
         host.scale = normalized_scale;
         return this;
     }
     let slice = ns_data::to_rust_slice(env, data);
     let Ok(image) = Image::from_bytes(slice) else {
+        let dummy = get_dummy_cg_image(env);
         let host = env.objc.borrow_mut::<UIImageHostObject>(this);
-        host.cg_image = get_dummy_cg_image(env);
+        host.cg_image = dummy;
         host.scale = normalized_scale;
         return this;
     };
