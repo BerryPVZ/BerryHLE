@@ -26,6 +26,23 @@ pub mod ui_navigation_controller;
 pub type UIModalTransitionStyle = i32;
 pub type UIModalPresentationStyle = i32;
 
+fn invoke_void_block(env: &mut Environment, block: id) {
+    if block == nil {
+        return;
+    }
+    let invoke_addr: u32 = env.mem.read(block.cast::<u32>() + 3u32);
+    if invoke_addr == 0 {
+        log!(
+            "Warning: UIViewController completion block {:?} has NULL invoke pointer; skipping.",
+            block
+        );
+        return;
+    }
+    use crate::abi::{CallFromHost, GuestFunction};
+    let invoke = GuestFunction::from_addr_with_thumb_bit(invoke_addr);
+    let _: () = invoke.call_from_host(env, (block,));
+}
+
 #[derive(Default)]
 pub(crate) struct UIViewControllerHostObject {
     /// The root view.
@@ -221,7 +238,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     if nib_name != nil { release(env, nib_name); }
     if bundle != nil { release(env, bundle); }
     if title != nil { release(env, title); }
-    if presented != nil { release(env, presented); }
+    if presented != nil {
+        let presented_host = env.objc.borrow_mut::<UIViewControllerHostObject>(presented);
+        if presented_host.presenting_view_controller == this {
+            presented_host.presenting_view_controller = nil;
+        }
+        release(env, presented);
+    }
     // presenting_view_controller is a non-retained back-pointer; do not
     // release.
     let (navigation_item, refresh_control, tab_bar_item) = {
@@ -488,35 +511,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())dismissModalViewControllerAnimated:(bool)animated {
-    // Apple docs: "If you call this method on the modal view controller
-    // itself, it automatically forwards the message to the presenting view
-    // controller." Forward the call up the chain when `self` does not own a
-    // presented view controller.
-    let presented = env.objc.borrow::<UIViewControllerHostObject>(this).presented_view_controller;
-    if presented == nil {
-        let presenter = env.objc.borrow::<UIViewControllerHostObject>(this).presenting_view_controller;
-        if presenter != nil {
-            return msg![env; presenter dismissModalViewControllerAnimated:animated];
-        }
-        log_dbg!(
-            "[(UIViewController*){:?} dismissModalViewControllerAnimated:{}] no presented vc",
-            this, animated
-        );
-        return;
-    }
-
-    () = msg![env; presented viewWillDisappear:animated];
-
-    let presented_view: id = msg![env; presented view];
-    if presented_view != nil {
-        () = msg![env; presented_view removeFromSuperview];
-    }
-
-    () = msg![env; presented viewDidDisappear:animated];
-
-    env.objc.borrow_mut::<UIViewControllerHostObject>(presented).presenting_view_controller = nil;
-    env.objc.borrow_mut::<UIViewControllerHostObject>(this).presented_view_controller = nil;
-    release(env, presented);
+    () = msg![env; this dismissViewControllerAnimated:animated completion:nil];
 }
 // Presents an MPMoviePlayerViewController modally.
 // https://developer.apple.com/documentation/mediaplayer/uiviewcontroller/1619166-presentmovieplayerviewcontroller
@@ -639,13 +634,18 @@ pub const CLASSES: ClassExports = objc_classes! {
     let host_obj = env.objc.borrow_mut::<UIViewControllerHostObject>(this);
     let old_modal = std::mem::replace(&mut host_obj.presented_view_controller, modal_vc);
     if old_modal != nil {
-        // Stack-on-stack presentation is not supported here; just drop the
-        // previous reference cleanly. Apps that need this should be fixed up
-        // separately.
         log!(
             "WARNING: presentModalViewController: replacing existing presented vc {:?} on {:?}",
             old_modal, this
         );
+        let old_view = env.objc.borrow::<UIViewControllerHostObject>(old_modal).view;
+        if old_view != nil {
+            () = msg![env; old_view removeFromSuperview];
+        }
+        let old_host = env.objc.borrow_mut::<UIViewControllerHostObject>(old_modal);
+        if old_host.presenting_view_controller == this {
+            old_host.presenting_view_controller = nil;
+        }
         release(env, old_modal);
     }
     env.objc.borrow_mut::<UIViewControllerHostObject>(modal_vc).presenting_view_controller = this;
@@ -664,8 +664,12 @@ pub const CLASSES: ClassExports = objc_classes! {
         if let Some(callback) = env.objc.lookup_selector("ageGateDidCompleted") {
             let app: id = msg_class![env; UIApplication sharedApplication];
             let delegate: id = msg![env; app delegate];
-            log!("AgeGateView detected: completing age gate automatically on app delegate {:?}", delegate);
-            if delegate != nil {
+            if delegate != nil
+                && env
+                    .objc
+                    .object_has_method_named(&env.mem, delegate, "ageGateDidCompleted")
+            {
+                log!("AgeGateView detected: completing age gate automatically on app delegate {:?}", delegate);
                 // The app hosts its age gate in a dedicated UIWindow which it
                 // makes key *before* presenting the gate. Because we complete
                 // the gate synchronously instead of running the real
@@ -789,13 +793,56 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())presentViewController:(id)vc
                   animated:(bool)animated
-                completion:(id)_completion {
-    msg![env; this presentModalViewController:vc animated:animated]
+                completion:(id)completion {
+    () = msg![env; this presentModalViewController:vc animated:animated];
+    if vc != nil {
+        invoke_void_block(env, completion);
+    }
 }
 
 - (())dismissViewControllerAnimated:(bool)animated
-                         completion:(id)_completion {
-    msg![env; this dismissModalViewControllerAnimated:animated]
+                         completion:(id)completion {
+    // Apple docs: "If you call this method on the modal view controller
+    // itself, it automatically forwards the message to the presenting view
+    // controller."
+    let presented = env
+        .objc
+        .borrow::<UIViewControllerHostObject>(this)
+        .presented_view_controller;
+    if presented == nil {
+        let presenter = env
+            .objc
+            .borrow::<UIViewControllerHostObject>(this)
+            .presenting_view_controller;
+        if presenter != nil {
+            () = msg![env; presenter dismissViewControllerAnimated:animated completion:completion];
+            return;
+        }
+        log_dbg!(
+            "[(UIViewController*){:?} dismissViewControllerAnimated:{}] no presented vc",
+            this,
+            animated
+        );
+        return;
+    }
+
+    () = msg![env; presented viewWillDisappear:animated];
+
+    let presented_view: id = msg![env; presented view];
+    if presented_view != nil {
+        () = msg![env; presented_view removeFromSuperview];
+    }
+
+    () = msg![env; presented viewDidDisappear:animated];
+
+    env.objc
+        .borrow_mut::<UIViewControllerHostObject>(presented)
+        .presenting_view_controller = nil;
+    env.objc
+        .borrow_mut::<UIViewControllerHostObject>(this)
+        .presented_view_controller = nil;
+    release(env, presented);
+    invoke_void_block(env, completion);
 }
 
 // Apple docs: The style used to transition the receiver's modal view controller

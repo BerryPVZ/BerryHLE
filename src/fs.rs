@@ -1128,6 +1128,7 @@ impl Fs {
         // runs (matching the behaviour real iOS would show after the app
         // modifies its own bundle, which is impossible on a real device but
         // some games assume it works).
+        let mut root = root;
         let cow_dir = if !read_only_mode {
             let path = paths::user_data_base_path()
                 .join(paths::SANDBOX_DIR)
@@ -1141,6 +1142,7 @@ impl Fs {
                 );
                 None
             } else {
+                Self::overlay_cow_directory(&mut root, &path);
                 Some(path)
             }
         } else {
@@ -1155,6 +1157,37 @@ impl Fs {
         };
         assert!(fs.lookup_node(&bundle_guest_path).is_some());
         (fs, bundle_guest_path)
+    }
+
+    fn overlay_cow_directory(node: &mut FsNode, host_dir: &Path) {
+        let FsNode::Directory { children, .. } = node else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(host_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let entry_path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                if let Some(child_node) = children.get_mut(&name) {
+                    Self::overlay_cow_directory(child_node, &entry_path);
+                }
+            } else if file_type.is_file() && children.contains_key(&name) {
+                children.insert(
+                    name,
+                    FsNode::File {
+                        location: FileLocation::Path(entry_path),
+                        writeable: true,
+                    },
+                );
+            }
+        }
     }
 
     /// Create a fake filesystem (see [crate::Environment::new_without_app]).
@@ -1665,13 +1698,18 @@ impl Fs {
             OpenDir,
             /// Reject the request.
             Reject,
-            /// Copy-on-Write: extract IPA content to this host path (content
-            /// may already be on disk if `Vec<u8>` is empty).
-            CowIpa(PathBuf, Vec<u8>),
+            /// Copy-on-Write: extract IPA content to this host path (`None`
+            /// when already extracted on disk).
+            CowIpa(PathBuf, Option<Vec<u8>>),
         }
 
-        // Clone the CoW base path before the mutable borrow of self.root.
+        // Clone the CoW base path and canonicalize guest path components before
+        // borrowing `self.root` mutably, preventing relative/`..` traversal.
         let cow_base_opt: Option<PathBuf> = self.cow_dir.clone();
+        let canonical_components: Vec<String> = resolve_path(path, Some(&self.working_directory))
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
 
         // First borrow scope: inspect existing node, collect all data we need.
         let (existing_new_filename, action): (String, OpenAction) = {
@@ -1701,16 +1739,26 @@ impl Fs {
                             // Copy-on-Write for IPA bundle files.
                             if let FileLocation::IpaFileRef(ipa_ref) = location {
                                 if let Some(cow_base) = cow_base_opt.clone() {
-                                    let guest_str = path.as_str();
-                                    let rel = guest_str.trim_start_matches('/');
-                                    let host_path =
-                                        rel.split('/').fold(cow_base, |acc, c| acc.join(c));
+                                    if canonical_components.is_empty()
+                                        || canonical_components.iter().any(|c| {
+                                            c.is_empty()
+                                                || c == "."
+                                                || c == ".."
+                                                || c.contains('\\')
+                                                || c.contains(':')
+                                        })
+                                    {
+                                        return Err(());
+                                    }
+                                    let host_path = canonical_components
+                                        .iter()
+                                        .fold(cow_base, |acc, c| acc.join(c));
                                     // Read the IPA content now while the borrow is valid.
                                     let content = if !host_path.exists() {
                                         let mut ipa_file = ipa_ref.open();
                                         let mut buf = Vec::new();
                                         match ipa_file.read_to_end(&mut buf) {
-                                            Ok(_) => buf,
+                                            Ok(_) => Some(buf),
                                             Err(e) => {
                                                 log!(
                                                     "CoW: failed to read IPA content for {:?}: {}",
@@ -1721,7 +1769,7 @@ impl Fs {
                                             }
                                         }
                                     } else {
-                                        Vec::new() // already on disk
+                                        None // already on disk
                                     };
                                     OpenAction::CowIpa(host_path, content)
                                 } else {
@@ -1800,7 +1848,7 @@ impl Fs {
             }
             OpenAction::CowIpa(host_path, content) => {
                 // Write the IPA content to the CoW location if needed.
-                if !content.is_empty() {
+                if let Some(content) = content {
                     if let Some(parent) = host_path.parent() {
                         if let Err(e) = std::fs::create_dir_all(parent) {
                             log!(

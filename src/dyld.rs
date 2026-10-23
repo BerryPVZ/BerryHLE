@@ -666,28 +666,16 @@ impl Dyld {
                         patch_count
                     );
                 }
-
-                // `std::string(const char*)` with a NULL argument is constructed
-                // via `_S_construct(NULL, NULL + npos)`. libstdc++ detects the NULL
-                // pointer and calls `std::__throw_logic_error("basic_string::
-                // _S_construct null not valid")`. With the `__throw_*` helpers
-                // neutered to `BX LR` above, that throw becomes a no-op and
-                // execution falls through to the *normal* construction path, which
-                // does `memcpy(rep_data, NULL, npos)` and sets the string length to
-                // `npos`. The over-sized copy is skipped by `Mem::memmove`, but the
-                // resulting corrupt (length == npos) string sends some apps into an
-                // effectively infinite loop (e.g. Turbo Dismount's startup builds
-                // std::strings from a table that contains a NULL entry under
-                // touchHLE).
-                //
-                // The documented intent of the throw-neutering is for `std::
-                // string(NULL)` to behave like an *empty* string. We make that
-                // actually happen by retargeting the NULL-pointer branch inside
-                // `_S_construct` so it jumps to the function's existing
-                // "empty string" path (which returns `_S_empty_rep()._M_refdata()`)
-                // instead of the throw / over-sized-copy path.
-                patch_string_s_construct_null(dylib, mem);
             }
+        }
+
+        // Always redirect `std::string((const char*)NULL)` in bundled libstdc++
+        // to the empty-string representation, even when the guest SjLj runtime
+        // is active. Games such as Geometry Dash 1.0 and Turbo Dismount pass
+        // NULL to `std::string(const char*)` during startup without catching
+        // `std::logic_error`.
+        for dylib in bins.iter().skip(1) {
+            patch_string_s_construct_null(dylib, mem);
         }
     }
 

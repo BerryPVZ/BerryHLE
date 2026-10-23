@@ -225,10 +225,25 @@ fn make_task(
     autorelease(env, task)
 }
 
+fn responds_to(env: &mut crate::Environment, target: id, selector_name: &str) -> bool {
+    if target == nil {
+        return false;
+    }
+    let sel = env
+        .objc
+        .lookup_selector(selector_name)
+        .unwrap_or_else(|| env.objc.register_host_selector(selector_name.to_string(), &mut env.mem));
+    msg![env; target respondsToSelector:sel]
+}
+
 fn schedule_task_poll(env: &mut crate::Environment, task: id, delay: f64) {
     let selector = env
         .objc
-        .register_host_selector("_touchHLE_pollNetwork".to_string(), &mut env.mem);
+        .lookup_selector("_touchHLE_pollNetwork")
+        .unwrap_or_else(|| {
+            env.objc
+                .register_host_selector("_touchHLE_pollNetwork".to_string(), &mut env.mem)
+        });
     () = msg![env; task performSelector:selector withObject:nil afterDelay:delay];
 }
 
@@ -306,20 +321,17 @@ fn finish_task(env: &mut crate::Environment, task: id, result: url_loading::Http
         host.state = NS_URL_SESSION_TASK_STATE_COMPLETED;
         host.receiver = None;
         host.bytes_received = received;
+        let handler = std::mem::replace(&mut host.completion_handler, nil);
         let previous_response = std::mem::replace(&mut host.response, response_object);
         let previous_error = std::mem::replace(&mut host.error, error_object);
-        (
-            host.session,
-            host.completion_handler,
-            previous_response,
-            previous_error,
-        )
+        (host.session, handler, previous_response, previous_error)
     };
     release(env, previous_response);
     release(env, previous_error);
 
     if handler != nil {
         invoke_completion_handler(env, handler, first_result, response_object, error_object);
+        release(env, handler);
         return;
     }
     let delegate: id = if session != nil {
@@ -332,12 +344,20 @@ fn finish_task(env: &mut crate::Environment, task: id, result: url_loading::Http
     }
     if error_object == nil {
         if is_download {
-            () = msg![env; delegate URLSession:session downloadTask:task didFinishDownloadingToURL:first_result];
-        } else {
+            if responds_to(
+                env,
+                delegate,
+                "URLSession:downloadTask:didFinishDownloadingToURL:",
+            ) {
+                () = msg![env; delegate URLSession:session downloadTask:task didFinishDownloadingToURL:first_result];
+            }
+        } else if responds_to(env, delegate, "URLSession:dataTask:didReceiveData:") {
             () = msg![env; delegate URLSession:session dataTask:task didReceiveData:first_result];
         }
     }
-    () = msg![env; delegate URLSession:session task:task didCompleteWithError:error_object];
+    if responds_to(env, delegate, "URLSession:task:didCompleteWithError:") {
+        () = msg![env; delegate URLSession:session task:task didCompleteWithError:error_object];
+    }
 }
 
 fn start_task_network(env: &mut crate::Environment, task: id) {
@@ -352,6 +372,14 @@ fn start_task_network(env: &mut crate::Environment, task: id) {
     };
     if existing_receiver {
         schedule_task_poll(env, task, 0.05);
+        return;
+    }
+
+    if let Some(local_result) = url_loading::try_local_file_request(env, request) {
+        env.objc
+            .borrow_mut::<NSURLSessionTaskHostObject>(task)
+            .receiver = Some(url_loading::immediate_async_result(local_result));
+        schedule_task_poll(env, task, 0.0);
         return;
     }
 
@@ -545,6 +573,46 @@ pub const CLASSES: ClassExports = objc_classes! {
         .timeout_interval_for_resource = value;
 }
 
+- (id)copyWithZone:(crate::objc::NSZonePtr)_zone {
+    let &NSURLSessionConfigurationHostObject {
+        identifier,
+        allows_cellular_access,
+        http_additional_headers,
+        url_cache,
+        request_cache_policy,
+        timeout_interval_for_request,
+        timeout_interval_for_resource,
+    } = env
+        .objc
+        .borrow::<NSURLSessionConfigurationHostObject>(this);
+    let copy: id = msg_class![env; NSURLSessionConfiguration alloc];
+    let copy: id = msg![env; copy init];
+    let copied_id: id = if identifier == nil {
+        nil
+    } else {
+        msg![env; identifier copy]
+    };
+    let copied_headers: id = if http_additional_headers == nil {
+        nil
+    } else {
+        msg![env; http_additional_headers copy]
+    };
+    retain(env, url_cache);
+    {
+        let host = env
+            .objc
+            .borrow_mut::<NSURLSessionConfigurationHostObject>(copy);
+        host.identifier = copied_id;
+        host.allows_cellular_access = allows_cellular_access;
+        host.http_additional_headers = copied_headers;
+        host.url_cache = url_cache;
+        host.request_cache_policy = request_cache_policy;
+        host.timeout_interval_for_request = timeout_interval_for_request;
+        host.timeout_interval_for_resource = timeout_interval_for_resource;
+    }
+    copy
+}
+
 - (())dealloc {
     let &NSURLSessionConfigurationHostObject {
         identifier,
@@ -594,12 +662,18 @@ pub const CLASSES: ClassExports = objc_classes! {
     let new: id = msg![env; this alloc];
     let new: id = msg![env; new init];
 
-    retain(env, configuration);
+    let copied_config: id = if configuration == nil {
+        let default_cfg: id =
+            msg_class![env; NSURLSessionConfiguration defaultSessionConfiguration];
+        retain(env, default_cfg)
+    } else {
+        msg![env; configuration copy]
+    };
     retain(env, delegate);
     retain(env, queue);
     {
         let host = env.objc.borrow_mut::<NSURLSessionHostObject>(new);
-        host.configuration = configuration;
+        host.configuration = copied_config;
         host.delegate = delegate;
         host.delegate_queue = queue;
     }
@@ -607,7 +681,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)configuration {
-    env.objc.borrow::<NSURLSessionHostObject>(this).configuration
+    let config = env.objc.borrow::<NSURLSessionHostObject>(this).configuration;
+    if config == nil {
+        nil
+    } else {
+        let copy: id = msg![env; config copy];
+        autorelease(env, copy)
+    }
 }
 - (id)delegate {
     env.objc.borrow::<NSURLSessionHostObject>(this).delegate
@@ -632,7 +712,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow::<NSURLSessionHostObject>(this).session_description
 }
 - (())setSessionDescription:(id)description {
-    let copy: id = msg![env; description copy];
+    let copy: id = if description == nil {
+        nil
+    } else {
+        msg![env; description copy]
+    };
     let old = env.objc.borrow::<NSURLSessionHostObject>(this).session_description;
     env.objc.borrow_mut::<NSURLSessionHostObject>(this).session_description = copy;
     release(env, old);
@@ -784,7 +868,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     drop(receiver);
     let selector = env
         .objc
-        .register_host_selector("_touchHLE_completeCancellation".to_string(), &mut env.mem);
+        .lookup_selector("_touchHLE_completeCancellation")
+        .unwrap_or_else(|| {
+            env.objc
+                .register_host_selector("_touchHLE_completeCancellation".to_string(), &mut env.mem)
+        });
     () = msg![env; this performSelector:selector withObject:nil afterDelay:0.0_f64];
 }
 

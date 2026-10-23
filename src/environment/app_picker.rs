@@ -154,10 +154,28 @@ fn enumerate_apps(apps_dir: &Path) -> Result<Vec<AppInfo>, std::io::Error> {
     Ok(apps)
 }
 
+fn sqlite_file_belongs_to_bundle(
+    file_name: &str,
+    bundle_id: &str,
+    other_bundle_ids: &[&str],
+) -> bool {
+    let target_prefix = format!("{}_", sqlite_namespace(bundle_id));
+    if !file_name.starts_with(target_prefix.as_str()) {
+        return false;
+    }
+    !other_bundle_ids.iter().any(|other_id| {
+        if *other_id == bundle_id {
+            return false;
+        }
+        let other_prefix = format!("{}_", sqlite_namespace(other_id));
+        other_prefix.len() > target_prefix.len() && file_name.starts_with(other_prefix.as_str())
+    })
+}
+
 /// Deletes an app completely, like iOS does when an app and its data are
 /// removed: the `.app` folder or `.ipa` file in the apps directory, the
 /// sandbox folder (`Documents`, `Library`, ...) and the SQLite databases.
-fn delete_app(app: &AppInfo) -> Result<(), String> {
+fn delete_app(app: &AppInfo, all_apps: &[AppInfo]) -> Result<(), String> {
     // The app goes first. If that fails, its data is kept.
     let removed = if app.path.is_dir() {
         std::fs::remove_dir_all(&app.path)
@@ -166,6 +184,19 @@ fn delete_app(app: &AppInfo) -> Result<(), String> {
     };
     removed.map_err(|e| format!("couldn't delete {}: {}", app.path.display(), e))?;
     echo!("Deleted app: {}", app.path.display());
+
+    // If another installed bundle/IPA shares the exact same bundle identifier,
+    // keep the shared sandbox and SQLite databases intact.
+    if all_apps
+        .iter()
+        .any(|other| other.path != app.path && other.bundle_id == app.bundle_id)
+    {
+        log!(
+            "Keeping shared app data for {:?} because another bundle with the same ID remains installed",
+            app.bundle_id
+        );
+        return Ok(());
+    }
 
     // The app is already gone, so failures from here on are only logged.
     if is_plain_name(&app.bundle_id) {
@@ -185,14 +216,21 @@ fn delete_app(app: &AppInfo) -> Result<(), String> {
         );
     }
 
-    // touchHLE names each database `{namespace}_{file name}`.
+    // touchHLE names each database `{namespace}_{file name}`. Exclude longer
+    // sibling namespaces (`com.foo.game_hd_` when deleting `com.foo.game`).
+    let other_bundle_ids: Vec<&str> = all_apps
+        .iter()
+        .filter(|other| other.path != app.path)
+        .map(|other| other.bundle_id.as_str())
+        .collect();
     let sqlite_dir = paths::user_data_base_path().join(paths::SQLITE_DIR);
-    let prefix = format!("{}_", sqlite_namespace(&app.bundle_id));
     if let Ok(entries) = std::fs::read_dir(&sqlite_dir) {
         for entry in entries.flatten() {
             let file_name = entry.file_name().to_string_lossy().into_owned();
             let path = entry.path();
-            if file_name.starts_with(prefix.as_str()) && path.is_file() {
+            if sqlite_file_belongs_to_bundle(&file_name, &app.bundle_id, &other_bundle_ids)
+                && path.is_file()
+            {
                 if let Err(e) = std::fs::remove_file(&path) {
                     log!("Warning: couldn't delete {}: {}", path.display(), e);
                 }
@@ -242,6 +280,21 @@ mod delete_app_tests {
         assert!(!is_plain_name(".."));
         assert!(!is_plain_name("a/b"));
         assert!(!is_plain_name("a\\b"));
+    }
+
+    #[test]
+    fn sqlite_prefix_excludes_longer_sibling_bundle_id() {
+        let others = ["com.foo.game_hd", "com.bar.other"];
+        assert!(sqlite_file_belongs_to_bundle(
+            "com.foo.game_save.sqlite",
+            "com.foo.game",
+            &others
+        ));
+        assert!(!sqlite_file_belongs_to_bundle(
+            "com.foo.game_hd_save.sqlite",
+            "com.foo.game",
+            &others
+        ));
     }
 }
 
@@ -1349,8 +1402,10 @@ fn app_picker_inner(
         } else if std::mem::take(&mut host_obj.delete_confirm) {
             if let Some(app_idx) = pending_delete.take() {
                 hide_delete_dialog(env, main_run_loop, delegate, &delete_dialog);
-                let result = match apps.as_ref().ok().and_then(|list| list.get(app_idx)) {
-                    Some(app) => delete_app(app),
+                let result = match apps.as_ref().ok().and_then(|list| {
+                    list.get(app_idx).map(|app| delete_app(app, list.as_slice()))
+                }) {
+                    Some(res) => res,
                     None => Err("the app is no longer in the list".to_string()),
                 };
                 match result {

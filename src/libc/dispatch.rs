@@ -110,14 +110,16 @@ pub const CONSTANTS: ConstantExports = &[(
 
 #[derive(Default)]
 pub struct State {
-    /// Set of `dispatch_once_t` guest addresses that have already fired.
-    once_tokens: std::collections::HashSet<u32>,
     /// Backing POSIX semaphore for each dispatch semaphore handle. Dispatch
     /// semaphores must really block, so they are backed by the same host
     /// semaphore objects as `sem_t` rather than a bare counter.
     semaphores: HashMap<u32, MutPtr<sem_t>>,
     /// Named queues keyed by label.
     named_queues: HashMap<String, u32>,
+    /// Cached guest C-string labels keyed by queue handle (`0` unused).
+    queue_labels: HashMap<u32, crate::mem::ConstPtr<u8>>,
+    /// Cached empty guest C-string for unknown queue handles.
+    empty_label: Option<crate::mem::ConstPtr<u8>>,
     /// Next queue handle to hand out.
     next_queue_handle: u32,
     /// Queue-specific values set via `dispatch_queue_set_specific`, keyed by
@@ -143,18 +145,18 @@ pub(super) fn get_state(env: &mut Environment) -> &mut State {
 
 /// `dispatch_once(dispatch_once_t *predicate, dispatch_block_t block)`
 ///
-/// Calls `block` exactly once for a given `predicate` address.
-/// Since we're single-threaded this is straightforward.
+/// Calls `block` at most once per initialized `dispatch_once_t` (`0` -> `~0`).
+/// Reading the guest `predicate` word directly matches Clang's inline fast path
+/// (`*predicate == ~0l`) and allows heap/ivar `dispatch_once_t` slots to work
+/// when freed memory is later reallocated at the same address.
 fn dispatch_once(
     env: &mut Environment,
     predicate: MutPtr<dispatch_once_t>,
     block: dispatch_block_t,
 ) {
-    let token_addr = predicate.to_bits();
-    if env.libc_state.dispatch.once_tokens.contains(&token_addr) {
+    if predicate.is_null() || env.mem.read(predicate) == -1 {
         return;
     }
-    env.libc_state.dispatch.once_tokens.insert(token_addr);
     // Mark the predicate so native code that reads it directly sees "done".
     env.mem.write(predicate, -1i32); // ~0 == done on Apple platforms
 
@@ -164,24 +166,15 @@ fn dispatch_once(
 }
 
 /// `dispatch_once_f(dispatch_once_t *predicate, void *context, dispatch_function_t work)`
-///
-/// The function-pointer variant of `dispatch_once`. Apple documents it
-/// in `<dispatch/once.h>` and uses it heavily inside the libdispatch
-/// "C interface" thunks emitted by clang for non-block once-init code.
-/// Semantics match `dispatch_once`: the `work` function is invoked at
-/// most once for each `predicate` address, with `context` passed as its
-/// single argument. <https://developer.apple.com/documentation/dispatch/1452833-dispatch_once_f>
 fn dispatch_once_f(
     env: &mut Environment,
     predicate: MutPtr<dispatch_once_t>,
     context: MutVoidPtr,
     work: GuestFunction,
 ) {
-    let token_addr = predicate.to_bits();
-    if env.libc_state.dispatch.once_tokens.contains(&token_addr) {
+    if predicate.is_null() || env.mem.read(predicate) == -1 {
         return;
     }
-    env.libc_state.dispatch.once_tokens.insert(token_addr);
     env.mem.write(predicate, -1i32); // ~0 == done on Apple platforms
 
     if work.addr_with_thumb_bit() != 0 {
@@ -224,8 +217,8 @@ fn dispatch_queue_create(
     label: ConstVoidPtr, // const char*
     attr: i32,           // DISPATCH_QUEUE_SERIAL / DISPATCH_QUEUE_CONCURRENT
 ) -> dispatch_queue_t {
-    let label_str = if label.is_null() {
-        "<anonymous>".to_string()
+    let raw_label = if label.is_null() {
+        String::new()
     } else {
         env.mem
             .cstr_at_utf8(label.cast())
@@ -234,13 +227,21 @@ fn dispatch_queue_create(
     };
     log_dbg!(
         "dispatch_queue_create({:?}, attr={}) -> stub",
-        label_str,
+        if raw_label.is_empty() {
+            "<anonymous>"
+        } else {
+            raw_label.as_str()
+        },
         attr
     );
+    let label_cstr = env.mem.alloc_and_write_cstr(raw_label.as_bytes()).cast_const();
     let st = get_state(env);
     st.next_queue_handle += 2; // keep odd
     let handle = st.next_queue_handle | 0x0100_0000;
-    st.named_queues.insert(label_str, handle);
+    if !raw_label.is_empty() {
+        st.named_queues.insert(raw_label, handle);
+    }
+    st.queue_labels.insert(handle, label_cstr);
     MutVoidPtr::from_bits(handle)
 }
 
@@ -250,30 +251,54 @@ fn dispatch_queue_attr_make_with_qos_class(
     _qos_class: u32,
     _relative_priority: i32,
 ) -> dispatch_queue_t {
-    // Apple docs (<dispatch/queue.h>):
-    //   "Returns an attribute value which may be provided to
-    //   dispatch_queue_create to hint the system to use the given QoS
-    //   class. Since touchHLE doesn't model thread QoS — it runs
-    //   everything on the main thread queue — the documented behaviour
-    //   we can faithfully implement is to return the input attr
-    //   unchanged: any subsequent dispatch_queue_create(label,
-    //   returned_attr) then behaves identically to using the original
-    //   attr (which is the only behaviour touchHLE supports today).
-    //   Edge case per Apple: if qos_class == QOS_CLASS_UNSPECIFIED (0)
-    //   AND attr == NULL, returns NULL; same null-pass-through
-    //   behaviour falls out naturally from returning attr."
     attr
 }
 
-fn dispatch_queue_get_label(env: &mut Environment, _queue: dispatch_queue_t) -> ConstVoidPtr {
-    // Return an empty string — label lookup not implemented.
-    let empty = env.mem.alloc_and_write_cstr(b"");
-    empty.cast_void().cast_const()
+fn dispatch_queue_get_label(env: &mut Environment, queue: dispatch_queue_t) -> ConstVoidPtr {
+    // DISPATCH_CURRENT_QUEUE_LABEL is NULL (0): resolve to the running queue.
+    let handle = if queue.is_null() {
+        get_state(env)
+            .current_queue_stack
+            .last()
+            .copied()
+            .unwrap_or(MAIN_QUEUE_PTR)
+    } else {
+        queue.to_bits()
+    };
+    if let Some(&ptr) = get_state(env).queue_labels.get(&handle) {
+        return ptr.cast_void();
+    }
+    if handle == MAIN_QUEUE_PTR {
+        let ptr = env
+            .mem
+            .alloc_and_write_cstr(b"com.apple.main-thread")
+            .cast_const();
+        get_state(env).queue_labels.insert(MAIN_QUEUE_PTR, ptr);
+        return ptr.cast_void();
+    }
+    if handle == GLOBAL_QUEUE_PTR {
+        let ptr = env
+            .mem
+            .alloc_and_write_cstr(b"com.apple.root.default-priority")
+            .cast_const();
+        get_state(env).queue_labels.insert(GLOBAL_QUEUE_PTR, ptr);
+        return ptr.cast_void();
+    }
+    if let Some(empty) = get_state(env).empty_label {
+        return empty.cast_void();
+    }
+    let empty = env.mem.alloc_and_write_cstr(b"").cast_const();
+    get_state(env).empty_label = Some(empty);
+    empty.cast_void()
 }
 
-fn dispatch_get_current_queue(_env: &mut Environment) -> dispatch_queue_t {
-    // We always run on the "main" queue.
-    MutVoidPtr::from_bits(MAIN_QUEUE_PTR)
+fn dispatch_get_current_queue(env: &mut Environment) -> dispatch_queue_t {
+    let current = get_state(env)
+        .current_queue_stack
+        .last()
+        .copied()
+        .unwrap_or(MAIN_QUEUE_PTR);
+    MutVoidPtr::from_bits(current)
 }
 
 fn dispatch_queue_retain(_env: &mut Environment, queue: dispatch_queue_t) -> dispatch_queue_t {
@@ -316,23 +341,27 @@ fn dispatch_sync(env: &mut Environment, queue: dispatch_queue_t, block: dispatch
 
 fn dispatch_async_f(
     env: &mut Environment,
-    _queue: dispatch_queue_t,
+    queue: dispatch_queue_t,
     context: MutVoidPtr,
     work: GuestFunction,
 ) {
     if work != GuestFunction::null_ptr() {
+        get_state(env).current_queue_stack.push(queue.to_bits());
         let _: () = work.call_from_host(env, (context,));
+        get_state(env).current_queue_stack.pop();
     }
 }
 
 fn dispatch_sync_f(
     env: &mut Environment,
-    _queue: dispatch_queue_t,
+    queue: dispatch_queue_t,
     context: MutVoidPtr,
     work: GuestFunction,
 ) {
     if work != GuestFunction::null_ptr() {
+        get_state(env).current_queue_stack.push(queue.to_bits());
         let _: () = work.call_from_host(env, (context,));
+        get_state(env).current_queue_stack.pop();
     }
 }
 
@@ -383,10 +412,10 @@ fn dispatch_apply_f(
 /// most 60s so a bogus/absolute value can't wedge a timer decades out.
 pub(super) fn dispatch_after_delay_secs(when: u64) -> f64 {
     if when == DISPATCH_TIME_FOREVER {
-        return 60.0;
+        return f64::INFINITY;
     }
     let secs = (when as f64) / 1_000_000_000.0;
-    secs.clamp(0.0, 60.0)
+    secs.clamp(0.0, 86_400.0)
 }
 
 // Main-queue timers only make work ready. Delivery is an input source,
@@ -407,17 +436,11 @@ fn schedule_after(
     let cls: Class = env
         .objc
         .get_known_class("_touchHLE_DispatchAfter", &mut env.mem);
-    if main {
-        let timer: id = msg_class![env; NSTimer timerWithTimeInterval:delay
-            target:cls selector:selector userInfo:dict repeats:false];
-        let run_loop: id = msg_class![env; NSRunLoop mainRunLoop];
-        let mode = get_static_str(env, NSRunLoopCommonModes);
-        let _: () = msg![env; run_loop addTimer:timer forMode:mode];
-    } else {
-        // Preserve the existing fallback for queues not implemented here.
-        let _: id = msg_class![env; NSTimer scheduledTimerWithTimeInterval:delay
-            target:cls selector:selector userInfo:dict repeats:false];
-    }
+    let timer: id = msg_class![env; NSTimer timerWithTimeInterval:delay
+        target:cls selector:selector userInfo:dict repeats:false];
+    let run_loop: id = msg_class![env; NSRunLoop mainRunLoop];
+    let mode = get_static_str(env, NSRunLoopCommonModes);
+    let _: () = msg![env; run_loop addTimer:timer forMode:mode];
 }
 
 fn enqueue_after(env: &mut Environment, target: id, timer: id, selector: &str) {
@@ -452,7 +475,7 @@ fn dispatch_after(
     queue: dispatch_queue_t,
     block: dispatch_block_t,
 ) {
-    if block.is_null() {
+    if block.is_null() || when == DISPATCH_TIME_FOREVER {
         return;
     }
     let delay = dispatch_after_delay_secs(when);
@@ -461,8 +484,10 @@ fn dispatch_after(
     let block = crate::libc::blocks::_Block_copy(env, block.cast_void().cast_const());
     log_dbg!("dispatch_after: scheduling block {:?} in {}s", block, delay);
     let num: id = msg_class![env; NSNumber numberWithUnsignedInt:(block.to_bits())];
+    let queue_num: id = msg_class![env; NSNumber numberWithUnsignedInt:(queue.to_bits())];
     let key: id = get_static_str(env, "_touchHLE_dispatch_after_block");
-    let dict: id = dict_from_keys_and_objects(env, &[(key, num)]);
+    let queue_key: id = get_static_str(env, "_touchHLE_dispatch_after_queue");
+    let dict: id = dict_from_keys_and_objects(env, &[(key, num), (queue_key, queue_num)]);
     schedule_after(
         env,
         delay,
@@ -480,16 +505,25 @@ fn dispatch_after_f(
     context: MutVoidPtr,
     work: GuestFunction,
 ) {
-    if work == GuestFunction::null_ptr() {
+    if work == GuestFunction::null_ptr() || when == DISPATCH_TIME_FOREVER {
         return;
     }
     let delay = dispatch_after_delay_secs(when);
     log_dbg!("dispatch_after_f: scheduling fn {:?} in {}s", work, delay);
     let ctx_num: id = msg_class![env; NSNumber numberWithUnsignedInt:(context.to_bits())];
     let work_num: id = msg_class![env; NSNumber numberWithUnsignedInt:(work.addr_with_thumb_bit())];
+    let queue_num: id = msg_class![env; NSNumber numberWithUnsignedInt:(queue.to_bits())];
     let ctx_key: id = get_static_str(env, "_touchHLE_dispatch_after_ctx");
     let work_key: id = get_static_str(env, "_touchHLE_dispatch_after_work");
-    let dict: id = dict_from_keys_and_objects(env, &[(ctx_key, ctx_num), (work_key, work_num)]);
+    let queue_key: id = get_static_str(env, "_touchHLE_dispatch_after_queue");
+    let dict: id = dict_from_keys_and_objects(
+        env,
+        &[
+            (ctx_key, ctx_num),
+            (work_key, work_num),
+            (queue_key, queue_num),
+        ],
+    );
     schedule_after(
         env,
         delay,
@@ -518,14 +552,23 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (())_touchHLE_dispatchAfterFireBlock:(id)timer {
     let dict: id = msg![env; timer userInfo];
     let key: id = get_static_str(env, "_touchHLE_dispatch_after_block");
+    let queue_key: id = get_static_str(env, "_touchHLE_dispatch_after_queue");
     let num: id = msg![env; dict objectForKey:key];
     if num == crate::objc::nil {
         return;
     }
+    let queue_num: id = msg![env; dict objectForKey:queue_key];
+    let queue_bits: u32 = if queue_num != crate::objc::nil {
+        msg![env; queue_num unsignedIntValue]
+    } else {
+        MAIN_QUEUE_PTR
+    };
     let bits: u32 = msg![env; num unsignedIntValue];
     let block: dispatch_block_t = Ptr::from_bits(bits);
     if !block.is_null() {
+        get_state(env).current_queue_stack.push(queue_bits);
         call_void_block(env, block);
+        get_state(env).current_queue_stack.pop();
         crate::libc::blocks::_Block_release(env, block.cast_void().cast_const());
     }
 }
@@ -534,17 +577,26 @@ pub const CLASSES: ClassExports = objc_classes! {
     let dict: id = msg![env; timer userInfo];
     let ctx_key: id = get_static_str(env, "_touchHLE_dispatch_after_ctx");
     let work_key: id = get_static_str(env, "_touchHLE_dispatch_after_work");
+    let queue_key: id = get_static_str(env, "_touchHLE_dispatch_after_queue");
     let ctx_num: id = msg![env; dict objectForKey:ctx_key];
     let work_num: id = msg![env; dict objectForKey:work_key];
     if work_num == crate::objc::nil {
         return;
     }
+    let queue_num: id = msg![env; dict objectForKey:queue_key];
+    let queue_bits: u32 = if queue_num != crate::objc::nil {
+        msg![env; queue_num unsignedIntValue]
+    } else {
+        MAIN_QUEUE_PTR
+    };
     let ctx_bits: u32 = msg![env; ctx_num unsignedIntValue];
     let work_bits: u32 = msg![env; work_num unsignedIntValue];
     let context: MutVoidPtr = Ptr::from_bits(ctx_bits);
     let work = GuestFunction::from_addr_with_thumb_bit(work_bits);
     if work != GuestFunction::null_ptr() {
+        get_state(env).current_queue_stack.push(queue_bits);
         let _: () = work.call_from_host(env, (context,));
+        get_state(env).current_queue_stack.pop();
     }
 }
 
@@ -565,7 +617,12 @@ fn dispatch_time(_env: &mut Environment, when: u64, delta: i64) -> u64 {
     if when == DISPATCH_TIME_FOREVER {
         return DISPATCH_TIME_FOREVER;
     }
-    when.saturating_add(delta as u64)
+    if delta >= 0 {
+        when.saturating_add(delta as u64)
+            .min(DISPATCH_TIME_FOREVER - 1)
+    } else {
+        when.saturating_sub(delta.unsigned_abs())
+    }
 }
 
 fn dispatch_walltime(_env: &mut Environment, _spec: ConstVoidPtr, delta: i64) -> u64 {
@@ -575,31 +632,37 @@ fn dispatch_walltime(_env: &mut Environment, _spec: ConstVoidPtr, delta: i64) ->
 
 // MARK: - dispatch_group
 
-fn dispatch_group_create(_env: &mut Environment) -> dispatch_group_t {
-    // Return a small non-null sentinel.
-    MutVoidPtr::from_bits(0x0200_0001)
+fn dispatch_group_create(env: &mut Environment) -> dispatch_group_t {
+    let st = get_state(env);
+    st.next_queue_handle += 2;
+    let handle = st.next_queue_handle | 0x0200_0000;
+    MutVoidPtr::from_bits(handle)
 }
 
 fn dispatch_group_async(
     env: &mut Environment,
     _group: dispatch_group_t,
-    _queue: dispatch_queue_t,
+    queue: dispatch_queue_t,
     block: dispatch_block_t,
 ) {
     if !block.is_null() {
+        get_state(env).current_queue_stack.push(queue.to_bits());
         call_void_block(env, block);
+        get_state(env).current_queue_stack.pop();
     }
 }
 
 fn dispatch_group_async_f(
     env: &mut Environment,
     _group: dispatch_group_t,
-    _queue: dispatch_queue_t,
+    queue: dispatch_queue_t,
     context: MutVoidPtr,
     work: GuestFunction,
 ) {
     if work != GuestFunction::null_ptr() {
+        get_state(env).current_queue_stack.push(queue.to_bits());
         let _: () = work.call_from_host(env, (context,));
+        get_state(env).current_queue_stack.pop();
     }
 }
 
@@ -613,23 +676,27 @@ fn dispatch_group_wait(_env: &mut Environment, _group: dispatch_group_t, _timeou
 fn dispatch_group_notify(
     env: &mut Environment,
     _group: dispatch_group_t,
-    _queue: dispatch_queue_t,
+    queue: dispatch_queue_t,
     block: dispatch_block_t,
 ) {
     if !block.is_null() {
+        get_state(env).current_queue_stack.push(queue.to_bits());
         call_void_block(env, block);
+        get_state(env).current_queue_stack.pop();
     }
 }
 
 fn dispatch_group_notify_f(
     env: &mut Environment,
     _group: dispatch_group_t,
-    _queue: dispatch_queue_t,
+    queue: dispatch_queue_t,
     context: MutVoidPtr,
     work: GuestFunction,
 ) {
     if work != GuestFunction::null_ptr() {
+        get_state(env).current_queue_stack.push(queue.to_bits());
         let _: () = work.call_from_host(env, (context,));
+        get_state(env).current_queue_stack.pop();
     }
 }
 

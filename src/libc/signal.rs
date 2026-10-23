@@ -109,6 +109,12 @@ pub struct State {
     /// the same signal must not re-enter the handler (it would recurse
     /// forever); re-raising it performs the default action instead.
     handling: Vec<i32>,
+    /// Whether a hardware-fault signal was delivered to a guest handler.
+    pub(crate) fatal_delivered: bool,
+}
+
+fn is_fault_signal(signum: i32) -> bool {
+    matches!(signum, SIGILL | SIGBUS | SIGFPE | SIGSEGV | SIGSYS)
 }
 
 // Guest-visible sizes from Darwin's `sys/signal.h` and `mach/arm/_structs.h`
@@ -326,18 +332,25 @@ fn default_signal_action(env: &mut Environment, signum: i32) {
         SIGCONT => {
             log_dbg!("Signal {} ({}) ignored (process is not stopped)", signum, name);
         }
+        // Legacy ad and analytics SDKs frequently omit SIG_IGN/SO_NOSIGPIPE
+        // before writing to closed sockets; ignore SIGPIPE in GUI game runs.
+        SIGPIPE if !env.options.headless => {
+            log!(
+                "Warning: ignoring default SIGPIPE so broken socket writes \
+                 report EPIPE instead of ending the game."
+            );
+        }
         // The remaining signals terminate the process, with a core dump
         // for the fault-like ones.
         SIGHUP | SIGINT | SIGQUIT | SIGILL | SIGTRAP | SIGABRT | SIGEMT | SIGFPE | SIGKILL
         | SIGBUS | SIGSEGV | SIGSYS | SIGPIPE | SIGALRM | SIGTERM | SIGXCPU | SIGXFSZ
         | SIGVTALRM | SIGPROF | SIGUSR1 | SIGUSR2 => {
             log!(
-                "Guest received fatal signal {} ({}) via raise(); ending the \
-                 guest session through the return-to-host path.",
+                "Guest received fatal signal {} ({}) via raise().",
                 signum,
                 name
             );
-            crate::libc::stdlib::end_guest_termination(
+            crate::libc::stdlib::recover_or_end_guest_termination(
                 env,
                 &format!("raise({signum}) [signal {name}]"),
                 crate::environment::GuestTermination::Signal(signum),
@@ -398,6 +411,9 @@ pub(crate) fn raise_signal(env: &mut Environment, signum: i32) -> RaiseOutcome {
                 handler,
                 signum
             );
+            if is_fault_signal(signum) {
+                env.libc_state.signal.fatal_delivered = true;
+            }
             env.libc_state.signal.handling.push(signum);
             let func = GuestFunction::from_addr_with_thumb_bit(handler);
             let siginfo_context = if action.flags & SA_SIGINFO != 0 {

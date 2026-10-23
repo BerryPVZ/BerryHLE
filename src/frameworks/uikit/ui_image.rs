@@ -81,6 +81,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (id)imageNamed:(id)name { // NSString*
+    if name == nil {
+        return nil;
+    }
     let bundle: id = msg_class![env; NSBundle mainBundle];
     let mut path: id = msg![env; bundle pathForResource:name ofType:nil];
     let name_str = ns_string::to_rust_string(env, name).to_string();
@@ -105,13 +108,34 @@ pub const CLASSES: ClassExports = objc_classes! {
             None => (name_str.clone(), "png".to_string()),
         };
         let ext_ns = ns_string::from_rust_string(env, ext);
-        for candidate in [
-            format!("{}~iphone", stem),
-            format!("{}@2x~iphone", stem),
-            format!("{}@3x~iphone", stem),
-            format!("{}@2x", stem),
-            format!("{}@3x", stem),
-        ] {
+        let is_ipad = env
+            .options
+            .device_family
+            .map_or(false, |family| family.is_ipad());
+        let candidates: Vec<String> = if is_ipad {
+            vec![
+                stem.clone(),
+                format!("{}~ipad", stem),
+                format!("{}@2x~ipad", stem),
+                format!("{}@2x", stem),
+                format!("{}~iphone", stem),
+                format!("{}@2x~iphone", stem),
+                format!("{}@3x~iphone", stem),
+                format!("{}@3x", stem),
+            ]
+        } else {
+            vec![
+                stem.clone(),
+                format!("{}~iphone", stem),
+                format!("{}@2x~iphone", stem),
+                format!("{}@3x~iphone", stem),
+                format!("{}@2x", stem),
+                format!("{}@3x", stem),
+                format!("{}~ipad", stem),
+                format!("{}@2x~ipad", stem),
+            ]
+        };
+        for candidate in candidates {
             let candidate = ns_string::from_rust_string(env, candidate);
             path = msg![env; bundle pathForResource:candidate ofType:ext_ns];
             release(env, candidate);
@@ -171,18 +195,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 // iOS 4.0+
-+ (id)imageWithCGImage:(CGImageRef)cg_image scale:(CGFloat)_scale orientation:(NSInteger)orientation {
-    // touchHLE's UIImage doesn't honour the scale factor (the app already
-    // assumes the image's pixel dimensions are correct), so we just call
-    // the regular initializer and store the orientation. Apps on iOS 5/6
-    // (e.g. ketchapp's "2 Cars") rely on this overload existing —
-    // returning `nil` from `[UIImage imageWithCGImage:scale:orientation:]`
-    // makes most images render as a placeholder.
++ (id)imageWithCGImage:(CGImageRef)cg_image scale:(CGFloat)scale orientation:(NSInteger)orientation {
     let new: id = msg![env; this alloc];
-    let new: id = msg![env; new initWithCGImage:cg_image];
-    if new != nil {
-        env.objc.borrow_mut::<UIImageHostObject>(new).orientation = orientation;
-    }
+    let new: id = msg![env; new initWithCGImage:cg_image scale:scale orientation:orientation];
     autorelease(env, new)
 }
 
@@ -191,13 +206,24 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; this imageWithCGImage:cg_image scale:scale orientation:(0i32)]
 }
 
++ (id)imageWithData:(id)data scale:(CGFloat)scale {
+    let new: id = msg![env; this alloc];
+    let new: id = msg![env; new initWithData:data scale:scale];
+    autorelease(env, new)
+}
+
 // MARK: - Initializers
 
 - (id)initWithCGImage:(CGImageRef)cg_image {
+    msg![env; this initWithCGImage:cg_image scale:1.0 orientation:(0i32)]
+}
+
+- (id)initWithCGImage:(CGImageRef)cg_image scale:(CGFloat)scale orientation:(NSInteger)orientation {
     CGImageRetain(env, cg_image);
     let host = env.objc.borrow_mut::<UIImageHostObject>(this);
     host.cg_image = cg_image;
-    host.orientation = 0;
+    host.scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    host.orientation = orientation;
     host.left_cap_width = 0;
     host.top_cap_height = 0;
     this
@@ -240,9 +266,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     // Retina-only apps (see the `@2x`/`@3x` fallback in `imageNamed:`):
     // without it a 60x60-pixel `foo@2x.png` would report a 60x60-point
     // size and lay out (and hit-test) at twice its intended size.
-    let scale: CGFloat = if lower_path.contains("@3x.") {
+    let scale: CGFloat = if lower_path.contains("@3x.") || lower_path.contains("@3x~") {
         3.0
-    } else if lower_path.contains("@2x.") {
+    } else if lower_path.contains("@2x.") || lower_path.contains("@2x~") {
         2.0
     } else {
         1.0
@@ -255,16 +281,32 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)initWithData:(id)data { // NSData*
+    msg![env; this initWithData:data scale:1.0]
+}
+
+- (id)initWithData:(id)data scale:(CGFloat)scale { // NSData*
+    let normalized_scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
     if data == nil {
-        env.objc.borrow_mut::<UIImageHostObject>(this).cg_image = get_dummy_cg_image(env);
+        let host = env.objc.borrow_mut::<UIImageHostObject>(this);
+        host.cg_image = get_dummy_cg_image(env);
+        host.scale = normalized_scale;
         return this;
     }
     let slice = ns_data::to_rust_slice(env, data);
     let Ok(image) = Image::from_bytes(slice) else {
-        env.objc.borrow_mut::<UIImageHostObject>(this).cg_image = get_dummy_cg_image(env);
+        let host = env.objc.borrow_mut::<UIImageHostObject>(this);
+        host.cg_image = get_dummy_cg_image(env);
+        host.scale = normalized_scale;
         return this;
     };
-    env.objc.borrow_mut::<UIImageHostObject>(this).cg_image = cg_image::from_image(env, image);
+    let cg = cg_image::from_image(env, image);
+    let host = env.objc.borrow_mut::<UIImageHostObject>(this);
+    host.cg_image = cg;
+    host.scale = normalized_scale;
     this
 }
 
@@ -304,14 +346,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - Stretchable Images (iOS 2.0 - 4.x legacy method)
 
 - (id)stretchableImageWithLeftCapWidth:(NSInteger)leftCapWidth topCapHeight:(NSInteger)topCapHeight {
-    let cg_image = env.objc.borrow::<UIImageHostObject>(this).cg_image;
+    let &UIImageHostObject {
+        cg_image,
+        scale,
+        orientation,
+        ..
+    } = env.objc.borrow::<UIImageHostObject>(this);
 
-    // Создаем новый объект UIImage на основе того же CGImage.
-    // ИСПОЛЬЗУЕМ msg_class! для отправки сообщения alloc классу
     let new_img: id = msg_class![env; UIImage alloc];
-    let new_img: id = msg![env; new_img initWithCGImage:cg_image];
+    let new_img: id = msg![env; new_img initWithCGImage:cg_image scale:scale orientation:orientation];
 
-    // Но прописываем ему параметры растяжения
     let host = env.objc.borrow_mut::<UIImageHostObject>(new_img);
     host.left_cap_width = leftCapWidth;
     host.top_cap_height = topCapHeight;
@@ -402,8 +446,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     if context == nil { return; }
     let image = env.objc.borrow::<UIImageHostObject>(this).cg_image;
     if image == nil { return; }
-    let tile_w = CGImageGetWidth(env, image) as CGFloat;
-    let tile_h = CGImageGetHeight(env, image) as CGFloat;
+    let scale = env.objc.borrow::<UIImageHostObject>(this).scale.max(1.0);
+    let tile_w = CGImageGetWidth(env, image) as CGFloat / scale;
+    let tile_h = CGImageGetHeight(env, image) as CGFloat / scale;
     if tile_w <= 0.0 || tile_h <= 0.0 || rect.size.width <= 0.0 || rect.size.height <= 0.0 {
         return;
     }

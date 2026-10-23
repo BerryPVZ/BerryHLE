@@ -106,7 +106,48 @@ impl Clone for AudioFile {
     fn clone(&self) -> Self {
         let inner = match self.inner {
             AudioFileInner::Mp3(ref mp3) => AudioFileInner::Mp3(mp3.clone()),
-            _ => Self::parse_inner(self.raw_data.as_ref().clone()).unwrap(),
+            AudioFileInner::Aac(ref aac) => AudioFileInner::Aac(aac.clone()),
+            AudioFileInner::Symphonia(ref pcm) => AudioFileInner::Symphonia(pcm.clone()),
+            AudioFileInner::Wave(_) => Self::parse_inner(self.raw_data.as_ref().clone()).unwrap(),
+        };
+        AudioFile {
+            raw_data: self.raw_data.clone(),
+            inner,
+        }
+    }
+}
+
+impl AudioFile {
+    /// Clone this `AudioFile` for PCM-expecting consumers such as
+    /// `ExtAudioFileWrapAudioFileID` and `ExtAudioFileOpenURL`. Compressed
+    /// `Mp3` and `Aac` packet streams are decoded to 16-bit LPCM via Symphonia
+    /// so `ExtAudioFileRead` serves PCM frames instead of seeing VBR
+    /// `packet_size_fixed() == 0`.
+    pub fn clone_decoded_to_pcm(&self) -> Self {
+        let inner = match self.inner {
+            AudioFileInner::Mp3(ref mp3) => {
+                match symphonia_formats::decode_symphonia_to_pcm(Cursor::new(
+                    self.raw_data.as_ref().clone(),
+                )) {
+                    Ok(pcm) => AudioFileInner::Symphonia(pcm),
+                    Err(_) => AudioFileInner::Mp3(mp3.clone()),
+                }
+            }
+            AudioFileInner::Aac(ref aac) => {
+                if let Ok(pcm) =
+                    symphonia_formats::decode_symphonia_to_pcm(Cursor::new(aac.packet_bytes.clone()))
+                {
+                    AudioFileInner::Symphonia(pcm)
+                } else if let Ok(pcm) = symphonia_formats::decode_symphonia_to_pcm(Cursor::new(
+                    self.raw_data.as_ref().clone(),
+                )) {
+                    AudioFileInner::Symphonia(pcm)
+                } else {
+                    AudioFileInner::Aac(aac.clone())
+                }
+            }
+            AudioFileInner::Symphonia(ref pcm) => AudioFileInner::Symphonia(pcm.clone()),
+            AudioFileInner::Wave(_) => Self::parse_inner(self.raw_data.as_ref().clone()).unwrap(),
         };
         AudioFile {
             raw_data: self.raw_data.clone(),
