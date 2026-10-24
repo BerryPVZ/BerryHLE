@@ -763,7 +763,7 @@ mod tests {
             true,
         );
         assert!(url.contains("files_count%3A%5B8%20TO%20%2A%5D"));
-        assert!(url.contains("title%3Agangstar~"));
+        assert!(url.contains("title%3AGangstar~"));
         assert!(url.contains("identifier%3Agv%2A"));
         assert!(url.contains("week%20desc"));
     }
