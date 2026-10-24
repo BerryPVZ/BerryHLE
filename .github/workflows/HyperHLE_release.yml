@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       publish_hyperhle_release:
-        description: Publish a HyperHLE release (after all builds succeed)
+        description: Publish after all builds succeed; disable for a build-only run
         type: boolean
-        default: false
+        default: true
   push:
     branches: [ "trunk" ]
   pull_request:
@@ -18,11 +18,10 @@ env:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  # Runs on trunk queue instead of cancelling each other: a cancelled run never
-  # publishes its release, so frequent pushes could otherwise hold releases
-  # back indefinitely. Queued runs start after the previous one finishes and
-  # so see any tag it published.
-  cancel-in-progress: ${{ github.ref != 'refs/heads/trunk' }}
+  # Avoid replacing pending trunk pushes with newer runs.
+  # GitHub caps each queue at 100; queue: max disables cancellation.
+  queue: max
+  cancel-in-progress: false
 
 jobs:
   test-osx:
