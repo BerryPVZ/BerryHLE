@@ -1,7 +1,8 @@
 #!/bin/sh
-# Decide whether this workflow should publish a HyperHLE release and which
-# vMAJOR.MINOR.PATCH tag to use. Eligible chore pushes publish automatically;
-# workflow_dispatch publishes when FORCE_HYPERHLE_RELEASE is true.
+# Decide whether to publish a HyperHLE release and which vMAJOR.MINOR.PATCH tag
+# to use. A release is due every 6 commits on HEAD since the latest release
+# tag, or since the commit that introduced hyperhle release automation when no
+# tag exists yet.
 #
 # The second and third numbers count from 0 up to 12 and then carry into the
 # number before them: v1.0.12 is followed by v1.1.0, and v1.12.12 by v2.0.0.
@@ -10,6 +11,7 @@
 # after v1.0.121 is v1.1.0.
 set -eu
 
+RELEASE_EVERY=6
 # Highest value of the second and third numbers; the first is unbounded.
 VERSION_PART_MAX=12
 WORKFLOW_MARKER="dev-scripts/hyperhle-should-release.sh"
@@ -46,35 +48,26 @@ else
 fi
 
 version="v${major}.${minor}.${patch}"
-head_release_tag="$(git tag --points-at HEAD |
-    grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)"
 
-if [ "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ] && [ -n "$head_release_tag" ]; then
-    # Reuse tag on rerun so retries update, rather than duplicate, a release.
-    version="$head_release_tag"
-    should_release=true
-elif [ "${FORCE_HYPERHLE_RELEASE:-}" = "true" ]; then
+if [ "${FORCE_HYPERHLE_RELEASE:-}" = "true" ]; then
     should_release=true
 elif [ "${GITHUB_EVENT_NAME:-}" = "workflow_dispatch" ]; then
-    # Manual runs can opt out of publishing and still build artifacts.
+    # Manual "Build HyperHLE" runs must never publish files to Releases;
+    # they only produce build artifacts.
     should_release=false
-elif [ -n "$head_release_tag" ]; then
-    # A separate push run may find that this commit was already released.
+elif [ "$commits_since" -lt "$RELEASE_EVERY" ]; then
     should_release=false
 elif git rev-parse "refs/tags/${version}" >/dev/null 2>&1; then
     should_release=false
 else
-    # Only eligible chore pushes invoke this script automatically.
     should_release=true
 fi
 
 if [ "$should_release" = true ]; then
     if [ "${FORCE_HYPERHLE_RELEASE:-}" = "true" ]; then
-        # Manual release notes list the latest 6 commits.
+        # Manual release: publish script uses git log -n 6 (see changelog_limit).
         changelog_from=""
         changelog_limit=6
-    elif [ "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ] && [ -n "$head_release_tag" ]; then
-        changelog_from=""
     elif [ -n "$latest_tag" ]; then
         changelog_from="$latest_tag"
     elif [ -n "${baseline:-}" ]; then
