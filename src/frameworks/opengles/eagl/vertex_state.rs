@@ -2,13 +2,13 @@
 use crate::gles::{gles2_raw as gl, GLES};
 use std::ffi::c_void;
 
-pub(super) struct SavedAttribute {
+pub(crate) struct SavedAttribute {
     values: [i32; 6],
     pointer: *mut c_void,
 }
 
 impl SavedAttribute {
-    pub(super) unsafe fn capture(gles: &mut dyn GLES, attribute: u32) -> Self {
+    pub(crate) unsafe fn capture(gles: &mut dyn GLES, attribute: u32) -> Self {
         let mut values = [0; 6];
         for (value, pname) in values.iter_mut().zip([
             gl::VERTEX_ATTRIB_ARRAY_ENABLED,
@@ -25,7 +25,7 @@ impl SavedAttribute {
         Self { values, pointer }
     }
 
-    pub(super) unsafe fn restore(self, gles: &mut dyn GLES, attribute: u32) {
+    pub(crate) unsafe fn restore(self, gles: &mut dyn GLES, attribute: u32) {
         let [enabled, size, kind, normalized, stride, buffer] = self.values;
         gles.BindBuffer(gl::ARRAY_BUFFER, buffer as u32);
         gles.VertexAttribPointer(attribute, size, kind as u32, normalized as _, stride, self.pointer);

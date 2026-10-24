@@ -10,6 +10,7 @@
 //! topic.
 
 mod eagl;
+pub(crate) use eagl::vertex_state::SavedAttribute;
 mod gles_guest;
 mod software_vao;
 

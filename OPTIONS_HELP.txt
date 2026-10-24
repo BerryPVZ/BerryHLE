@@ -541,3 +541,12 @@ Other options:
 --no-root-autorotation  Let a game engine rotate its own portrait drawable.
 
     --present-default-framebuffer  Copy a guest frame drawn into framebuffer zero.
+
+    --home-button / --no-home-button
+        Show or hide the bottom-right HOME button. Enabled by default.
+        Both controls are available under launcher Settings > App Controls.
+        HOME force-closes the current game and returns to the desktop app picker.
+    --return-to-picker / --no-return-to-picker
+        Return to the desktop picker when a game closes or crashes. Enabled by
+        default. Headless test sessions always report their original failure.
+        The previous crash log is kept as touchHLE_last_crash.txt.

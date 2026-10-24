@@ -571,6 +571,7 @@ fn overlay_active() -> bool {
 }
 
 pub fn touch_down(abs: (f32, f32), viewport: (u32, u32, u32, u32)) -> bool {
+    if crate::home_button::down(abs, viewport) { return true; }
     if !overlay_active() {
         return false;
     }
@@ -599,6 +600,7 @@ pub fn touch_down(abs: (f32, f32), viewport: (u32, u32, u32, u32)) -> bool {
 }
 
 pub fn touch_motion(abs: (f32, f32), _viewport: (u32, u32, u32, u32)) -> bool {
+    if crate::home_button::motion() { return true; }
     if !overlay_active() {
         return false;
     }
@@ -609,6 +611,7 @@ pub fn touch_motion(abs: (f32, f32), _viewport: (u32, u32, u32, u32)) -> bool {
 }
 
 pub fn touch_up(abs: (f32, f32), viewport: (u32, u32, u32, u32)) -> bool {
+    if crate::home_button::up(abs, viewport) { return true; }
     if !overlay_active() {
         return false;
     }
@@ -1195,22 +1198,24 @@ fn safe_mode_colors(enabled: bool) -> ((f32, f32, f32, f32), (f32, f32, f32, f32
 /// present paths), in viewport pixel space. Renders with GLES 1.x
 /// fixed-function calls.
 pub unsafe fn draw(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32)) {
+    bind_overlay_context();
     let Some(quads) = build_scene(gles, viewport) else {
         return;
     };
     render_gles1(gles, viewport, &quads);
 }
 
-/// Entry point for native OpenGL ES 2.0 present paths (see
-/// present_renderbuffer_es2), which lack the fixed-function pipeline.
-pub unsafe fn draw_es2(
-    gles: &mut dyn GLES,
-    viewport: (u32, u32, u32, u32),
-    context_token: usize,
-) {
-    // When the game switches EAGL contexts (e.g. between apps or between
-    // context instances), all our cached GL objects (program, VBO, atlas
-    // texture) belong to a dead context. Drop them so they get rebuilt.
+/// Drop names belonging to a previous GL context or app session.
+pub(crate) fn reset_cached_context() {
+    *OVERLAY_CONTEXT_TOKEN.lock().unwrap() = None;
+    *OVERLAY_PROGRAM.lock().unwrap() = None;
+    *OVERLAY_VBO.lock().unwrap() = None;
+    *OVERLAY_WHITE_TEX.lock().unwrap() = None;
+    invalidate_atlas();
+}
+
+unsafe fn bind_overlay_context() {
+    let context_token = sdl2_sys::SDL_GL_GetCurrentContext() as usize;
     {
         let mut stored = OVERLAY_CONTEXT_TOKEN.lock().unwrap();
         if *stored != Some(context_token) {
@@ -1224,6 +1229,15 @@ pub unsafe fn draw_es2(
             invalidate_atlas();
         }
     }
+}
+
+/// Draw the host overlay on a shader-based GLES context.
+pub unsafe fn draw_es2(
+    gles: &mut dyn GLES,
+    viewport: (u32, u32, u32, u32),
+    _context_token: usize,
+) {
+    bind_overlay_context();
     let Some(quads) = build_scene(gles, viewport) else {
         return;
     };
@@ -1236,11 +1250,9 @@ unsafe fn build_scene(
     gles: &mut dyn GLES,
     viewport: (u32, u32, u32, u32),
 ) -> Option<Vec<Quad>> {
-    if !HARDWARE_ENABLED.load(Ordering::SeqCst) {
-        return None;
-    }
     let mut ui_state = UI.lock().unwrap();
-    if !ui_state.enabled || ui_state.app_id.is_none() {
+    let trainer_active = HARDWARE_ENABLED.load(Ordering::SeqCst) && ui_state.enabled && ui_state.app_id.is_some();
+    if !trainer_active && !crate::home_button::enabled() {
         return None;
     }
     if ensure_atlas(gles).is_none() {
@@ -1250,6 +1262,15 @@ unsafe fn build_scene(
     let Some(atlas) = atlas_guard.as_ref() else { return None; };
 
     let mut quads: Vec<Quad> = Vec::new();
+    if crate::home_button::enabled() {
+        let (x,y,w,h)=crate::home_button::rect(viewport);
+        push_rect(&mut quads, Rect { x,y,w,h }, COL_PANEL);
+        let size=h*0.38;
+        let tw=text_width(atlas,"HOME",size);
+        push_text(&mut quads,atlas,"HOME",x+(w-tw)/2.0,y+h*0.26,size,COL_TEXT);
+    }
+    if !trainer_active { return Some(quads); }
+
 
     let layout = compute_layout(&ui_state, viewport);
 
@@ -1844,13 +1865,15 @@ unsafe fn render_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quads:
     gles.GetIntegerv(gles2::TEXTURE_BINDING_2D, &mut old_tex0);
     let blend_was_on = gles.IsEnabled(gles2::BLEND) != 0;
     let attribs = [program.a_pos as GLuint, program.a_uv as GLuint, program.a_col as GLuint];
-    let mut attrib_states = [0u8; 3];
-    for (slot, &attrib) in attrib_states.iter_mut().zip(attribs.iter()) {
-        let mut v: GLint = 0;
-        gles.GetVertexAttribiv(attrib as GLuint, gles2::VERTEX_ATTRIB_ARRAY_ENABLED, &mut v);
-        *slot = v as u8;
-    }
+    let attrib_states = attribs.map(|attrib|
+        crate::frameworks::opengles::SavedAttribute::capture(gles, attrib));
+    let mut blend = [0; 4];
+    for (value, pname) in blend.iter_mut().zip([gles2::BLEND_SRC_RGB, gles2::BLEND_DST_RGB,
+        gles2::BLEND_SRC_ALPHA, gles2::BLEND_DST_ALPHA]) { gles.GetIntegerv(pname, value); }
 
+    let mut equations=[0;2];
+    for (value,pname) in equations.iter_mut().zip([gles2::BLEND_EQUATION_RGB,gles2::BLEND_EQUATION_ALPHA]) { gles.GetIntegerv(pname,value); }
+    gles.BlendEquationSeparate(gles2::FUNC_ADD,gles2::FUNC_ADD);
     gles.UseProgram(program.program);
     gles.Uniform2f(program.u_viewport, viewport.2 as f32, viewport.3 as f32);
     gles.Uniform1i(program.u_tex, 0);
@@ -1918,13 +1941,9 @@ unsafe fn render_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quads:
         gles.DrawArrays(gles2::TRIANGLE_STRIP, 0, 4);
     }
 
-    for (&attr, &was) in attribs.iter().zip(attrib_states.iter()) {
-        if was != 0 {
-            gles.EnableVertexAttribArray(attr as _);
-        } else {
-            gles.DisableVertexAttribArray(attr as _);
-        }
-    }
+    for (&attr, saved) in attribs.iter().zip(attrib_states) { saved.restore(gles, attr); }
+    gles.BlendFuncSeparate(blend[0] as _, blend[1] as _, blend[2] as _, blend[3] as _);
+    gles.BlendEquationSeparate(equations[0] as _,equations[1] as _);
     if !blend_was_on {
         gles.Disable(gles2::BLEND);
     }

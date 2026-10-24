@@ -1862,7 +1862,7 @@ unsafe fn restore_present_framebuffers(gles: &mut dyn GLES, draw: GLuint, read: 
     }
 }
 
-mod vertex_state;
+pub(crate) mod vertex_state;
 
 /// Query only enums supported by this context; cache per EAGL context.
 unsafe fn present_supports_srgb_write_control(gles: &mut dyn GLES) -> bool {
@@ -4085,6 +4085,55 @@ mod readback_buffer_tests {
 mod native_present_regression {
     use super::*;
     use crate::gles::{gles3_native::GLES3NativeContext, gles30_raw as gl, GLESContext};
+
+    #[test]
+    #[ignore = "Requires a real Windows GPU; run explicitly with --ignored"]
+    fn home_overlay_draws_and_restores_guest_attributes_and_blending() {
+        let mut window = crate::window::Window::graphics_test_window().unwrap();
+        let mut context = GLES3NativeContext::new(&mut window).unwrap();
+        let mut gles = context.make_current(&mut window);
+        unsafe {
+            gles.Viewport(0, 0, 480, 320);
+            gles.ClearColor(1.0, 0.0, 0.0, 1.0);
+            gles.Clear(gl::COLOR_BUFFER_BIT);
+            let mut buffer=0;
+            gles.GenBuffers(1,&mut buffer);
+            gles.BindBuffer(gl::ARRAY_BUFFER,buffer);
+            let data=[0.0f32; 32];
+            gles.BufferData(gl::ARRAY_BUFFER,128,data.as_ptr().cast(),gl::STATIC_DRAW);
+            gles.VertexAttribPointer(2,3,gl::FLOAT,gl::FALSE,20,16usize as *const _);
+            gles.DisableVertexAttribArray(2);
+            gles.BlendFuncSeparate(gl::ONE,gl::ZERO,gl::ZERO,gl::ONE);
+            gles.BlendEquationSeparate(gl::FUNC_REVERSE_SUBTRACT,gl::FUNC_ADD);
+            crate::home_button::configure(true,false);
+            crate::trainer_ui::draw_es2(gles.as_mut(),(0,0,480,320),0x484f4d45);
+            let view=(0,0,480,320);
+            assert!(!crate::home_button::up((450.0,300.0),view));
+            assert!(!crate::home_button::force_close());
+            assert!(crate::home_button::down((450.0,300.0),view));
+            assert!(crate::home_button::motion());
+            assert!(crate::home_button::up((0.0,0.0),view));
+            assert!(!crate::home_button::force_close());
+            assert!(crate::home_button::down((450.0,300.0),view));
+            assert!(crate::home_button::up((450.0,300.0),view));
+            assert!(crate::home_button::force_close());
+            crate::home_button::configure(false,false);
+            for (pname,expected) in [(gl::VERTEX_ATTRIB_ARRAY_SIZE,3),
+                (gl::VERTEX_ATTRIB_ARRAY_STRIDE,20),
+                (gl::VERTEX_ATTRIB_ARRAY_ENABLED,0),
+                (gl::VERTEX_ATTRIB_ARRAY_BUFFER_BINDING,buffer as GLint)] {
+                let mut actual=0; gles.GetVertexAttribiv(2,pname,&mut actual);
+                assert_eq!(actual,expected);
+            }
+            assert_eq!(get_int(gles.as_mut(),gl::BLEND_SRC_RGB),gl::ONE as GLint);
+            assert_eq!(get_int(gles.as_mut(),gl::BLEND_SRC_ALPHA),gl::ZERO as GLint);
+            assert_eq!(get_int(gles.as_mut(),gl::BLEND_EQUATION_RGB),gl::FUNC_REVERSE_SUBTRACT as GLint);
+            let mut pixel=[0u8;4];
+            gles.ReadPixels(423,13,1,1,gl::RGBA,gl::UNSIGNED_BYTE,pixel.as_mut_ptr().cast());
+            assert!(pixel[0]<100 && pixel[1]<100 && pixel[2]<100,"HOME background missing: {pixel:?}");
+            assert_eq!(gles.GetError(),0);
+        }
+    }
 
     #[test]
     #[ignore = "Requires a real Windows GPU; run explicitly with --ignored"]

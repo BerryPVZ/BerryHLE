@@ -57,6 +57,7 @@ mod stack;
 mod guest_clock;
 mod trainer;
 mod trainer_ui;
+mod home_button;
 mod window;
 
 // Environment is used very frequently used and used to be in this module, so
@@ -217,7 +218,50 @@ Special options:
 ";
 /// Run a guest session, keeping its termination separate from emulator errors.
 /// `None` denotes a host-only operation or a return without guest termination.
-pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<Option<GuestTermination>, String> {
+pub fn main<T: Iterator<Item = String>>(args: T) -> Result<Option<GuestTermination>, String> {
+    let args: Vec<String> = args.collect();
+    let picker_args: Vec<String> = args.iter().skip(1).filter(|arg| matches!(arg.as_str(),
+        "--home-button" | "--no-home-button" | "--return-to-picker" | "--no-return-to-picker")).cloned().collect();
+    home_button::configure(false, false);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| main_session(args.into_iter())));
+    let should_return = home_button::auto_return() || home_button::force_close();
+    if should_return {
+        // Start a fresh process: guest threads, GL objects and compatibility
+        // caches from a crashed app must never leak into the next game.
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            let crashed = match &result {
+                Err(_) | Ok(Err(_)) => true,
+                Ok(Ok(Some(GuestTermination::Signal(_)))) => true,
+                Ok(Ok(Some(GuestTermination::Exit(code)))) => *code != 0,
+                _ => false,
+            };
+            let base = paths::user_data_base_path();
+            let saved_log = if crashed { "touchHLE_last_crash.txt" } else { "touchHLE_previous_app.txt" };
+            let _ = std::fs::copy(base.join("touchHLE_log.txt"), base.join(saved_log));
+            let mut picker = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
+            picker.args(picker_args);
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                picker.creation_flags(0x08000000); // keep the replacement console hidden
+            }
+            picker.spawn().map_err(|e| format!("Could not return to app picker: {e}"))?;
+        }
+    }
+    match result {
+        Ok(result) => result,
+        Err(payload) if should_return => {
+            let message = payload.downcast_ref::<String>().cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                .unwrap_or_else(|| "Application stopped unexpectedly".to_owned());
+            Err(message)
+        }
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+fn main_session<T: Iterator<Item = String>>(mut args: T) -> Result<Option<GuestTermination>, String> {
     crash_handler::install();
     crash_handler::install_panic_hook();
 
@@ -580,6 +624,7 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<Option<GuestTermi
         assert!(parse_result == Ok(true));
     }
 
+    home_button::configure_for_options(&options);
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         Environment::new(bundle, fs, options.clone(), app_args.unwrap_or_default())
     }));

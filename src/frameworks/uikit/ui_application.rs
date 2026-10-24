@@ -1242,6 +1242,10 @@ pub(super) fn exit(env: &mut Environment) {
         let _: () = msg![env; pool drain];
     };
 
+    if !env.is_app_picker {
+        env.request_guest_termination(crate::GuestTermination::Exit(0));
+        return;
+    }
     std::process::exit(0);
 }
 

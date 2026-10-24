@@ -2011,6 +2011,11 @@ impl Environment {
         let panic_cell = self.panic_cell.clone();
         let mut stepping = false;
         loop {
+            if crate::home_button::force_close() {
+                self.threads[self.current_thread].host_context = Some(curr_host_context);
+                return Some(GuestTermination::Exit(0));
+            }
+
             #[cfg(target_os = "ios")]
             if crate::take_host_exit_request() {
                 echo!("Returning to the iOS host library.");

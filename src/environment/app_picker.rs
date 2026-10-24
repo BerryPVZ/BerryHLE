@@ -385,6 +385,8 @@ struct AppPickerDelegateHostObject {
     force_composition: Option<bool>,
     gles_native: Option<bool>,
     fullscreen: Option<bool>,
+    home_button: Option<bool>,
+    return_to_picker: Option<bool>,
     device_model_tag: Option<i32>,
     device_model_toggle: bool,
     device_model_scroll_up: bool,
@@ -412,6 +414,8 @@ struct PickerSettings {
     scale_hack: Option<NonZeroU32>,
     orientation: Option<DeviceOrientation>,
     fullscreen: bool,
+    home_button: bool,
+    return_to_picker: bool,
     preserve_aspect_ratio: bool,
     gles_native: bool,
     force_composition: bool,
@@ -431,6 +435,8 @@ impl PickerSettings {
             scale_hack: None,
             orientation: None,
             fullscreen: options.fullscreen,
+            home_button: options.home_button,
+            return_to_picker: options.return_to_picker,
             preserve_aspect_ratio: options.preserve_aspect_ratio,
             gles_native,
             force_composition: options.force_composition,
@@ -468,6 +474,8 @@ impl PickerSettings {
                     }
                 }
                 "fullscreen" => set_bool(value, &mut settings.fullscreen),
+                "home_button" => set_bool(value, &mut settings.home_button),
+                "return_to_picker" => set_bool(value, &mut settings.return_to_picker),
                 "preserve_aspect_ratio" => set_bool(value, &mut settings.preserve_aspect_ratio),
                 "gles_native" => set_bool(value, &mut settings.gles_native),
                 "force_composition" => set_bool(value, &mut settings.force_composition),
@@ -500,6 +508,8 @@ impl PickerSettings {
              scale_hack={}\n\
              orientation={orientation}\n\
              fullscreen={}\n\
+             home_button={}\n\
+             return_to_picker={}\n\
              preserve_aspect_ratio={}\n\
              gles_native={}\n\
              force_composition={}\n\
@@ -513,6 +523,8 @@ impl PickerSettings {
             self.scale_hack
                 .map_or_else(|| "default".to_string(), |n| n.to_string()),
             self.fullscreen,
+            self.home_button,
+            self.return_to_picker,
             self.preserve_aspect_ratio,
             self.gles_native,
             self.force_composition,
@@ -698,6 +710,14 @@ const CLASSES: ClassExports = objc_classes! {
 - (())traceGLErrors:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).trace_gl_errors = Some(switch_state);
+}
+- (())homeButton:(id)switch {
+    let enabled: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).home_button = Some(enabled);
+}
+- (())returnToPicker:(id)switch {
+    let enabled: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).return_to_picker = Some(enabled);
 }
 - (())preserveAspectRatio:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
@@ -1093,6 +1113,8 @@ fn app_picker_inner(
     );
     let mut quick_options_scale_hack = picker_settings.scale_hack;
     let mut quick_options_fullscreen = picker_settings.fullscreen;
+    let mut quick_options_home_button = picker_settings.home_button;
+    let mut quick_options_return_to_picker = picker_settings.return_to_picker;
     let mut quick_options_orientation = picker_settings.orientation;
     let mut quick_options_analog_stick_tilt_controls = picker_settings.analog_stick_tilt_controls;
     let mut quick_options_network = picker_settings.network;
@@ -1672,6 +1694,10 @@ fn app_picker_inner(
             quick_options_force_composition_override = Some(force_composition);
         } else if let Some(gles_native) = std::mem::take(&mut host_obj.gles_native) {
             quick_options_gles_native = gles_native || !crate::window::angle_backend_available();
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.home_button) {
+            quick_options_home_button = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.return_to_picker) {
+            quick_options_return_to_picker = enabled;
         } else if let Some(fullscreen) = std::mem::take(&mut host_obj.fullscreen) {
             quick_options_fullscreen = fullscreen;
         }
@@ -1679,6 +1705,8 @@ fn app_picker_inner(
         picker_settings.scale_hack = quick_options_scale_hack;
         picker_settings.orientation = quick_options_orientation;
         picker_settings.fullscreen = quick_options_fullscreen;
+        picker_settings.home_button = quick_options_home_button;
+        picker_settings.return_to_picker = quick_options_return_to_picker;
         picker_settings.preserve_aspect_ratio = quick_options_preserve_aspect_ratio;
         picker_settings.gles_native = quick_options_gles_native;
         picker_settings.force_composition =
@@ -1741,6 +1769,8 @@ fn app_picker_inner(
             .to_string(),
         );
     }
+    option_args.push(if quick_options_home_button { "--home-button" } else { "--no-home-button" }.to_owned());
+    option_args.push(if quick_options_return_to_picker { "--return-to-picker" } else { "--no-return-to-picker" }.to_owned());
     if quick_options_fullscreen {
         option_args.push("--fullscreen".to_string());
     } else {
@@ -3902,6 +3932,13 @@ fn setup_settings(
     ));
     }
     sections.push(("GRAPHICS", graphics_rows));
+    if show_fullscreen_row {
+        sections.push(("APP CONTROLS", vec![
+            SettingsRow::Toggle("Show HOME button", "homeButton:", picker_settings.home_button, true),
+            SettingsRow::Toggle("Return to launcher", "returnToPicker:", picker_settings.return_to_picker, true),
+        ]));
+    }
+
     sections.push((
         "DEVICE",
         vec![
