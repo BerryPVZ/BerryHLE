@@ -25,45 +25,59 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/trunk' }}
 
 jobs:
-  build-osx:
-    runs-on: macos-latest  
+  test-osx:
+    needs: [check-hyperhle-release]
+    # Release check skips pull requests and tags; keep validation running unless cancelled.
+    if: >-
+      always() &&
+      !cancelled() &&
+      (
+        github.event_name != 'push' ||
+        (
+          (startsWith(github.event.head_commit.message, 'chore:') || startsWith(github.event.head_commit.message, 'chore(')) &&
+          needs.check-hyperhle-release.outputs.should_release == 'true'
+        )
+      )
+    runs-on: macos-latest
 
-    steps:  
+    steps:
       - name: Checkout touchHLE
         uses: actions/checkout@main
         with:
           submodules: recursive
           fetch-depth: 0
           fetch-tags: true
-          
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@master
 
-      - name: Try to get cached copy of Boost  
-        id: cache-boost  
+      - name: Cache Rust test build artifacts
+        uses: Swatinem/rust-cache@master
+        with:
+          shared-key: macos-test
+
+      - name: Try to get cached copy of Boost
+        id: cache-boost
         uses: actions/cache@main
-        with:  
-          path: vendor/boost  
-          key: boost_1_81_0_macos  
-          
-      - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}  
-        name: Download Boost  
-        run: curl -L -O "https://archives.boost.io/release/1.81.0/source/boost_1_81_0.tar.gz"  
-        
-      - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}  
-        name: Extract Boost  
-        run: mkdir -p vendor && tar xzf boost_1_81_0.tar.gz -C vendor && mv vendor/boost_1_81_0 vendor/boost  
+        with:
+          path: vendor/boost
+          key: boost_1_81_0_macos
+
+      - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+        name: Download Boost
+        run: curl -L -O "https://archives.boost.io/release/1.81.0/source/boost_1_81_0.tar.gz"
+
+      - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+        name: Extract Boost
+        run: mkdir -p vendor && tar xzf boost_1_81_0.tar.gz -C vendor && mv vendor/boost_1_81_0 vendor/boost
 
       - name: Setup CMake
         uses: lukka/get-cmake@latest
         with:
           cmakeVersion: "~3.29.0"
 
-      - name: Install x86_64 toolchain  
-        run: rustup target add x86_64-apple-darwin  
+      - name: Install x86_64 toolchain
+        run: rustup target add x86_64-apple-darwin
 
       # TestApp is built with LLVM 12 against the common-3.0 SDK, as in
-      # touchHLE's CI. These steps were removed in 49d9d48e.
+      # touchHLE's CI.
       - name: Try to get cached copy of LLVM
         id: cache-llvm
         uses: actions/cache@main
@@ -84,9 +98,57 @@ jobs:
 
       - name: Test
         run: cargo test --target x86_64-apple-darwin
-        
-      - name: Build  
-        run: cargo build --target x86_64-apple-darwin --release  
+
+  build-osx:
+    needs: [check-hyperhle-release]
+    if: >-
+      always() &&
+      !cancelled() &&
+      (
+        github.event_name != 'push' ||
+        (
+          (startsWith(github.event.head_commit.message, 'chore:') || startsWith(github.event.head_commit.message, 'chore(')) &&
+          needs.check-hyperhle-release.outputs.should_release == 'true'
+        )
+      )
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout touchHLE
+        uses: actions/checkout@main
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@master
+
+      - name: Try to get cached copy of Boost
+        id: cache-boost
+        uses: actions/cache@main
+        with:
+          path: vendor/boost
+          key: boost_1_81_0_macos
+
+      - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+        name: Download Boost
+        run: curl -L -O "https://archives.boost.io/release/1.81.0/source/boost_1_81_0.tar.gz"
+
+      - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+        name: Extract Boost
+        run: mkdir -p vendor && tar xzf boost_1_81_0.tar.gz -C vendor && mv vendor/boost_1_81_0 vendor/boost
+
+      - name: Setup CMake
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: "~3.29.0"
+
+      - name: Install x86_64 toolchain
+        run: rustup target add x86_64-apple-darwin
+
+      - name: Build
+        run: cargo build --target x86_64-apple-darwin --release
 
       - name: Create .app bundle and DMG
         # `hdiutil create` periodically fails on the `macos-15-arm64` GitHub
@@ -139,6 +201,17 @@ jobs:
           path: touchHLE.dmg
 
   build-linux:
+    needs: [check-hyperhle-release]
+    if: >-
+      always() &&
+      !cancelled() &&
+      (
+        github.event_name != 'push' ||
+        (
+          (startsWith(github.event.head_commit.message, 'chore:') || startsWith(github.event.head_commit.message, 'chore(')) &&
+          needs.check-hyperhle-release.outputs.should_release == 'true'
+        )
+      )
     runs-on: ubuntu-latest
 
     steps:
@@ -211,6 +284,17 @@ jobs:
           path: touchHLE_linux_bundle/
 
   build-android:
+    needs: [check-hyperhle-release]
+    if: >-
+      always() &&
+      !cancelled() &&
+      (
+        github.event_name != 'push' ||
+        (
+          (startsWith(github.event.head_commit.message, 'chore:') || startsWith(github.event.head_commit.message, 'chore(')) &&
+          needs.check-hyperhle-release.outputs.should_release == 'true'
+        )
+      )
     runs-on: ubuntu-latest  
 
     steps:  
@@ -304,11 +388,15 @@ jobs:
     - name: Generate local.properties file  
       run: echo 'sdk.dir='$ANDROID_SDK_ROOT > android/local.properties  
 
-    - name: Set up JDK 17  
+    - name: Set up JDK 17
       uses: actions/setup-java@v4
       with:
         distribution: temurin
         java-version: '17'
+        cache: gradle
+        cache-dependency-path: |
+          android/**/*.gradle
+          android/gradle.properties
 
     - name: Build for Android  
       run: cd android && ../gradle/gradle-8.11.1/bin/gradle assembleRelease && mv app/build/outputs/apk/release/HyperHLE-Reborn-release.apk ../HyperHLE-Reborn.apk  
@@ -356,11 +444,19 @@ jobs:
     # (https://github.com/johnny901901901/Applesauce). This builds the three
     # unsigned/fakesigned IPAs it ships and uploads each one on its own.
     #
-    # It waits for check-hyperhle-release only to learn the version a release
-    # build will be tagged with; that job is skipped outside trunk pushes and
-    # manual runs, and the iOS build runs regardless.
+    # It waits for check-hyperhle-release for release eligibility and version.
+    # Builds still run for manual, pull-request, and tag events.
     needs: [check-hyperhle-release]
-    if: ${{ !cancelled() }}
+    if: >-
+      always() &&
+      !cancelled() &&
+      (
+        github.event_name != 'push' ||
+        (
+          (startsWith(github.event.head_commit.message, 'chore:') || startsWith(github.event.head_commit.message, 'chore(')) &&
+          needs.check-hyperhle-release.outputs.should_release == 'true'
+        )
+      )
     runs-on: macos-latest
     env:
       HYPERHLE_VERSION: ${{ needs.check-hyperhle-release.outputs.should_release == 'true' && needs.check-hyperhle-release.outputs.version || '' }}
@@ -453,11 +549,19 @@ jobs:
           archive: false
 
   build-win:
-    # Like build-ios, this waits for check-hyperhle-release only to learn the
-    # version a release build will be tagged with (for the installer), and
-    # runs regardless.
+    # Like build-ios, this waits for release eligibility and version. Builds
+    # still run for manual, pull-request, and tag events.
     needs: [check-hyperhle-release]
-    if: ${{ !cancelled() }}
+    if: >-
+      always() &&
+      !cancelled() &&
+      (
+        github.event_name != 'push' ||
+        (
+          (startsWith(github.event.head_commit.message, 'chore:') || startsWith(github.event.head_commit.message, 'chore(')) &&
+          needs.check-hyperhle-release.outputs.should_release == 'true'
+        )
+      )
     runs-on: windows-2022
     env:
       HYPERHLE_VERSION: ${{ needs.check-hyperhle-release.outputs.should_release == 'true' && needs.check-hyperhle-release.outputs.version || '' }}
@@ -539,7 +643,8 @@ jobs:
   check-hyperhle-release:
     runs-on: ubuntu-latest
     if: >-
-      (github.event_name == 'push' && github.ref == 'refs/heads/trunk') ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/trunk' &&
+        (startsWith(github.event.head_commit.message, 'chore:') || startsWith(github.event.head_commit.message, 'chore('))) ||
       github.event_name == 'workflow_dispatch'
     outputs:
       should_release: ${{ steps.check.outputs.should_release }}
@@ -559,10 +664,11 @@ jobs:
         run: ./dev-scripts/hyperhle-should-release.sh
 
   publish-hyperhle-release:
-    needs: [check-hyperhle-release, build-osx, build-linux, build-android, build-win, build-ios]
+    needs: [check-hyperhle-release, test-osx, build-osx, build-linux, build-android, build-win, build-ios]
     if: >-
       needs.check-hyperhle-release.result == 'success' &&
       needs.check-hyperhle-release.outputs.should_release == 'true' &&
+      needs.test-osx.result == 'success' &&
       needs.build-osx.result == 'success' &&
       needs.build-linux.result == 'success' &&
       needs.build-android.result == 'success' &&
