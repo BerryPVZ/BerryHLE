@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const CATALOG_ROWS: usize = 20;
+const DETAIL_ROWS: usize = 20;
 const CATALOG_ROW_HEIGHT: CGFloat = 86.0;
 const FILE_ROW_HEIGHT: CGFloat = 80.0;
 const DOWNLOAD_ROW_HEIGHT: CGFloat = 110.0;
@@ -39,6 +40,7 @@ const TAB_HEIGHT: CGFloat = 48.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum CatalogSort {
+    Popular,
     Title,
     Newest,
     Oldest,
@@ -47,14 +49,16 @@ enum CatalogSort {
 impl CatalogSort {
     fn next(self) -> Self {
         match self {
-            Self::Title => Self::Newest,
+            Self::Popular => Self::Newest,
             Self::Newest => Self::Oldest,
             Self::Oldest => Self::Title,
+            Self::Title => Self::Popular,
         }
     }
 
     fn label(self) -> &'static str {
         match self {
+            Self::Popular => "Popular",
             Self::Title => "A–Z",
             Self::Newest => "Newest",
             Self::Oldest => "Oldest",
@@ -63,11 +67,19 @@ impl CatalogSort {
 
     fn query_value(self) -> &'static str {
         match self {
+            // Match archive.org's default collection ordering: weekly views.
+            Self::Popular => "week desc",
             Self::Title => "title asc",
             Self::Newest => "publicdate desc",
             Self::Oldest => "publicdate asc",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CatalogScope {
+    Collections,
+    All,
 }
 
 #[derive(Clone, Debug)]
@@ -77,6 +89,7 @@ struct CatalogItem {
     version: Option<String>,
     date: Option<String>,
     creator: Option<String>,
+    files_count: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -368,6 +381,7 @@ struct StoreActions {
     retry: bool,
     cancel: bool,
     sort: bool,
+    fuzzy: bool,
     tap: Option<CGPoint>,
     item: Option<NSInteger>,
     download: Option<NSInteger>,
@@ -388,6 +402,7 @@ fn take_actions(env: &mut Environment, delegate: id) -> StoreActions {
         retry: std::mem::take(&mut host.archive_store_retry),
         cancel: std::mem::take(&mut host.archive_store_cancel),
         sort: std::mem::take(&mut host.archive_store_sort),
+        fuzzy: std::mem::take(&mut host.archive_store_fuzzy),
         tap: std::mem::take(&mut host.archive_store_tap),
         item: std::mem::take(&mut host.archive_store_item),
         download: std::mem::take(&mut host.archive_store_download),
@@ -410,8 +425,10 @@ enum ScrollTap {
 }
 
 struct CatalogState {
+    scope: CatalogScope,
     query: String,
     sort: CatalogSort,
+    fuzzy: bool,
     page: usize,
     total: u64,
     loading: bool,
@@ -423,8 +440,10 @@ struct CatalogState {
 impl CatalogState {
     fn new() -> Self {
         Self {
+            scope: CatalogScope::Collections,
             query: String::new(),
-            sort: CatalogSort::Title,
+            sort: CatalogSort::Popular,
+            fuzzy: false,
             page: 1,
             total: 0,
             loading: false,
@@ -432,6 +451,17 @@ impl CatalogState {
             current: None,
             error: None,
         }
+    }
+
+    fn select_scope(&mut self, sender: &Sender<StoreMessage>, scope: CatalogScope) {
+        if self.scope == scope && (self.current.is_some() || self.loading) {
+            return;
+        }
+        self.scope = scope;
+        self.query.clear();
+        self.sort = CatalogSort::Popular;
+        self.fuzzy = false;
+        self.load(sender, 1);
     }
 
     fn load(&mut self, sender: &Sender<StoreMessage>, page: usize) {
@@ -443,10 +473,12 @@ impl CatalogState {
         request_catalog(
             sender,
             self.generation,
+            self.scope,
             self.query.clone(),
             self.page,
             CATALOG_ROWS,
             self.sort,
+            self.fuzzy,
         );
     }
 
@@ -461,6 +493,9 @@ struct DetailsState {
     loading: bool,
     generation: u64,
     error: Option<String>,
+    file_query: String,
+    file_page: usize,
+    matching_files: Vec<usize>,
 }
 
 impl DetailsState {
@@ -471,17 +506,66 @@ impl DetailsState {
             loading: false,
             generation: 0,
             error: None,
+            file_query: String::new(),
+            file_page: 1,
+            matching_files: Vec::new(),
         }
+    }
+
+    fn open(&mut self, sender: &Sender<StoreMessage>, item: CatalogItem) {
+        self.file_query.clear();
+        self.load(sender, item);
     }
 
     fn load(&mut self, sender: &Sender<StoreMessage>, item: CatalogItem) {
         self.generation += 1;
         self.details = None;
+        self.matching_files.clear();
+        self.file_page = 1;
         self.loading = true;
         self.error = None;
         let identifier = item.identifier.clone();
         self.item = Some(item);
         request_details(sender, self.generation, identifier);
+    }
+
+    fn set_file_query(&mut self, query: String) {
+        self.file_query = query.trim().to_string();
+        self.file_page = 1;
+        self.rebuild_file_matches();
+    }
+
+    fn rebuild_file_matches(&mut self) {
+        let terms: Vec<String> = self
+            .file_query
+            .split_whitespace()
+            .map(|term| term.to_lowercase())
+            .collect();
+        self.matching_files = self
+            .details
+            .as_ref()
+            .map(|details| {
+                details
+                    .files
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, file)| {
+                        let name = file.name.to_lowercase();
+                        terms.iter().all(|term| name.contains(term))
+                    })
+                    .map(|(index, _)| index)
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+
+    fn page_count(&self) -> usize {
+        ((self.matching_files.len() + DETAIL_ROWS - 1) / DETAIL_ROWS).max(1)
+    }
+
+    fn file_index(&self, row: usize) -> Option<usize> {
+        let position = (self.file_page.saturating_sub(1) * DETAIL_ROWS) + row;
+        self.matching_files.get(position).copied()
     }
 }
 
@@ -500,7 +584,9 @@ struct StoreViews {
     back_button: id,
     toolbar: id,
     search_field: id,
+    search_button: id,
     sort_button: id,
+    fuzzy_button: id,
     status_panel: id,
     status_label: id,
     scroll_view: id,
@@ -508,7 +594,8 @@ struct StoreViews {
     previous_button: id,
     next_button: id,
     page_label: id,
-    browse_tab: id,
+    collections_tab: id,
+    all_tab: id,
     downloads_tab: id,
     width: CGFloat,
     full_height: CGFloat,
@@ -580,34 +667,74 @@ pub(super) fn run_archive_store(
                 ns_string::to_rust_string(env, text).into_owned()
             };
             let _: bool = msg![env; (views.search_field) resignFirstResponder];
-            catalog.query = query.trim().to_string();
-            screen = Screen::Browse;
-            catalog.load(&sender, 1);
-            dirty = true;
-        } else if actions.previous && screen == Screen::Browse {
-            if !catalog.loading && catalog.page > 1 {
-                catalog.load(&sender, catalog.page - 1);
-                dirty = true;
+            match screen {
+                Screen::Browse => {
+                    catalog.query = query.trim().to_string();
+                    catalog.load(&sender, 1);
+                }
+                Screen::Details => details.set_file_query(query),
+                Screen::Downloads => {}
             }
-        } else if actions.next && screen == Screen::Browse {
-            if !catalog.loading && catalog.page_count() > catalog.page {
-                catalog.load(&sender, catalog.page + 1);
-                dirty = true;
+            dirty = true;
+        } else if actions.previous && screen != Screen::Downloads {
+            match screen {
+                Screen::Browse if !catalog.loading && catalog.page > 1 => {
+                    catalog.load(&sender, catalog.page - 1);
+                    dirty = true;
+                }
+                Screen::Details if !details.loading && details.file_page > 1 => {
+                    details.file_page -= 1;
+                    dirty = true;
+                }
+                _ => {}
+            }
+        } else if actions.next && screen != Screen::Downloads {
+            match screen {
+                Screen::Browse if !catalog.loading && catalog.page_count() > catalog.page => {
+                    catalog.load(&sender, catalog.page + 1);
+                    dirty = true;
+                }
+                Screen::Details
+                    if !details.loading && details.page_count() > details.file_page =>
+                {
+                    details.file_page += 1;
+                    dirty = true;
+                }
+                _ => {}
             }
         } else if actions.back && screen == Screen::Details {
             screen = Screen::Browse;
+            set_label(env, views.search_field, &catalog.query);
             dirty = true;
         } else if let Some(tab) = actions.tab {
             let _: bool = msg![env; (views.search_field) resignFirstResponder];
-            screen = if tab == 1 {
-                Screen::Downloads
+            if tab == 2 {
+                screen = Screen::Downloads;
             } else {
-                Screen::Browse
-            };
+                screen = Screen::Browse;
+                let scope = if tab == 1 {
+                    CatalogScope::All
+                } else {
+                    CatalogScope::Collections
+                };
+                catalog.select_scope(&sender, scope);
+                set_label(env, views.search_field, &catalog.query);
+            }
             dirty = true;
         } else if actions.sort && screen == Screen::Browse {
             catalog.sort = catalog.sort.next();
             catalog.load(&sender, 1);
+            dirty = true;
+        } else if actions.fuzzy && screen == Screen::Browse {
+            let text: id = msg![env; (views.search_field) text];
+            if text != nil {
+                catalog.query = ns_string::to_rust_string(env, text).trim().to_string();
+            }
+            let _: bool = msg![env; (views.search_field) resignFirstResponder];
+            catalog.fuzzy = !catalog.fuzzy;
+            if !catalog.query.is_empty() {
+                catalog.load(&sender, 1);
+            }
             dirty = true;
         } else if let Some(point) = actions.tap {
             let target = scroll_tap_target(
@@ -623,7 +750,8 @@ pub(super) fn run_archive_store(
                             .cloned();
                         if let Some(item) = item {
                             screen = Screen::Details;
-                            details.load(&sender, item);
+                            details.open(&sender, item);
+                            set_label(env, views.search_field, "");
                         }
                     }
                     ScrollTap::Download(index) => {
@@ -666,7 +794,8 @@ pub(super) fn run_archive_store(
                     .cloned();
                 if let Some(item) = item {
                     screen = Screen::Details;
-                    details.load(&sender, item);
+                    details.open(&sender, item);
+                    set_label(env, views.search_field, "");
                     dirty = true;
                 }
             }
@@ -720,6 +849,7 @@ pub(super) fn run_archive_store(
     host.archive_store_retry = false;
     host.archive_store_cancel = false;
     host.archive_store_sort = false;
+    host.archive_store_fuzzy = false;
     host.archive_store_item = None;
     host.archive_store_download = None;
     host.archive_store_tab = None;
@@ -774,6 +904,8 @@ fn drain_messages(
                     Ok(item_details) => {
                         artwork.request(sender, &item_details.identifier);
                         details.details = Some(item_details);
+                        details.file_page = 1;
+                        details.rebuild_file_matches();
                         details.error = None;
                     }
                     Err(error) => {
@@ -807,7 +939,7 @@ fn drain_messages(
                             task.downloaded = downloaded;
                             task.total = total;
                         }
-                        update_download_progress(env, views, screen, downloads);
+                        update_download_progress(env, views, screen, catalog, downloads);
                     }
                 }
                 DownloadEvent::Finished { result } => {
@@ -921,7 +1053,7 @@ fn build_store_views(
         background,
     );
     () = msg![env; root addSubview:toolbar];
-    let field_width = width - 144.0;
+    let field_width = (width - 194.0).max(90.0);
     let search_field: id = msg_class![env; UITextField alloc];
     let search_field: id = msg![env; search_field initWithFrame:(rect(
         8.0,
@@ -948,11 +1080,11 @@ fn build_store_views(
     () = msg![env; toolbar addSubview:search_field];
 
     let blue = ui_color(env, 0.0, 0.40, 0.82, 1.0);
-    make_button(
+    let search_button = make_button(
         env,
         delegate,
         toolbar,
-        rect(width - 130.0, 7.0, 48.0, 34.0),
+        rect(width - 180.0, 7.0, 40.0, 34.0),
         "Go",
         "archiveStoreSearch",
         0,
@@ -960,12 +1092,23 @@ fn build_store_views(
         white,
     );
     let sort_background = ui_color(env, 0.86, 0.91, 0.98, 1.0);
+    let fuzzy_button = make_button(
+        env,
+        delegate,
+        toolbar,
+        rect(width - 134.0, 7.0, 54.0, 34.0),
+        "Fuzzy",
+        "archiveStoreFuzzy",
+        0,
+        sort_background,
+        blue,
+    );
     let sort_button = make_button(
         env,
         delegate,
         toolbar,
         rect(width - 74.0, 7.0, 66.0, 34.0),
-        "A–Z",
+        "Popular",
         "archiveStoreSort",
         0,
         sort_background,
@@ -1061,14 +1204,25 @@ fn build_store_views(
         tab_separator_color,
     );
     () = msg![env; tab_bar addSubview:tab_separator];
-    let browse_tab = make_button(
+    let collections_tab = make_button(
         env,
         delegate,
         tab_bar,
-        rect(0.0, 1.0, width / 2.0, TAB_HEIGHT - 1.0),
-        "Browse",
+        rect(0.0, 1.0, width / 3.0, TAB_HEIGHT - 1.0),
+        "Collections",
         "archiveStoreTab:",
         0,
+        clear,
+        blue,
+    );
+    let all_tab = make_button(
+        env,
+        delegate,
+        tab_bar,
+        rect(width / 3.0, 1.0, width / 3.0, TAB_HEIGHT - 1.0),
+        "All IPAs",
+        "archiveStoreTab:",
+        1,
         clear,
         blue,
     );
@@ -1076,10 +1230,10 @@ fn build_store_views(
         env,
         delegate,
         tab_bar,
-        rect(width / 2.0, 1.0, width / 2.0, TAB_HEIGHT - 1.0),
+        rect(width * 2.0 / 3.0, 1.0, width / 3.0, TAB_HEIGHT - 1.0),
         "Downloads",
         "archiveStoreTab:",
-        1,
+        2,
         clear,
         blue,
     );
@@ -1106,7 +1260,9 @@ fn build_store_views(
         back_button,
         toolbar,
         search_field,
+        search_button,
         sort_button,
+        fuzzy_button,
         status_panel,
         status_label,
         scroll_view,
@@ -1114,7 +1270,8 @@ fn build_store_views(
         previous_button,
         next_button,
         page_label,
-        browse_tab,
+        collections_tab,
+        all_tab,
         downloads_tab,
         width,
         full_height,
@@ -1203,9 +1360,12 @@ fn update_chrome(
     downloads: &DownloadManager,
 ) {
     let browsing = screen == Screen::Browse;
-    () = msg![env; (views.toolbar) setHidden:(!browsing)];
-    () = msg![env; (views.pager) setHidden:(!browsing)];
+    let searching = screen != Screen::Downloads;
+    () = msg![env; (views.toolbar) setHidden:(!searching)];
+    () = msg![env; (views.pager) setHidden:(!searching)];
     () = msg![env; (views.back_button) setHidden:(screen != Screen::Details)];
+    () = msg![env; (views.sort_button) setHidden:(!browsing)];
+    () = msg![env; (views.fuzzy_button) setHidden:(!browsing)];
     let title = match screen {
         Screen::Details => details
             .item
@@ -1217,7 +1377,53 @@ fn update_chrome(
     set_label(env, views.nav_title, title);
     set_button_title(env, views.sort_button, catalog.sort.label());
 
-    let toolbar_height = if browsing { TOOLBAR_HEIGHT } else { 0.0 };
+    let blue = ui_color(env, 0.0, 0.40, 0.82, 1.0);
+    let white: id = msg_class![env; UIColor whiteColor];
+    let selected = ui_color(env, 0.86, 0.91, 0.98, 1.0);
+    let (fuzzy_background, fuzzy_color) = if catalog.fuzzy {
+        (blue, white)
+    } else {
+        (selected, blue)
+    };
+    () = msg![env; (views.fuzzy_button) setBackgroundColor:fuzzy_background];
+    () = msg![env; (views.fuzzy_button) setTitleColor:fuzzy_color forState:UIControlStateNormal];
+    if browsing {
+        () = msg![env; (views.search_field) setFrame:(rect(
+            8.0,
+            7.0,
+            (views.width - 194.0).max(90.0),
+            34.0
+        ))];
+        () = msg![env; (views.search_button) setFrame:(rect(
+            views.width - 180.0,
+            7.0,
+            40.0,
+            34.0
+        ))];
+    } else {
+        () = msg![env; (views.search_field) setFrame:(rect(
+            8.0,
+            7.0,
+            (views.width - 90.0).max(90.0),
+            34.0
+        ))];
+        () = msg![env; (views.search_button) setFrame:(rect(
+            views.width - 74.0,
+            7.0,
+            66.0,
+            34.0
+        ))];
+    }
+    let placeholder_text = if browsing {
+        "Search apps, IDs, developers"
+    } else {
+        "Search IPA files in this collection"
+    };
+    let placeholder = ns_string::from_rust_string(env, placeholder_text.to_string());
+    () = msg![env; (views.search_field) setPlaceholder:placeholder];
+    release(env, placeholder);
+
+    let toolbar_height = if searching { TOOLBAR_HEIGHT } else { 0.0 };
     let status_y = views.nav_height + toolbar_height;
     () = msg![env; (views.status_panel) setFrame:(rect(
         0.0,
@@ -1226,7 +1432,7 @@ fn update_chrome(
         STATUS_HEIGHT
     ))];
     let scroll_y = status_y + STATUS_HEIGHT;
-    let bottom = TAB_HEIGHT + if browsing { PAGER_HEIGHT } else { 0.0 };
+    let bottom = TAB_HEIGHT + if searching { PAGER_HEIGHT } else { 0.0 };
     () = msg![env; (views.scroll_view) setFrame:(rect(
         0.0,
         scroll_y,
@@ -1240,20 +1446,21 @@ fn update_chrome(
         Screen::Downloads => downloads_status(downloads),
     };
     set_label(env, views.status_label, &status);
+    let (page, page_count, loading) = match screen {
+        Screen::Browse => (catalog.page, catalog.page_count(), catalog.loading),
+        Screen::Details => (details.file_page, details.page_count(), details.loading),
+        Screen::Downloads => (1, 1, false),
+    };
     set_label(
         env,
         views.page_label,
-        &format!("Page {} / {}", catalog.page.min(catalog.page_count()), catalog.page_count()),
+        &format!("Page {} / {}", page.min(page_count), page_count),
     );
-    set_button_enabled(
-        env,
-        views.previous_button,
-        !catalog.loading && catalog.page > 1,
-    );
+    set_button_enabled(env, views.previous_button, !loading && page > 1);
     set_button_enabled(
         env,
         views.next_button,
-        !catalog.loading && catalog.page < catalog.page_count(),
+        !loading && page < page_count,
     );
 
     let pending = downloads.pending_count();
@@ -1263,27 +1470,35 @@ fn update_chrome(
         format!("Downloads ({pending})")
     };
     set_button_title(env, views.downloads_tab, &downloads_title);
-    let selected = ui_color(env, 0.86, 0.91, 0.98, 1.0);
     let clear: id = msg_class![env; UIColor clearColor];
-    let browse_background = if screen == Screen::Downloads {
-        clear
-    } else {
+    let collections_background = if screen != Screen::Downloads
+        && catalog.scope == CatalogScope::Collections
+    {
         selected
+    } else {
+        clear
+    };
+    let all_background = if screen != Screen::Downloads && catalog.scope == CatalogScope::All {
+        selected
+    } else {
+        clear
     };
     let downloads_background = if screen == Screen::Downloads {
         selected
     } else {
         clear
     };
-    () = msg![env; (views.browse_tab) setBackgroundColor:browse_background];
+    () = msg![env; (views.collections_tab) setBackgroundColor:collections_background];
+    () = msg![env; (views.all_tab) setBackgroundColor:all_background];
     () = msg![env; (views.downloads_tab) setBackgroundColor:downloads_background];
-    update_nav_subtitle(env, views, screen, downloads);
+    update_nav_subtitle(env, views, screen, catalog, downloads);
 }
 
 fn update_nav_subtitle(
     env: &mut Environment,
     views: &StoreViews,
     screen: Screen,
+    catalog: &CatalogState,
     downloads: &DownloadManager,
 ) {
     let text = if let Some(task) = downloads.active_task() {
@@ -1300,8 +1515,11 @@ fn update_nav_subtitle(
         }
     } else {
         match screen {
-            Screen::Browse => "Internet Archive • ipaarchive".to_string(),
-            Screen::Details => "App information and available versions".to_string(),
+            Screen::Browse => match catalog.scope {
+                CatalogScope::Collections => "Internet Archive • Collections".to_string(),
+                CatalogScope::All => "Internet Archive • All IPAs".to_string(),
+            },
+            Screen::Details => "Collection information and IPA files".to_string(),
             Screen::Downloads => "Queue, progress and installation".to_string(),
         }
     };
@@ -1309,9 +1527,13 @@ fn update_nav_subtitle(
 }
 
 fn catalog_status(catalog: &CatalogState) -> String {
+    let noun = match catalog.scope {
+        CatalogScope::Collections => "collections",
+        CatalogScope::All => "apps",
+    };
     if catalog.loading {
         return if catalog.query.is_empty() {
-            "Loading catalog…".to_string()
+            format!("Loading {noun}…")
         } else {
             format!("Searching for “{}”…", catalog.query)
         };
@@ -1323,17 +1545,22 @@ fn catalog_status(catalog: &CatalogState) -> String {
         return "Browse the Internet Archive collection.".to_string();
     };
     if page.items.is_empty() {
-        return format!("No results for “{}”.", catalog.query);
+        return if catalog.query.is_empty() {
+            format!("No {noun} found.")
+        } else {
+            format!("No results for “{}”. Try Fuzzy search.", catalog.query)
+        };
     }
     let first = (page.page - 1) * CATALOG_ROWS + 1;
     let last = first + page.items.len() - 1;
     let query = if catalog.query.is_empty() {
-        "apps".to_string()
+        noun.to_string()
     } else {
         format!("results for “{}”", catalog.query)
     };
+    let fuzzy = if catalog.fuzzy { " • Fuzzy" } else { "" };
     format!(
-        "{first}–{last} of {} {query} • {}",
+        "{first}–{last} of {} {query} • {}{fuzzy}",
         catalog.total,
         catalog.sort.label()
     )
@@ -1341,20 +1568,24 @@ fn catalog_status(catalog: &CatalogState) -> String {
 
 fn details_status(details: &DetailsState) -> String {
     if details.loading {
-        return "Loading app details and IPA files…".to_string();
+        return "Loading collection details and IPA files…".to_string();
     }
     if details.error.is_some() {
-        return "Couldn't load app details.".to_string();
+        return "Couldn't load collection details.".to_string();
     }
-    let Some(details) = &details.details else {
-        return "App information.".to_string();
+    let Some(loaded) = &details.details else {
+        return "Collection information.".to_string();
     };
-    let total_size: u64 = details.files.iter().filter_map(|file| file.size).sum();
-    let mut text = format!(
-        "{} IPA version{}",
-        details.files.len(),
-        if details.files.len() == 1 { "" } else { "s" }
-    );
+    if !details.file_query.is_empty() {
+        return format!(
+            "{} of {} IPA files match “{}”",
+            details.matching_files.len(),
+            loaded.files.len(),
+            details.file_query
+        );
+    }
+    let total_size: u64 = loaded.files.iter().filter_map(|file| file.size).sum();
+    let mut text = format!("{} IPA files", loaded.files.len());
     if total_size > 0 {
         text.push_str(&format!(" • {} combined", format_size(total_size)));
     }
@@ -1397,18 +1628,19 @@ fn scroll_tap_target(
             (within_row <= 80.0 && index < page.items.len()).then_some(ScrollTap::Item(index))
         }
         Screen::Details => {
-            if !action_x {
+            if !action_x || details.details.is_none() {
                 return None;
             }
-            let loaded = details.details.as_ref()?;
             let relative = point.y - 228.0;
             if relative < 0.0 {
                 return None;
             }
-            let index = (relative / FILE_ROW_HEIGHT).floor() as usize;
-            let within_row = relative - index as CGFloat * FILE_ROW_HEIGHT;
-            (within_row >= 21.0 && within_row <= 53.0 && index < loaded.files.len())
-                .then_some(ScrollTap::Download(index))
+            let row = (relative / FILE_ROW_HEIGHT).floor() as usize;
+            let within_row = relative - row as CGFloat * FILE_ROW_HEIGHT;
+            if within_row < 21.0 || within_row > 53.0 || row >= DETAIL_ROWS {
+                return None;
+            }
+            details.file_index(row).map(ScrollTap::Download)
         }
         Screen::Downloads => {
             if !action_x {
@@ -1453,7 +1685,11 @@ fn render_catalog(
     artwork: &ArtworkCache,
 ) -> CGFloat {
     if catalog.loading {
-        add_message(env, views, "Loading the latest catalog…", false);
+        let message = match catalog.scope {
+            CatalogScope::Collections => "Loading IPA collections…",
+            CatalogScope::All => "Loading the complete IPA catalog…",
+        };
+        add_message(env, views, message, false);
         return 210.0;
     }
     if let Some(error) = &catalog.error {
@@ -1465,7 +1701,12 @@ fn render_catalog(
         return 210.0;
     };
     if page.items.is_empty() {
-        add_message(env, views, "No apps matched this search. Try a different title, identifier or developer.", false);
+        let message = if catalog.fuzzy {
+            "No similar archives matched. Try fewer words or switch to All IPAs."
+        } else {
+            "No archives matched. Try Fuzzy search for similar titles and abbreviations."
+        };
+        add_message(env, views, message, false);
         return 210.0;
     }
 
@@ -1599,7 +1840,7 @@ fn render_details(
     let section = new_label(
         env,
         rect(14.0, 200.0, views.width - 28.0, 22.0),
-        "AVAILABLE IPA VERSIONS",
+        "IPA FILES",
         11.0,
         true,
         gray,
@@ -1628,12 +1869,26 @@ fn render_details(
         );
         return 430.0;
     }
+    if details.matching_files.is_empty() {
+        add_message_at(
+            env,
+            views,
+            230.0,
+            "No IPA files match this search. Try a shorter title or clear the search.",
+            false,
+        );
+        return 430.0;
+    }
 
+    let page = details.file_page.min(details.page_count());
+    let start = (page - 1) * DETAIL_ROWS;
+    let end = (start + DETAIL_ROWS).min(details.matching_files.len());
     let blue = ui_color(env, 0.0, 0.40, 0.82, 1.0);
     let green = ui_color(env, 0.12, 0.58, 0.32, 1.0);
     let disabled = ui_color(env, 0.68, 0.73, 0.80, 1.0);
-    for (index, file) in loaded.files.iter().enumerate() {
-        let y = 228.0 + index as CGFloat * FILE_ROW_HEIGHT;
+    for (row_index, file_index) in details.matching_files[start..end].iter().copied().enumerate() {
+        let file = &loaded.files[file_index];
+        let y = 228.0 + row_index as CGFloat * FILE_ROW_HEIGHT;
         let row = new_view(env, rect(8.0, y, row_width, 74.0), white);
         () = msg![env; row setUserInteractionEnabled:false];
         let row_layer: id = msg![env; row layer];
@@ -1679,7 +1934,7 @@ fn render_details(
         );
         views.rows.push(row);
     }
-    236.0 + loaded.files.len() as CGFloat * FILE_ROW_HEIGHT
+    236.0 + (end - start) as CGFloat * FILE_ROW_HEIGHT
 }
 
 fn render_downloads(
@@ -1691,7 +1946,7 @@ fn render_downloads(
         add_message(
             env,
             views,
-            "Your queue and installed packages will appear here. You can queue several versions and return to Browse.",
+            "Your queue and installed packages will appear here. You can queue several versions and return to Collections or All IPAs.",
             false,
         );
         return 220.0;
@@ -1802,6 +2057,7 @@ fn update_download_progress(
     env: &mut Environment,
     views: &StoreViews,
     screen: Screen,
+    catalog: &CatalogState,
     downloads: &DownloadManager,
 ) {
     for progress in &views.download_progress {
@@ -1813,7 +2069,7 @@ fn update_download_progress(
         frame.size.width = progress.width * task.fraction() as CGFloat;
         () = msg![env; (progress.fill) setFrame:frame];
     }
-    update_nav_subtitle(env, views, screen, downloads);
+    update_nav_subtitle(env, views, screen, catalog, downloads);
 }
 
 fn download_task_status(task: &DownloadTask) -> String {
@@ -1998,6 +2254,9 @@ fn item_initials(title: &str) -> String {
 
 fn catalog_subtitle(item: &CatalogItem) -> String {
     let mut parts = Vec::new();
+    if let Some(files_count) = item.files_count {
+        parts.push(format!("{files_count} files"));
+    }
     if let Some(version) = &item.version {
         parts.push(format!("v{version}"));
     }
@@ -2055,16 +2314,18 @@ fn truncate_chars(value: &str, limit: usize) -> String {
 fn request_catalog(
     sender: &Sender<StoreMessage>,
     generation: u64,
+    scope: CatalogScope,
     query: String,
     page: usize,
     rows: usize,
     sort: CatalogSort,
+    fuzzy: bool,
 ) {
     let worker_sender = sender.clone();
     let spawn = std::thread::Builder::new()
         .name("HyperHLE archive catalog".to_string())
         .spawn(move || {
-            let result = network::fetch_catalog(&query, page, rows, sort);
+            let result = network::fetch_catalog(scope, &query, page, rows, sort, fuzzy);
             let _ = worker_sender.send(StoreMessage::Catalog { generation, result });
         });
     if let Err(error) = spawn {
@@ -2179,11 +2440,42 @@ mod tests {
 
     #[test]
     fn sorting_cycles_and_icons_have_stable_initials() {
-        assert_eq!(CatalogSort::Title.next(), CatalogSort::Newest);
+        assert_eq!(CatalogSort::Popular.next(), CatalogSort::Newest);
         assert_eq!(CatalogSort::Newest.next(), CatalogSort::Oldest);
         assert_eq!(CatalogSort::Oldest.next(), CatalogSort::Title);
+        assert_eq!(CatalogSort::Title.next(), CatalogSort::Popular);
         assert_eq!(item_initials("Temple Run"), "TR");
         assert_eq!(item_initials("Minecraft"), "MI");
         assert_eq!(item_initials(""), "IPA");
+    }
+
+    #[test]
+    fn details_filter_and_pagination_keep_original_file_indices() {
+        let mut state = DetailsState::new();
+        state.details = Some(ItemDetails {
+            identifier: "collection".to_string(),
+            title: "Collection".to_string(),
+            version: None,
+            creator: None,
+            date: None,
+            description: None,
+            files: (1..=45)
+                .map(|index| ArchiveFile {
+                    name: format!("Game {index}.ipa"),
+                    size: None,
+                    version: None,
+                })
+                .collect(),
+        });
+        state.rebuild_file_matches();
+        assert_eq!(state.matching_files.len(), 45);
+        assert_eq!(state.page_count(), 3);
+        state.file_page = 2;
+        assert_eq!(state.file_index(0), Some(20));
+        state.set_file_query("game 45".to_string());
+        assert_eq!(state.matching_files, vec![44]);
+        assert_eq!(state.file_page, 1);
+        assert_eq!(state.file_index(0), Some(44));
+        assert_eq!(state.file_index(1), None);
     }
 }

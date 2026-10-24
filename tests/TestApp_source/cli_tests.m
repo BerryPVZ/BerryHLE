@@ -561,6 +561,138 @@ int test_dispatch_after_f_default_mode(void) {
 int test_dispatch_after_common_mode(void) {
   return check_dispatch_after_source(NO, YES);
 }
+
+// Apple: global queues run work concurrently, and dispatch_async "returns
+// immediately after the block has been submitted and never waits for the
+// block to be invoked". The work below waits for its submitter to move on
+// after dispatch_async returns, as Noblemen: 1896 does (HyperHLE-Reborn
+// issue 307), so it deadlocks if the work runs on the submitting thread.
+// https://developer.apple.com/documentation/dispatch/1453057-dispatch_async
+extern dispatch_queue_t dispatch_get_global_queue(long identifier,
+                                                  unsigned long flags);
+extern void dispatch_async(dispatch_queue_t queue, void (^block)(void));
+extern void dispatch_async_f(dispatch_queue_t queue, void *context,
+                             void (*work)(void *));
+static pthread_mutex_t global_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t global_queue_cond = PTHREAD_COND_INITIALIZER;
+static int global_queue_state;
+static pthread_t global_queue_submitter;
+static int global_queue_work_thread; // 1: worker thread, -1: submitter
+static int global_queue_main_block;  // 1: main thread, -1: another thread
+static void global_queue_work(void *context) {
+  global_queue_work_thread =
+      pthread_equal(pthread_self(), global_queue_submitter) ? -1 : 1;
+  pthread_mutex_lock(&global_queue_mutex);
+  while (global_queue_state == 0)
+    pthread_cond_wait(&global_queue_cond, &global_queue_mutex);
+  global_queue_state = 2;
+  pthread_cond_broadcast(&global_queue_cond);
+  pthread_mutex_unlock(&global_queue_mutex);
+  // Main queue work submitted from a worker runs on the main thread.
+  dispatch_async(dispatch_get_main_queue(), ^{
+    global_queue_main_block =
+        pthread_equal(pthread_self(), global_queue_submitter) ? 1 : -1;
+  });
+}
+static int check_dispatch_async_global_queue(BOOL function) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  global_queue_state = 0;
+  global_queue_work_thread = 0;
+  global_queue_main_block = 0;
+  global_queue_submitter = pthread_self();
+  dispatch_queue_t queue = dispatch_get_global_queue(0, 0);
+  if (function)
+    dispatch_async_f(queue, NULL, global_queue_work);
+  else
+    dispatch_async(queue, ^{
+      global_queue_work(NULL);
+    });
+  pthread_mutex_lock(&global_queue_mutex);
+  global_queue_state = 1;
+  pthread_cond_broadcast(&global_queue_cond);
+  while (global_queue_state != 2)
+    pthread_cond_wait(&global_queue_cond, &global_queue_mutex);
+  pthread_mutex_unlock(&global_queue_mutex);
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
+  while (global_queue_main_block == 0 && [deadline timeIntervalSinceNow] > 0)
+    [[NSRunLoop mainRunLoop]
+           runMode:NSDefaultRunLoopMode
+        beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+  [pool drain];
+  if (global_queue_work_thread != 1)
+    return -1;
+  return global_queue_main_block == 1 ? 0 : -2;
+}
+int test_dispatch_async_global_queue(void) {
+  return check_dispatch_async_global_queue(NO);
+}
+int test_dispatch_async_f_global_queue(void) {
+  return check_dispatch_async_global_queue(YES);
+}
+
+// From Apple's dladdr(3) man page: dladdr() returns non-zero and fills in
+// the image path and base, and the nearest lower symbol, for an address in
+// a loaded image, and returns 0 otherwise. Symbol names have no leading
+// underscore. The old SDK has no dlfcn.h; this is its Dl_info layout.
+// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/dladdr.3.html
+typedef struct {
+  const char *dli_fname;
+  void *dli_fbase;
+  const char *dli_sname;
+  void *dli_saddr;
+} TestAppDlInfo;
+extern int dladdr(const void *addr, TestAppDlInfo *info);
+int test_dladdr(void) {
+  TestAppDlInfo info;
+  memset(&info, 0, sizeof(info));
+  if (!dladdr((const void *)&test_dladdr, &info))
+    return -1;
+  if (info.dli_fname == NULL || strstr(info.dli_fname, "TestApp") == NULL)
+    return -2;
+  // An image's base address is its Mach-O header (MH_MAGIC or MH_MAGIC_64).
+  if (info.dli_fbase == NULL)
+    return -3;
+  uint32_t magic = *(const uint32_t *)info.dli_fbase;
+  if (magic != 0xfeedface && magic != 0xfeedfacf)
+    return -3;
+  if (info.dli_sname == NULL || strcmp(info.dli_sname, "test_dladdr") != 0)
+    return -4;
+  if (info.dli_saddr != (void *)&test_dladdr)
+    return -5;
+  // The page at address 0 is not part of any image.
+  if (dladdr((const void *)4, &info) != 0)
+    return -6;
+  return 0;
+}
+
+// Apple: +[AVAsset assetWithURL:] "Returns an asset for inspection of a
+// resource referenced by a given URL" (iOS 5.0+). Talking Ted relies on it
+// to load its animations (HyperHLE-Reborn issue 303).
+// https://developer.apple.com/documentation/avfoundation/avasset/1389943-assetwithurl
+@interface AVAsset : NSObject
++ (id)assetWithURL:(NSURL *)url;
+@end
+@interface AVURLAsset : AVAsset
+- (NSURL *)URL;
+@end
+@interface NSObject (AVAssetTest)
+- (BOOL)isKindOfClass:(Class)cls;
+- (BOOL)isEqual:(id)object;
+@end
+int test_AVAsset_assetWithURL(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  NSURL *url = [NSURL URLWithString:@"file:///nonexistent/movie.m4v"];
+  id asset = [AVAsset assetWithURL:url];
+  int result = 0;
+  if (asset == nil)
+    result = -1;
+  else if (![asset isKindOfClass:[AVURLAsset class]])
+    result = -2;
+  else if (![[asset URL] isEqual:url])
+    result = -3;
+  [pool drain];
+  return result;
+}
 extern int test_runloop_audio_queue(void);
 extern int test_runloop_audio_queue_null(void);
 extern int test_runloop_audio_unit_independent(void);
@@ -7507,6 +7639,10 @@ struct {
     FUNC_DEF(test_dispatch_after_default_mode),
     FUNC_DEF(test_dispatch_after_f_default_mode),
     FUNC_DEF(test_dispatch_after_common_mode),
+    FUNC_DEF(test_dispatch_async_global_queue),
+    FUNC_DEF(test_dispatch_async_f_global_queue),
+    FUNC_DEF(test_dladdr),
+    FUNC_DEF(test_AVAsset_assetWithURL),
     FUNC_DEF(test_runloop_audio_queue),
     FUNC_DEF(test_runloop_audio_queue_null),
     FUNC_DEF(test_runloop_audio_unit_independent),

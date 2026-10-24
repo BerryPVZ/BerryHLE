@@ -24,7 +24,6 @@ pub mod qsort;
 
 #[derive(Default)]
 pub struct State {
-    dladdr_names: std::collections::HashMap<usize, ConstPtr<u8>>,
     rand: u32,
     random: u32,
     arc4random: u32,
@@ -1351,34 +1350,7 @@ fn system(env: &mut Environment, cmd: ConstPtr<u8>) -> i32 {
     }
 }
 
-fn dladdr(env: &mut Environment, addr: ConstVoidPtr, info: MutVoidPtr) -> i32 {
-    if info.is_null() {
-        return 0;
-    }
-    let address = addr.to_bits() & !1;
-    let Some(index) = env
-        .bins
-        .iter()
-        .position(|bin| (bin.text_base..bin.last_segment_end).contains(&address))
-    else {
-        return 0;
-    };
-    let base = env.bins[index].text_base;
-    let name = if let Some(&name) = env.libc_state.stdlib.dladdr_names.get(&index) {
-        name
-    } else {
-        let name = env.bins[index].name.clone();
-        let ptr = env.mem.alloc(name.len() as u32 + 1).cast::<u8>();
-        env.mem
-            .bytes_at_mut(ptr, name.len() as u32)
-            .copy_from_slice(name.as_bytes());
-        env.mem.write(ptr + name.len() as u32, 0u8);
-        env.libc_state
-            .stdlib
-            .dladdr_names
-            .insert(index, ptr.cast_const());
-        ptr.cast_const()
-    };
+pub(super) fn restore_dladdr_compatibility_metadata(env: &mut Environment, index: usize, base: u32) {
     // BTC's GameManager init inspects the in-memory encryption command.
     // A decrypted dump clears cryptid, unlike the running device image.
     // Restore that metadata for these apps only, after the loader has accepted
@@ -1410,14 +1382,6 @@ fn dladdr(env: &mut Environment, addr: ConstVoidPtr, info: MutVoidPtr) -> i32 {
             offset += size;
         }
     }
-    // Dl_info: filename, image base, nearest symbol name, symbol address.
-    // Image-only resolution is valid when symbol information is unavailable.
-    let fields = info.cast::<u32>();
-    env.mem.write(fields, name.to_bits());
-    env.mem.write(fields + 1, base);
-    env.mem.write(fields + 2, 0u32);
-    env.mem.write(fields + 3, 0u32);
-    1
 }
 
 fn kqueue(_env: &mut Environment) -> i32 {
@@ -2103,7 +2067,6 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(fcvt(_, _, _, _)),
     export_c_func!(gcvt(_, _, _)),
     export_c_func!(system(_)),
-    export_c_func!(dladdr(_, _)),
     export_c_func!(kqueue()),
     export_c_func!(_NSGetExecutablePath(_, _)),
     export_c_func!(kevent(_, _, _, _, _, _)),
