@@ -534,3 +534,8 @@ Other options:
         Disable Globbert's debug overlay.
 
 --image-cache-mb=N  Reuse decoded file images within N MiB (0 disables; maximum 1024).
+
+--sort-bundle-resources  Sort bundle resource lists lexically (numbered animation frames).
+--no-root-autorotation  Let a game engine rotate its own portrait drawable.
+
+    --present-default-framebuffer  Copy a guest frame drawn into framebuffer zero.

@@ -1200,6 +1200,17 @@ impl Fs {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn resource_listing_fixture(names: &[&str]) -> Fs {
+        let mut directory = FsNode::dir();
+        for name in names {
+            directory = directory.with_child(name, FsNode::resource_file("unused-listing-fixture".into()));
+        }
+        let mut fs = Self::new_fake_fs();
+        fs.root = FsNode::dir().with_child("Frames", directory);
+        fs
+    }
+
     /// Get the absolute path of the guest app's (sandboxed) home directory.
     pub fn home_directory(&self) -> &GuestPath {
         &self.home_directory

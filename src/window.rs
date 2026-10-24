@@ -922,6 +922,12 @@ pub struct Window {
 }
 
 impl Window {
+    #[cfg(test)]
+    pub(crate) fn graphics_test_window() -> Result<Self, String> {
+        let mut window = Self::new("BerryHLE graphics regression", None, None, &Options::default())?;
+        window.window.hide();
+        Ok(window)
+    }
     /// Returns [true] if touchHLE is running on a device where we should always
     /// display fullscreen, but SDL2 will let us control the orientation, i.e.
     /// Android and iOS devices.

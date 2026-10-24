@@ -586,7 +586,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // Собираем имена файлов в вектор в отдельном блоке,
     // чтобы заимствование env.fs освободилось до вызовов msg! /
     // from_rust_string
-    let matched_files: Vec<String> = {
+    let mut matched_files: Vec<String> = {
         let target_ext = ext_str.as_ref().map(|s| s.to_lowercase());
         match env.fs.enumerate(crate::fs::GuestPath::new(&actual_dir_str)) {
             Ok(entries) => {
@@ -614,6 +614,10 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
     };
 
+    // Resource enumeration order is not an API guarantee. Some old games
+    // consume this list directly as numbered animation frames, so provide
+    // deterministic lexical ordering as an explicit compatibility option.
+    if env.options.sort_bundle_resources { matched_files.sort(); }
     // Теперь env.fs не заимствован — можно безопасно использовать env
     for file_name in matched_files {
         let ns_file_name = ns_string::from_rust_string(env, file_name);
@@ -1450,4 +1454,39 @@ fn scan_quoted_sanitized(env: &mut Environment, scanner: id) -> id {
         log_dbg!("scan_quoted_sanitized: unhandled backslash in token");
     }
     res
+}
+
+
+#[cfg(test)]
+mod animation_resource_order_tests {
+    use super::*;
+    #[test]
+    fn frame_resource_option_sorts_actual_ns_bundle_results_without_changing_default_order() {
+        let _guard = crate::environment::FRAMEWORK_TEST_LOCK.lock().unwrap();
+        let mut environment = crate::Environment::new_for_framework_tests().unwrap();
+        let env = &mut environment;
+        *env.fs = crate::fs::Fs::resource_listing_fixture(&[
+            "cat_idle0002.jpg", "cat_idle0000.jpg", "cat_idle0001.jpg", "sound.wav",
+        ]);
+        let original: Vec<String> = env.fs.enumerate(crate::fs::GuestPath::new("/Frames"))
+            .unwrap().filter(|p| p.ends_with(".jpg")).map(|p| format!("/Frames/{p}")).collect();
+        let root = ns_string::from_rust_string(env, "/".into());
+        let bundle: id = msg_class![env; NSBundle bundleWithPath:root];
+        let ext = ns_string::from_rust_string(env, "jpg".into());
+        let dir = ns_string::from_rust_string(env, "Frames".into());
+        for enabled in [false, true] {
+            env.options.sort_bundle_resources = enabled;
+            let files: id = msg![env; bundle pathsForResourcesOfType:ext inDirectory:dir];
+            let count: crate::frameworks::foundation::NSUInteger = msg![env; files count];
+            let mut actual = Vec::new();
+            for i in 0..count {
+                let path: id = msg![env; files objectAtIndex:i];
+                actual.push(ns_string::to_rust_string(env, path).to_string());
+            }
+            let mut expected = original.clone();
+            if enabled { expected.sort(); }
+            assert_eq!(actual, expected);
+            assert_eq!(actual.len(), 3);
+        }
+    }
 }

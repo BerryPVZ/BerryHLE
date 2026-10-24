@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 
 #[derive(Copy, Clone)]
 struct EaglPresentOptions {
+    present_default_framebuffer: bool,
     trace_gl_errors: bool,
     present_mode: PresentMode,
     present_finish: bool,
@@ -1202,6 +1203,7 @@ pub const CLASSES: ClassExports = objc_classes! {
                 renderbuffer,
             );
             let options = EaglPresentOptions {
+                present_default_framebuffer: env.options.present_default_framebuffer,
                 trace_gl_errors: env.options.trace_gl_errors,
                 present_mode: env.options.present_mode,
                 present_finish: env.options.present_finish,
@@ -1853,6 +1855,13 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, renderbuffer: GLuint, mut pixel
 /// minimum amount of ES 2.0 state, draw the textured quad with a small
 /// dedicated shader program, and restore. GLES2 attributes include the vertex
 /// pointer and captured VBO binding, even while an attribute is disabled.
+unsafe fn restore_present_framebuffers(gles: &mut dyn GLES, draw: GLuint, read: Option<GLuint>) {
+    gles.BindFramebuffer(crate::gles::gles2_raw::FRAMEBUFFER, draw);
+    if let Some(read) = read {
+        gles.BindFramebuffer(crate::gles::gles30_raw::READ_FRAMEBUFFER, read);
+    }
+}
+
 mod vertex_state;
 
 unsafe fn present_renderbuffer_es2(
@@ -1864,6 +1873,7 @@ unsafe fn present_renderbuffer_es2(
     virtual_cursor_visible_at: Option<(f32, f32, bool)>,
     present_finish: bool,
     context_token: usize,
+    present_default_framebuffer: bool,
 ) {
     use crate::gles::gles2_raw as gles2;
 
@@ -1884,6 +1894,9 @@ unsafe fn present_renderbuffer_es2(
     gles.ActiveTexture(old_active_texture as GLenum);
     let mut old_framebuffer: GLint = 0;
     gles.GetIntegerv(gles2::FRAMEBUFFER_BINDING, &mut old_framebuffer);
+    let old_read_framebuffer = if gles.has_separate_framebuffer_bindings() {
+        Some(get_int(gles, crate::gles::gles30_raw::READ_FRAMEBUFFER_BINDING) as GLuint)
+    } else { None };
     let mut old_viewport = [0i32; 4];
     gles.GetIntegerv(gles2::VIEWPORT, old_viewport.as_mut_ptr());
     let mut old_clear_color = [0.0f32; 4];
@@ -1919,7 +1932,7 @@ unsafe fn present_renderbuffer_es2(
         // black even though the guest just rendered a valid frame. Keep the
         // cached source FBO as a fallback only when the bound FBO cannot be
         // verified to contain this drawable.
-        let (attached_renderbuffer, framebuffer_status) = if old_framebuffer != 0 {
+        let (attached_renderbuffer, attachment_type, framebuffer_status) = if old_framebuffer != 0 {
             let mut attached = 0;
             gles.GetFramebufferAttachmentParameteriv(
                 gles2::FRAMEBUFFER,
@@ -1927,16 +1940,23 @@ unsafe fn present_renderbuffer_es2(
                 gles2::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
                 &mut attached,
             );
+            let mut attachment_type = 0;
+            gles.GetFramebufferAttachmentParameteriv(gles2::FRAMEBUFFER, gles2::COLOR_ATTACHMENT0,
+                gles2::FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &mut attachment_type);
             (
                 attached as GLuint,
+                attachment_type as GLenum,
                 gles.CheckFramebufferStatus(gles2::FRAMEBUFFER),
             )
         } else {
-            (0, gles2::FRAMEBUFFER_COMPLETE)
+            (0, gles2::NONE, gles2::FRAMEBUFFER_COMPLETE)
         };
-        let use_bound_framebuffer = old_framebuffer != 0
+        // AIR can draw into the host default framebuffer; copy before clearing it.
+        let use_default = present_default_framebuffer && old_framebuffer == 0;
+        let use_bound_framebuffer = use_default || (old_framebuffer != 0
             && attached_renderbuffer == renderbuffer
-            && framebuffer_status == gles2::FRAMEBUFFER_COMPLETE;
+            && attachment_type == gles2::RENDERBUFFER
+            && framebuffer_status == gles2::FRAMEBUFFER_COMPLETE);
         if !use_bound_framebuffer {
             // Resolve the guest's current draw target before switching to the
             // cached source FBO. Otherwise a tile-based driver can discard the
@@ -1967,6 +1987,19 @@ unsafe fn present_renderbuffer_es2(
                 )
             });
         }
+
+        // https://registry.khronos.org/OpenGL-Refpages/es3.0/html/glCopyTexSubImage2D.xhtml
+        // ES3 copies from READ_FRAMEBUFFER, not the draw binding inspected
+        // above. Keep DRAW untouched on tiled GPUs, but select the drawable
+        // as the copy source even when the guest left another READ bound.
+        if use_bound_framebuffer && old_read_framebuffer.is_some() {
+            gles.BindFramebuffer(crate::gles::gles30_raw::READ_FRAMEBUFFER, old_framebuffer as _);
+        }
+        let source_read_buffer = if old_read_framebuffer.is_some() {
+            let previous = get_int(gles, crate::gles::gles30_raw::READ_BUFFER) as GLenum;
+            gles.ReadBuffer(if use_default { gles2::BACK } else { gles2::COLOR_ATTACHMENT0 });
+            Some(previous)
+        } else { None };
 
         // Copy into preallocated texture storage. CopyTexImage2D reallocates
         // that storage on every frame, while CopyTexSubImage2D does not.
@@ -2015,7 +2048,8 @@ unsafe fn present_renderbuffer_es2(
         if es2_scissor_was_on {
             gles.Enable(gles2::SCISSOR_TEST);
         }
-        gles.BindFramebuffer(gles2::FRAMEBUFFER, old_framebuffer as _);
+        if let Some(buffer) = source_read_buffer { gles.ReadBuffer(buffer); }
+        restore_present_framebuffers(gles, old_framebuffer as _, old_read_framebuffer);
         static LOGGED: std::sync::Once = std::sync::Once::new();
         LOGGED.call_once(|| {
             log!("GLES2 presenter: cached FBO and glCopyTexSubImage2D fast path")
@@ -2061,7 +2095,7 @@ unsafe fn present_renderbuffer_es2(
         });
         gles.BindBuffer(gles2::ARRAY_BUFFER, old_array_buffer as GLuint);
         gles.BindBuffer(gles2::ELEMENT_ARRAY_BUFFER, old_elem_buffer as GLuint);
-        gles.BindFramebuffer(gles2::FRAMEBUFFER, old_framebuffer as GLuint);
+        restore_present_framebuffers(gles, old_framebuffer as _, old_read_framebuffer);
         gles.ActiveTexture(gles2::TEXTURE0);
         gles.BindTexture(gles2::TEXTURE_2D, old_texture0_binding as GLuint);
         gles.ActiveTexture(old_active_texture as GLenum);
@@ -2196,7 +2230,7 @@ unsafe fn present_renderbuffer_es2(
     });
     gles.BindBuffer(gles2::ARRAY_BUFFER, old_array_buffer as GLuint);
     gles.BindBuffer(gles2::ELEMENT_ARRAY_BUFFER, old_elem_buffer as GLuint);
-    gles.BindFramebuffer(gles2::FRAMEBUFFER, old_framebuffer as GLuint);
+    restore_present_framebuffers(gles, old_framebuffer as _, old_read_framebuffer);
     gles.ActiveTexture(gles2::TEXTURE0);
     gles.BindTexture(gles2::TEXTURE_2D, old_texture0_binding as GLuint);
     gles.ActiveTexture(old_active_texture as GLenum);
@@ -2895,6 +2929,7 @@ unsafe fn present_renderbuffer(
             virtual_cursor_visible_at,
             options.present_finish,
             context_token,
+            options.present_default_framebuffer,
         );
         std::mem::drop(gles_boxed);
         env.window.as_mut().unwrap().swap_window();
@@ -3996,6 +4031,62 @@ mod readback_buffer_tests {
         assert_eq!(buffer, vec![0; 64]);
         prepare_readback_buffer(&mut buffer, 256);
         assert_eq!(buffer, vec![0; 256]);
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod native_present_regression {
+    use super::*;
+    use crate::gles::{gles3_native::GLES3NativeContext, gles30_raw as gl, GLESContext};
+
+    #[test]
+    #[ignore = "Requires a real Windows GPU; run explicitly with --ignored"]
+    fn native_es3_present_copies_drawable_with_separate_read_binding() {
+        let mut window = crate::window::Window::graphics_test_window().unwrap();
+        let mut context = GLES3NativeContext::new(&mut window).unwrap();
+        let mut gles = context.make_current(&mut window);
+        unsafe {
+            let mut rb = 0;
+            gles.GenRenderbuffers(1, &mut rb);
+            gles.BindRenderbuffer(gl::RENDERBUFFER, rb);
+            gles.RenderbufferStorage(gl::RENDERBUFFER, gl::RGBA8, 16, 16);
+            let mut source = 0;
+            gles.GenFramebuffers(1, &mut source);
+            gles.BindFramebuffer(gl::FRAMEBUFFER, source);
+            gles.FramebufferRenderbuffer(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::RENDERBUFFER, rb);
+            assert_eq!(gles.CheckFramebufferStatus(gl::FRAMEBUFFER), gl::FRAMEBUFFER_COMPLETE);
+            gles.ClearColor(1.0, 0.0, 0.0, 1.0);
+            gles.Clear(gl::COLOR_BUFFER_BIT);
+            // ES3 exposes independent read/draw bindings. The drawable's
+            // draw FBO is correct while READ still refers to the host window.
+            gles.BindFramebuffer(gl::READ_FRAMEBUFFER, 0);
+            assert_eq!(gles.GetError(), 0);
+            present_renderbuffer_es2(gles.as_mut(), rb, 0, (0, 0, 16, 16),
+                crate::matrix::Matrix::identity(), None, false, 0, false);
+            assert_eq!(get_int(gles.as_mut(), gl::DRAW_FRAMEBUFFER_BINDING), source as GLint);
+            assert_eq!(get_int(gles.as_mut(), gl::READ_FRAMEBUFFER_BINDING), 0);
+            gles.BindFramebuffer(gl::READ_FRAMEBUFFER, 0);
+            let mut pixel = [0u8; 4];
+            gles.ReadPixels(8, 8, 1, 1, gl::RGBA, gl::UNSIGNED_BYTE, pixel.as_mut_ptr().cast());
+            assert_eq!(gles.GetError(), 0);
+            assert!(pixel[0] > 240 && pixel[1] < 10 && pixel[2] < 10,
+                "Presented drawable must be red, got {pixel:?}");
+            // The AIR compatibility mode must copy framebuffer zero before
+            // clearing it. The EAGL renderbuffer deliberately contains black.
+            gles.BindFramebuffer(gl::FRAMEBUFFER, source);
+            gles.ClearColor(0.0, 0.0, 0.0, 1.0);
+            gles.Clear(gl::COLOR_BUFFER_BIT);
+            gles.BindFramebuffer(gl::FRAMEBUFFER, 0);
+            gles.ClearColor(0.0, 1.0, 0.0, 1.0);
+            gles.Clear(gl::COLOR_BUFFER_BIT);
+            present_renderbuffer_es2(gles.as_mut(), rb, 0, (0, 0, 16, 16),
+                crate::matrix::Matrix::identity(), None, false, 0, true);
+            gles.ReadPixels(8, 8, 1, 1, gl::RGBA, gl::UNSIGNED_BYTE, pixel.as_mut_ptr().cast());
+            assert_eq!(gles.GetError(), 0);
+            assert!(pixel[0] < 10 && pixel[1] > 240 && pixel[2] < 10,
+                "Default framebuffer must stay green, got {pixel:?}");
+
+        }
     }
 }
 

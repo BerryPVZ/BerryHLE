@@ -162,6 +162,12 @@ pub struct Options {
     pub present_finish: bool,
     /// Budget for reusing decoded file images; 0 disables this optimization.
     pub image_cache_mb: u32,
+    /// Compatibility ordering for apps that treat resource lists as frames.
+    pub sort_bundle_resources: bool,
+    /// Present the host default framebuffer for renderers using framebuffer zero.
+    pub present_default_framebuffer: bool,
+    /// Whether UIKit synthesizes rotation of a window's root view.
+    pub root_autorotation: bool,
     /// See [VsyncMode]. Can also be set with the `TOUCHHLE_VSYNC` environment
     /// variable (the option takes precedence).
     pub vsync: VsyncMode,
@@ -346,6 +352,9 @@ impl Default for Options {
             landscape_uiscreen_bounds: false,
             rotation_fix: false,
             image_cache_mb: 0,
+            sort_bundle_resources: false,
+            present_default_framebuffer: false,
+            root_autorotation: true,
             force_gles1_context: std::env::var("TOUCHHLE_FORCE_GLES1_CONTEXT")
                 .map(|value| {
                     let value = value.trim();
@@ -422,6 +431,18 @@ impl Options {
             self.fix_movie_player = true;
         } else if arg == "--no-fix-movie-player" {
             self.fix_movie_player = false;
+        } else if arg == "--sort-bundle-resources" {
+            self.sort_bundle_resources = true;
+        } else if arg == "--present-default-framebuffer" {
+            self.present_default_framebuffer = true;
+        } else if arg == "--no-present-default-framebuffer" {
+            self.present_default_framebuffer = false;
+        } else if arg == "--no-sort-bundle-resources" {
+            self.sort_bundle_resources = false;
+        } else if arg == "--no-root-autorotation" {
+            self.root_autorotation = false;
+        } else if arg == "--root-autorotation" {
+            self.root_autorotation = true;
         } else if let Some(value) = arg.strip_prefix("--image-cache-mb=") {
             self.image_cache_mb = value.parse::<u32>().ok().filter(|n| *n <= 1024)
                 .ok_or("Image cache budget must be between 0 and 1024 MiB")?;

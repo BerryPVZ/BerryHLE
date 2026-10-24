@@ -389,10 +389,10 @@ com.anarchyent.mcwikipaid: --device-family=iphone-4
 # Break the Cookie: Sports (Kobold2D config.lua uses CCDirector rotation).
 # Its Info.plist advertises portrait too, despite landscape-only gameplay.
 # Read back the portrait drawable and apply device rotation once.
-hu.BV.BTC-Olympic: --landscape-left --present-mode=readback
+hu.BV.BTC-Olympic: --landscape-left --present-mode=readback --no-root-autorotation
 
 # Break the Cookie Free uses the same CCDirector drawable and startup checks.
-hu.BV.BreakTheCookieFree: --landscape-left --present-mode=readback
+hu.BV.BreakTheCookieFree: --landscape-left --present-mode=readback --no-root-autorotation
 
 # Food Fight mixes NIB-based UIKit menus with a MashEAGLView. Keep the
 # compositor active while the game's GL renderer is idle on menu screens.
@@ -403,7 +403,10 @@ com.tomatoflix.foodfight: --force-composition
 com.crazylion.buddyman.tm.kick2: --device-family=iphone --landscape-right --present-rotate=0
 
 # Draw and Escape advertises all orientations; config.lua selects LandscapeLeft.
-hu.BV.DrawAndEscape: --landscape-left --landscape-uiscreen-bounds --present-rotate=0
+hu.BV.DrawAndEscape: --landscape-left --no-root-autorotation
 
 # Talking Tom streams full-size image files for every animation frame.
-com.outfit7.talkingtomipad: --image-cache-mb=256
+com.outfit7.talkingtomipad: --image-cache-mb=256 --sort-bundle-resources
+
+# AIR renders into framebuffer zero rather than its EAGL drawable.
+com.ea.pvzchinesephonics.ipad.bvc: --present-default-framebuffer
