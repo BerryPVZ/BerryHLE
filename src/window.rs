@@ -2826,15 +2826,13 @@ impl Window {
                 let rhs = drawable_size.1 as u64 * app_width as u64;
                 lhs.abs_diff(rhs) <= app_width.max(app_height) as u64
             };
-            return if self.preserve_aspect_ratio {
-                if self.aspect_ratio_constraint.is_native() && native_ratio_matches {
-                    (0, 0, drawable_size.0, drawable_size.1)
-                } else {
-                    geometry::fit_viewport((app_width, app_height), drawable_size)
-                }
-            } else {
-                (0, 0, drawable_size.0, drawable_size.1)
-            };
+            return geometry::desktop_viewport(
+                (app_width, app_height),
+                drawable_size,
+                self.fullscreen,
+                self.preserve_aspect_ratio,
+                self.aspect_ratio_constraint.is_native() && native_ratio_matches,
+            );
         }
 
         // Fit the actual drawable in windowed mode too: the compositor may

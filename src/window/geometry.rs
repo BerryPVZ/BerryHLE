@@ -53,6 +53,23 @@ pub(super) fn window_to_drawable(
     )
 }
 
+/// Fullscreen always fits the game; windowed mode follows its resize setting.
+/// Native window constraints may bypass fitting only outside fullscreen.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(super) fn desktop_viewport(
+    app_size: (u32, u32),
+    drawable_size: (u32, u32),
+    fullscreen: bool,
+    window_preserves_aspect: bool,
+    native_ratio_matches: bool,
+) -> (u32, u32, u32, u32) {
+    if fullscreen || (window_preserves_aspect && !native_ratio_matches) {
+        fit_viewport(app_size, drawable_size)
+    } else {
+        (0, 0, drawable_size.0, drawable_size.1)
+    }
+}
+
 /// Center the app in the drawable, preserving its aspect ratio.
 pub(super) fn fit_viewport(
     (app_width, app_height): (u32, u32),
@@ -98,6 +115,33 @@ pub(super) fn normalize_viewport_coords(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn fullscreen_fits_portrait_landscape_and_ultrawide_with_matching_input() {
+        for (app, display, expected) in [
+            ((320, 480), (1920, 1080), (600, 0, 720, 1080)),
+            ((1024, 768), (1920, 1080), (240, 0, 1440, 1080)),
+            ((1024, 768), (3440, 1440), (760, 0, 1920, 1440)),
+            ((480, 320), (1920, 1200), (60, 0, 1800, 1200)),
+        ] {
+            for window_preserves_aspect in [false, true] {
+                for native_ratio_matches in [false, true] {
+                    let viewport = desktop_viewport(app, display, true,
+                        window_preserves_aspect, native_ratio_matches);
+                    assert_eq!(viewport, expected);
+                    let center = (display.0 as f32 / 2.0, display.1 as f32 / 2.0);
+                    assert_eq!(normalize_viewport_coords(center, viewport), (0.0, 0.0));
+                    assert_eq!(normalize_viewport_coords((0.0, center.1), viewport).0, -0.5);
+                }
+            }
+        }
+        // Leaving fullscreen restores the windowed stretch preference.
+        assert_eq!(desktop_viewport((320, 480), (1920, 1080), false, false, false),
+            (0, 0, 1920, 1080));
+        assert_eq!(desktop_viewport((320, 480), (1920, 1080), false, true, false),
+            (600, 0, 720, 1080));
+    }
 
     #[test]
     fn matching_sizes_preserve_coordinates() {
