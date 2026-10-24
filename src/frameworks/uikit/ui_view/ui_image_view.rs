@@ -93,8 +93,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     () = msg![env; this setImage:image];
 
-    // UIImageView disables user interaction by default (unlike plain UIView).
-    () = msg![env; this setUserInteractionEnabled:false];
+    // UIImageView defaults `userInteractionEnabled` to `NO` when the archive
+    // omits `UIUserInteractionDisabled`, but respects an explicit value when
+    // Interface Builder enabled interaction on a container UIImageView.
+    let key_interaction_disabled = get_static_str(env, "UIUserInteractionDisabled");
+    if !msg![env; coder containsValueForKey:key_interaction_disabled] {
+        () = msg![env; this setUserInteractionEnabled:false];
+    }
 
     this
 }

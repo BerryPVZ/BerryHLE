@@ -17,12 +17,11 @@ The repository does not distribute commercial apps or iOS firmware. Put an app b
 
 ## Newly tested and working games
 
-The titles below have been tested with HyperHLE-Reborn and are known to run. Compatibility may still vary with the app version, virtual device profile, host GPU/driver, and settings; this list does not guarantee that every feature or a full playthrough works.
+The titles below have been tested with HyperHLE-Reborn and are known to run. Compatibility may still vary with the app version, virtual device profile, host GPU/driver, and settings; this list does not guarantee that every feature or a full playthrough works. Also any update can break these games in list, report if it doesn't work
 
 - N.O.V.A. 3 (Playable)
 - Gangstar Vegas (Unplayable on adreno)
 - Geometry Dash (Playable)
-- Terraria (Playable)
 - Modern Combat 3 (Playable)
 - Asphalt 7 (Playable)
 - Turbo Dismount (Playable)

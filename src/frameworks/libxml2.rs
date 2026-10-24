@@ -568,9 +568,22 @@ fn xmlInitParser(_env: &mut Environment) {
 
 #[allow(non_snake_case)]
 fn xmlCleanupParser(_env: &mut Environment) {
-    // libxml2 documents this as "rarely needed"; we forward it but keep our
-    // handle table intact.
-    unsafe { xml::xmlCleanupParser() };
+    // Host-side no-op: this call must never reach the real library.
+    //
+    // On iOS the guest's libxml2 lives in its own process, so tearing the
+    // library down when an app asks for it is harmless. Ours is linked into
+    // the emulator and shared by every app it launches, and
+    // `xmlCleanupParser()` destroys libxml2's global mutexes (`xmlParserMutex`,
+    // the dict mutex, ...). libxml2's one-time init guard then refuses to
+    // recreate them, so the next parse — the same app's `.fnt` font loads, or
+    // the next app we open — locks a destroyed pthread mutex and bionic aborts
+    // the whole emulator with "FORTIFY: pthread_mutex_lock called on a
+    // destroyed mutex (no fault address)". That is the crash Robbery Bob hits
+    // on Android: it calls xmlCleanupParser() during startup and then loads
+    // fonts through xmlReaderForFile().
+    //
+    // Our handle tables are unaffected: they belong to us, not to libxml2,
+    // and stay valid for the lifetime of the process.
 }
 
 #[allow(non_snake_case)]
@@ -2794,10 +2807,12 @@ fn xmlInitMemory(_env: &mut Environment) -> i32 {
 /// state. Mirrors `xmlCleanupParser()` in the lifecycle pairing
 /// (`xmlInitMemory` ↔ `xmlCleanupMemory`). Documented at
 /// <https://gnome.pages.gitlab.gnome.org/libxml2/devhelp/libxml2-xmlmemory.html>.
+///
+/// Host-side no-op, for the same reason as [xmlCleanupParser]: the guest's
+/// cleanup request refers to its own copy of libxml2, while ours is shared by
+/// the whole emulator process and cannot be re-initialised afterwards.
 #[allow(non_snake_case)]
-fn xmlCleanupMemory(_env: &mut Environment) {
-    unsafe { xml::xmlCleanupMemory() };
-}
+fn xmlCleanupMemory(_env: &mut Environment) {}
 
 /// `double xmlXPathCastToNumber(xmlXPathObjectPtr val)` — XPath 1.0
 /// §4.4 number-conversion. Forwarded verbatim to libxml2 so all four

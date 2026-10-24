@@ -131,6 +131,16 @@ test('free-form body is checked as a whole', () => {
 ${IPA}
 touchHLE::frameworks: something went wrong`;
   assert.deepStrictEqual(checkIssue(body).missing, []);
+  const gdriveBody = `Payback crashes when the second mission starts, the screen goes white.
+https://drive.google.com/file/d/1AbCdEfGhIjKlMnOpQrStUvWxYz/view?usp=sharing
+touchHLE::frameworks: something went wrong`;
+  assert.deepStrictEqual(checkIssue(gdriveBody).missing, []);
+  const emuBody =
+    'Opening the Settings panel from the Android home screen flickers when closing.';
+  assert.deepStrictEqual(
+    checkIssue(emuBody, '[Emulator] Settings animation flicker').missing,
+    [],
+  );
   assert.strictEqual(checkIssue('').missing.length, 2);
   assert.strictEqual(checkIssue(null).missing.length, 2);
 });

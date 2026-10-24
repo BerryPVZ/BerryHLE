@@ -2137,7 +2137,7 @@ impl GLES for GLES1OnGLES2<'_> {
     unsafe fn DeleteBuffers(&mut self, n: GLsizei, buffers: *const GLuint) {
         if !buffers.is_null() {
             for i in 0..n.max(0) as usize {
-                let buffer = buffers.add(i).read();
+                let buffer = buffers.add(i).read_unaligned();
                 self.state.array_buffer_data.remove(&buffer);
                 self.state.element_array_buffer_data.remove(&buffer);
             }
@@ -2151,21 +2151,26 @@ impl GLES for GLES1OnGLES2<'_> {
         data: *const GLvoid,
         usage: GLenum,
     ) {
+        if size < 0 {
+            gl::BufferData(target, size, std::ptr::null(), usage);
+            return;
+        }
+        let size_usize = size as usize;
         let binding = match target {
             gl::ARRAY_BUFFER => self.state.array_buffer_binding,
             gl::ELEMENT_ARRAY_BUFFER => self.state.element_array_buffer_binding,
             _ => 0,
         };
-        if binding != 0 && size >= 0 {
+        if binding != 0 {
             let store = if target == gl::ARRAY_BUFFER {
                 &mut self.state.array_buffer_data
             } else {
                 &mut self.state.element_array_buffer_data
             };
             let bytes = store.entry(binding).or_default();
-            bytes.resize(size as usize, 0);
-            if !data.is_null() {
-                std::ptr::copy_nonoverlapping(data.cast::<u8>(), bytes.as_mut_ptr(), size as usize);
+            bytes.resize(size_usize, 0);
+            if !data.is_null() && size_usize > 0 {
+                std::ptr::copy_nonoverlapping(data.cast::<u8>(), bytes.as_mut_ptr(), size_usize);
             }
         }
         gl::BufferData(target, size, data, usage);
@@ -2177,27 +2182,34 @@ impl GLES for GLES1OnGLES2<'_> {
         size: GLsizeiptr,
         data: *const GLvoid,
     ) {
+        if offset < 0 || size < 0 {
+            gl::BufferSubData(target, offset, size, std::ptr::null());
+            return;
+        }
         let binding = match target {
             gl::ARRAY_BUFFER => self.state.array_buffer_binding,
             gl::ELEMENT_ARRAY_BUFFER => self.state.element_array_buffer_binding,
             _ => 0,
         };
-        if binding != 0 && offset >= 0 && size >= 0 && !data.is_null() {
-            let store = if target == gl::ARRAY_BUFFER {
-                &mut self.state.array_buffer_data
-            } else {
-                &mut self.state.element_array_buffer_data
-            };
-            let bytes = store.entry(binding).or_default();
-            let end = offset as usize + size as usize;
-            if end > bytes.len() {
-                bytes.resize(end, 0);
+        if binding != 0 && !data.is_null() {
+            if let Some(end) = (offset as usize).checked_add(size as usize) {
+                let store = if target == gl::ARRAY_BUFFER {
+                    &mut self.state.array_buffer_data
+                } else {
+                    &mut self.state.element_array_buffer_data
+                };
+                let bytes = store.entry(binding).or_default();
+                if end > bytes.len() {
+                    bytes.resize(end, 0);
+                }
+                if size > 0 {
+                    std::ptr::copy_nonoverlapping(
+                        data.cast::<u8>(),
+                        bytes.as_mut_ptr().add(offset as usize),
+                        size as usize,
+                    );
+                }
             }
-            std::ptr::copy_nonoverlapping(
-                data.cast::<u8>(),
-                bytes.as_mut_ptr().add(offset as usize),
-                size as usize,
-            );
         }
         gl::BufferSubData(target, offset, size, data);
     }

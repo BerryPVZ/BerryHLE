@@ -204,6 +204,13 @@ impl Bundle {
                     format!("{}.png", base_name),         // Fallback
                 ]
             }
+        } else if device_family.is_phone_667() {
+            vec![
+                format!("{}-667h@2x.png", base_name), // iPhone 6 (4.7-inch)
+                format!("{}-568h@2x.png", base_name), // iPhone 5 (4-inch)
+                format!("{}@2x.png", base_name),      // iPhone Retina
+                format!("{}.png", base_name),         // iPhone non-Retina
+            ]
         } else if device_family.is_phone_568() {
             vec![
                 format!("{}-568h@2x.png", base_name), // iPhone 5 (4-inch)

@@ -54,6 +54,7 @@ mod imp {
         pub const EXCEPTION_OCCURRED: usize = 15;
         pub const EXCEPTION_CLEAR: usize = 17;
         pub const NEW_GLOBAL_REF: usize = 21;
+        pub const DELETE_GLOBAL_REF: usize = 22;
         pub const DELETE_LOCAL_REF: usize = 23;
         pub const GET_OBJECT_CLASS: usize = 31;
         pub const GET_STATIC_METHOD_ID: usize = 113;
@@ -110,14 +111,22 @@ mod imp {
             unsafe { crate::android_jni::table_fn(self.env, index) }
         }
 
-        fn exception_pending(&self) -> bool {
+        fn clear_if_exception(&self) -> bool {
             let Some(f): Option<unsafe extern "C" fn(*mut c_void) -> *mut c_void> =
                 self.slot(slots::EXCEPTION_OCCURRED)
             else {
                 return false;
             };
             let thrown = unsafe { f(self.env) };
-            !thrown.is_null()
+            if thrown.is_null() {
+                false
+            } else {
+                // Clear the pending exception BEFORE DeleteLocalRef so ART
+                // CheckJNI never sees DeleteLocalRef with an active throwable.
+                self.clear_exception();
+                self.delete_local_ref(thrown);
+                true
+            }
         }
 
         fn clear_exception(&self) {
@@ -279,6 +288,18 @@ mod imp {
             unsafe { f(self.env, obj) }
         }
 
+        fn delete_global_ref(&self, obj: *mut c_void) {
+            if obj.is_null() {
+                return;
+            }
+            let Some(f): Option<unsafe extern "C" fn(*mut c_void, *mut c_void)> =
+                self.slot(slots::DELETE_GLOBAL_REF)
+            else {
+                return;
+            };
+            unsafe { f(self.env, obj) }
+        }
+
         fn call_static_void(&self, class: *mut c_void, method: *mut c_void, args: &[JValue]) {
             let Some(f): Option<
                 unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *const JValue),
@@ -287,9 +308,7 @@ mod imp {
                 return;
             };
             unsafe { f(self.env, class, method, args.as_ptr()) };
-            if self.exception_pending() {
-                self.clear_exception();
-            }
+            self.clear_if_exception();
         }
 
         fn call_static_bool(
@@ -310,8 +329,8 @@ mod imp {
                 return false;
             };
             let r = unsafe { f(self.env, class, method, args.as_ptr()) };
-            if self.exception_pending() {
-                self.clear_exception();
+            if self.clear_if_exception() {
+                return false;
             }
             r != 0
         }
@@ -335,8 +354,8 @@ mod imp {
                 return -1;
             };
             let r = unsafe { f(self.env, class, method, args.as_ptr()) };
-            if self.exception_pending() {
-                self.clear_exception();
+            if self.clear_if_exception() {
+                return -1;
             }
             r
         }
@@ -359,8 +378,8 @@ mod imp {
                 return std::ptr::null_mut();
             };
             let r = unsafe { f(self.env, class, method, args.as_ptr()) };
-            if self.exception_pending() {
-                self.clear_exception();
+            if self.clear_if_exception() {
+                return std::ptr::null_mut();
             }
             r
         }
@@ -448,14 +467,7 @@ mod imp {
             }
             mid
         }
-        fn resolve(jni: &Jni) -> Option<JniCache> {
-            let class = match jni.main_activity_global_class() {
-                Some(class) => class,
-                None => {
-                    log!("MainActivity class not found; native WebView disabled");
-                    return None;
-                }
-            };
+        fn resolve_methods(jni: &Jni, class: *mut c_void) -> Option<JniCache> {
             Some(JniCache {
                 class,
                 show: method(jni, class, "showWebOverlay", "(Ljava/lang/String;IIII)I")?,
@@ -482,6 +494,20 @@ mod imp {
                 open_url: method(jni, class, "openExternalUrl", "(Ljava/lang/String;)I")?,
                 open_content_uri: method(jni, class, "openContentUri", "(Ljava/lang/String;)I")?,
             })
+        }
+        fn resolve(jni: &Jni) -> Option<JniCache> {
+            let class = match jni.main_activity_global_class() {
+                Some(class) => class,
+                None => {
+                    log!("MainActivity class not found; native WebView disabled");
+                    return None;
+                }
+            };
+            let cache = resolve_methods(jni, class);
+            if cache.is_none() {
+                jni.delete_global_ref(class);
+            }
+            cache
         }
         let Some(jni) = Jni::attach() else {
             log!("No JNIEnv from SDL; native WebView disabled");

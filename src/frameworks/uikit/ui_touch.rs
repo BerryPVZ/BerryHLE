@@ -7,15 +7,9 @@
 //! `UITouch`.
 
 use super::ui_event;
-use super::ui_gesture_recognizer::{
-    UIGestureRecognizerHostObject, UIGestureRecognizerStatePossible,
-    UIGestureRecognizerStateRecognized, UISwipeGestureRecognizerDirectionDown,
-    UISwipeGestureRecognizerDirectionLeft, UISwipeGestureRecognizerDirectionRight,
-    UISwipeGestureRecognizerDirectionUp,
-};
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect};
 use crate::frameworks::foundation::{NSInteger, NSTimeInterval, NSUInteger};
-use crate::mem::{GuestUSize, MutVoidPtr};
+use crate::mem::GuestUSize;
 use crate::objc::{
     autorelease, id, msg, msg_class, msg_send_no_type_checking, nil, objc_classes, release, retain,
     ClassExports, HostObject, NSZonePtr,
@@ -183,10 +177,9 @@ fn stale_cancel_and_release(env: &mut Environment, finger_id: FingerId, touch: i
     );
     let stale_view: id = touch_ivars(env, touch, |v| v.view);
     if stale_view != nil {
-        // Phase 4 mirrors `cancel_for_gesture`: not a public phase, so guests
-        // that poll `phase` see the touch as neither began, moved nor ended.
+        // Phase 4 (`UITouchPhaseCancelled`) mirrors `cancel_for_gesture`.
         touch_ivars(env, touch, |v| v.phase = 4);
-        let stale_set: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
+        let stale_set: id = msg_class![env; NSMutableSet new];
         () = msg![env; stale_set addObject:touch];
         let cancel_event = ui_event::new_event(env, stale_set);
         () = msg![env; stale_view touchesCancelled:stale_set withEvent:cancel_event];
@@ -468,18 +461,19 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (CGPoint)locationInView:(id)that_view {
     let (location, window, view) = touch_ivars(env, this, |v| (v.location, v.window, v.view));
-    let location_in_window: CGPoint = msg![env; window
-        convertPoint:location fromWindow:nil];
+    let location_in_window: CGPoint = if window != nil {
+        msg![env; window convertPoint:location fromWindow:nil]
+    } else {
+        location
+    };
     let mut result: CGPoint = if that_view == nil {
         location_in_window
     } else {
-        msg![env;
-        that_view convertPoint:location_in_window fromView:window]
+        msg![env; that_view convertPoint:location_in_window fromView:window]
     };
 
     let remap_view = if that_view != nil { that_view } else { view };
-    let should_remap =
-        touchhle_should_use_landscape_touch_remap(env) || should_remap_touch_location_for_view(env, remap_view);
+    let should_remap = should_remap_touch_location_for_view(env, remap_view);
 
     if crate::env_flag_cached!("TOUCHHLE_TRACE_TOUCH_REMAP") {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -530,17 +524,19 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (CGPoint)previousLocationInView:(id)that_view {
     let (previous_location, window, view) =
         touch_ivars(env, this, |v| (v.previous_location, v.window, v.view));
-    let location_in_window: CGPoint = msg![env; window
-        convertPoint:previous_location fromWindow:nil];
+    let location_in_window: CGPoint = if window != nil {
+        msg![env; window convertPoint:previous_location fromWindow:nil]
+    } else {
+        previous_location
+    };
     let mut result: CGPoint = if that_view == nil {
         location_in_window
     } else {
-        msg![env;
-        that_view convertPoint:location_in_window fromView:window]
+        msg![env; that_view convertPoint:location_in_window fromView:window]
     };
 
     let remap_view = if that_view != nil { that_view } else { view };
-    if touchhle_should_use_landscape_touch_remap(env) || should_remap_touch_location_for_view(env, remap_view) {
+    if should_remap_touch_location_for_view(env, remap_view) {
         result = touchhle_cocos_remap_point(env, remap_view, result);
     }
 
@@ -655,7 +651,11 @@ fn touchhle_send_cocos_touch_aliases(
 
     let all_sel = env
         .objc
-        .register_host_selector(all_sel_name.to_string(), &mut env.mem);
+        .lookup_selector(all_sel_name)
+        .unwrap_or_else(|| {
+            env.objc
+                .register_host_selector(all_sel_name.to_string(), &mut env.mem)
+        });
     let responds_all: bool = msg![env; view respondsToSelector:all_sel];
     if responds_all {
         let _: () = msg_send_no_type_checking(env, (view, all_sel, touches, event));
@@ -663,7 +663,11 @@ fn touchhle_send_cocos_touch_aliases(
 
     let one_sel = env
         .objc
-        .register_host_selector(one_sel_name.to_string(), &mut env.mem);
+        .lookup_selector(one_sel_name)
+        .unwrap_or_else(|| {
+            env.objc
+                .register_host_selector(one_sel_name.to_string(), &mut env.mem)
+        });
     let responds_one: bool = msg![env; view respondsToSelector:one_sel];
     if responds_one {
         let arr: id = msg![env; touches allObjects];
@@ -737,32 +741,48 @@ fn touchhle_send_cocos_touch_aliases_to_hierarchy(
 }
 
 
-/// Whether a window contains any real content, i.e. at least one view nested
-/// below the window's own root view(s). Empty helper windows left behind by
-/// completed modal flows (age gate, ATT prompt, …) have only a bare, childless
-/// root view and must not intercept touches meant for the window underneath.
+/// Whether a window contains any real content. Empty helper windows left
+/// behind by completed modal flows (age gate, ATT prompt, ...) have only a
+/// bare, childless plain `UIView` root and must not intercept touches meant
+/// for the window underneath, whereas a game window whose root view is itself
+/// a `CAEAGLLayer`-backed view (`EAGLView` / `GLKView`), custom `UIView`
+/// subclass, or rendered layer is real content even with zero subviews.
 fn touchhle_window_has_content(env: &mut Environment, window: id) -> bool {
     let subviews: id = msg![env; window subviews];
     let count: NSUInteger = msg![env; subviews count];
     for i in 0..count {
         let root: id = msg![env; subviews objectAtIndex:i];
+        let hidden: bool = msg![env; root isHidden];
+        if hidden {
+            continue;
+        }
         let root_subviews: id = msg![env; root subviews];
         let root_count: NSUInteger = msg![env; root_subviews count];
         if root_count > 0 {
             return true;
+        }
+        let root_class: crate::objc::Class = msg![env; root class];
+        if env.objc.get_class_name(root_class) != "UIView" {
+            return true;
+        }
+        let layer: id = msg![env; root layer];
+        if layer != nil {
+            let layer_class: crate::objc::Class = msg![env; layer class];
+            if env.objc.get_class_name(layer_class) == "CAEAGLLayer" {
+                return true;
+            }
+            let contents: id = msg![env; layer contents];
+            if contents != nil {
+                return true;
+            }
         }
     }
     false
 }
 
 /// Returns true for a view that cannot itself be a meaningful touch target:
-/// a plain `UIView` (not a `UIControl` subclass) with no subviews. Some apps
-/// (and some nib setups) leave such an empty, fully transparent view on top of
-/// the real content; because it is `userInteractionEnabled` by default it
-/// swallows every touch under the standard `hitTest:` even though there is
-/// nothing there to interact with. Doodle Jump's launch cross-promo is covered
-/// by exactly such an empty sibling view, which otherwise makes its close
-/// button unreachable.
+/// a plain `UIView` (not a `UIControl` or custom subclass) with no subviews,
+/// no gesture recognizers, no layer contents, and a clear background color.
 fn touchhle_is_empty_overlay(env: &mut Environment, view: id) -> bool {
     let class: crate::objc::Class = msg![env; view class];
     if env.objc.get_class_name(class) != "UIView" {
@@ -770,7 +790,36 @@ fn touchhle_is_empty_overlay(env: &mut Environment, view: id) -> bool {
     }
     let subviews: id = msg![env; view subviews];
     let count: NSUInteger = msg![env; subviews count];
-    count == 0
+    if count != 0 {
+        return false;
+    }
+    let recognizers: id = msg![env; view gestureRecognizers];
+    if recognizers != nil {
+        let rec_count: NSUInteger = msg![env; recognizers count];
+        if rec_count > 0 {
+            return false;
+        }
+    }
+    let layer: id = msg![env; view layer];
+    if layer != nil {
+        let contents: id = msg![env; layer contents];
+        if contents != nil {
+            return false;
+        }
+    }
+    let bg_color: id = msg![env; view backgroundColor];
+    if bg_color != nil {
+        if super::ui_color::get_pattern_image(&env.objc, bg_color) != nil {
+            return false;
+        }
+        let cg: crate::frameworks::core_graphics::cg_color::CGColorRef = msg![env; bg_color CGColor];
+        if !cg.is_null()
+            && crate::frameworks::core_graphics::cg_color::to_rgba(&env.objc, cg).3 > 0.01
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Depth-first search for the frontmost interactive descendant of `root` that
@@ -838,9 +887,8 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         msg![env; process_info systemUptime]
     };
 
-    let touches: id = msg_class![env;
-        NSMutableSet
-        allocWithZone:(MutVoidPtr::null())];
+    let touches: id = msg_class![env; NSMutableSet new];
+    autorelease(env, touches);
 
     for (finger_id, coords) in map {
         // A Down for a finger that is still tracked means an earlier Up or
@@ -887,8 +935,8 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             .insert(finger_id, new_touch);
     }
 
-    let all_touches_set: id = msg_class![env; NSMutableSet
-        allocWithZone:(MutVoidPtr::null())];
+    let all_touches_set: id = msg_class![env; NSMutableSet new];
+    autorelease(env, all_touches_set);
     let existing_touches: Vec<id> = env
         .framework_state
         .uikit
@@ -1096,9 +1144,8 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         }
 
         if let Entry::Vacant(e) = view_touches.entry(view) {
-            let s: id = msg_class![env;
-                NSMutableSet
-                allocWithZone:(MutVoidPtr::null())];
+            let s: id = msg_class![env; NSMutableSet new];
+            autorelease(env, s);
             e.insert(s);
         }
         let v_set: id = *view_touches.get(&view).unwrap();
@@ -1173,17 +1220,16 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         env.objc.borrow_mut::<UITouchHostObject>(touch).move_count += 1;
 
         if let Entry::Vacant(e) = view_touches.entry(view) {
-            let s: id = msg_class![env;
-                NSMutableSet
-                allocWithZone:(MutVoidPtr::null())];
+            let s: id = msg_class![env; NSMutableSet new];
+            autorelease(env, s);
             e.insert(s);
         }
         let v_set: id = *view_touches.get(&view).unwrap();
         let _: () = msg![env; v_set addObject:touch];
     }
 
-    let all_touches_set: id = msg_class![env; NSMutableSet
-        allocWithZone:(MutVoidPtr::null())];
+    let all_touches_set: id = msg_class![env; NSMutableSet new];
+    autorelease(env, all_touches_set);
     let existing: Vec<id> = env
         .framework_state
         .uikit
@@ -1288,12 +1334,10 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         msg![env; pi systemUptime]
     };
 
-    let touches: id = msg_class![env;
-        NSMutableSet
-        allocWithZone:(MutVoidPtr::null())];
-    let all_touches_set: id = msg_class![env;
-        NSMutableSet
-        allocWithZone:(MutVoidPtr::null())];
+    let touches: id = msg_class![env; NSMutableSet new];
+    autorelease(env, touches);
+    let all_touches_set: id = msg_class![env; NSMutableSet new];
+    autorelease(env, all_touches_set);
     let existing: Vec<id> = env
         .framework_state
         .uikit
@@ -1351,9 +1395,8 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             touches addObject:touch];
 
         if let Entry::Vacant(e) = view_touches.entry(view) {
-            let s: id = msg_class![env;
-                NSMutableSet
-                allocWithZone:(MutVoidPtr::null())];
+            let s: id = msg_class![env; NSMutableSet new];
+            autorelease(env, s);
             e.insert(s);
         }
         let v_set: id = *view_touches.get(&view).unwrap();

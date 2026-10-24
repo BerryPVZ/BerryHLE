@@ -24,6 +24,20 @@ pub(super) struct NSDataHostObject {
 
 impl HostObject for NSDataHostObject {}
 
+fn write_cocoa_file_read_error(env: &mut Environment, error_ptr: MutVoidPtr, code: i32) {
+    if error_ptr.is_null() {
+        return;
+    }
+    let domain = crate::frameworks::foundation::ns_string::get_static_str(
+        env,
+        crate::frameworks::foundation::ns_error::NSCocoaErrorDomain,
+    );
+    let ns_error: id = msg_class![env; NSError alloc];
+    let ns_error: id = msg![env; ns_error initWithDomain:domain code:code userInfo:nil];
+    autorelease(env, ns_error);
+    env.mem.write(error_ptr.cast(), ns_error);
+}
+
 /// Standard Base64 (RFC 4648, `+/` alphabet, `=` padding), as produced by
 /// Apple's `-base64EncodedDataWithOptions:` with no options.
 fn base64_encode(input: &[u8]) -> Vec<u8> {
@@ -110,10 +124,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)dataWithContentsOfFile:(id)path
                      options:(NSUInteger)options
                        error:(MutVoidPtr)error {
-    let _ = options;
-    let _ = error;
     let new: id = msg![env; this alloc];
-    let new: id = msg![env; new initWithContentsOfFile:path];
+    let new: id = msg![env; new initWithContentsOfFile:path options:options error:error];
     autorelease(env, new)
 }
 
@@ -196,9 +208,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // `*error` is only written on failure: callers may pass an uninitialized
     // pointer.
     if url == nil {
-        if !error_ptr.is_null() {
-            env.mem.write(error_ptr.cast(), nil);
-        }
+        write_cocoa_file_read_error(env, error_ptr, 258);
         release(env, this);
         return nil;
     }
@@ -206,11 +216,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let is_file: bool = msg![env; url isFileURL];
     if is_file {
         let path: id = msg![env; url path];
-        let result: id = msg![env; this initWithContentsOfFile:path];
-        if result == nil && !error_ptr.is_null() {
-            env.mem.write(error_ptr.cast(), nil);
-        }
-        return result;
+        return msg![env; this initWithContentsOfFile:path options:0u32 error:error_ptr];
     }
 
     let result = crate::frameworks::foundation::url_loading::send(
@@ -294,8 +300,21 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)initWithContentsOfFile:(id)path
                      options:(NSUInteger)_options
-                       error:(MutVoidPtr)_error {
-    msg![env; this initWithContentsOfFile:path]
+                       error:(MutVoidPtr)error_ptr {
+    if path == nil {
+        write_cocoa_file_read_error(env, error_ptr, 258);
+        release(env, this);
+        return nil;
+    }
+    let result: id = msg![env; this initWithContentsOfFile:path];
+    if result == nil {
+        write_cocoa_file_read_error(
+            env,
+            error_ptr,
+            crate::frameworks::foundation::ns_error::NSFileReadNoSuchFileError,
+        );
+    }
+    result
 }
 
 - (id)initWithContentsOfMappedFile:(id)path {

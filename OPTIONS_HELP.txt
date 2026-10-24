@@ -67,7 +67,7 @@ Device options:
             iphone-2g  (iPhone1,1)   iphone-3g  (iPhone1,2)
             iphone-3gs (iPhone2,1)   iphone-4   (iPhone3,1)
             iphone-4s  (iPhone4,1)   iphone-5   (iPhone5,1)
-            iphone-5c  (iPhone5,3)
+            iphone-5c  (iPhone5,3)   iphone-6   (iPhone7,2)
         iPad family (32-bit):
             ipad-1  (iPad1,1)   ipad-2  (iPad2,1)   ipad-3  (iPad3,1)
             ipad-4  (iPad3,4)   ipad-5  (iPad6,11)
