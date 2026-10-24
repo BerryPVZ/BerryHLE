@@ -388,9 +388,22 @@ pub(super) fn set_run_loop(env: &mut Environment, timer: id, run_loop: id) {
 /// For use by `NSRunLoop`: check if a timer is due to fire and fire it if
 //necessary.
 /// Returns the next firing time in guest-clock coordinates, if any.
+pub(crate) fn next_repeating_deadline(due: Instant, now: Instant, interval: std::time::Duration) -> Instant {
+    // Missed firings collapse into one callback; the following deadline must
+    // be strictly in the future, including exact interval boundaries.
+    // https://developer.apple.com/documentation/foundation/timer
+    if due > now { return due; }
+    let interval = interval.max(std::time::Duration::from_nanos(1));
+    let elapsed = now.saturating_duration_since(due).as_nanos();
+    let periods = elapsed / interval.as_nanos() + 1;
+    u32::try_from(periods).ok().and_then(|n| interval.checked_mul(n))
+        .and_then(|advance| due.checked_add(advance))
+        .filter(|next| *next > now)
+        .unwrap_or_else(|| now.checked_add(interval).unwrap_or(now))
+}
+
 pub(super) fn handle_timer(env: &mut Environment, timer: id) -> Option<Instant> {
     let &NSTimerHostObject {
-        ns_interval,
         rust_interval,
         target,
         selector,
@@ -412,33 +425,10 @@ pub(super) fn handle_timer(env: &mut Environment, timer: id) -> Option<Instant> 
         return Some(due_by);
     }
 
-    let overdue_by = now.duration_since(due_by);
     retain(env, timer);
 
     if repeats {
-        // Guard every step of the rescheduling math against junk floats. A
-        // pathological ns_interval (e.g. NaN — see HyperHLE log #4) used
-        // to propagate through `.ceil() as u32` (yielding 0 for NaN) and
-        // then through `checked_mul`/`checked_add` until something
-        // eventually unwrapped to a panic. Here we keep the computation
-        // strictly bounded and fall back to the next interval if any step
-        // overflows.
-        let ratio = if ns_interval.is_finite() && ns_interval > 0.0 {
-            (overdue_by.as_secs_f64() / ns_interval).max(1.0).ceil()
-        } else {
-            1.0
-        };
-        let advance_by: u32 = if ratio.is_finite() && (1.0..=(u32::MAX as f64)).contains(&ratio) {
-            ratio as u32
-        } else {
-            1
-        };
-        let advance_by_dur = rust_interval
-            .checked_mul(advance_by)
-            .unwrap_or(rust_interval);
-        let next_time = due_by
-            .checked_add(advance_by_dur)
-            .unwrap_or_else(|| env.guest_clock.now() + rust_interval);
+        let next_time = next_repeating_deadline(due_by, now, rust_interval);
         env.objc.borrow_mut::<NSTimerHostObject>(timer).due_by = Some(next_time);
     }
 
@@ -475,4 +465,23 @@ pub(super) fn handle_timer(env: &mut Environment, timer: id) -> Option<Instant> 
     release(env, timer);
 
     final_due_by
+}
+
+#[cfg(test)]
+mod repeating_deadline_tests {
+    use super::*;
+    use std::time::Duration;
+    #[test]
+    fn missed_firings_keep_phase_and_never_fire_again_at_the_same_instant() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(40);
+        assert_eq!(next_repeating_deadline(start + interval, start, interval), start + interval);
+        for elapsed in [0, 1, 39, 40, 41, 79, 80, 119, 120, 121] {
+            let now = start + Duration::from_millis(elapsed);
+            let next = next_repeating_deadline(start, now, interval);
+            assert!(next > now);
+            assert_eq!(next.duration_since(start).as_millis(), ((elapsed / 40 + 1) * 40) as u128);
+        }
+        assert!(next_repeating_deadline(start, start, Duration::ZERO) > start);
+    }
 }

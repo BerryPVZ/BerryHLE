@@ -147,24 +147,9 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
             return Some(recomposite_next);
         }
 
-        // See NSTimer implementation for a discussion of what this does.
-        let overdue_by = now.duration_since(recomposite_next);
-        log_dbg!("Recompositing, overdue by {:?}", overdue_by);
-        // TODO: Use `.div_duration_f64()` once that is stabilized.
-        let advance_by = (overdue_by.as_secs_f64() / interval).max(1.0).ceil();
-        assert!(advance_by == (advance_by as u32) as f64);
-        let advance_by = advance_by as u32;
-        if advance_by > 1 {
-            log_dbg!("Warning: compositor is lagging. It is overdue by {}s and has missed {} interval(s)!", overdue_by.as_secs_f64(), advance_by - 1);
-        }
-        let advance_by = ns_time_interval_to_duration_or_zero(interval)
-            .checked_mul(advance_by)
-            .unwrap_or(Duration::ZERO);
-        Some(
-            recomposite_next
-                .checked_add(advance_by)
-                .unwrap_or(recomposite_next),
-        )
+        Some(crate::frameworks::foundation::ns_timer::next_repeating_deadline(
+            recomposite_next, now, ns_time_interval_to_duration_or_zero(interval),
+        ))
     } else {
         // Apple's NSTimer/CADisplayLink "missed deadline" handling is
         // tolerant of bogus intervals: if the guest hands us a negative

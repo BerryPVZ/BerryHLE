@@ -46,6 +46,41 @@ pub const kCFStringEncodingUTF32: CFStringEncoding = 0x0c000100;
 pub const kCFStringEncodingUTF32BE: CFStringEncoding = 0x18000100;
 pub const kCFStringEncodingUTF32LE: CFStringEncoding = 0x1c000100;
 
+fn windows_codepage(encoding: CFStringEncoding) -> u32 {
+    // Apple returns InvalidId for encodings without a Windows codepage.
+    // https://github.com/apple/swift-corelibs-foundation/blob/main/Sources/CoreFoundation/CFStringUtilities.c
+    match encoding {
+        kCFStringEncodingMacRoman => 10000,
+        kCFStringEncodingASCII => 20127,
+        kCFStringEncodingUTF8 => 65001,
+        kCFStringEncodingUTF16 | kCFStringEncodingUTF16LE => 1200,
+        kCFStringEncodingUTF16BE => 1201,
+        kCFStringEncodingUTF32 | kCFStringEncodingUTF32LE => 12000,
+        kCFStringEncodingUTF32BE => 12001,
+        kCFStringEncodingISOLatin1 => 28591,
+        kCFStringEncodingWindowsLatin1 => 1252,
+        _ => u32::MAX,
+    }
+}
+
+fn CFStringConvertEncodingToWindowsCodepage(_env: &mut Environment, encoding: CFStringEncoding) -> u32 {
+    windows_codepage(encoding)
+}
+
+#[cfg(test)]
+mod windows_codepage_tests {
+    use super::*;
+    #[test]
+    fn unicode_and_legacy_encodings_have_real_codepages() {
+        assert_eq!(windows_codepage(kCFStringEncodingUTF8), 65001);
+        assert_eq!(windows_codepage(kCFStringEncodingMacRoman), 10000);
+        assert_eq!(windows_codepage(kCFStringEncodingWindowsLatin1), 1252);
+        assert_eq!(windows_codepage(kCFStringEncodingUTF16BE), 1201);
+        assert_eq!(windows_codepage(kCFStringEncodingUTF32LE), 12000);
+        assert_eq!(windows_codepage(u32::MAX), u32::MAX);
+    }
+}
+
 // String normalization forms
 pub type CFStringNormalizationForm = CFIndex;
 pub const kCFStringNormalizationFormD: CFStringNormalizationForm = 0;
@@ -2359,6 +2394,7 @@ pub const CONSTANTS: ConstantExports = &[
 ];
 
 pub const FUNCTIONS: FunctionExports = &[
+    export_c_func!(CFStringConvertEncodingToWindowsCodepage(_)),
     // Lifecycle
     export_c_func!(CFStringRetain(_)),
     export_c_func!(CFStringRelease(_)),

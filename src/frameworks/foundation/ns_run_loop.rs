@@ -685,22 +685,11 @@ fn run_loop_body(
         let mut sleep_until = None;
         let mut handled = false;
 
-        // Commit implicit CATransactions
-        // From the CATransaction docs:
-        //  "Implicit transactions are created automatically when the layer
-        //  tree is modified by a thread without an active transaction and are
-        //  committed automatically when the thread’s runloop next iterates."
-        ca_transaction::State::commit_implicit_transaction(env);
-
-        // We want to process those only on the main run loop
+        // Deliver input before timers, but commit and compose after their
+        // callbacks have updated the layer tree for this iteration.
         if is_main_run_loop && (mode == NSDefaultRunLoopMode || mode == "UITrackingRunLoopMode") {
             let (next_due, delivered) = uikit::handle_events_with_result(env);
             handled |= delivered;
-            limit_sleep_time(&mut sleep_until, next_due);
-
-            uikit::ui_view::layout_pending_views(env);
-            let force_video_composition = media_player::has_active_video(env);
-            let next_due = core_animation::recomposite_if_necessary(env, force_video_composition);
             limit_sleep_time(&mut sleep_until, next_due);
         }
 
@@ -814,6 +803,18 @@ fn run_loop_body(
 
         if is_main_run_loop {
             media_player::handle_players(env);
+        }
+
+        // Core Animation commits at the end of the run-loop iteration.
+        // Composing before NSTimer callbacks displays the previous image and
+        // introduces an extra, varying refresh of delay in timer animations.
+        // https://developer.apple.com/documentation/quartzcore/catransaction
+        ca_transaction::State::commit_implicit_transaction(env);
+        if is_main_run_loop && (mode == NSDefaultRunLoopMode || mode == "UITrackingRunLoopMode") {
+            uikit::ui_view::layout_pending_views(env);
+            let force_video_composition = media_player::has_active_video(env);
+            let next_due = core_animation::recomposite_if_necessary(env, force_video_composition);
+            limit_sleep_time(&mut sleep_until, next_due);
         }
 
         // Unfortunately, touchHLE has to poll for certain things repeatedly;

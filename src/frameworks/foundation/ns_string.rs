@@ -1519,6 +1519,23 @@ pub const CLASSES: ClassExports = objc_classes! {
     autorelease(env, new_string)
 }
 
+- (id)precomposedStringWithCanonicalMapping {
+    // NFC preserves canonical equivalence, including accented resource names.
+    // https://developer.apple.com/documentation/foundation/nsstring/precomposedstringwithcanonicalmapping
+    use unicode_normalization::UnicodeNormalization;
+    let normalized: String = to_rust_string(env, this).nfc().collect();
+    let result = from_rust_string(env, normalized);
+    autorelease(env, result)
+}
+
+- (id)stringByResolvingSymlinksInPath {
+    // The VFS materializes bundle symlinks when mounting them, so there are
+    // no unresolved symbolic links to traverse here. Still expand '~' and
+    // normalize the path; returning nil breaks Foundation resource URLs.
+    // https://developer.apple.com/documentation/foundation/nsstring/resolvingsymlinksinpath
+    msg![env; this stringByStandardizingPath]
+}
+
 - (id)stringByStandardizingPath {
     let expanded: id = msg![env; this stringByExpandingTildeInPath];
     let path = to_rust_string(env, expanded);
@@ -3164,5 +3181,41 @@ pub fn CFStringGetCharactersPtr(env: &mut Environment, the_string: id) -> ConstP
         cfstr.bytes.cast()
     } else {
         Ptr::null()
+    }
+}
+
+
+#[cfg(test)]
+mod resource_path_normalization_tests {
+    use super::*;
+    use crate::Environment;
+
+    #[test]
+    fn resource_paths_and_canonical_names_do_not_disappear() {
+        let _guard = crate::environment::FRAMEWORK_TEST_LOCK.lock().unwrap();
+        let mut environment = Environment::new_for_framework_tests().unwrap();
+        let env = &mut environment;
+        for (source, expected) in [
+            ("/var//mobile/./Library/../test.png", "/var/mobile/test.png"),
+            ("/does-not-exist/data.png", "/does-not-exist/data.png"),
+        ] {
+            let source = from_rust_string(env, source.to_owned());
+            let resolved: id = msg![env; source stringByResolvingSymlinksInPath];
+            assert_ne!(resolved, nil);
+            assert_eq!(to_rust_string(env, resolved), expected);
+            release(env, source);
+        }
+        for (source, expected) in [
+            ("Cafe\u{301}.png", "Caf\u{e9}.png"),
+            ("nu\u{308}\u{30c}", "n\u{1da}"),
+            ("\u{1100}\u{1161}", "\u{ac00}"),
+            ("ASCII/path.png", "ASCII/path.png"),
+        ] {
+            let source = from_rust_string(env, source.to_owned());
+            let normalized: id = msg![env; source precomposedStringWithCanonicalMapping];
+            assert_ne!(normalized, nil);
+            assert_eq!(to_rust_string(env, normalized), expected);
+            release(env, source);
+        }
     }
 }

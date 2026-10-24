@@ -575,9 +575,7 @@ impl GLES for GLES3OnGL3<'_> {
         type_: GLenum,
         pixels: *const GLvoid,
     ) {
-        if format == gles11::BGRA_EXT {
-            internalformat = gles11::BGRA_EXT as GLint;
-        }
+        internalformat = super::util::desktop_texture_internal_format(internalformat);
         gl33::TexImage2D(
             target,
             level,

@@ -9,6 +9,29 @@ use super::gles11_raw as gles11; // constants only
 use super::gles11_raw::types::{GLenum, GLfixed, GLfloat, GLint, GLsizei};
 use super::GLES;
 
+/// Desktop GL accepts BGRA as a pixel layout, but not as texture storage.
+/// Keep sized internal formats and the caller's external format intact.
+/// https://registry.khronos.org/OpenGL-Refpages/gl4/html/glTexImage2D.xhtml
+pub fn desktop_texture_internal_format(internalformat: GLint) -> GLint {
+    if internalformat == gles11::BGRA_EXT as GLint {
+        gles11::RGBA as GLint
+    } else {
+        internalformat
+    }
+}
+
+#[cfg(test)]
+mod desktop_texture_format_tests {
+    use super::*;
+    #[test]
+    fn bgra_uploads_use_rgba_storage_without_overwriting_sized_formats() {
+        assert_eq!(desktop_texture_internal_format(gles11::BGRA_EXT as _), gles11::RGBA as GLint);
+        for internal in [gles11::RGBA, gles11::RGB, gles11::ALPHA, 0x8058] {
+            assert_eq!(desktop_texture_internal_format(internal as _), internal as GLint);
+        }
+    }
+}
+
 #[cfg(test)]
 mod pvrtc_payload_size_tests {
     use super::pvrtc_payload_size;

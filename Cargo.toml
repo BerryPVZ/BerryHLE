@@ -136,6 +136,7 @@ bzip2 = "0.4"
 # Blocking HTTP client used to give NSURLConnection / NSURLSession real
 # networking (pure-Rust TLS via rustls, so no system OpenSSL dependency).
 ureq = { version = "2.9", features = ["tls", "gzip"] }
+unicode-normalization = "=0.1.24"
 
 [build-dependencies]
 cargo-license = "0.5.1"

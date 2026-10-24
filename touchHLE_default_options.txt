@@ -403,7 +403,7 @@ com.tomatoflix.foodfight: --force-composition
 com.crazylion.buddyman.tm.kick2: --device-family=iphone --landscape-right --present-rotate=0
 
 # Draw and Escape advertises all orientations; config.lua selects LandscapeLeft.
-hu.BV.DrawAndEscape: --landscape-left
+hu.BV.DrawAndEscape: --landscape-left --landscape-uiscreen-bounds --present-rotate=0
 
 # Talking Tom streams full-size image files for every animation frame.
 com.outfit7.talkingtomipad: --image-cache-mb=256
