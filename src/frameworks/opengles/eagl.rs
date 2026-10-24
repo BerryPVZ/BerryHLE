@@ -1864,6 +1864,34 @@ unsafe fn restore_present_framebuffers(gles: &mut dyn GLES, draw: GLuint, read: 
 
 mod vertex_state;
 
+/// Query only enums supported by this context; cache per EAGL context.
+unsafe fn present_supports_srgb_write_control(gles: &mut dyn GLES) -> bool {
+    PRESENT_SRGB_WRITE_CONTROL.with(|cache| {
+        if let Some(supported) = cache.get() { return supported; }
+        let mut supported = false;
+        if gles.is_es3() {
+            let count = get_int(gles, crate::gles::gles30_raw::NUM_EXTENSIONS);
+            for index in 0..count.max(0) as GLuint {
+                let extension = gles.GetStringi(crate::gles::gles2_raw::EXTENSIONS, index);
+                if !extension.is_null() {
+                    let extension = std::ffi::CStr::from_ptr(extension.cast()).to_bytes();
+                    supported |= extension == b"GL_EXT_sRGB_write_control"
+                        || extension == b"GL_ARB_framebuffer_sRGB"
+                        || extension == b"GL_EXT_framebuffer_sRGB";
+                }
+            }
+        } else {
+            let extensions = gles.GetString(crate::gles::gles2_raw::EXTENSIONS);
+            if !extensions.is_null() {
+                supported = std::ffi::CStr::from_ptr(extensions.cast()).to_bytes()
+                    .split(|&c| c == b' ').any(|ext| ext == b"GL_EXT_sRGB_write_control");
+            }
+        }
+        cache.set(Some(supported));
+        supported
+    })
+}
+
 unsafe fn present_renderbuffer_es2(
     gles: &mut dyn GLES,
     renderbuffer: GLuint,
@@ -2061,6 +2089,19 @@ unsafe fn present_renderbuffer_es2(
     gles.BindBuffer(gles2::ARRAY_BUFFER, present_objects.quad_vbo);
     gles.BindFramebuffer(gles2::FRAMEBUFFER, window_framebuffer);
 
+    // Default-framebuffer pixels already include the window's sRGB encoding.
+    // The copy texture stores those bytes unchanged; encoding them again on
+    // output washes out midtones. Keep this scoped to the opt-in default-FBO
+    // path and preserve the guest's write-control state.
+    // https://registry.khronos.org/OpenGL/extensions/EXT/EXT_sRGB_write_control.txt
+    const FRAMEBUFFER_SRGB_EXT: GLenum = 0x8DB9;
+    let restore_srgb_write = present_default_framebuffer && old_framebuffer == 0
+        && present_supports_srgb_write_control(gles)
+        && gles.IsEnabled(FRAMEBUFFER_SRGB_EXT) != 0;
+    if restore_srgb_write {
+        gles.Disable(FRAMEBUFFER_SRGB_EXT);
+    }
+
     // Configure the destination viewport (the window) and clear.
     gles.Viewport(
         viewport.0 as _,
@@ -2135,6 +2176,7 @@ unsafe fn present_renderbuffer_es2(
         if scissor_was_on {
             gles.Enable(gles2::SCISSOR_TEST);
         }
+        if restore_srgb_write { gles.Enable(FRAMEBUFFER_SRGB_EXT); }
         return;
     };
 
@@ -2271,6 +2313,8 @@ unsafe fn present_renderbuffer_es2(
         gles.Enable(gles2::SCISSOR_TEST);
     }
 
+    if restore_srgb_write { gles.Enable(FRAMEBUFFER_SRGB_EXT); }
+
     // The renderbuffer present is performed by us (the emulator), not by the
     // guest app. On a real iPhone OS device the equivalent work happens
     // inside `-[EAGLContext presentRenderbuffer:]` / the windowserver, behind
@@ -2321,6 +2365,8 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     static PRESENT_OBJECTS: std::cell::Cell<Option<PresentObjects>> =
         const { std::cell::Cell::new(None) };
+    static PRESENT_SRGB_WRITE_CONTROL: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
     static PRESENT_SOURCE_RENDERBUFFER: std::cell::Cell<GLuint> =
         const { std::cell::Cell::new(0) };
     static PRESENT_TEXTURE_SIZE: std::cell::Cell<Option<(GLint, GLint)>> =
@@ -2351,6 +2397,7 @@ fn invalidate_present_cache_for_context(context_token: usize) {
         changed
     });
     if changed {
+        PRESENT_SRGB_WRITE_CONTROL.with(|cell| cell.set(None));
         PRESENT_PROGRAM.with(|cell| cell.set(None));
         PRESENT_OBJECTS.with(|cell| cell.set(None));
         PRESENT_SOURCE_RENDERBUFFER.with(|cell| cell.set(0));
@@ -4071,6 +4118,25 @@ mod native_present_regression {
             assert_eq!(gles.GetError(), 0);
             assert!(pixel[0] > 240 && pixel[1] < 10 && pixel[2] < 10,
                 "Presented drawable must be red, got {pixel:?}");
+            // Midtones expose extra sRGB encoding hidden by red/green tests.
+            assert!(present_supports_srgb_write_control(gles.as_mut()));
+            for enabled in [true, false] {
+                if enabled { gles.Enable(0x8DB9); } else { gles.Disable(0x8DB9); }
+                gles.BindFramebuffer(gl::FRAMEBUFFER, 0);
+                gles.ClearColor(0.15, 0.35, 0.65, 0.4);
+                gles.Clear(gl::COLOR_BUFFER_BIT);
+                let mut before = [0u8; 4];
+                gles.ReadPixels(8, 8, 1, 1, gl::RGBA, gl::UNSIGNED_BYTE, before.as_mut_ptr().cast());
+                present_renderbuffer_es2(gles.as_mut(), rb, 0, (0, 0, 16, 16),
+                    crate::matrix::Matrix::identity(), None, false, 0, true);
+                gles.ReadPixels(8, 8, 1, 1, gl::RGBA, gl::UNSIGNED_BYTE, pixel.as_mut_ptr().cast());
+                assert_eq!(gles.GetError(), 0);
+                assert_eq!(gles.IsEnabled(0x8DB9) != 0, enabled);
+                for channel in 0..3 {
+                    assert!((before[channel] as i16 - pixel[channel] as i16).abs() <= 2,
+                        "Presentation changed midtones: {before:?} -> {pixel:?}");
+                }
+            }
             // The AIR compatibility mode must copy framebuffer zero before
             // clearing it. The EAGL renderbuffer deliberately contains black.
             gles.BindFramebuffer(gl::FRAMEBUFFER, source);
