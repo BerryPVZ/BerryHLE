@@ -4,7 +4,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use super::{ArchiveFile, CatalogItem, CatalogPage, CatalogSort, DownloadOutcome, ItemDetails};
+use super::{
+    ArchiveFile, CatalogItem, CatalogPage, CatalogScope, CatalogSort, DownloadOutcome, ItemDetails,
+};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -12,27 +14,70 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const COLLECTION_ID: &str = "ipaarchive";
+// Archive does not mark multi-file IPA bundles as collections. Ordinary
+// one-app items usually contain five to seven files including metadata.
+const COLLECTION_MIN_FILES: usize = 8;
 const MAX_JSON_RESPONSE_SIZE: usize = 64 * 1024 * 1024;
 const MAX_ARTWORK_RESPONSE_SIZE: usize = 8 * 1024 * 1024;
 
 pub(super) fn fetch_catalog(
+    scope: CatalogScope,
     query: &str,
     page: usize,
     rows: usize,
     sort: CatalogSort,
+    fuzzy: bool,
 ) -> Result<CatalogPage, String> {
     let page = page.max(1);
     let rows = rows.clamp(1, 50);
-    let json = fetch_json(&catalog_url(query, page, rows, sort))?;
+    let json = fetch_json(&catalog_url(scope, query, page, rows, sort, fuzzy))?;
     parse_catalog(&json, page)
 }
 
-fn catalog_url(query: &str, page: usize, rows: usize, sort: CatalogSort) -> String {
+fn catalog_url(
+    scope: CatalogScope,
+    query: &str,
+    page: usize,
+    rows: usize,
+    sort: CatalogSort,
+    fuzzy: bool,
+) -> String {
     let mut archive_query = format!("collection:{COLLECTION_ID}");
-    for term in query.split_whitespace().take(8) {
-        let term: String = term.chars().take(80).collect();
-        let term = escape_lucene_term(&term);
-        if !term.is_empty() {
+    if scope == CatalogScope::Collections {
+        archive_query.push_str(&format!(" AND files_count:[{COLLECTION_MIN_FILES} TO *]"));
+    }
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .take(8)
+        .map(|term| term.chars().take(80).collect::<String>())
+        .map(|term| escape_lucene_term(&term))
+        .filter(|term| !term.is_empty())
+        .collect();
+    if fuzzy && !terms.is_empty() {
+        let clauses: Vec<String> = terms
+            .iter()
+            .map(|term| {
+                format!(
+                    "(title:{term}~ OR identifier:{term}~ OR creator:{term}~ OR title:{term}* OR identifier:{term}*)"
+                )
+            })
+            .collect();
+        let mut combined = format!("({})", clauses.join(" AND "));
+        if terms.len() >= 2 {
+            let acronym: String = terms
+                .iter()
+                .filter_map(|term| term.chars().find(|character| character.is_alphanumeric()))
+                .collect::<String>()
+                .to_lowercase();
+            if acronym.chars().count() >= 2 {
+                combined = format!(
+                    "({combined} OR identifier:{acronym}* OR title:{acronym}*)"
+                );
+            }
+        }
+        archive_query.push_str(&format!(" AND {combined}"));
+    } else {
+        for term in terms {
             archive_query.push_str(&format!(
                 " AND (title:{term}* OR identifier:{term}* OR creator:{term}*)"
             ));
@@ -46,6 +91,7 @@ fn catalog_url(query: &str, page: usize, rows: usize, sort: CatalogSort) -> Stri
         "year",
         "creator",
         "version",
+        "files_count",
     ];
     let mut url = format!(
         "https://archive.org/advancedsearch.php?q={}",
@@ -98,12 +144,14 @@ fn parse_catalog(json: &Value, requested_page: usize) -> Result<CatalogPage, Str
             .or_else(|| document.get("year").and_then(json_text))
             .map(|date| short_date(&date));
         let creator = document.get("creator").and_then(json_text);
+        let files_count = document.get("files_count").and_then(json_u64);
         items.push(CatalogItem {
             identifier,
             title,
             version,
             date,
             creator,
+            files_count,
         });
     }
     Ok(CatalogPage {
@@ -679,18 +727,45 @@ mod tests {
     }
 
     #[test]
-    fn catalog_urls_support_search_and_sorting() {
-        let url = catalog_url("need:for speed*", 4, 25, CatalogSort::Newest);
+    fn catalog_urls_support_scopes_fuzzy_search_and_sorting() {
+        let url = catalog_url(
+            CatalogScope::All,
+            "need:for speed*",
+            4,
+            25,
+            CatalogSort::Newest,
+            false,
+        );
         assert!(url.contains("page=4"));
         assert!(url.contains("rows=25"));
         assert!(url.contains("need%5C%3Afor"));
         assert!(url.contains("speed%5C%2A"));
         assert!(url.contains("creator%3A"));
         assert!(url.contains("publicdate%20desc"));
-        let url = catalog_url("", 1, 20, CatalogSort::Title);
+        let url = catalog_url(
+            CatalogScope::All,
+            "",
+            1,
+            20,
+            CatalogSort::Title,
+            false,
+        );
         assert!(url.contains("collection%3Aipaarchive"));
         assert!(url.contains("title%20asc"));
         assert!(!url.contains("mediatype"));
+
+        let url = catalog_url(
+            CatalogScope::Collections,
+            "Gangstar Vegas",
+            1,
+            20,
+            CatalogSort::Popular,
+            true,
+        );
+        assert!(url.contains("files_count%3A%5B8%20TO%20%2A%5D"));
+        assert!(url.contains("title%3Agangstar~"));
+        assert!(url.contains("identifier%3Agv%2A"));
+        assert!(url.contains("week%20desc"));
     }
 
     #[test]
