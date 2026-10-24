@@ -361,6 +361,7 @@ struct AppPickerDelegateHostObject {
     archive_store_download: Option<NSInteger>,
     archive_store_tab: Option<NSInteger>,
     archive_store_sort: bool,
+    archive_store_fuzzy: bool,
     archive_store_queue_action: Option<NSInteger>,
     archive_store_tap: Option<CGPoint>,
     settings_show: bool,
@@ -624,6 +625,9 @@ const CLASSES: ClassExports = objc_classes! {
 }
 - (())archiveStoreSort {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_sort = true;
+}
+- (())archiveStoreFuzzy {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_fuzzy = true;
 }
 - (())archiveStoreQueueAction:(id)sender {
     let tag: NSInteger = msg![env; sender tag];
