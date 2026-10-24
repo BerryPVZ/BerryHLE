@@ -3,6 +3,7 @@ View options:
     --no-fullscreen
         Display the app in full screen. The default is to display in a window
         instead, except on Android which always uses full screen.
+        The launcher opens fullscreen independently of this game setting.
 
         The app's output will fit your screen without stretching, with black
         borders in unused space to preserve its proportions. This is independent

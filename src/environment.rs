@@ -1169,6 +1169,12 @@ impl Environment {
         };
         #[cfg(not(target_os = "macos"))]
         let window_icon = Some(icon);
+        // The launcher fills the desktop independently of the selected game's
+        // fullscreen preference, which remains in `options` for picker settings.
+        let launcher_window_options = options::Options {
+            fullscreen: true,
+            ..options.clone()
+        };
         let window = Some(Box::new(window::Window::new(
             &format!(
                 "BerryHLE {}{}{}",
@@ -1182,7 +1188,7 @@ impl Environment {
             ),
             window_icon,
             launch_image,
-            &options,
+            &launcher_window_options,
         )?));
 
         let mut mem = mem::Mem::new();
