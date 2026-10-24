@@ -522,6 +522,15 @@ fn rotate_fullscreen_size(orientation: DeviceOrientation, screen_size: (u32, u32
 }
 /// Tell SDL2 what orientation we want. Only useful on Android and iOS.
 fn set_sdl2_orientation(orientation: DeviceOrientation) {
+    // Host orientation is independent of the emulated phone's home-button
+    // side. Let Android choose the upright landscape on phones AND tablets
+    // whose natural display orientation is landscape.
+    // https://developer.android.com/reference/android/content/pm/ActivityInfo#SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+    if cfg!(target_os = "android") && matches!(orientation,
+        DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight) {
+        sdl2::hint::set("SDL_IOS_ORIENTATIONS", "LandscapeLeft LandscapeRight");
+        return;
+    }
     // On iOS the host UI decides the actual interface orientation, so only
     // tell SDL2 which family of orientations the current game may use.
     if cfg!(target_os = "ios") {
@@ -3065,6 +3074,51 @@ pub fn launch_ipa_picker(env: &mut Environment) -> Result<(), String> {
             "SDL_AndroidSendMessage returned {result}, and opening the \
              apps directory failed too: {e}"
         )),
+    }
+}
+
+/// Import a launcher wallpaper through the host's file chooser. Android's
+/// chooser finishes asynchronously; the launcher watches the imported file.
+pub fn launch_wallpaper_picker(env: &mut Environment) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let result = env.on_parent_stack_in_coroutine(|_, _| unsafe {
+            SDL_AndroidSendMessage(0x8002, 0)
+        });
+        return if result == 0 { Ok(()) } else { Err("Couldn't open wallpaper chooser".into()) };
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = env;
+        #[cfg(target_os = "windows")]
+        let output = {
+            use std::os::windows::process::CommandExt;
+            std::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-STA", "-Command",
+                    "Add-Type -AssemblyName System.Windows.Forms; $picker = New-Object System.Windows.Forms.OpenFileDialog; $picker.Title = 'Change wallpaper'; $picker.Filter = 'Images|*.png;*.jpg;*.jpeg;*.bmp'; if ($picker.ShowDialog() -eq 'OK') { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; [Console]::Write($picker.FileName) }"])
+                .creation_flags(0x08000000).output()
+        };
+        #[cfg(target_os = "macos")]
+        let output = std::process::Command::new("osascript")
+            .args(["-e", "POSIX path of (choose file with prompt \"Change wallpaper\" of type {\"public.image\"})"])
+            .output();
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let output = std::process::Command::new("zenity")
+            .args(["--file-selection", "--title=Change wallpaper", "--file-filter=Images | *.png *.jpg *.jpeg *.bmp"])
+            .output();
+        let output = output.map_err(|e| format!("Couldn't open wallpaper chooser: {e}"))?;
+        if !output.status.success() || output.stdout.is_empty() { return Ok(()); }
+        let filename = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
+        let bytes = std::fs::read(filename.trim()).map_err(|e| e.to_string())?;
+        crate::image::Image::from_bytes(&bytes)?;
+        let destination = crate::paths::user_data_base_path().join("BerryHLE_wallpaper.custom");
+        let temporary = destination.with_extension("pending");
+        std::fs::write(&temporary, bytes).map_err(|e| e.to_string())?;
+        // Windows rename cannot replace a file. Copy the fully written temp
+        // file, then remove it; no partial picker download is ever imported.
+        std::fs::copy(&temporary, destination).map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_file(temporary);
+        Ok(())
     }
 }
 

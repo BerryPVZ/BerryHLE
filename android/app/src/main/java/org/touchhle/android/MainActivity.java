@@ -84,6 +84,8 @@ public class MainActivity extends SDLActivity {
     // Message ID sent from the Rust app picker (see window.rs) to open the
     // .ipa file picker. Must match window.rs ADD_IPA_COMMAND.
     private static final int MSG_ADD_IPA = 0x8000;
+    private static final int MSG_WALLPAPER = 0x8002;
+    private static final int REQUEST_WALLPAPER = 3;
 
     // Message ID sent from the Rust WebView bridge (see android_web_view.rs)
     // to notify the emulated app that a page finished loading in a real
@@ -438,6 +440,20 @@ public class MainActivity extends SDLActivity {
 
     @Override
     protected boolean onUnhandledMessage(int message, Object data) {
+        if (message == MSG_WALLPAPER) {
+            runOnUiThread(() -> {
+                Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+                intent.addCategory(Intent.CATEGORY_OPENABLE);
+                intent.setType("image/*");
+                try {
+                    startActivityForResult(Intent.createChooser(intent, "Change wallpaper"),
+                            REQUEST_WALLPAPER);
+                } catch (Exception e) {
+                    Log.e(TAG, "Couldn't open wallpaper chooser", e);
+                }
+            });
+            return true;
+        }
         if (message == MSG_ADD_IPA) {
             // The message arrives on SDL's native thread; the file picker
             // must be started from the UI thread.
@@ -473,6 +489,29 @@ public class MainActivity extends SDLActivity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_WALLPAPER) {
+            if (resultCode != Activity.RESULT_OK || data == null || data.getData() == null) return;
+            final Uri uri = data.getData();
+            new Thread(() -> {
+                File pending = new File(getExternalFilesDir(null), "BerryHLE_wallpaper.pending");
+                try (InputStream input = getContentResolver().openInputStream(uri)) {
+                    android.graphics.Bitmap bitmap = android.graphics.BitmapFactory.decodeStream(input);
+                    if (bitmap == null) throw new IOException("Unsupported image");
+                    try (FileOutputStream output = new FileOutputStream(pending)) {
+                        if (!bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, output))
+                            throw new IOException("Couldn't encode wallpaper");
+                    } finally {
+                        bitmap.recycle();
+                    }
+                    File destination = new File(getExternalFilesDir(null), "BerryHLE_wallpaper.custom");
+                    if (!pending.renameTo(destination)) throw new IOException("Couldn't save wallpaper");
+                } catch (Exception e) {
+                    pending.delete();
+                    Log.e(TAG, "Couldn't import wallpaper", e);
+                }
+            }, "BerryHLE-wallpaper").start();
+            return;
+        }
         if (requestCode != REQUEST_ADD_IPA || resultCode != Activity.RESULT_OK
                 || data == null || data.getData() == null) {
             return;

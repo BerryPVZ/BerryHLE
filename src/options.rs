@@ -160,6 +160,8 @@ pub struct Options {
     /// the app's draws correctly; costs a GPU pipeline stall per frame.
     /// Can also be enabled with `TOUCHHLE_PRESENT_FINISH=1`.
     pub present_finish: bool,
+    /// Budget for reusing decoded file images; 0 disables this optimization.
+    pub image_cache_mb: u32,
     /// See [VsyncMode]. Can also be set with the `TOUCHHLE_VSYNC` environment
     /// variable (the option takes precedence).
     pub vsync: VsyncMode,
@@ -343,6 +345,7 @@ impl Default for Options {
             present_rotate: None,
             landscape_uiscreen_bounds: false,
             rotation_fix: false,
+            image_cache_mb: 0,
             force_gles1_context: std::env::var("TOUCHHLE_FORCE_GLES1_CONTEXT")
                 .map(|value| {
                     let value = value.trim();
@@ -419,6 +422,9 @@ impl Options {
             self.fix_movie_player = true;
         } else if arg == "--no-fix-movie-player" {
             self.fix_movie_player = false;
+        } else if let Some(value) = arg.strip_prefix("--image-cache-mb=") {
+            self.image_cache_mb = value.parse::<u32>().ok().filter(|n| *n <= 1024)
+                .ok_or("Image cache budget must be between 0 and 1024 MiB")?;
         } else if arg == "--landscape-left" {
             self.initial_orientation = DeviceOrientation::LandscapeLeft;
         } else if arg == "--landscape-right" {

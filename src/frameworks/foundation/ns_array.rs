@@ -1604,6 +1604,7 @@ mod removal_regression_tests {
 
     #[test]
     fn cleanup_keeps_array_visible_during_comparison_and_honors_ownership() {
+        let _guard = crate::environment::FRAMEWORK_TEST_LOCK.lock().unwrap();
         // Removing a defeated game object must finish comparisons before any
         // matching object can be deallocated. Equality methods may inspect
         // the array; CF-backed non-retaining arrays must not release entries.

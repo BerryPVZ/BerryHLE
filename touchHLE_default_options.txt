@@ -401,3 +401,9 @@ com.tomatoflix.foodfight: --force-composition
 # Buddyman Kick 2 draws a landscape buffer and manually rotates its GL layer.
 # Display the native buffer directly instead of copying it through the CPU.
 com.crazylion.buddyman.tm.kick2: --device-family=iphone --landscape-right --present-rotate=0
+
+# Draw and Escape advertises all orientations; config.lua selects LandscapeLeft.
+hu.BV.DrawAndEscape: --landscape-left
+
+# Talking Tom streams full-size image files for every animation frame.
+com.outfit7.talkingtomipad: --image-cache-mb=256

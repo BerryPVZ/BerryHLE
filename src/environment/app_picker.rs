@@ -344,6 +344,7 @@ struct AppPickerDelegateHostObject {
     recent_app_tapped: bool,
     settings_show: bool,
     settings_hide: bool,
+    change_wallpaper: bool,
     scale_hack_default: bool,
     scale_hack1: bool,
     scale_hack2: bool,
@@ -563,6 +564,9 @@ const CLASSES: ClassExports = objc_classes! {
 }
 - (())settingsHide {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).settings_hide = true;
+}
+- (())changeWallpaper {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).change_wallpaper = true;
 }
 - (())scaleHackDefault {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).scale_hack_default = true;
@@ -791,7 +795,7 @@ fn app_picker_inner(
     // Wallpaper
     let mut found_wallpaper = false;
     let mut wallpaper_view: Option<id> = None;
-    for candidate in paths::WALLPAPER_FILES {
+    for candidate in std::iter::once(&"BerryHLE_wallpaper.custom").chain(paths::WALLPAPER_FILES.iter()) {
         let candidate = paths::user_data_base_path().join(candidate);
         if !candidate.exists() {
             continue;
@@ -1090,8 +1094,37 @@ fn app_picker_inner(
     }
     // If an app is picked, this loop returns. If the user quits touchHLE, the
     // process exits.
+    let custom_wallpaper = paths::user_data_base_path().join("BerryHLE_wallpaper.custom");
+    let mut wallpaper_stamp = std::fs::metadata(&custom_wallpaper).ok().and_then(|m| m.modified().ok());
+    let mut wallpaper_checked_at = Instant::now();
     let app_path = loop {
         run_run_loop_single_iteration(env, main_run_loop);
+        if wallpaper_checked_at.elapsed() >= Duration::from_millis(500) {
+            wallpaper_checked_at = Instant::now();
+            let stamp = std::fs::metadata(&custom_wallpaper).ok().and_then(|m| m.modified().ok());
+            if stamp.is_some() && stamp != wallpaper_stamp {
+                wallpaper_stamp = stamp;
+                match std::fs::read(&custom_wallpaper).map_err(|e| e.to_string())
+                    .and_then(|bytes| Image::from_bytes(&bytes)) {
+                    Ok(image) => {
+                        let frame = fit_wallpaper(image.dimensions(), bounds.size);
+                        let cg = cg_image::from_image(env, image);
+                        let image: id = msg_class![env; UIImage imageWithCGImage:cg];
+                        cg_image::CGImageRelease(env, cg);
+                        let view = if let Some(view) = wallpaper_view { view } else {
+                            let view: id = msg_class![env; UIImageView alloc];
+                            let view: id = msg![env; view initWithImage:image];
+                            () = msg![env; window insertSubview:view atIndex:0i32];
+                            wallpaper_view = Some(view);
+                            view
+                        };
+                        () = msg![env; view setImage:image];
+                        () = msg![env; view setFrame:frame];
+                    }
+                    Err(error) => echo!("Couldn't load wallpaper: {error}"),
+                }
+            }
+        }
 
         if status_time_updated_at.elapsed() >= Duration::from_secs(10) {
             status_time_updated_at = Instant::now();
@@ -1293,6 +1326,10 @@ fn app_picker_inner(
             // the apps directory is opened in the file manager instead.
             if let Err(e) = crate::window::launch_ipa_picker(env) {
                 echo!("Couldn't open IPA picker: {}", e);
+            }
+        } else if std::mem::take(&mut host_obj.change_wallpaper) {
+            if let Err(error) = crate::window::launch_wallpaper_picker(env) {
+                echo!("Couldn't change wallpaper: {error}");
             }
         } else if std::mem::take(&mut host_obj.settings_show) {
             show_settings_screen(env, main_run_loop, delegate, &settings);
@@ -3399,6 +3436,7 @@ fn make_segment_buttons(
 /// One row of the settings screen.
 #[derive(Clone, Copy)]
 enum SettingsRow {
+    Action(&'static str, &'static str),
     /// A label with a row of segment buttons below it.
     Segmented(&'static str, &'static [(&'static str, &'static str)]),
     /// The "Device model" row (its dropdown is a root-level overlay).
@@ -3669,6 +3707,7 @@ fn setup_settings(
             true,
         ));
     }
+    display_rows.push(SettingsRow::Action("Change wallpaper…", "changeWallpaper"));
     sections.push(("DISPLAY", display_rows));
     let mut graphics_rows = vec![
             SettingsRow::Toggle(
@@ -3769,6 +3808,17 @@ fn setup_settings(
         let mut row_y: CGFloat = 0.0;
         for (index, row) in rows.iter().enumerate() {
             match *row {
+                SettingsRow::Action(label, action) => {
+                    let button: id = msg_class![env; UIButton buttonWithType:1i32];
+                    () = msg![env; button setFrame:(rect(side, row_y, inner_width - 2.0 * side, SETTINGS_ROW_HEIGHT))];
+                    let title = ns_string::from_rust_string(env, label.to_owned());
+                    () = msg![env; button setTitle:title forState:UIControlStateNormal];
+                    () = msg![env; button layoutSubviews];
+                    release(env, title);
+                    let selector = env.objc.lookup_selector(action).unwrap();
+                    () = msg![env; button addTarget:delegate action:selector forControlEvents:UIControlEventTouchUpInside];
+                    () = msg![env; group addSubview:button];
+                }
                 SettingsRow::Segmented(label, buttons) => {
                     let label_view = new_label(
                         env,

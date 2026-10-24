@@ -1851,8 +1851,10 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, renderbuffer: GLuint, mut pixel
 ///
 /// This is intentionally simpler than the fixed-function version: we save the
 /// minimum amount of ES 2.0 state, draw the textured quad with a small
-/// dedicated shader program, and restore. The app's matrices, vertex pointers
-/// etc. are not part of ES 2.0 state and thus need no save/restore.
+/// dedicated shader program, and restore. GLES2 attributes include the vertex
+/// pointer and captured VBO binding, even while an attribute is disabled.
+mod vertex_state;
+
 unsafe fn present_renderbuffer_es2(
     gles: &mut dyn GLES,
     renderbuffer: GLuint,
@@ -2105,12 +2107,8 @@ unsafe fn present_renderbuffer_es2(
     // The presenter only changes the two attributes it owns. Querying all 16
     // slots on every frame is unnecessary driver traffic.
     let attribute_slots = [program.a_pos as GLuint, program.a_uv as GLuint];
-    let mut attrib_was_enabled = [0u8; 2];
-    for (slot, &attribute) in attrib_was_enabled.iter_mut().zip(attribute_slots.iter()) {
-        let mut v: GLint = 0;
-        gles.GetVertexAttribiv(attribute, gles2::VERTEX_ATTRIB_ARRAY_ENABLED, &mut v);
-        *slot = v as u8;
-    }
+    let attribute_state = attribute_slots.map(|attribute|
+        vertex_state::SavedAttribute::capture(gles, attribute));
 
     gles.UseProgram(program.program);
     gles.Uniform1i(program.u_tex, 0);
@@ -2182,13 +2180,12 @@ unsafe fn present_renderbuffer_es2(
         let _ = pressed;
     }
 
-    // Restore vertex attribute enabled state so the app's next draw works.
-    for (&attribute, &was) in attribute_slots.iter().zip(attrib_was_enabled.iter()) {
-        if was != 0 {
-            gles.EnableVertexAttribArray(attribute);
-        } else {
-            gles.DisableVertexAttribArray(attribute);
-        }
+    // VertexAttribPointer captures the buffer binding as well as the pointer.
+    // Restore the complete descriptor, including disabled arrays: engines
+    // can re-enable an array next frame without submitting its pointer again.
+    // https://registry.khronos.org/OpenGL-Refpages/es2.0/xhtml/glVertexAttribPointer.xml
+    for (&attribute, saved) in attribute_slots.iter().zip(attribute_state) {
+        saved.restore(gles, attribute);
     }
 
     // Restore state we touched

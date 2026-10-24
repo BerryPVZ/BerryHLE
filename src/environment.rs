@@ -461,6 +461,10 @@ fn generate_binary_load_order(graph: &[BinaryDependencyNode]) -> Result<Vec<usiz
 static ENVIRONMENT_INSTANCE_EXISTS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+// Framework fixtures share the process-wide OpenAL context manager.
+#[cfg(test)]
+pub(crate) static FRAMEWORK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl Environment {
     /// Loads the binary and sets up the emulator.
     pub fn new(

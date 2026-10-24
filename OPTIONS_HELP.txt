@@ -532,3 +532,5 @@ Other options:
 
     --no-globbert-debug
         Disable Globbert's debug overlay.
+
+--image-cache-mb=N  Reuse decoded file images within N MiB (0 disables; maximum 1024).

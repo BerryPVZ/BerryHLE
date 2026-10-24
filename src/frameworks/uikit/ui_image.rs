@@ -75,6 +75,8 @@ fn image_resource_candidates_for_device(name: &str, is_ipad: bool) -> (Vec<Strin
 #[derive(Default)]
 pub struct State {
     cached_images: HashMap<String, id>,
+    file_images: std::collections::VecDeque<(String, Vec<u8>, CGImageRef, usize)>,
+    file_image_bytes: usize,
 }
 
 impl State {
@@ -275,9 +277,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         release(env, this);
         return nil;
     };
-    let Ok(image) = Image::from_bytes(&bytes) else {
-        release(env, this);
-        return nil;
+    let cg = match decoded_file_image(env, &path_str, bytes) {
+        Ok(cg) => cg,
+        Err(_) => { release(env, this); return nil; }
     };
 
     // Infer the scale factor from the Retina filename suffix so that
@@ -292,7 +294,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     } else {
         1.0
     };
-    let cg = cg_image::from_image(env, image);
     let host = env.objc.borrow_mut::<UIImageHostObject>(this);
     host.cg_image = cg;
     host.scale = scale;
@@ -745,5 +746,93 @@ mod resource_tests {
         let (candidates, extension) = image_resource_candidates("art.v1/headphones");
         assert_eq!(candidates[0], "art.v1/headphones");
         assert_eq!(extension, "png");
+    }
+}
+
+fn decoded_file_image(env: &mut Environment, path_str: &str, bytes: Vec<u8>) -> Result<CGImageRef, String> {
+    // File-backed UIImage objects remain distinct, and the file is read on
+    // every call so writable files never return stale pixels. Only immutable
+    // decoded CGImage backing is shared when the bytes still match exactly.
+    // Apple: imageWithContentsOfFile does not cache the UIImage object.
+    // https://developer.apple.com/documentation/uikit/uiimage/init(contentsoffile:)
+    let budget = env.options.image_cache_mb as usize * 1024 * 1024;
+    let cached = if budget > 0 {
+        let state = State::get_mut(env);
+        let index = state.file_images.iter().position(|(path, data, _, _)|
+            path == path_str && data == &bytes);
+        index.map(|index| {
+            let entry = state.file_images.remove(index).unwrap();
+            let cg = entry.2;
+            state.file_images.push_back(entry);
+            cg
+        })
+    } else { None };
+    let cg = if let Some(cg) = cached {
+        CGImageRetain(env, cg)
+    } else {
+        let image = Image::from_bytes(&bytes)?;
+        let size = image.pixels().len().saturating_add(bytes.len());
+        let cg = cg_image::from_image(env, image);
+        if size <= budget {
+            while State::get(env).file_image_bytes.saturating_add(size) > budget {
+                let entry = State::get_mut(env).file_images.pop_front().unwrap();
+                State::get_mut(env).file_image_bytes -= entry.3;
+                CGImageRelease(env, entry.2);
+            }
+            CGImageRetain(env, cg);
+            State::get_mut(env).file_images.push_back((path_str.to_string(), bytes, cg, size));
+            State::get_mut(env).file_image_bytes += size;
+        }
+        cg
+    };
+    Ok(cg)
+}
+
+#[cfg(test)]
+mod file_image_cache_tests {
+    use super::*;
+
+    fn png(pixel: [u8; 4]) -> Vec<u8> {
+        let image = Image::from_pixels(1, 1, pixel.to_vec());
+        let mut bytes = Vec::<u8>::new();
+        assert_ne!(image.write_png_image((&mut bytes as *mut Vec<u8>).cast(),
+            1, 1, &pixel, 4), 0);
+        bytes
+    }
+
+    #[test]
+    fn file_image_cache_reuses_pixels_but_never_stale_or_invalid_file_bytes() {
+        let _guard = crate::environment::FRAMEWORK_TEST_LOCK.lock().unwrap();
+        let mut env = Environment::new_for_framework_tests().unwrap();
+        env.options.image_cache_mb = 1;
+        let first = png([255, 0, 0, 255]);
+        let changed = png([0, 255, 0, 255]);
+        let a = decoded_file_image(&mut env, "/frame.png", first.clone()).unwrap();
+        let b = decoded_file_image(&mut env, "/frame.png", first.clone()).unwrap();
+        assert_eq!(a, b);
+        let c = decoded_file_image(&mut env, "/frame.png", changed).unwrap();
+        assert_ne!(a, c);
+        assert_eq!(cg_image::borrow_image(&env.objc, c).pixels(), &[0, 255, 0, 255]);
+        assert!(decoded_file_image(&mut env, "/frame.png", vec![0; 12]).is_err());
+        env.options.image_cache_mb = 0;
+        let uncached = decoded_file_image(&mut env, "/frame.png", first).unwrap();
+        assert_ne!(a, uncached);
+        for image in [a, b, c, uncached] { CGImageRelease(&mut env, image); }
+        // Two 400x400 decoded images exceed the one-MiB budget. Eviction
+        // must release the cache's ownership without invalidating a caller.
+        env.options.image_cache_mb = 1;
+        let mut held = Vec::new();
+        for color in [40, 80] {
+            let pixels = vec![color; 400 * 400 * 4];
+            let image = Image::from_pixels(400, 400, pixels.clone());
+            let mut bytes = Vec::<u8>::new();
+            assert_ne!(image.write_png_image((&mut bytes as *mut Vec<u8>).cast(),
+                400, 400, &pixels, 1600), 0);
+            held.push(decoded_file_image(&mut env, &format!("/{color}.png"), bytes).unwrap());
+        }
+        assert!(State::get(&env).file_image_bytes <= 1024 * 1024);
+        assert_eq!(State::get(&env).file_images.len(), 1);
+        assert_eq!(cg_image::borrow_image(&env.objc, held[0]).dimensions(), (400, 400));
+        for image in held { CGImageRelease(&mut env, image); }
     }
 }
