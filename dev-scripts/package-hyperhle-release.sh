@@ -35,18 +35,6 @@ do
     fi
 done
 
-macos_dmg=""
-for candidate in \
-    artifacts/macos/BerryHLE.dmg \
-    artifacts/macos/HyperHLE.dmg \
-    artifacts/macos/touchHLE.dmg
-do
-    if [ -e "$candidate" ]; then
-        macos_dmg="$candidate"
-        break
-    fi
-done
-
 android_apk=""
 for candidate in \
     artifacts/android/BerryHLE.apk \
@@ -58,7 +46,7 @@ do
     fi
 done
 
-for path in "$macos_dmg" "$android_apk"; do
+for path in "$android_apk"; do
     if [ -z "$path" ] || [ ! -e "$path" ]; then
         echo "Missing build artifact (all platform builds must succeed): $path" >&2
         exit 1
@@ -173,8 +161,6 @@ cd "$ROOT/dev-scripts"
 
 prefix="BerryHLE"
 
-./prepare-release.sh --create-zip-macos "$ROOT/$macos_dmg" \
-    -o "$ROOT/release/${prefix}_macOS_x86_64.zip"
 ./prepare-release.sh --create-zip-android "$ROOT/$android_apk" \
     -o "$ROOT/release/${prefix}_Android_AArch64.zip"
 ./prepare-release.sh --create-zip-windows \

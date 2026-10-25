@@ -93,8 +93,6 @@ impl VsyncMode {
 #[derive(Clone)]
 pub struct Options {
     pub fullscreen: bool,
-    pub home_button: bool,
-    pub return_to_picker: bool,
     /// Keep the emulated display's aspect ratio when resizing a desktop window.
     pub preserve_aspect_ratio: bool,
     pub device_family: Option<DeviceFamily>,
@@ -302,8 +300,6 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             fullscreen: false,
-            home_button: true,
-            return_to_picker: true,
             preserve_aspect_ratio: false,
             trainer_disabled: true,
             globbert_debug: false,
@@ -419,15 +415,7 @@ impl Options {
             Ok(arg)
         }
 
-        if arg == "--home-button" {
-            self.home_button = true;
-        } else if arg == "--no-home-button" {
-            self.home_button = false;
-        } else if arg == "--return-to-picker" {
-            self.return_to_picker = true;
-        } else if arg == "--no-return-to-picker" {
-            self.return_to_picker = false;
-        } else if arg == "--fullscreen" {
+        if arg == "--fullscreen" {
             self.fullscreen = true;
         } else if arg == "--no-fullscreen" {
             self.fullscreen = false;

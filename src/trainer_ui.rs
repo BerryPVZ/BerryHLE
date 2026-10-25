@@ -571,7 +571,6 @@ fn overlay_active() -> bool {
 }
 
 pub fn touch_down(abs: (f32, f32), viewport: (u32, u32, u32, u32)) -> bool {
-    if crate::home_button::down(abs, viewport) { return true; }
     if !overlay_active() {
         return false;
     }
@@ -600,7 +599,6 @@ pub fn touch_down(abs: (f32, f32), viewport: (u32, u32, u32, u32)) -> bool {
 }
 
 pub fn touch_motion(abs: (f32, f32), _viewport: (u32, u32, u32, u32)) -> bool {
-    if crate::home_button::motion() { return true; }
     if !overlay_active() {
         return false;
     }
@@ -611,7 +609,6 @@ pub fn touch_motion(abs: (f32, f32), _viewport: (u32, u32, u32, u32)) -> bool {
 }
 
 pub fn touch_up(abs: (f32, f32), viewport: (u32, u32, u32, u32)) -> bool {
-    if crate::home_button::up(abs, viewport) { return true; }
     if !overlay_active() {
         return false;
     }
@@ -1205,15 +1202,6 @@ pub unsafe fn draw(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32)) {
     render_gles1(gles, viewport, &quads);
 }
 
-/// Drop names belonging to a previous GL context or app session.
-pub(crate) fn reset_cached_context() {
-    *OVERLAY_CONTEXT_TOKEN.lock().unwrap() = None;
-    *OVERLAY_PROGRAM.lock().unwrap() = None;
-    *OVERLAY_VBO.lock().unwrap() = None;
-    *OVERLAY_WHITE_TEX.lock().unwrap() = None;
-    invalidate_atlas();
-}
-
 unsafe fn bind_overlay_context() {
     let context_token = sdl2_sys::SDL_GL_GetCurrentContext() as usize;
     {
@@ -1250,9 +1238,11 @@ unsafe fn build_scene(
     gles: &mut dyn GLES,
     viewport: (u32, u32, u32, u32),
 ) -> Option<Vec<Quad>> {
+    if !HARDWARE_ENABLED.load(Ordering::SeqCst) {
+        return None;
+    }
     let mut ui_state = UI.lock().unwrap();
-    let trainer_active = HARDWARE_ENABLED.load(Ordering::SeqCst) && ui_state.enabled && ui_state.app_id.is_some();
-    if !trainer_active && !crate::home_button::enabled() {
+    if !ui_state.enabled || ui_state.app_id.is_none() {
         return None;
     }
     if ensure_atlas(gles).is_none() {
@@ -1262,15 +1252,6 @@ unsafe fn build_scene(
     let Some(atlas) = atlas_guard.as_ref() else { return None; };
 
     let mut quads: Vec<Quad> = Vec::new();
-    if crate::home_button::enabled() {
-        let (x,y,w,h)=crate::home_button::rect(viewport);
-        push_rect(&mut quads, Rect { x,y,w,h }, COL_PANEL);
-        let size=h*0.38;
-        let tw=text_width(atlas,"HOME",size);
-        push_text(&mut quads,atlas,"HOME",x+(w-tw)/2.0,y+h*0.26,size,COL_TEXT);
-    }
-    if !trainer_active { return Some(quads); }
-
 
     let layout = compute_layout(&ui_state, viewport);
 
