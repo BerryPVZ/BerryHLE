@@ -1581,6 +1581,8 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ns_uuid::CLASSES,
         ns_value::CLASSES,
         ns_xml_parser::CLASSES,
+        #[cfg(test)]
+        ns_xml_parser::tests::CLASSES,
     ],
     constant_exports: &[
         ns_calendar::CONSTANTS,
@@ -1740,7 +1742,34 @@ fn hash_helper<T: std::hash::Hash>(hashable: &T) -> NSUInteger {
 
 const FUNCTIONS: FunctionExports = &[
     export_c_func!(NSStringFromRange(_)),
+    export_c_func!(NSRangeFromString(_)),
     export_c_func!(NSUnionRange(_, _)),
     export_c_func!(NSGetSizeAndAlignment(_, _, _)),
     export_c_func!(CFStringGetCharactersPtr(_)),
 ];
+
+// Foundation scans up to the first two decimal integers, even without braces.
+// https://github.com/swiftlang/swift-corelibs-foundation/blob/main/Sources/Foundation/NSRange.swift
+fn range_from_string(string: &str) -> NSRange {
+    let mut numbers = string.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty());
+    let mut next = || numbers.next().map_or(0, |digits| digits.bytes().fold(0u32,
+        |n, digit| n.saturating_mul(10).saturating_add((digit - b'0') as u32)));
+    NSRange { location: next(), length: next() }
+}
+fn NSRangeFromString(env: &mut Environment, string: id) -> NSRange {
+    range_from_string(&ns_string::to_rust_string(env, string))
+}
+#[cfg(test)]
+mod range_string_tests {
+    use super::*;
+    #[test]
+    fn range_strings_and_partial_ranges() {
+        for (text, location, length) in [("{35, 213}", 35, 213), ("", 0, 0),
+            ("invalid", 0, 0), ("12", 12, 0), ("location=12 length=34 ignored=56", 12, 34),
+            ("{4294967295, 0}", u32::MAX, 0)] {
+            let range = range_from_string(text);
+            let actual = (range.location, range.length);
+            assert_eq!(actual, (location, length));
+        }
+    }
+}

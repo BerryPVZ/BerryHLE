@@ -6,12 +6,11 @@
 //! Mach task functions for ARM arch.
 
 use crate::dyld::{export_c_func, FunctionExports};
-use crate::environment::ThreadBlock;
 use crate::libc::mach::core_types::{integer_t, natural_t};
 use crate::libc::mach::init::MACH_TASK_SELF;
 use crate::libc::mach::port::mach_port_t;
 use crate::libc::mach::thread_info::{
-    kern_return_t, thread_state_flavor_t, thread_state_t, KERN_SUCCESS,
+    kern_return_t, thread_state_flavor_t, thread_state_t, KERN_INVALID_ARGUMENT, KERN_SUCCESS,
 };
 use crate::libc::mach::vm_map::vm_allocate;
 use crate::mem::{guest_size_of, GuestUSize, MutPtr, SafeRead};
@@ -120,28 +119,32 @@ fn thread_get_state(
     // stack. A stub that returns success without writing the buffer leaves
     // the caller with zeroed registers and causes it to scan starting from
     // address 0 (NULL-PAGE READ), hanging Unity games during startup.
-    assert_eq!(flavor, MACHINE_THREAD_STATE);
+    // XNU returns KERN_INVALID_ARGUMENT for unsupported flavors or a short
+    // state buffer; it must never write past the caller's supplied capacity.
+    // https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/arm64/status.c
+    let Some(thread_id) = target_thread.checked_sub(1).map(|id| id as ThreadId) else {
+        return KERN_INVALID_ARGUMENT;
+    };
+    if flavor != MACHINE_THREAD_STATE || thread_id >= env.threads.len()
+        || !env.threads[thread_id].active || old_state.is_null() || old_state_count.is_null()
+    {
+        return KERN_INVALID_ARGUMENT;
+    }
 
     let out_size_available = env.mem.read(old_state_count);
     let out_size_expected = guest_size_of::<arm_thread_state>() / guest_size_of::<integer_t>();
-    assert!(out_size_expected <= out_size_available);
-
-    // Expected `thread send right` is thread_id + 1. See `mach_thread_self()`.
-    let thread_id = (target_thread - 1) as ThreadId;
+    if out_size_available < out_size_expected {
+        return KERN_INVALID_ARGUMENT;
+    }
 
     let (regs, cpsr) = if thread_id == env.current_thread {
         (*env.cpu.regs(), env.cpu.cpsr())
     } else {
-        // Mono only calls this on threads it has previously suspended.
-        assert!(matches!(
-            env.threads[thread_id].blocked_by,
-            ThreadBlock::Suspended(_, _)
-        ));
-        let ctx = env
-            .threads
-            .get(thread_id)
-            .and_then(|t| t.guest_context.as_ref())
-            .expect("thread_get_state on thread without saved context");
+        // Only one guest CPU runs at a time; other threads have a saved
+        // register context whether sleeping, runnable or explicitly suspended.
+        let Some(ctx) = env.threads[thread_id].guest_context.as_ref() else {
+            return KERN_INVALID_ARGUMENT;
+        };
         (ctx.regs, ctx.cpsr)
     };
 
@@ -166,3 +169,33 @@ pub const FUNCTIONS: FunctionExports = &[
     // number); not duplicated here to avoid a duplicate-symbol export.
     export_c_func!(thread_get_state(_, _, _, _)),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mem::Ptr;
+
+    #[test]
+    fn invalid_requests_leave_state_and_count_untouched() {
+        let _guard = crate::environment::FRAMEWORK_TEST_LOCK.lock().unwrap();
+        let env = &mut Environment::new_for_framework_tests().unwrap();
+        let state: MutPtr<u32> = env.mem.alloc(18 * 4).cast();
+        for i in 0..18 { env.mem.write(state + i, 0xdeadbeefu32); }
+        let count = env.mem.alloc_and_write(16u32);
+        for (port, flavor, capacity) in [(1, ARM_THREAD_STATE, 16),
+            (0, ARM_THREAD_STATE, 17), (99, ARM_THREAD_STATE, 17), (1, 999, 17)] {
+            env.mem.write(count, capacity);
+            assert_eq!(thread_get_state(env, port, flavor, state.cast(), count), KERN_INVALID_ARGUMENT);
+            for i in 0..18 { assert_eq!(env.mem.read(state + i), 0xdeadbeefu32); }
+            assert_eq!(env.mem.read(count), capacity);
+        }
+        assert_eq!(thread_get_state(env, 1, ARM_THREAD_STATE, Ptr::null(), count), KERN_INVALID_ARGUMENT);
+        assert_eq!(thread_get_state(env, 1, ARM_THREAD_STATE, state.cast(), Ptr::null()), KERN_INVALID_ARGUMENT);
+        env.mem.write(count, 18u32);
+        let registers = *env.cpu.regs();
+        assert_eq!(thread_get_state(env, 1, ARM_THREAD_STATE, state.cast(), count), KERN_SUCCESS);
+        assert_eq!(env.mem.read(count), 17);
+        for i in 0..16 { assert_eq!(env.mem.read(state + i), registers[i as usize]); }
+        assert_eq!(env.mem.read(state + 17), 0xdeadbeefu32);
+    }
+}

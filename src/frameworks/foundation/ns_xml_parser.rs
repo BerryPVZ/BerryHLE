@@ -178,7 +178,12 @@ pub const CLASSES: ClassExports = objc_classes! {
         () = msg![env; delegate parserDidStartDocument:this];
     }
 
+    // The delegate can change inside any callback (SMXMLDocument hands off
+    // to child elements this way). Resolve it again for every notification.
+    // Swift Foundation XMLParser.swift likewise reads parser.delegate at
+    // each SAX callback: https://github.com/swiftlang/swift-corelibs-foundation/blob/main/Sources/FoundationXML/XMLParser.swift
     for event in &events {
+        let delegate = env.objc.borrow::<NSXMLParserHostObject>(this).delegate;
         match event {
             Event::Empty(e) => {
                 let name = safe_local_name(e.local_name().as_ref());
@@ -198,6 +203,7 @@ pub const CLASSES: ClassExports = objc_classes! {
                                         attributes:dict];
                 }
 
+                let delegate = env.objc.borrow::<NSXMLParserHostObject>(this).delegate;
                 let sel_end: SEL = env.objc.register_host_selector(
                     "parser:didEndElement:namespaceURI:qualifiedName:".to_string(),
                     &mut env.mem,
@@ -293,6 +299,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     // ── Phase 3: Finalize ─────────────────────────────────────────────
+    let delegate = env.objc.borrow::<NSXMLParserHostObject>(this).delegate;
     let sel_did_end: SEL = env.objc.register_host_selector(
         "parserDidEndDocument:".to_string(),
         &mut env.mem,
@@ -308,6 +315,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         let error = make_parse_error(env, error_position, error_message);
         env.objc.borrow_mut::<NSXMLParserHostObject>(this).error = error;
 
+        let delegate = env.objc.borrow::<NSXMLParserHostObject>(this).delegate;
         let sel_err: SEL = env.objc.register_host_selector(
             "parser:parseErrorOccurred:".to_string(),
             &mut env.mem,
@@ -408,4 +416,106 @@ fn make_parse_error(env: &mut Environment, code: i32, message: String) -> id {
                                                     userInfo:user_info];
     retain(env, error);
     error
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+    use super::super::ns_string::to_rust_string;
+
+    #[derive(Default)]
+    struct Delegate {
+        events: Vec<String>,
+        on_document: id,
+        on_start: id,
+        on_end: id,
+        clear_on_start: bool,
+    }
+    impl HostObject for Delegate {}
+
+    pub const CLASSES: ClassExports = objc_classes! {
+        (env, this, _cmd);
+        @implementation _BerryXMLDelegateTest: NSObject
+        + (id)allocWithZone:(NSZonePtr)_zone {
+            env.objc.alloc_object(this, Box::<Delegate>::default(), &mut env.mem)
+        }
+        - (())parserDidStartDocument:(id)parser {
+            let host = env.objc.borrow_mut::<Delegate>(this);
+            host.events.push("document-start".into());
+            let next = host.on_document;
+            if next != nil { () = msg![env; parser setDelegate:next]; }
+        }
+        - (())parser:(id)parser didStartElement:(id)name namespaceURI:(id)_uri
+                       qualifiedName:(id)_qname attributes:(id)_attributes {
+            let name = to_rust_string(env, name).to_string();
+            let host = env.objc.borrow_mut::<Delegate>(this);
+            host.events.push(format!("start:{name}"));
+            let (next, clear) = (host.on_start, host.clear_on_start);
+            if next != nil || clear { () = msg![env; parser setDelegate:next]; }
+        }
+        - (())parser:(id)parser didEndElement:(id)name namespaceURI:(id)_uri qualifiedName:(id)_qname {
+            let name = to_rust_string(env, name).to_string();
+            let host = env.objc.borrow_mut::<Delegate>(this);
+            host.events.push(format!("end:{name}"));
+            let next = host.on_end;
+            if next != nil { () = msg![env; parser setDelegate:next]; }
+        }
+        - (())parser:(id)_parser foundCharacters:(id)text {
+            let text = to_rust_string(env, text).to_string();
+            env.objc.borrow_mut::<Delegate>(this).events.push(format!("text:{text}"));
+        }
+        - (())parserDidEndDocument:(id)_parser {
+            env.objc.borrow_mut::<Delegate>(this).events.push("document-end".into());
+        }
+        @end
+    };
+
+    fn parser(env: &mut Environment) -> id {
+        let xml = b"<root><leaf/>payload</root>";
+        let bytes = env.mem.alloc(xml.len() as u32);
+        env.mem.bytes_at_mut(bytes.cast(), xml.len() as u32).copy_from_slice(xml);
+        let data: id = msg_class![env; NSData dataWithBytesNoCopy:bytes
+            length:(xml.len() as NSUInteger) freeWhenDone:true];
+        let parser: id = msg_class![env; NSXMLParser alloc];
+        msg![env; parser initWithData:data]
+    }
+
+    #[test]
+    fn callbacks_follow_delegate_handoffs_including_empty_elements() {
+        let _guard = crate::environment::FRAMEWORK_TEST_LOCK.lock().unwrap();
+        let env = &mut Environment::new_for_framework_tests().unwrap();
+        let parser = parser(env);
+        let a: id = msg_class![env; _BerryXMLDelegateTest new];
+        let b: id = msg_class![env; _BerryXMLDelegateTest new];
+        let c: id = msg_class![env; _BerryXMLDelegateTest new];
+        let d: id = msg_class![env; _BerryXMLDelegateTest new];
+        env.objc.borrow_mut::<Delegate>(a).on_document = b;
+        env.objc.borrow_mut::<Delegate>(b).on_start = c;
+        env.objc.borrow_mut::<Delegate>(c).on_start = d;
+        env.objc.borrow_mut::<Delegate>(c).on_end = b;
+        env.objc.borrow_mut::<Delegate>(d).on_end = c;
+        () = msg![env; parser setDelegate:a];
+        let parsed: bool = msg![env; parser parse];
+        assert!(parsed);
+        assert_eq!(env.objc.borrow::<Delegate>(a).events, ["document-start"]);
+        assert_eq!(env.objc.borrow::<Delegate>(b).events, ["start:root", "document-end"]);
+        assert_eq!(env.objc.borrow::<Delegate>(c).events, ["start:leaf", "text:payload", "end:root"]);
+        assert_eq!(env.objc.borrow::<Delegate>(d).events, ["end:leaf"]);
+        for object in [parser, a, b, c, d] { release(env, object); }
+    }
+
+    #[test]
+    fn clearing_delegate_stops_subsequent_callbacks() {
+        let _guard = crate::environment::FRAMEWORK_TEST_LOCK.lock().unwrap();
+        let env = &mut Environment::new_for_framework_tests().unwrap();
+        let parser = parser(env);
+        let delegate: id = msg_class![env; _BerryXMLDelegateTest new];
+        env.objc.borrow_mut::<Delegate>(delegate).clear_on_start = true;
+        () = msg![env; parser setDelegate:delegate];
+        let parsed: bool = msg![env; parser parse];
+        assert!(parsed);
+        assert_eq!(env.objc.borrow::<Delegate>(delegate).events, ["document-start", "start:root"]);
+        release(env, parser);
+        release(env, delegate);
+    }
 }

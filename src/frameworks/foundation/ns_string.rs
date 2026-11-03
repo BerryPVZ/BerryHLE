@@ -1704,6 +1704,15 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (f64)doubleValue { float_value_common(env, this) }
 
+// https://developer.apple.com/documentation/foundation/nsstring/boolvalue
+- (bool)boolValue {
+    string_bool_value(&to_rust_string(env, this))
+}
+
+- (i64)longLongValue {
+    string_long_long_value(&to_rust_string(env, this))
+}
+
 - (NSInteger)integerValue { msg![env; this intValue] }
 
 - (i32)intValue {
@@ -3226,5 +3235,56 @@ mod resource_path_normalization_tests {
             assert_eq!(to_rust_string(env, normalized), expected);
             release(env, source);
         }
+    }
+}
+
+// NSString's numeric conversions consume a decimal prefix, ignoring suffixes.
+// https://developer.apple.com/documentation/foundation/nsstring/longlongvalue
+fn string_long_long_value(string: &str) -> i64 {
+    let string = string.trim_start();
+    let (negative, rest) = if let Some(rest) = string.strip_prefix('-') {
+        (true, rest)
+    } else { (false, string.strip_prefix('+').unwrap_or(string)) };
+    let limit = i64::MAX as u64 + u64::from(negative);
+    let magnitude = rest.bytes().take_while(u8::is_ascii_digit)
+        .fold(0u64, |n, digit| n.saturating_mul(10).saturating_add((digit - b'0') as u64).min(limit));
+    if negative { (-(magnitude as i128)) as i64 } else { magnitude as i64 }
+}
+
+fn string_bool_value(string: &str) -> bool {
+    let string = string.trim_start();
+    if matches!(string.as_bytes().first(), Some(b'Y' | b'y' | b'T' | b't')) { return true; }
+    let string = string.strip_prefix(['+', '-']).unwrap_or(string).trim_start_matches('0');
+    matches!(string.as_bytes().first(), Some(b'1'..=b'9'))
+}
+
+#[cfg(test)]
+mod numeric_value_tests {
+    use super::*;
+    #[test]
+    fn boolean_flags_and_decimal_prefixes() {
+        for text in ["true", "YES", "  y", "-00042suffix", "+001", "9"] { assert!(string_bool_value(text), "{text}"); }
+        for text in ["false", "NO", "", "0", "-000", "+yes", "0.1", "word1"] { assert!(!string_bool_value(text), "{text}"); }
+        for (text, expected) in [("-9223372036854775808", i64::MIN),
+            ("9223372036854775807", i64::MAX), ("99999999999999999999999999999", i64::MAX),
+            ("-99999999999999999999999999999", i64::MIN), (" +1234ms", 1234), ("hello", 0)] {
+            assert_eq!(string_long_long_value(text), expected);
+        }
+    }
+    #[test]
+    fn conversions_reach_mutable_and_immutable_strings() {
+        let _guard = crate::environment::FRAMEWORK_TEST_LOCK.lock().unwrap();
+        let env = &mut Environment::new_for_framework_tests().unwrap();
+        let text = from_rust_string(env, "true".into());
+        let mutable: id = msg![env; text mutableCopy];
+        for string in [text, mutable] {
+            let value: bool = msg![env; string boolValue];
+            assert!(value);
+            release(env, string);
+        }
+        let text = from_rust_string(env, "4294967296".into());
+        let value: i64 = msg![env; text longLongValue];
+        assert_eq!(value, 4294967296);
+        release(env, text);
     }
 }
