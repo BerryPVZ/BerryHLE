@@ -3,9 +3,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-//! The attribute-only portion of the NSKeyedArchiver compiled model format.
-//! Unsupported relationships/inheritance fail explicitly rather than silently
-//! creating an empty model.
+//! The attribute and relationship portion of the NSKeyedArchiver compiled
+//! model format.
+//! Unsupported inheritance, fetched properties and transient properties fail
+//! explicitly rather than silently creating an incomplete model.
 use plist::Value;
 trait ValueFields {
     fn get(&self, key: &str) -> Option<&Value>;
@@ -31,6 +32,13 @@ fn field<'a>(objects: &'a [Value], v: &'a Value, key: &str) -> Result<&'a Value,
     )
 }
 
+// Counts and delete rules are plain integers in the compiled model, but
+// accept an object reference as well so a differently packed archive still
+// parses.
+fn integer(objects: &[Value], v: &Value) -> Option<i64> {
+    resolve(objects, v).ok()?.as_signed_integer()
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct Attribute {
     pub name: String,
@@ -39,10 +47,20 @@ pub(super) struct Attribute {
     pub default: Option<Value>,
 }
 #[derive(Debug, Clone)]
+pub(super) struct Relationship {
+    pub name: String,
+    pub destination: String,
+    pub to_many: bool,
+    pub inverse: Option<String>,
+    pub optional: bool,
+    pub delete_rule: i32,
+}
+#[derive(Debug, Clone)]
 pub(super) struct Entity {
     pub name: String,
     pub class: String,
     pub attributes: Vec<Attribute>,
+    pub relationships: Vec<Relationship>,
 }
 
 pub(super) fn supported_type(kind: i32) -> bool {
@@ -89,61 +107,111 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Vec<Entity>, String> {
             .and_then(Value::as_array)
             .ok_or("Invalid entity properties")?;
         let mut attributes = Vec::new();
+        let mut relationships = Vec::new();
         for property in properties {
             let property = resolve(objects, property)?;
             let class_desc = field(objects, property, "$class")?;
-            if class_desc.get("$classname").and_then(Value::as_string)
-                != Some("NSAttributeDescription")
-            {
-                return Err("Relationships and fetched properties are not implemented".into());
-            }
-            let kind = property
-                .get("NSAttributeType")
-                .and_then(Value::as_signed_integer)
-                .ok_or("Missing attribute type")? as i32;
-            if !supported_type(kind) {
-                return Err(format!("Unsupported attribute type {kind}"));
-            }
+            let class_name = class_desc
+                .get("$classname")
+                .and_then(Value::as_string)
+                .unwrap_or("");
             let name = field(objects, property, "NSPropertyName")?
                 .as_string()
                 .ok_or("Invalid property name")?
                 .to_owned();
-            if property.get("NSIsTransient").and_then(Value::as_boolean)==Some(true) {
-                return Err("Transient attributes are not implemented".into());
-            }
             let optional = property
                 .get("NSIsOptional")
                 .and_then(Value::as_boolean)
                 .unwrap_or(false);
-            let default = match property.get("NSDefaultValue") {
-                None => None,
-                Some(v) if v.as_uid().is_some_and(|v| v.get() == 0) => None,
-                Some(v) => {
-                    let value = resolve(objects, v)?;
-                    if !matches!(
-                        value,
-                        Value::String(_)
-                            | Value::Integer(_)
-                            | Value::Real(_)
-                            | Value::Boolean(_)
-                            | Value::Data(_)
-                    ) {
-                        return Err("Unsupported archived default value".into());
+            if property.get("NSIsTransient").and_then(Value::as_boolean) == Some(true) {
+                return Err("Transient properties are not implemented".into());
+            }
+            match class_name {
+                "NSAttributeDescription" => {
+                    let kind = property
+                        .get("NSAttributeType")
+                        .and_then(Value::as_signed_integer)
+                        .ok_or("Missing attribute type")? as i32;
+                    if !supported_type(kind) {
+                        return Err(format!("Unsupported attribute type {kind}"));
                     }
-                    Some(value.clone())
+                    let default = match property.get("NSDefaultValue") {
+                        None => None,
+                        Some(v) if v.as_uid().is_some_and(|v| v.get() == 0) => None,
+                        Some(v) => {
+                            let value = resolve(objects, v)?;
+                            if !matches!(
+                                value,
+                                Value::String(_)
+                                    | Value::Integer(_)
+                                    | Value::Real(_)
+                                    | Value::Boolean(_)
+                                    | Value::Data(_)
+                            ) {
+                                return Err("Unsupported archived default value".into());
+                            }
+                            Some(value.clone())
+                        }
+                    };
+                    attributes.push(Attribute {
+                        name,
+                        kind,
+                        optional,
+                        default,
+                    });
                 }
-            };
-            attributes.push(Attribute {
-                name,
-                kind,
-                optional,
-                default,
-            });
+                "NSRelationshipDescription" => {
+                    let destination = field(objects, property, "NSDestinationEntity")?;
+                    let destination = field(objects, destination, "NSEntityName")?
+                        .as_string()
+                        .ok_or("Invalid relationship destination")?
+                        .to_owned();
+                    // The compiled model stores the cardinality as NSMinCount and
+                    // NSMaxCount; there is no NSIsToMany key. A max count of 1 is
+                    // to-one, everything else (including 0, unbounded) is to-many.
+                    let max_count = property
+                        .get("NSMaxCount")
+            .and_then(|v| integer(objects, v))
+                        .unwrap_or(1);
+                    let to_many = max_count != 1;
+                    let inverse = match property.get("NSInverseRelationship") {
+                        None => None,
+                        Some(v) if v.as_uid().is_some_and(|v| v.get() == 0) => None,
+                        Some(v) => {
+                            let inverse = resolve(objects, v)?;
+                            Some(
+                                field(objects, inverse, "NSPropertyName")?
+                                    .as_string()
+                                    .ok_or("Invalid inverse relationship")?
+                                    .to_owned(),
+                            )
+                        }
+                    };
+                    let delete_rule = property
+                        .get("NSDeleteRule")
+            .and_then(|v| integer(objects, v))
+                        .unwrap_or(1) as i32;
+                    relationships.push(Relationship {
+                        name,
+                        destination,
+                        to_many,
+                        inverse,
+                        optional,
+                        delete_rule,
+                    });
+                }
+                "NSFetchedPropertyDescription" => {
+                    return Err("Fetched properties are not implemented".into());
+                }
+                other => return Err(format!("Unsupported property class {other}")),
+            }
         }
+
         out.push(Entity {
             name,
             class,
             attributes,
+        relationships,
         });
     }
     Ok(out)
@@ -170,6 +238,10 @@ mod tests {
     // class descriptors and backreferences emitted by the model compiler.
     // This is intentionally independent of any particular app's model.
     fn archive(relationship: bool) -> Vec<u8> {
+        archive_with(relationship, 1)
+    }
+
+    fn archive_with(relationship: bool, max_count: i64) -> Vec<u8> {
         let mut objects = vec![
             Value::String("$null".into()),
             dictionary(&[("NSEntities", reference(2)), ("$class", reference(13))]),
@@ -245,7 +317,10 @@ mod tests {
                 ("NSEntity", reference(4)),
                 ("NSDestinationEntity", reference(4)),
                 ("NSIsOptional", Value::Boolean(true)),
-                ("NSIsToMany", Value::Boolean(false)),
+                ("NSMinCount", Value::Integer(0i64.into())),
+                ("NSMaxCount", Value::Integer(max_count.into())),
+            ("NSInverseRelationship", reference(0)),
+            ("NSDeleteRule", Value::Integer(1i64.into())),
                 ("$class", reference(15)),
             ]);
         }
@@ -287,8 +362,26 @@ mod tests {
     }
 
     #[test]
-    fn compiled_model_rejects_relationship_instead_of_dropping_it() {
-        let error = parse(&archive(true)).unwrap_err();
-        assert!(error.contains("Relationships"), "{error}");
+    fn compiled_model_parses_relationship_descriptions() {
+        let entities = parse(&archive(true)).unwrap();
+        assert_eq!(entities.len(), 1);
+        let entity = &entities[0];
+        assert_eq!(entity.attributes.len(), 1);
+        assert_eq!(entity.relationships.len(), 1);
+        let relationship = &entity.relationships[0];
+        assert_eq!(relationship.name, "title");
+        assert_eq!(relationship.destination, "Entry");
+        assert!(!relationship.to_many);
+        assert!(relationship.optional);
+        assert_eq!(relationship.inverse, None);
+        assert_eq!(relationship.delete_rule, 1);
     }
+
+#[test]
+fn compiled_model_reads_unbounded_relationship_as_to_many() {
+let entities = parse(&archive_with(true, 0)).unwrap();
+let relationship = &entities[0].relationships[0];
+assert!(relationship.to_many);
+}
+
 }

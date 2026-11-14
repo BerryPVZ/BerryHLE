@@ -5,6 +5,13 @@
  */
 //! Supported Core Data model/context operations. No success is reported until
 //! model validation and the SQLite transaction have actually succeeded.
+//!
+//! Relationships are stored in a join table, so a to-many is just multiple
+//! rows. `NSNullifyDeleteRule` and `NSCascadeDeleteRule` are honoured;
+//! `NSDenyDeleteRule` and `NSNoActionDeleteRule` behave as nullify because
+//! there is no validation pass that could report a deny before the graph is
+//! already modified. Dotted key paths (`spouse.name`) do not traverse, and
+//! `ANY`/`@count` in a predicate see the relationship as a plain set.
 use super::*;
 use crate::frameworks::foundation::{
     core_data_model as model, core_data_store as storage, ns_data, ns_date, ns_predicate,
@@ -129,6 +136,40 @@ fn properties(env: &mut Environment, entity: id) -> Vec<(String, id)> {
         })
         .collect()
 }
+fn attributes(env: &mut Environment, entity: id) -> Vec<(String, id)> {
+    properties(env, entity)
+        .into_iter()
+        .filter(|(_, property)| {
+            env.objc
+                .get_host_object(*property)
+                .is_some_and(|h| h.as_any().is::<NSAttributeDescriptionHostObject>())
+        })
+        .collect()
+}
+fn relationships(env: &mut Environment, entity: id) -> Vec<(String, id)> {
+    properties(env, entity)
+        .into_iter()
+        .filter(|(_, property)| {
+            env.objc
+                .get_host_object(*property)
+                .is_some_and(|h| h.as_any().is::<NSRelationshipDescriptionHostObject>())
+        })
+        .collect()
+}
+/// The objects a to-many relationship currently holds, or the single object of
+/// a to-one relationship. Empty when the value is nil.
+fn related_objects(env: &mut Environment, value: id, to_many: bool) -> Vec<id> {
+    if value == nil {
+        return Vec::new();
+    }
+    if to_many {
+        let all: id = msg![env; value allObjects];
+        items(env, all)
+    } else {
+        vec![value]
+    }
+}
+
 fn model_fingerprint(env: &mut Environment, object_model: id) -> Result<String, String> {
     let entities = env
         .objc
@@ -148,7 +189,8 @@ fn model_fingerprint(env: &mut Environment, object_model: id) -> Result<String, 
             .try_get_known_class(&class_name, &mut env.mem)
             .ok_or("Unknown managed object class")?;
         let mut attrs = Vec::new();
-        for (key, attr) in properties(env, entity) {
+        let mut rels = Vec::new();
+        for (key, property) in properties(env, entity) {
             if env
                 .objc
                 .declared_property_attributes(class_id, &key, &env.mem)
@@ -159,58 +201,108 @@ fn model_fingerprint(env: &mut Environment, object_model: id) -> Result<String, 
                         .into(),
                 );
             }
-            let actual = env.objc.get_host_object(attr).and_then(|h| {
+            let (transient, optional) = {
+                let p = env.objc.borrow::<NSPropertyDescriptionHostObject>(property);
+                (p.transient, p.optional)
+            };
+            if transient {
+                return Err("Transient properties are not implemented".into());
+            }
+            let attribute = env.objc.get_host_object(property).and_then(|h| {
                 h.as_any()
                     .downcast_ref::<NSAttributeDescriptionHostObject>()
             });
-            let a = actual.ok_or("Relationships are not implemented")?;
-            if !model::supported_type(a.attribute_type) {
-                return Err("Unsupported attribute type".into());
+            if let Some(a) = attribute {
+                if !model::supported_type(a.attribute_type) {
+                    return Err("Unsupported attribute type".into());
+                }
+                let kind = a.attribute_type;
+                let default = a.default_value;
+                let default = if default == nil {
+                    None
+                } else {
+                    Some(attribute_value(env, default, kind, &key)?)
+                };
+                attrs.push(format!("{key}:{kind}:{optional}:{default:?}"));
+                continue;
             }
-            let kind = a.attribute_type;
-            let default = a.default_value;
-            let p = env.objc.borrow::<NSPropertyDescriptionHostObject>(attr);
-            if p.transient {
-                return Err("Transient attributes are not implemented".into());
-            }
-            let optional = p.optional;
-            let default = if default == nil {
-                None
-            } else {
-                Some(attribute_value(env, default, kind, &key)?)
+            let relationship = env.objc.get_host_object(property).and_then(|h| {
+                h.as_any()
+                    .downcast_ref::<NSRelationshipDescriptionHostObject>()
+            });
+            let Some(r) = relationship else {
+                return Err("Unsupported property description".into());
             };
-            attrs.push(format!("{key}:{kind}:{optional}:{default:?}"));
+            let (destination, inverse, to_many, delete_rule) = (
+                r.destination_entity,
+                r.inverse_relationship,
+                (r.max_count != 1),
+                r.delete_rule,
+            );
+            let destination = if destination == nil {
+                String::new()
+            } else {
+                let name = env
+                    .objc
+                    .borrow::<NSEntityDescriptionHostObject>(destination)
+                    .name;
+                string(env, name)
+            };
+            let inverse = if inverse == nil {
+                String::new()
+            } else {
+                let name = env
+                    .objc
+                    .borrow::<NSPropertyDescriptionHostObject>(inverse)
+                    .name;
+                string(env, name)
+            };
+            rels.push(format!(
+                "{key}:{destination}:{to_many}:{optional}:{delete_rule}:{inverse}"
+            ));
         }
         attrs.sort();
+        rels.sort();
         descriptions.push(format!(
-            "{}:{}:{attrs:?}",
+            "{}:{}:{attrs:?}:{rels:?}",
             string(env, name),
             string(env, class)
         ));
     }
     descriptions.sort();
-    Ok(format!("VetusCoreData1:{descriptions:?}"))
+    Ok(format!("VetusCoreData2:{descriptions:?}"))
 }
 pub(super) fn load_model(env: &mut Environment, this: id, bytes: &[u8]) -> Result<(), String> {
     let entities = model::parse(bytes)?;
     let mut result = Vec::new();
-    for description in entities {
+    for description in &entities {
         let entity: id = msg_class![env; NSEntityDescription new];
-        let name = text(env, description.name);
-        let class = text(env, description.class);
+        let name = text(env, description.name.clone());
+        let class = text(env, description.class.clone());
         () = msg![env; entity setName:name];
         () = msg![env; entity setManagedObjectClassName:class];
         let mut props = Vec::new();
-        for attribute in description.attributes {
+        for attribute in &description.attributes {
             let property: id = msg_class![env; NSAttributeDescription new];
-            let name = text(env, attribute.name);
+            let name = text(env, attribute.name.clone());
             () = msg![env; property setName:name];
             () = msg![env; property setAttributeType:(attribute.kind)];
             () = msg![env; property setOptional:(attribute.optional)];
-            if let Some(value) = attribute.default {
-                let object = value_to_object(env, &value, attribute.kind)?;
+            if let Some(value) = &attribute.default {
+                let object = value_to_object(env, value, attribute.kind)?;
                 () = msg![env; property setDefaultValue:object];
             }
+            props.push(property);
+        }
+        for relationship in &description.relationships {
+            let property: id = msg_class![env; NSRelationshipDescription new];
+            let name = text(env, relationship.name.clone());
+            () = msg![env; property setName:name];
+            () = msg![env; property setOptional:(relationship.optional)];
+            () = msg![env; property setDeleteRule:(relationship.delete_rule)];
+            // maxCount 1 is to-one; 0 is unbounded, which is to-many.
+            let max_count: NSUInteger = if relationship.to_many { 0 } else { 1 };
+            () = msg![env; property setMaxCount:max_count];
             props.push(property);
         }
         let attributes = array(env, props.clone());
@@ -219,6 +311,41 @@ pub(super) fn load_model(env: &mut Environment, this: id, bytes: &[u8]) -> Resul
             release(env, attr);
         }
         result.push(entity);
+    }
+    // Second pass: destinations and inverses can only be linked once every
+    // entity exists.
+    for (description, entity) in entities.iter().zip(result.iter()) {
+        for relationship in &description.relationships {
+            let name = text(env, relationship.name.clone());
+            let props = env
+                .objc
+                .borrow::<NSEntityDescriptionHostObject>(*entity)
+                .properties_by_name;
+            let property: id = msg![env; props objectForKey:name];
+            if property == nil {
+                continue;
+            }
+            let destination = entities
+                .iter()
+                .position(|e| e.name == relationship.destination)
+                .map(|index| result[index]);
+            let Some(destination) = destination else {
+                continue;
+            };
+            () = msg![env; property setDestinationEntity:destination];
+            let Some(inverse) = &relationship.inverse else {
+                continue;
+            };
+            let inverse_name = text(env, inverse.clone());
+            let props = env
+                .objc
+                .borrow::<NSEntityDescriptionHostObject>(destination)
+                .properties_by_name;
+            let inverse_property: id = msg![env; props objectForKey:inverse_name];
+            if inverse_property != nil {
+                () = msg![env; property setInverseRelationship:inverse_property];
+            }
+        }
     }
     let entities = array(env, result.clone());
     () = msg![env; this setEntities:entities];
@@ -313,9 +440,38 @@ fn dynamic_set(env: &mut Environment, object: id, cmd: crate::objc::SEL, value: 
         }
     }
 }
+// A to-many relationship is an empty set rather than nil, so callers can add
+// to it without a nil check.
+fn ensure_relationship_sets(env: &mut Environment, object: id, entity: id) {
+    for (key, relationship) in relationships(env, entity) {
+        if env
+            .objc
+            .borrow::<NSRelationshipDescriptionHostObject>(relationship)
+            .max_count
+            == 1
+        {
+            continue;
+        }
+        if env
+            .objc
+            .borrow::<NSManagedObjectHostObject>(object)
+            .values
+            .contains_key(&key)
+        {
+            continue;
+        }
+        let set: id = msg_class![env; NSMutableSet new];
+        retain(env, set);
+        env.objc
+            .borrow_mut::<NSManagedObjectHostObject>(object)
+            .values
+            .insert(key, set);
+    }
+}
+
 pub(super) fn apply_defaults(env: &mut Environment, object: id) {
     let entity = env.objc.borrow::<NSManagedObjectHostObject>(object).entity;
-    for (key, attr) in properties(env, entity) {
+    for (key, attr) in attributes(env, entity) {
         let value = env
             .objc
             .borrow::<NSAttributeDescriptionHostObject>(attr)
@@ -324,6 +480,7 @@ pub(super) fn apply_defaults(env: &mut Environment, object: id) {
             set_value(env, object, &key, value);
         }
     }
+    ensure_relationship_sets(env, object, entity);
 }
 pub(super) fn insert_new(env: &mut Environment, entity: id, context: id) -> id {
     if entity == nil {
@@ -506,7 +663,7 @@ fn replace_values(
 ) -> Result<(), String> {
     let entity = env.objc.borrow::<NSManagedObjectHostObject>(object).entity;
     let mut values = HashMap::new();
-    for (key, attr) in properties(env, entity) {
+    for (key, attr) in attributes(env, entity) {
         if let Some(value) = record.attributes.get(&key) {
             let kind = env
                 .objc
@@ -526,8 +683,98 @@ fn replace_values(
     for value in old.into_values() {
         release(env, value);
     }
+    ensure_relationship_sets(env, object, entity);
     Ok(())
 }
+fn apply_stored_relationships(
+    env: &mut Environment,
+    context: id,
+    store: id,
+    skip_dirty: bool,
+) -> Result<(), String> {
+    let rows = env
+        .objc
+        .borrow::<NSPersistentStoreHostObject>(store)
+        .storage
+        .as_ref()
+        .ok_or("Store is not open")?
+        .relationships()?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let objects = env
+        .objc
+        .borrow::<NSManagedObjectContextHostObject>(context)
+        .objects
+        .clone();
+    let mut by_row = HashMap::new();
+    for object in &objects {
+        let row_id = env.objc.borrow::<NSManagedObjectHostObject>(*object).row_id;
+        if row_id > 0 {
+            by_row.insert(row_id, *object);
+        }
+    }
+    for (source_id, name, target_id) in rows {
+        let (Some(source), Some(target)) = (
+            by_row.get(&source_id).copied(),
+            by_row.get(&target_id).copied(),
+        ) else {
+            continue;
+        };
+        // An object with unsaved changes keeps its in-memory relationships;
+        // reloading them here would silently undo the guest's edits.
+        if skip_dirty && env.objc.borrow::<NSManagedObjectHostObject>(source).dirty {
+            continue;
+        }
+        let entity = env.objc.borrow::<NSManagedObjectHostObject>(source).entity;
+        let Some((_, property)) = relationships(env, entity)
+            .into_iter()
+            .find(|(key, _)| *key == name)
+        else {
+            continue;
+        };
+        let to_many = env
+            .objc
+            .borrow::<NSRelationshipDescriptionHostObject>(property)
+            .max_count
+            != 1;
+        if to_many {
+            let set = {
+                let existing = env
+                    .objc
+                    .borrow::<NSManagedObjectHostObject>(source)
+                    .values
+                    .get(&name)
+                    .copied()
+                    .unwrap_or(nil);
+                if existing != nil {
+                    existing
+                } else {
+                    let set: id = msg_class![env; NSMutableSet new];
+                    retain(env, set);
+                    env.objc
+                        .borrow_mut::<NSManagedObjectHostObject>(source)
+                        .values
+                        .insert(name.clone(), set);
+                    set
+                }
+            };
+            () = msg![env; set addObject:target];
+        } else {
+            retain(env, target);
+            let old = env
+                .objc
+                .borrow_mut::<NSManagedObjectHostObject>(source)
+                .values
+                .insert(name.clone(), target);
+            if let Some(old) = old {
+                release(env, old);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn load_registered(env: &mut Environment, context: id) -> Result<(), String> {
     let store = store_for_context(env, context)?;
     let records = env
@@ -590,6 +837,7 @@ fn load_registered(env: &mut Environment, context: id) -> Result<(), String> {
             () = msg![env; object awakeFromFetch];
         }
     }
+    apply_stored_relationships(env, context, store, true)?;
     Ok(())
 }
 pub(super) fn fetch(env: &mut Environment, context: id, request: id, error: MutPtr<id>) -> id {
@@ -706,8 +954,8 @@ fn serialize_object(env: &mut Environment, object: id) -> Result<storage::Record
         .borrow::<NSEntityDescriptionHostObject>(entity)
         .name;
     let name = string(env, name);
-    let mut attributes = plist::Dictionary::new();
-    for (key, attribute) in properties(env, entity) {
+    let mut stored_attributes = plist::Dictionary::new();
+    for (key, attribute) in attributes(env, entity) {
         let a = env
             .objc
             .borrow::<NSAttributeDescriptionHostObject>(attribute);
@@ -724,12 +972,12 @@ fn serialize_object(env: &mut Environment, object: id) -> Result<storage::Record
             return Err(format!("Required attribute {key} is missing"));
         }
         let stored = attribute_value(env, value, kind, &key)?;
-        attributes.insert(key, stored);
+        stored_attributes.insert(key, stored);
     }
     Ok(storage::Record {
         id: row_id,
         entity: name,
-        attributes,
+        attributes: stored_attributes,
     })
 }
 pub(super) fn save(env: &mut Environment, context: id, error: MutPtr<id>) -> bool {
@@ -761,11 +1009,54 @@ pub(super) fn save(env: &mut Environment, context: id, error: MutPtr<id>) -> boo
             .as_mut()
             .ok_or("Store is not open")?
             .save(&records, &deleted)?;
-        for (object, id) in changed.into_iter().zip(ids) {
-            let o = env.objc.borrow_mut::<NSManagedObjectHostObject>(object);
+        for (object, id) in changed.iter().zip(ids) {
+            let o = env.objc.borrow_mut::<NSManagedObjectHostObject>(*object);
             o.row_id = id;
             o.inserted = false;
-            o.dirty = false;
+        }
+        // Row ids exist only now, so relationship rows are written afterwards.
+        let mut relationship_rows = Vec::new();
+        let mut relationship_sources = Vec::new();
+        for object in &changed {
+            let (entity, row_id, values) = {
+                let o = env.objc.borrow::<NSManagedObjectHostObject>(*object);
+                (o.entity, o.row_id, o.values.clone())
+            };
+            if row_id <= 0 {
+                continue;
+            }
+            relationship_sources.push(row_id);
+            for (key, property) in relationships(env, entity) {
+                let to_many = env
+                    .objc
+                    .borrow::<NSRelationshipDescriptionHostObject>(property)
+                    .max_count != 1;
+                let value = values.get(&key).copied().unwrap_or(nil);
+                for target in related_objects(env, value, to_many) {
+                    let (target_id, target_deleted) = {
+                        let t = env.objc.borrow::<NSManagedObjectHostObject>(target);
+                        (t.row_id, t.deleted)
+                    };
+                    // A target deleted in this same save has already had its
+                    // rows removed, so re-adding one would leave a dangling id.
+                    if target_id > 0 && !target_deleted {
+                        relationship_rows.push((row_id, key.clone(), target_id));
+                    }
+                }
+                }
+            }
+        env.objc
+            .borrow_mut::<NSPersistentStoreHostObject>(store)
+            .storage
+            .as_mut()
+            .ok_or("Store is not open")?
+            .save_relationships(&relationship_sources, &relationship_rows)?;
+        // Only clear the dirty flags once the relationship rows are stored
+        // too, so a failure here can be retried by saving again.
+        for object in &changed {
+            env.objc
+                .borrow_mut::<NSManagedObjectHostObject>(*object)
+                .dirty = false;
         }
         for object in objects {
             if env.objc.borrow::<NSManagedObjectHostObject>(object).deleted {
@@ -789,6 +1080,83 @@ pub(super) fn save(env: &mut Environment, context: id, error: MutPtr<id>) -> boo
         }
     }
 }
+/// Mark `object` deleted and apply its relationships' delete rules.
+///
+/// `NSNullifyDeleteRule` (1) is the default. `NSCascadeDeleteRule` (2) deletes
+/// the related objects too. `NSDenyDeleteRule` (3) and `NSNoActionDeleteRule`
+/// (0) both behave as nullify here: this store has no validation pass that
+/// could report a deny without first corrupting the graph.
+pub(super) fn delete_object(env: &mut Environment, object: id) {
+    if object == nil {
+        return;
+    }
+
+    if env.objc.borrow::<NSManagedObjectHostObject>(object).deleted {
+        return;
+    }
+// Mark first: a cyclic relationship would otherwise recurse forever.
+{
+let host = env.objc.borrow_mut::<NSManagedObjectHostObject>(object);
+host.deleted = true;
+host.dirty = true;
+}
+    let entity = env.objc.borrow::<NSManagedObjectHostObject>(object).entity;
+    for (key, property) in relationships(env, entity) {
+        let (delete_rule, inverse, to_many) = {
+            let r = env.objc.borrow::<NSRelationshipDescriptionHostObject>(property);
+            (r.delete_rule, r.inverse_relationship, r.max_count != 1)
+        };
+        let value = env
+            .objc
+            .borrow::<NSManagedObjectHostObject>(object)
+            .values
+            .get(&key)
+            .copied()
+            .unwrap_or(nil);
+        for target in related_objects(env, value, to_many) {
+            if target == nil {
+                continue;
+            }
+            if delete_rule == 2 {
+                delete_object(env, target);
+                continue;
+            }
+            if inverse == nil {
+                continue;
+            }
+            let inverse_name = string(
+                env,
+                env.objc
+                    .borrow::<NSPropertyDescriptionHostObject>(inverse)
+                    .name,
+            );
+            let target_entity = env.objc.borrow::<NSManagedObjectHostObject>(target).entity;
+            let inverse_to_many = relationships(env, target_entity)
+                .into_iter()
+                .find(|(name, _)| *name == inverse_name)
+                .is_some_and(|(_, property)| {
+                    env.objc
+                        .borrow::<NSRelationshipDescriptionHostObject>(property)
+                        .max_count != 1
+                });
+            if inverse_to_many {
+                let set = env
+                    .objc
+                    .borrow::<NSManagedObjectHostObject>(target)
+                    .values
+                    .get(&inverse_name)
+                    .copied()
+                    .unwrap_or(nil);
+                if set != nil {
+                    () = msg![env; set removeObject:object];
+                }
+            } else {
+                set_value(env, target, &inverse_name, nil);
+            }
+        }
+    }
+}
+
 pub(super) fn reset(env: &mut Environment, context: id) {
     let objects = std::mem::take(
         &mut env
@@ -834,6 +1202,7 @@ pub(super) fn rollback(env: &mut Environment, context: id) {
                 release(env, object);
             }
         }
+        apply_stored_relationships(env, context, store, false)?;
         Ok(())
     })();
     if let Err(e) = attempt {

@@ -154,6 +154,23 @@ struct NSAttributeDescriptionHostObject {
 }
 crate::impl_HostObject_with_superclass!(NSAttributeDescriptionHostObject);
 
+// MARK: - NSRelationshipDescription
+
+#[derive(Default)]
+struct NSRelationshipDescriptionHostObject {
+    superclass: NSPropertyDescriptionHostObject,
+    /// `NSEntityDescription*`
+    destination_entity: id,
+    /// `NSRelationshipDescription*`
+    inverse_relationship: id,
+    /// NSDeleteRule
+    delete_rule: NSInteger,
+    max_count: NSUInteger,
+    min_count: NSUInteger,
+    ordered: bool,
+}
+crate::impl_HostObject_with_superclass!(NSRelationshipDescriptionHostObject);
+
 // Apple Core Data — exported `NSString * const` identifiers used as
 // store-type tags, error-domain names, store-option keys, notification
 // names, and `userInfo` dictionary keys. The literal values must match
@@ -790,7 +807,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())deleteObject:(id)_object { // NSManagedObject*
-    let o=env.objc.borrow_mut::<NSManagedObjectHostObject>(_object);o.deleted=true;o.dirty=true;
+    runtime::delete_object(env, _object);
 }
 
 - (())refreshObject:(id)_object mergeChanges:(bool)_merge {
@@ -898,6 +915,21 @@ insertIntoManagedObjectContext:(id)context {           // NSManagedObjectContext
     let key=ns_string::to_rust_string(env,_key).into_owned();
     runtime::set_value(env,this,&key,_value);
 }
+
+- (id)mutableSetValueForKey:(id)_key {
+let key=ns_string::to_rust_string(env,_key).into_owned();
+let existing=env.objc.borrow::<NSManagedObjectHostObject>(this).values.get(&key).copied().unwrap_or(nil);
+if existing != nil {
+return existing;
+}
+// A to-many relationship is backed by a mutable set, so hand back an empty
+// one instead of nil and let the caller add to it.
+let set: id = msg_class![env; NSMutableSet new];
+runtime::set_value(env,this,&key,set);
+release(env,set);
+set
+}
+
 
 - (())willAccessValueForKey:(id)_key  {}
 - (())didAccessValueForKey:(id)_key   {}
@@ -1292,19 +1324,86 @@ insertIntoManagedObjectContext:(id)context {           // NSManagedObjectContext
 
 @implementation NSRelationshipDescription: NSPropertyDescription
 
-- (id)destinationEntity { nil }
-- (())setDestinationEntity:(id)_entity {}
-- (id)inverseRelationship { nil }
-- (())setInverseRelationship:(id)_rel {}
-- (NSInteger)deleteRule { 0 } // NSNoActionDeleteRule
-- (())setDeleteRule:(NSInteger)_rule {}
-- (bool)isToMany { false }
-- (NSUInteger)maxCount { 0 }
-- (())setMaxCount:(NSUInteger)_count {}
-- (NSUInteger)minCount { 0 }
-- (())setMinCount:(NSUInteger)_count {}
-- (bool)isOrdered { false }
-- (())setOrdered:(bool)_v {}
++ (id)allocWithZone:(NSZonePtr)_zone {
+    let host_object = Box::new(NSRelationshipDescriptionHostObject {
+        superclass: NSPropertyDescriptionHostObject::default(),
+        destination_entity: nil,
+        inverse_relationship: nil,
+        // NSDeleteRuleNullify, matching the model editor's default.
+        delete_rule: 1,
+        // A to-one relationship is maxCount 1; 0 means unbounded (to-many).
+        max_count: 1,
+        min_count: 0,
+        ordered: false,
+    });
+    env.objc.alloc_object(this, host_object, &mut env.mem)
+}
+
+- (())dealloc {
+    let host = env.objc.borrow::<NSRelationshipDescriptionHostObject>(this);
+    let (destination, inverse) = (host.destination_entity, host.inverse_relationship);
+    release(env, destination);
+    release(env, inverse);
+    ()=crate::objc::msg_super![env; this dealloc];
+}
+
+- (id)destinationEntity {
+    env.objc.borrow::<NSRelationshipDescriptionHostObject>(this).destination_entity
+}
+
+- (())setDestinationEntity:(id)entity {
+    let old = env.objc.borrow::<NSRelationshipDescriptionHostObject>(this).destination_entity;
+    release(env, old);
+    retain(env, entity);
+    env.objc.borrow_mut::<NSRelationshipDescriptionHostObject>(this).destination_entity = entity;
+}
+
+- (id)inverseRelationship {
+    env.objc.borrow::<NSRelationshipDescriptionHostObject>(this).inverse_relationship
+}
+
+- (())setInverseRelationship:(id)relationship {
+    let old = env.objc.borrow::<NSRelationshipDescriptionHostObject>(this).inverse_relationship;
+    release(env, old);
+    retain(env, relationship);
+    env.objc.borrow_mut::<NSRelationshipDescriptionHostObject>(this).inverse_relationship = relationship;
+}
+
+- (NSInteger)deleteRule {
+    env.objc.borrow::<NSRelationshipDescriptionHostObject>(this).delete_rule
+}
+
+- (())setDeleteRule:(NSInteger)rule {
+    env.objc.borrow_mut::<NSRelationshipDescriptionHostObject>(this).delete_rule = rule;
+}
+
+- (bool)isToMany {
+    env.objc.borrow::<NSRelationshipDescriptionHostObject>(this).max_count != 1
+}
+
+- (NSUInteger)maxCount {
+    env.objc.borrow::<NSRelationshipDescriptionHostObject>(this).max_count
+}
+
+- (())setMaxCount:(NSUInteger)count {
+    env.objc.borrow_mut::<NSRelationshipDescriptionHostObject>(this).max_count = count;
+}
+
+- (NSUInteger)minCount {
+    env.objc.borrow::<NSRelationshipDescriptionHostObject>(this).min_count
+}
+
+- (())setMinCount:(NSUInteger)count {
+    env.objc.borrow_mut::<NSRelationshipDescriptionHostObject>(this).min_count = count;
+}
+
+- (bool)isOrdered {
+    env.objc.borrow::<NSRelationshipDescriptionHostObject>(this).ordered
+}
+
+- (())setOrdered:(bool)value {
+    env.objc.borrow_mut::<NSRelationshipDescriptionHostObject>(this).ordered = value;
+}
 
 @end
 

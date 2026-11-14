@@ -3,7 +3,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-//! A private SQLite representation for supported Core Data attribute models.
+//! A private SQLite representation for supported Core Data attribute and
+//! relationship models.
 //! Apple explicitly documents that its SQLite representation is private:
 //! https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/CoreData/PersistentStoreFeatures.html
 //! Never overwrite/import an unrecognized store or claim migration succeeded.
@@ -50,8 +51,12 @@ impl Store {
             }
         } else {
             let tx = connection.transaction().map_err(|e| e.to_string())?;
-            tx.execute_batch("CREATE TABLE vetus_coredata_metadata(version INTEGER PRIMARY KEY,model TEXT NOT NULL); CREATE TABLE vetus_coredata_objects(id INTEGER PRIMARY KEY AUTOINCREMENT,entity TEXT NOT NULL,attributes BLOB NOT NULL);")
-                .map_err(|e|e.to_string())?;
+        tx.execute_batch(concat!(
+            "CREATE TABLE vetus_coredata_metadata(version INTEGER PRIMARY KEY,model TEXT NOT NULL);",
+            "CREATE TABLE vetus_coredata_objects(id INTEGER PRIMARY KEY AUTOINCREMENT,entity TEXT NOT NULL,attributes BLOB NOT NULL);",
+            "CREATE TABLE vetus_coredata_relationships(source_id INTEGER NOT NULL,name TEXT NOT NULL,target_id INTEGER NOT NULL,PRIMARY KEY(source_id,name,target_id));",
+        ))
+        .map_err(|e| e.to_string())?;
             tx.execute(
                 "INSERT INTO vetus_coredata_metadata(version,model) VALUES(1,?)",
                 [model],
@@ -97,6 +102,11 @@ impl Store {
         for id in deleted {
             tx.execute("DELETE FROM vetus_coredata_objects WHERE id=?", [id])
                 .map_err(|e| e.to_string())?;
+            tx.execute(
+                "DELETE FROM vetus_coredata_relationships WHERE source_id=? OR target_id=?",
+                [id, id],
+            )
+            .map_err(|e| e.to_string())?;
         }
         let mut ids = Vec::new();
         for record in records {
@@ -134,6 +144,53 @@ impl Store {
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(ids)
+    }
+    /// Replace the relationship rows of every object in `sources`.
+    ///
+    /// `rows` holds `(source_id, relationship_name, target_id)` triples. A
+    /// to-many relationship is simply several rows with the same source and
+    /// name, so no separate table is needed for it.
+    pub fn save_relationships(
+        &mut self,
+        sources: &[i64],
+        rows: &[(i64, String, i64)],
+    ) -> Result<(), String> {
+        let tx = self.connection.transaction().map_err(|e| e.to_string())?;
+        for source in sources {
+            tx.execute(
+                "DELETE FROM vetus_coredata_relationships WHERE source_id=?",
+                [source],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        for (source, name, target) in rows {
+            tx.execute(
+                "INSERT OR IGNORE INTO vetus_coredata_relationships(source_id,name,target_id) VALUES(?,?,?)",
+                params![source, name, target],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    /// All stored relationship rows as `(source_id, name, target_id)`.
+    pub fn relationships(&self) -> Result<Vec<(i64, String, i64)>, String> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT source_id,name,target_id FROM vetus_coredata_relationships ORDER BY source_id,name,target_id")
+            .map_err(|e| e.to_string())?;
+        let values = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        values
+            .map(|v| v.map_err(|e| e.to_string()))
+            .collect()
     }
 }
 
@@ -179,4 +236,47 @@ mod tests {
         assert!(Store::open(Some(&path), "model2").is_err());
         std::fs::remove_file(path).unwrap();
     }
+    #[test]
+    fn relationships_roundtrip_and_are_removed_with_either_end() {
+        let path = std::env::temp_dir().join(format!(
+            "vetus-coredata-rel-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut store = Store::open(Some(&path), "model1").unwrap();
+        let mut parent = Record {
+            id: 0,
+            entity: "Parent".into(),
+            attributes: Dictionary::new(),
+        };
+        let mut child = Record {
+            id: 0,
+            entity: "Child".into(),
+            attributes: Dictionary::new(),
+        };
+        let ids = store.save(&[parent.clone(), child.clone()], &[]).unwrap();
+        parent.id = ids[0];
+        child.id = ids[1];
+        store
+            .save_relationships(&[parent.id], &[(parent.id, "children".into(), child.id)])
+            .unwrap();
+        assert_eq!(
+            store.relationships().unwrap(),
+            vec![(parent.id, "children".to_owned(), child.id)]
+        );
+        // Saving the same source again replaces its rows rather than appending.
+        store
+            .save_relationships(&[parent.id], &[(parent.id, "children".into(), child.id)])
+            .unwrap();
+        assert_eq!(store.relationships().unwrap().len(), 1);
+        // Deleting either end drops the row, so no dangling ids survive.
+        store.save(&[], &[child.id]).unwrap();
+        assert!(store.relationships().unwrap().is_empty());
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
 }
