@@ -1238,6 +1238,19 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())addAnimation:(id)anim forKey:(id)key {
+    // A CATransition swaps the whole layer over time instead of
+    // interpolating a property, so the compositor has to drive it.
+    let is_transition = env
+        .objc
+        .get_host_object(anim)
+        .is_some_and(|object| {
+            object
+                .as_any()
+                .is::<super::ca_animation::CATransitionHostObject>()
+        });
+    if is_transition {
+        super::view_transition::begin_ca_transition(env, this, anim);
+    }
     let duration: CFTimeInterval = msg![env; anim duration];
     if duration == 0.0 {
         let duration: CFTimeInterval = msg_class![env; CATransaction animationDuration];

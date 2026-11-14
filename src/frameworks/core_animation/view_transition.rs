@@ -3,14 +3,16 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-//! Legacy UIView flip transitions. The outgoing hierarchy must survive removal
-//! from the container until the animation finishes.
+//! Core Animation transitions: legacy UIView flips and CATransition. The
+//! outgoing hierarchy must survive removal from the container until the
+//! animation finishes.
 //! https://developer.apple.com/documentation/uikit/uiview/setanimationtransition(_:for:cache:)
+//! https://developer.apple.com/documentation/quartzcore/catransition
 
-use super::{ca_layer, ca_layer::CALayerHostObject, composition, CACurrentMediaTime};
+use super::{ca_animation, ca_layer, ca_layer::CALayerHostObject, composition, CACurrentMediaTime};
 use crate::frameworks::core_graphics::CGRect;
 use crate::matrix::Matrix;
-use crate::objc::{id, release, retain};
+use crate::objc::{id, msg, msg_class, release, retain};
 use crate::Environment;
 use std::collections::HashMap;
 
@@ -18,6 +20,10 @@ use std::collections::HashMap;
 pub(super) struct State {
     active: HashMap<id, Active>,
 }
+
+/// Style code for `CATransition` fade. `Pending.kind` is an integer, but
+/// a `CATransition` type is a string, so it gets a synthetic code.
+const FADE: i32 = -1;
 
 pub(crate) struct Pending {
     layer: id,
@@ -35,8 +41,11 @@ struct Active {
     curve: i32,
 }
 
+/// Snapshot `layer` so it can keep being drawn (as the outgoing layer) after
+/// the caller replaces or removes its contents. `kind` is a
+/// `UIViewAnimationTransition`, or a negative `CATransition` style code.
 pub(crate) fn prepare(env: &mut Environment, layer: id, kind: i32, cache: bool) -> Option<Pending> {
-    if layer.is_null() || !matches!(kind, 1 | 2) {
+    if layer.is_null() || (kind > 0 && !matches!(kind, 1 | 2)) {
         return None;
     }
     composition::display_layers(env, layer);
@@ -52,6 +61,7 @@ pub(crate) fn prepare(env: &mut Environment, layer: id, kind: i32, cache: bool) 
     })
 }
 
+/// Drop a snapshot that will never be animated.
 pub(crate) fn discard(env: &mut Environment, pending: Pending) {
     ca_layer::release_transition_tree(env, pending.outgoing);
     release(env, pending.layer);
@@ -67,6 +77,8 @@ fn release_active(env: &mut Environment, active: Active) {
     discard(env, active.pending);
 }
 
+/// Begin animating a snapshot returned by [`prepare`]. Non-positive or
+/// non-finite durations settle immediately.
 pub(crate) fn start(
     env: &mut Environment,
     pending: Pending,
@@ -111,6 +123,7 @@ pub(crate) fn start(
         );
 }
 
+/// Release transitions whose duration has elapsed. Called every frame.
 pub(crate) fn expire(env: &mut Environment) {
     let now = CACurrentMediaTime(env);
     let expired: Vec<_> = env
@@ -134,6 +147,8 @@ pub(crate) fn expire(env: &mut Environment) {
     }
 }
 
+/// Whether any transition is still running, i.e. whether the compositor must
+/// keep drawing (and keep refreshing the outgoing snapshots).
 pub(crate) fn has_active(env: &Environment) -> bool {
     !env.framework_state
         .core_animation
@@ -156,23 +171,63 @@ pub(super) fn display_outgoing(env: &mut Environment) {
     }
 }
 
-pub(super) fn presentation(env: &mut Environment, layer: id) -> Option<(id, Matrix<4>)> {
+/// Cross-dissolve state for `layer`: the outgoing snapshot to draw
+/// underneath it, the outgoing opacity, and the live layer's opacity.
+/// `None` when no fade is running.
+pub(super) fn fade(env: &mut Environment, layer: id) -> Option<(id, f32, f32)> {
+    let (root, start, duration, curve) = {
+        let a = env
+            .framework_state
+            .core_animation
+            .view_transition
+            .active
+            .get(&layer)?;
+        if a.pending.kind >= 0 {
+            return None;
+        }
+        (a.pending.outgoing.root, a.start, a.duration, a.curve)
+    };
     let now = CACurrentMediaTime(env);
-    let a = env
-        .framework_state
-        .core_animation
-        .view_transition
-        .active
-        .get(&layer)?;
-    let progress = ((now - a.start) / a.duration).clamp(0.0, 1.0) as f32;
-    let progress = super::ca_media_timing_function::solve_view_curve(a.curve, progress);
+    let progress = ((now - start) / duration).clamp(0.0, 1.0) as f32;
+    let progress = super::ca_media_timing_function::solve_view_curve(curve, progress);
+    let (outgoing, incoming) = cross_dissolve(progress);
+    Some((root, outgoing, incoming))
+}
+
+/// The layer that should actually be drawn in `layer`'s place this frame,
+/// and the extra model-view transform needed for a flip.
+pub(super) fn presentation(env: &mut Environment, layer: id) -> Option<(id, Matrix<4>)> {
+    let (kind, start, duration, curve, outgoing, incoming) = {
+        let a = env
+            .framework_state
+            .core_animation
+            .view_transition
+            .active
+            .get(&layer)?;
+        // A fade draws the live layer at increasing opacity with the
+        // outgoing snapshot underneath it, so nothing is substituted here.
+        if a.pending.kind < 0 {
+            return None;
+        }
+        (
+            a.pending.kind,
+            a.start,
+            a.duration,
+            a.curve,
+            a.pending.outgoing.root,
+            a.incoming.as_ref().map(|tree| tree.root),
+        )
+    };
+    let now = CACurrentMediaTime(env);
+    let progress = ((now - start) / duration).clamp(0.0, 1.0) as f32;
+    let progress = super::ca_media_timing_function::solve_view_curve(curve, progress);
     let source = if progress < 0.5 {
-        a.pending.outgoing.root
+        outgoing
     } else {
-        a.incoming.as_ref().map_or(layer, |tree| tree.root)
+        incoming.unwrap_or(layer)
     };
     let bounds = env.objc.borrow::<CALayerHostObject>(source).bounds;
-    Some((source, flip_transform(bounds, a.pending.kind, progress)))
+    Some((source, flip_transform(bounds, kind, progress)))
 }
 
 fn flip_transform(bounds: CGRect, kind: i32, progress: f32) -> Matrix<4> {
@@ -206,6 +261,57 @@ fn flip_transform(bounds: CGRect, kind: i32, progress: f32) -> Matrix<4> {
             [0.0, 0.0, 0.0, 1.0],
         ]))
         .multiply(&Matrix::translate_3d(cx, cy, 0.0))
+}
+
+/// Start a `CATransition` added to `layer`. The caller has already
+/// checked that `anim` is a `CATransition`. Only `kCATransitionFade`
+/// is rendered; every other type cross-dissolves too, which is what
+/// Apple does for a type it does not recognise. As on iOS, a zero
+/// duration takes the `CATransaction` default.
+pub(super) fn begin_ca_transition(env: &mut Environment, layer: id, anim: id) {
+    let (duration, begin_time, started) = {
+        let t: &ca_animation::CATransitionHostObject = env
+            .objc
+            .borrow::<ca_animation::CATransitionHostObject>(anim);
+        (
+            t.superclass.duration,
+            t.superclass.begin_time,
+            t.superclass.started_at.is_some(),
+        )
+    };
+    let duration = if duration > 0.0 {
+        duration
+    } else {
+        msg_class![env; CATransaction animationDuration]
+    };
+    // `beginTime` is either a delay in seconds, or a timestamp already past.
+    let delay = if begin_time > 0.0 {
+        (begin_time - CACurrentMediaTime(env)).max(0.0)
+    } else {
+        0.0
+    };
+    if duration <= 0.0 || !duration.is_finite() {
+        return;
+    }
+    if started {
+        // The same transition object was added again; it is already
+        // running, so keep the existing snapshot instead of restarting.
+        return;
+    }
+    let Some(pending) = prepare(env, layer, FADE, false) else {
+        return;
+    };
+    let start_time = CACurrentMediaTime(env) + delay;
+    () = msg![env; anim setDuration:duration];
+    ca_animation::set_animation_start_time(env, anim, start_time);
+    start(env, pending, duration, delay, 0);
+}
+
+/// Opacities of the outgoing and incoming layers at `progress` through a
+/// cross-dissolve. The outgoing layer is drawn first, so the two weights
+/// always sum to 1 and the background never shows through.
+fn cross_dissolve(progress: f32) -> (f32, f32) {
+    (1.0 - progress, progress)
 }
 
 #[cfg(test)]
@@ -258,5 +364,17 @@ mod tests {
         let r = right.transform([320.0, 0.0, 0.0, 1.0]);
         assert!((l[0] / l[3] + r[0] / r[3] - 320.0).abs() < 0.001);
         assert!((l[1] / l[3] - r[1] / r[3]).abs() < 0.001);
+    }
+
+    #[test]
+    fn cross_dissolve_sums_to_one_and_never_shows_background() {
+        for progress in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let (outgoing, incoming) = cross_dissolve(progress);
+            assert!((outgoing + incoming - 1.0).abs() < 0.001);
+            assert!((0.0..=1.0).contains(&outgoing));
+            assert!((0.0..=1.0).contains(&incoming));
+        }
+        assert_eq!(cross_dissolve(0.0), (1.0, 0.0));
+        assert_eq!(cross_dissolve(1.0), (0.0, 1.0));
     }
 }

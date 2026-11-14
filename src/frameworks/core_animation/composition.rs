@@ -669,6 +669,23 @@ unsafe fn composite_layer_recursive(
 ) {
     let (layer, local_transform) =
      super::view_transition::presentation(env, layer).unwrap_or((layer, Matrix::identity()));
+    // A CATransition fade is a cross-dissolve: draw the outgoing snapshot
+    // underneath the live layer, then let the live layer fade in over it.
+    let fade_in = match super::view_transition::fade(env, layer) {
+        Some((outgoing, outgoing_opacity, fade_in)) => {
+            composite_layer_recursive(
+                env,
+                animation_state,
+                outgoing,
+                cumulative_transform,
+                opacity * outgoing_opacity,
+            );
+            fade_in
+        }
+        None => 1.0,
+    };
+    // Fade the whole subtree, not just this layer's own quad.
+    let opacity = opacity * fade_in;
     // TODO: this can't handle zPosition among other things, but it is not
     //       supported yet :)
     // TODO: back-to-front drawing is not efficient, could we use front-to-back?
