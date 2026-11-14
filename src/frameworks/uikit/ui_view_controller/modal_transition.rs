@@ -3,7 +3,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-//! Legacy UIKit cover-vertical modal presentation.
+//! Legacy UIKit modal presentation: cover-vertical slides, cross-dissolve
+//! fades. https://developer.apple.com/documentation/uikit/uimodaltransitionstyle
 //! https://developer.apple.com/documentation/uikit/uimodaltransitionstyle/coververtical
 //! https://github.com/touchHLE/touchHLE/blob/trunk/src/frameworks/uikit/ui_view_controller.rs
 use super::UIViewControllerHostObject;
@@ -95,6 +96,41 @@ pub fn animate(env: &mut Environment, presenter: id, modal: id, dismissing: bool
     () = msg![env; animation setDelegate:delegate];
     let key = get_static_str(env, "TouchHLECoverVertical");
     () = msg![env; layer addAnimation:animation forKey:key];
+    release(env, delegate);
+}
+
+/// Cross-dissolve presentation (`UIModalTransitionStyleCrossDissolve`).
+/// https://developer.apple.com/documentation/uikit/uimodaltransitionstyle/crossdissolve
+/// The presenter stays visible underneath: the modal fades in over it,
+/// and fades out before the completion hook fires.
+pub fn animate_fade(env: &mut Environment, presenter: id, modal: id, dismissing: bool) {
+    let view: id = msg![env; modal view];
+    if view == nil {
+        complete(env, presenter, modal, dismissing, false);
+        return;
+    }
+    let layer: id = msg![env; view layer];
+    let key = get_static_str(env, "opacity");
+    let animation: id = msg_class![env; CABasicAnimation animationWithKeyPath:key];
+    let from: id = msg_class![env; NSNumber numberWithFloat:(if dismissing { 1.0f32 } else { 0.0f32 })];
+    let to: id = msg_class![env; NSNumber numberWithFloat:(if dismissing { 0.0f32 } else { 1.0f32 })];
+    () = msg![env; animation setFromValue:from];
+    () = msg![env; animation setToValue:to];
+    () = msg![env; animation setDuration:(0.35f64)];
+    let curve = get_static_str(env, "easeInEaseOut");
+    let timing: id = msg_class![env; CAMediaTimingFunction functionWithName:curve];
+    () = msg![env; animation setTimingFunction:timing];
+    let fill = get_static_str(env, "forwards");
+    () = msg![env; animation setFillMode:fill];
+    let delegate: id = msg_class![env; _TouchHLEModalAnimation new];
+    *env.objc.borrow_mut::<ModalAnimation>(delegate) = ModalAnimation {
+        presenter: retain(env, presenter),
+        modal: retain(env, modal),
+        dismissing,
+    };
+    () = msg![env; animation setDelegate:delegate];
+    let animation_key = get_static_str(env, "TouchHLECrossDissolve");
+    () = msg![env; layer addAnimation:animation forKey:animation_key];
     release(env, delegate);
 }
 

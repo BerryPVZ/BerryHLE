@@ -689,6 +689,11 @@ crate::frameworks::core_animation::view_transition::expire(env);
 
 // MARK: - Block-based animation API (iOS 4+)
 //
+// A property set outside an explicit animation snaps too: there is no
+// implicit-animation path, because that needs -[CALayer actionForKey:],
+// CATransaction disableActions plumbing and a real model/presentation
+// split. Views only move when the guest animates them itself.
+//
 // touchHLE doesn't actually animate property changes — assignments inside
 // the `animations` block snap to their final value immediately. The
 // important contract that *must* be honoured is:
@@ -794,23 +799,70 @@ crate::frameworks::core_animation::view_transition::expire(env);
 
 // `+transitionWithView:duration:options:animations:completion:` and
 // `+transitionFromView:toView:duration:options:completion:` ship in
-// iOS 4 too. Real iOS swaps the view hierarchy with a flip / cross-
-// fade transition; touchHLE has no animator, so we do the swap
-// instantaneously and still fire the completion block — that keeps
-// games whose state machine waits on the completion (e.g. Bubble
-// Witch's level transition) from deadlocking.
+// iOS 4 too. `transitionWithView:` honours the transition bits of
+// `options`: a cross-dissolve or a horizontal flip is rendered through
+// the same machinery as `setAnimationTransition:forView:cache:`. Curl
+// and the vertical flips are not rendered yet and fall back to an
+// instant swap. `transitionFromView:toView:` still swaps the hierarchy
+// instantly, since the container it would have to animate is the views'
+// shared superview rather than either argument.
+// Either way the completion block still fires, which keeps games whose
+// state machine waits on it (e.g. Bubble Witch's level transition) from
+// deadlocking.
+// https://developer.apple.com/documentation/uikit/uiview/animationoptions
 
-+ (())transitionWithView:(id)_view
-                duration:(f64)duration
-                 options:(u32)options
-              animations:(MutPtr<()>)animations
-              completion:(MutPtr<()>)completion {
++ (())transitionWithView:(id)view
+duration:(f64)duration
+options:(u32)options
+animations:(MutPtr<()>)animations
+completion:(MutPtr<()>)completion {
+    // Apple: bits 20-23 of UIViewAnimationOptions select the transition.
+    // https://developer.apple.com/documentation/uikit/uiview/animationoptions
+    const TRANSITION_MASK: u32 = 0xF << 20;
+    let transition = ((options & TRANSITION_MASK) >> 20) as NSInteger;
+    // 1 and 2 are the horizontal flips, 5 is the cross-dissolve. The
+    // curl kinds (3, 4) and the vertical flips (6, 7) are not rendered
+    // yet, so they fall back to the instant swap below.
+    let kind: NSInteger = match transition {
+        1 | 2 => transition,
+        5 => -1,
+        _ => 0,
+    };
+    // `beginAnimations:` would discard an outer block, so a
+    // `transitionWithView:` nested inside one keeps the instant swap.
+    // https://developer.apple.com/documentation/uikit/uiview/transition(with:duration:options:animations:completion:)
+    let nested = env.framework_state.uikit.ui_view.animation_block.in_block;
+    if kind == 0 || view == nil || nested {
+        () = msg![env; this
+            animateWithDuration:duration
+            delay:(0.0_f64)
+            options:options
+            animations:animations
+            completion:completion
+        ];
+        return;
+    }
+    // Drive the transition through the legacy animation block so the
+    // compositor picks it up, then let `animateWithDuration:` schedule
+    // the completion block.
+    let animation_id: id = nil;
+    let context: MutPtr<()> = MutPtr::null();
+    () = msg![env; this beginAnimations:animation_id context:context];
+    () = msg![env; this setAnimationDuration:duration];
+    let curve: NSInteger = ((options >> 16) & 0x3) as NSInteger;
+    () = msg![env; this setAnimationCurve:curve];
+    () = msg![env; this setAnimationTransition:kind forView:view cache:false];
+    if !animations.is_null() {
+        invoke_void_block(env, animations);
+    }
+    () = msg![env; this commitAnimations];
+    let no_animations: MutPtr<()> = MutPtr::null();
     () = msg![env; this
         animateWithDuration:duration
-                      delay:(0.0_f64)
-                    options:options
-                 animations:animations
-                 completion:completion
+        delay:(0.0_f64)
+        options:options
+        animations:no_animations
+        completion:completion
     ];
 }
 
@@ -824,7 +876,7 @@ crate::frameworks::core_animation::view_transition::expire(env);
     // UIViewAnimationOptionShowHideTransitionViews option is set, in
     // which case both views remain in their hierarchy and only their
     // hidden state is toggled).
-    const SHOW_HIDE_OPTION: u32 = 1 << 19;
+    const SHOW_HIDE_OPTION: u32 = 1 << 8;
     if options & SHOW_HIDE_OPTION != 0 {
         if from_view != nil { let _: () = msg![env; from_view setHidden:true]; }
         if to_view != nil { let _: () = msg![env; to_view setHidden:false]; }

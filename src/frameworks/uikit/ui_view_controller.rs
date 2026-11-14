@@ -784,17 +784,19 @@ pub const CLASSES: ClassExports = objc_classes! {
     // appearance hooks for the new view, so we route through the window
     // directly instead of adding the view to the presenter's view.
    () = msg![env; window addSubview:modal_view];
-   if animated
-   && env
-   .objc
-   .borrow::<UIViewControllerHostObject>(modal_vc)
-   .modal_transition_style
-   == 0
-   {
-   modal_transition::animate(env, this, modal_vc, false);
-   } else {
-   modal_transition::complete(env, this, modal_vc, false, animated);
-   }
+    let style = env
+        .objc
+        .borrow::<UIViewControllerHostObject>(modal_vc)
+        .modal_transition_style;
+    // Cover-vertical (0) slides, cross-dissolve (2) fades. Any
+    // other style has no renderer yet, so it settles immediately.
+    if animated && style == 0 {
+        modal_transition::animate(env, this, modal_vc, false);
+    } else if animated && style == 2 {
+        modal_transition::animate_fade(env, this, modal_vc, false);
+    } else {
+        modal_transition::complete(env, this, modal_vc, false, animated);
+    }
 
 
     // The modal hierarchy is now fully attached to a window. Any UIWebView
@@ -865,17 +867,19 @@ pub const CLASSES: ClassExports = objc_classes! {
    .borrow_mut::<UIViewControllerHostObject>(presented)
    .is_being_dismissed = true;
    () = msg![env; presented viewWillDisappear:animated];
-   if animated
-   && env
-   .objc
-   .borrow::<UIViewControllerHostObject>(presented)
-   .modal_transition_style
-   == 0
-   {
-   modal_transition::animate(env, this, presented, true);
-   } else {
-   modal_transition::complete(env, this, presented, true, animated);
-   }
+    let style = env
+        .objc
+        .borrow::<UIViewControllerHostObject>(presented)
+        .modal_transition_style;
+    // Cover-vertical (0) slides, cross-dissolve (2) fades. Any
+    // other style has no renderer yet, so it settles immediately.
+    if animated && style == 0 {
+        modal_transition::animate(env, this, presented, true);
+    } else if animated && style == 2 {
+        modal_transition::animate_fade(env, this, presented, true);
+    } else {
+        modal_transition::complete(env, this, presented, true, animated);
+    }
    invoke_void_block(env, completion);
 }
 
