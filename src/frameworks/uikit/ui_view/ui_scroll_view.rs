@@ -26,8 +26,8 @@ const UIScrollViewKeyboardDismissModeInteractive: NSInteger = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Axis {
- Horizontal,
- Vertical,
+        Horizontal,
+        Vertical,
 }
 
 pub struct UIScrollViewHostObject {
@@ -45,8 +45,12 @@ pub struct UIScrollViewHostObject {
     bounces: bool,
     paging_enabled: bool,
     directional_lock_enabled: bool,
- locked_axis: Option<Axis>,
- locked_cumulative: (CGFloat, CGFloat),
+    locked_axis: Option<Axis>,
+    locked_cumulative: (CGFloat, CGFloat),
+    /// Whether the current touch sequence has scrolled the content. This is
+    /// what `-isDragging` reports, so a table view can tell a scroll from a
+    /// tap. Cleared when the touch sequence ends.
+    dragging: bool,
     minimum_zoom_scale: CGFloat,
     maximum_zoom_scale: CGFloat,
     zoom_scale: CGFloat,
@@ -80,8 +84,9 @@ impl Default for UIScrollViewHostObject {
             bounces: true,
             paging_enabled: false,
             directional_lock_enabled: false,
- locked_axis: None,
- locked_cumulative: (0.0, 0.0),
+            locked_axis: None,
+            locked_cumulative: (0.0, 0.0),
+            dragging: false,
             minimum_zoom_scale: 1.0,
             maximum_zoom_scale: 1.0,
             zoom_scale: 1.0,
@@ -331,9 +336,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (bool)isDecelerating {
     false
 }
-- (bool)isDragging {
-    false
-}
+    - (bool)isDragging {
+        env.objc.borrow::<UIScrollViewHostObject>(this).dragging
+    }
 - (bool)isTracking {
     false
 }
@@ -346,121 +351,128 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // MARK: - Touch handling
 
-- (())touchesMoved:(id)touches withEvent:(id)_event {
-    let scroll_enabled: bool = msg![env; this scrollEnabled];
-    if !scroll_enabled {
-        return;
+    - (())touchesMoved:(id)touches withEvent:(id)_event {
+        let scroll_enabled: bool = msg![env; this scrollEnabled];
+        if !scroll_enabled {
+            return;
+        }
+
+        let touch_arr: id = msg![env; touches allObjects];
+        let touch: id = msg![env; touch_arr objectAtIndex:0u32];
+        let bounds: CGRect = msg![env; this bounds];
+
+        let prev_location: CGPoint = msg![env; touch previousLocationInView:this];
+        let new_location: CGPoint = msg![env; touch locationInView:this];
+
+        let delta_x = new_location.x - prev_location.x;
+        let delta_y = new_location.y - prev_location.y;
+
+        let offset: CGPoint = msg![env; this contentOffset];
+        let content_size: CGSize = msg![env; this contentSize];
+
+        // Directional lock: with it enabled, a drag picks one axis and
+        // later moves on this touch sequence only move along that axis.
+        // The axis is decided by total travel, not by one noisy move.
+        let locked: bool = msg![env; this isDirectionalLockEnabled];
+        let delta = if locked {
+            let axis = {
+                let host = env.objc.borrow_mut::<UIScrollViewHostObject>(this);
+                match host.locked_axis {
+                    Some(axis) => axis,
+                    None => {
+                        host.locked_cumulative = (
+                            host.locked_cumulative.0 + delta_x,
+                            host.locked_cumulative.1 + delta_y,
+                        );
+                        let axis = lock_axis(host.locked_cumulative);
+                        host.locked_axis = Some(axis);
+                        axis
+                    }
+                }
+            };
+            match axis {
+                Axis::Horizontal => (delta_x, 0.0),
+                Axis::Vertical => (0.0, delta_y),
+            }
+        } else {
+            (delta_x, delta_y)
+        };
+
+        let new_offset = offset_after_drag(offset, content_size, bounds.size, delta);
+
+        log_dbg!("UIScrollView content offset: old {:?}, new {:?}", offset, new_offset);
+
+        if new_offset != offset {
+            // The content moved, so this touch sequence is a scroll and not a
+            // tap. `-isDragging` reports that to subclasses such as
+            // `UITableView`, which must not select a row after a scroll.
+            env.objc.borrow_mut::<UIScrollViewHostObject>(this).dragging = true;
+            () = msg![env; this setContentOffset:new_offset];
+
+            let delegate: id = msg![env; this delegate];
+            if delegate != nil {
+                let sel: SEL = env.objc.register_host_selector(
+                    "scrollViewDidScroll:".to_string(),
+                    &mut env.mem,
+                );
+
+                let responds: bool = msg![env; delegate respondsToSelector:sel];
+                if responds {
+                    () = msg![env; delegate scrollViewDidScroll:this];
+                }
+            }
+        }
     }
 
-    let touch_arr: id = msg![env; touches allObjects];
-    let touch: id     = msg![env; touch_arr objectAtIndex:0u32];
-    let bounds: CGRect = msg![env; this bounds];
-
-    let prev_location: CGPoint = msg![env; touch previousLocationInView:this];
-    let new_location:  CGPoint = msg![env; touch locationInView:this];
-
-    let delta_x = new_location.x - prev_location.x;
-    let delta_y = new_location.y - prev_location.y;
-
-    let offset:       CGPoint = msg![env; this contentOffset];
-    let content_size: CGSize  = msg![env; this contentSize];
-
-    // Directional lock: with it enabled, a drag picks one axis and
- // later moves on this touch sequence only move along that axis.
- // The axis is decided by total travel, not by one noisy move.
- let locked: bool = msg![env; this isDirectionalLockEnabled];
-let delta = if locked {
-let axis = {
-let host = env.objc.borrow_mut::<UIScrollViewHostObject>(this);
-match host.locked_axis {
-Some(axis) => axis,
-None => {
-host.locked_cumulative = (
-host.locked_cumulative.0 + delta_x,
-host.locked_cumulative.1 + delta_y,
-);
-let axis = lock_axis(host.locked_cumulative);
-host.locked_axis = Some(axis);
-axis
-}
-}
-};
- match axis {
- Axis::Horizontal => (delta_x, 0.0),
- Axis::Vertical => (0.0, delta_y),
- }
- } else {
- (delta_x, delta_y)
- };
-
- let new_offset = offset_after_drag(offset, content_size, bounds.size, delta);
-
-    log_dbg!("UIScrollView content offset: old {:?}, new {:?}", offset, new_offset);
-
-    if new_offset != offset {
-        () = msg![env; this setContentOffset:new_offset];
-
+    - (())touchesEnded:(id)_touches withEvent:(id)_event {
+        let host = env.objc.borrow_mut::<UIScrollViewHostObject>(this);
+        host.locked_axis = None;
+        host.locked_cumulative = (0.0, 0.0);
+        host.dragging = false;
         let delegate: id = msg![env; this delegate];
         if delegate != nil {
             let sel: SEL = env.objc.register_host_selector(
-                "scrollViewDidScroll:".to_string(),
+                "scrollViewDidEndDecelerating:".to_string(),
                 &mut env.mem,
             );
 
             let responds: bool = msg![env; delegate respondsToSelector:sel];
             if responds {
-                () = msg![env; delegate scrollViewDidScroll:this];
+                () = msg![env; delegate scrollViewDidEndDecelerating:this];
             }
         }
     }
-}
 
-- (())touchesEnded:(id)_touches withEvent:(id)_event {
- let host = env.objc.borrow_mut::<UIScrollViewHostObject>(this);
- host.locked_axis = None;
- host.locked_cumulative = (0.0, 0.0);
-    let delegate: id = msg![env; this delegate];
-    if delegate != nil {
-        let sel: SEL = env.objc.register_host_selector(
-            "scrollViewDidEndDecelerating:".to_string(),
-            &mut env.mem,
-        );
+    - (())touchesCancelled:(id)_touches withEvent:(id)_event {
+        let host = env.objc.borrow_mut::<UIScrollViewHostObject>(this);
+        host.locked_axis = None;
+        host.locked_cumulative = (0.0, 0.0);
+        host.dragging = false;
+        let delegate: id = msg![env; this delegate];
+        if delegate != nil {
+            let sel: SEL = env.objc.register_host_selector(
+                "scrollViewDidEndScrollingAnimation:".to_string(),
+                &mut env.mem,
+            );
 
-        let responds: bool = msg![env; delegate respondsToSelector:sel];
-        if responds {
-            () = msg![env; delegate scrollViewDidEndDecelerating:this];
+            let responds: bool = msg![env; delegate respondsToSelector:sel];
+            if responds {
+                () = msg![env; delegate scrollViewDidEndScrollingAnimation:this];
+            }
         }
     }
-}
 
-- (())touchesCancelled:(id)_touches withEvent:(id)_event {
- let host = env.objc.borrow_mut::<UIScrollViewHostObject>(this);
- host.locked_axis = None;
- host.locked_cumulative = (0.0, 0.0);
-    let delegate: id = msg![env; this delegate];
-    if delegate != nil {
-        let sel: SEL = env.objc.register_host_selector(
-            "scrollViewDidEndScrollingAnimation:".to_string(),
-            &mut env.mem,
-        );
-
-        let responds: bool = msg![env; delegate respondsToSelector:sel];
-        if responds {
-            () = msg![env; delegate scrollViewDidEndScrollingAnimation:this];
-        }
-    }
-}
 
 @end
 
 };
 /// Which axis a drag belongs to: the one with more travel so far.
 fn lock_axis(cumulative: (CGFloat, CGFloat)) -> Axis {
- if cumulative.0.abs() > cumulative.1.abs() {
- Axis::Horizontal
- } else {
- Axis::Vertical
- }
+    if cumulative.0.abs() > cumulative.1.abs() {
+        Axis::Horizontal
+    } else {
+        Axis::Vertical
+    }
 }
 
 /// Where `offset` ends up after the finger moves by `delta`: content follows
@@ -523,31 +535,30 @@ mod tests {
     }
 
     #[test]
+    fn content_slightly_wider_than_the_scroll_view_can_move_sideways() {
+        // The old settings layout: content 10pt wider than the scroll
+        // view, so a sideways finger drag produced a 10pt x-offset.
+        // Documents why content width must equal scroll view width.
+        let moved = offset_after_drag(
+            CGPoint { x: 0.0, y: 0.0 },
+            size(330.0, 2000.0),
+            size(320.0, 480.0),
+            (-10.0, -100.0),
+        );
+        let (moved_x, moved_y) = (moved.x, moved.y);
+        assert_eq!(moved_x, 10.0);
+        assert_eq!(moved_y, 100.0);
+    }
+
     #[test]
- fn content_slightly_wider_than_the_scroll_view_can_move_sideways() {
- // The old settings layout: content 10pt wider than the scroll
- // view, so a sideways finger drag produced a 10pt x-offset.
- // Documents why content width must equal scroll view width.
- let moved = offset_after_drag(
- CGPoint { x: 0.0, y: 0.0 },
- size(330.0, 2000.0),
- size(320.0, 480.0),
- (-10.0, -100.0),
- );
- let (moved_x, moved_y) = (moved.x, moved.y);
- assert_eq!(moved_x, 10.0);
- assert_eq!(moved_y, 100.0);
- }
+    fn lock_axis_picks_the_axis_with_more_travel() {
+        assert_eq!(super::lock_axis((20.0, 5.0)), super::Axis::Horizontal);
+        assert_eq!(super::lock_axis((5.0, 20.0)), super::Axis::Vertical);
+        assert_eq!(super::lock_axis((10.0, 10.0)), super::Axis::Vertical);
+    }
 
- #[test]
- fn lock_axis_picks_the_axis_with_more_travel() {
- assert_eq!(super::lock_axis((20.0, 5.0)), super::Axis::Horizontal);
- assert_eq!(super::lock_axis((5.0, 20.0)), super::Axis::Vertical);
- assert_eq!(super::lock_axis((10.0, 10.0)), super::Axis::Vertical);
- }
-
- #[test]
- fn content_smaller_than_the_scroll_view_never_moves() {
+    #[test]
+    fn content_smaller_than_the_scroll_view_never_moves() {
         let moved = offset_after_drag(
             CGPoint { x: 0.0, y: 0.0 },
             size(320.0, 400.0),
