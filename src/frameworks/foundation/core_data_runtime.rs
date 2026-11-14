@@ -270,7 +270,7 @@ fn model_fingerprint(env: &mut Environment, object_model: id) -> Result<String, 
         ));
     }
     descriptions.sort();
-    Ok(format!("VetusCoreData2:{descriptions:?}"))
+    Ok(format!("HyperHLECoreData2:{descriptions:?}"))
 }
 pub(super) fn load_model(env: &mut Environment, this: id, bytes: &[u8]) -> Result<(), String> {
     let entities = model::parse(bytes)?;
@@ -1002,30 +1002,19 @@ pub(super) fn save(env: &mut Environment, context: id, error: MutPtr<id>) -> boo
                 records.push(serialize_object(env, *object)?);
             }
         }
-        let ids = env
-            .objc
-            .borrow_mut::<NSPersistentStoreHostObject>(store)
-            .storage
-            .as_mut()
-            .ok_or("Store is not open")?
-            .save(&records, &deleted)?;
-        for (object, id) in changed.iter().zip(ids) {
-            let o = env.objc.borrow_mut::<NSManagedObjectHostObject>(*object);
-            o.row_id = id;
-            o.inserted = false;
-        }
-        // Row ids exist only now, so relationship rows are written afterwards.
+        // Relationship rows are collected before the save so that objects and
+        // their links commit in one transaction. A record that has not been
+        // inserted yet is referred to by the provisional id `-(index + 1)`,
+        // which Store::save resolves once the inserts have run.
         let mut relationship_rows = Vec::new();
         let mut relationship_sources = Vec::new();
-        for object in &changed {
+        for (index, object) in changed.iter().enumerate() {
             let (entity, row_id, values) = {
                 let o = env.objc.borrow::<NSManagedObjectHostObject>(*object);
                 (o.entity, o.row_id, o.values.clone())
             };
-            if row_id <= 0 {
-                continue;
-            }
-            relationship_sources.push(row_id);
+            let source = if row_id > 0 { row_id } else { -(index as i64) - 1 };
+            relationship_sources.push(source);
             for (key, property) in relationships(env, entity) {
                 let to_many = env
                     .objc
@@ -1039,20 +1028,39 @@ pub(super) fn save(env: &mut Environment, context: id, error: MutPtr<id>) -> boo
                     };
                     // A target deleted in this same save has already had its
                     // rows removed, so re-adding one would leave a dangling id.
-                    if target_id > 0 && !target_deleted {
-                        relationship_rows.push((row_id, key.clone(), target_id));
+                    if target_deleted {
+                        continue;
                     }
-                }
+                    let target = if target_id > 0 {
+                        target_id
+                    } else if let Some(position) = changed.iter().position(|o| *o == target) {
+                        -(position as i64) - 1
+                    } else {
+                        continue;
+                    };
+                    relationship_rows.push((source, key.clone(), target));
                 }
             }
-        env.objc
+        }
+        let ids = env
+            .objc
             .borrow_mut::<NSPersistentStoreHostObject>(store)
             .storage
             .as_mut()
             .ok_or("Store is not open")?
-            .save_relationships(&relationship_sources, &relationship_rows)?;
-        // Only clear the dirty flags once the relationship rows are stored
-        // too, so a failure here can be retried by saving again.
+            .save(
+                &records,
+                &deleted,
+                &relationship_sources,
+                &relationship_rows,
+            )?;
+        for (object, id) in changed.iter().zip(ids) {
+            let o = env.objc.borrow_mut::<NSManagedObjectHostObject>(*object);
+            o.row_id = id;
+            o.inserted = false;
+        }
+        // The save above commits objects and relationship rows in one
+        // transaction, so these flags only clear once both are durable.
         for object in &changed {
             env.objc
                 .borrow_mut::<NSManagedObjectHostObject>(*object)

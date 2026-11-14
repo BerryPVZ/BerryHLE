@@ -39,7 +39,7 @@ impl Store {
         if tables != 0 {
             let saved: String = connection
                 .query_row(
-                    "SELECT model FROM vetus_coredata_metadata WHERE version=1",
+                    "SELECT model FROM hyperhle_coredata_metadata WHERE version=1",
                     [],
                     |r| r.get(0),
                 )
@@ -52,13 +52,13 @@ impl Store {
         } else {
             let tx = connection.transaction().map_err(|e| e.to_string())?;
         tx.execute_batch(concat!(
-            "CREATE TABLE vetus_coredata_metadata(version INTEGER PRIMARY KEY,model TEXT NOT NULL);",
-            "CREATE TABLE vetus_coredata_objects(id INTEGER PRIMARY KEY AUTOINCREMENT,entity TEXT NOT NULL,attributes BLOB NOT NULL);",
-            "CREATE TABLE vetus_coredata_relationships(source_id INTEGER NOT NULL,name TEXT NOT NULL,target_id INTEGER NOT NULL,PRIMARY KEY(source_id,name,target_id));",
+            "CREATE TABLE hyperhle_coredata_metadata(version INTEGER PRIMARY KEY,model TEXT NOT NULL);",
+            "CREATE TABLE hyperhle_coredata_objects(id INTEGER PRIMARY KEY AUTOINCREMENT,entity TEXT NOT NULL,attributes BLOB NOT NULL);",
+            "CREATE TABLE hyperhle_coredata_relationships(source_id INTEGER NOT NULL,name TEXT NOT NULL,target_id INTEGER NOT NULL,PRIMARY KEY(source_id,name,target_id));",
         ))
         .map_err(|e| e.to_string())?;
             tx.execute(
-                "INSERT INTO vetus_coredata_metadata(version,model) VALUES(1,?)",
+                "INSERT INTO hyperhle_coredata_metadata(version,model) VALUES(1,?)",
                 [model],
             )
             .map_err(|e| e.to_string())?;
@@ -69,7 +69,7 @@ impl Store {
     pub fn records(&self) -> Result<Vec<Record>, String> {
         let mut stmt = self
             .connection
-            .prepare("SELECT id,entity,attributes FROM vetus_coredata_objects ORDER BY id")
+            .prepare("SELECT id,entity,attributes FROM hyperhle_coredata_objects ORDER BY id")
             .map_err(|e| e.to_string())?;
         let values = stmt
             .query_map([], |r| {
@@ -95,15 +95,34 @@ impl Store {
             })
             .collect()
     }
-    /// Commit all object changes together. Return permanent IDs only after
-    /// COMMIT succeeds; failed saves leave context changes pending.
-    pub fn save(&mut self, records: &[Record], deleted: &[i64]) -> Result<Vec<i64>, String> {
+    /// Replace the stored rows for every object in `records`, delete the
+    /// objects in `deleted`, and replace the relationship rows of every
+    /// object in `sources`, all in one SQLite transaction, so a failure
+    /// cannot leave attributes committed without their relationships.
+    ///
+    /// Returns the row ids of `records`, in the same order. `rows` holds
+    /// `(source_id, relationship_name, target_id)` triples; a to-many
+    /// relationship is simply several rows with the same source and name.
+    ///
+    /// A record that has not been inserted yet (`id == 0`) is referred to in
+    /// `sources` and `rows` by the provisional id `-(index + 1)`, where `index`
+    /// is its position in `records`. Those ids resolve to the real row ids the
+    /// inserts produce, inside the same transaction. `sources` may hold at
+    /// most one row per source, because each one drops that source's existing
+    /// relationship rows before the new ones are inserted.
+    pub fn save(
+        &mut self,
+        records: &[Record],
+        deleted: &[i64],
+        sources: &[i64],
+        rows: &[(i64, String, i64)],
+    ) -> Result<Vec<i64>, String> {
         let tx = self.connection.transaction().map_err(|e| e.to_string())?;
         for id in deleted {
-            tx.execute("DELETE FROM vetus_coredata_objects WHERE id=?", [id])
+            tx.execute("DELETE FROM hyperhle_coredata_objects WHERE id=?", [id])
                 .map_err(|e| e.to_string())?;
             tx.execute(
-                "DELETE FROM vetus_coredata_relationships WHERE source_id=? OR target_id=?",
+                "DELETE FROM hyperhle_coredata_relationships WHERE source_id=? OR target_id=?",
                 [id, id],
             )
             .map_err(|e| e.to_string())?;
@@ -116,7 +135,7 @@ impl Store {
                 .map_err(|e| e.to_string())?;
             let id = if record.id == 0 {
                 tx.execute(
-                    "INSERT INTO vetus_coredata_objects(entity,attributes) VALUES(?,?)",
+                    "INSERT INTO hyperhle_coredata_objects(entity,attributes) VALUES(?,?)",
                     params![record.entity, payload],
                 )
                 .map_err(|e| e.to_string())?;
@@ -124,7 +143,7 @@ impl Store {
             } else {
                 let exists = tx
                     .query_row(
-                        "SELECT id FROM vetus_coredata_objects WHERE id=?",
+                        "SELECT id FROM hyperhle_coredata_objects WHERE id=?",
                         [record.id],
                         |r| r.get::<_, i64>(0),
                     )
@@ -134,7 +153,7 @@ impl Store {
                     return Err("Object was removed by another context".into());
                 }
                 tx.execute(
-                    "UPDATE vetus_coredata_objects SET attributes=? WHERE id=?",
+                    "UPDATE hyperhle_coredata_objects SET attributes=? WHERE id=?",
                     params![payload, record.id],
                 )
                 .map_err(|e| e.to_string())?;
@@ -142,42 +161,45 @@ impl Store {
             };
             ids.push(id);
         }
-        tx.commit().map_err(|e| e.to_string())?;
-        Ok(ids)
-    }
-    /// Replace the relationship rows of every object in `sources`.
-    ///
-    /// `rows` holds `(source_id, relationship_name, target_id)` triples. A
-    /// to-many relationship is simply several rows with the same source and
-    /// name, so no separate table is needed for it.
-    pub fn save_relationships(
-        &mut self,
-        sources: &[i64],
-        rows: &[(i64, String, i64)],
-    ) -> Result<(), String> {
-        let tx = self.connection.transaction().map_err(|e| e.to_string())?;
+        // A negative id means "the record at index -id - 1", which only has a
+        // real row id now that the inserts above have run.
+        let resolve = |id: i64| -> Option<i64> {
+            if id < 0 {
+                ids.get((-id - 1) as usize).copied()
+            } else if id > 0 {
+                Some(id)
+            } else {
+                None
+            }
+        };
         for source in sources {
-            tx.execute(
-                "DELETE FROM vetus_coredata_relationships WHERE source_id=?",
-                [source],
-            )
-            .map_err(|e| e.to_string())?;
+            if let Some(source) = resolve(*source) {
+                tx.execute(
+                    "DELETE FROM hyperhle_coredata_relationships WHERE source_id=?",
+                    [source],
+                )
+                .map_err(|e| e.to_string())?;
+            }
         }
         for (source, name, target) in rows {
+            let (Some(source), Some(target)) = (resolve(*source), resolve(*target)) else {
+                continue;
+            };
             tx.execute(
-                "INSERT OR IGNORE INTO vetus_coredata_relationships(source_id,name,target_id) VALUES(?,?,?)",
+                "INSERT OR IGNORE INTO hyperhle_coredata_relationships(source_id,name,target_id) VALUES(?,?,?)",
                 params![source, name, target],
             )
             .map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(())
+        Ok(ids)
     }
+
     /// All stored relationship rows as `(source_id, name, target_id)`.
     pub fn relationships(&self) -> Result<Vec<(i64, String, i64)>, String> {
         let mut stmt = self
             .connection
-            .prepare("SELECT source_id,name,target_id FROM vetus_coredata_relationships ORDER BY source_id,name,target_id")
+            .prepare("SELECT source_id,name,target_id FROM hyperhle_coredata_relationships ORDER BY source_id,name,target_id")
             .map_err(|e| e.to_string())?;
         let values = stmt
             .query_map([], |r| {
@@ -193,14 +215,13 @@ impl Store {
             .collect()
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn sqlite_roundtrip_update_delete_and_model_validation() {
         let path = std::env::temp_dir().join(format!(
-            "vetus-coredata-{}-{}.sqlite",
+            "hyperhle-coredata-{}-{}.sqlite",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -215,7 +236,7 @@ mod tests {
             attributes: values,
         };
         let mut store = Store::open(Some(&path), "model1").unwrap();
-        record.id = store.save(&[record.clone()], &[]).unwrap()[0];
+        record.id = store.save(&[record.clone()], &[], &[], &[]).unwrap()[0];
         drop(store);
         let mut store = Store::open(Some(&path), "model1").unwrap();
         assert_eq!(
@@ -225,21 +246,103 @@ mod tests {
         record
             .attributes
             .insert("title".into(), Value::String("updated".into()));
-        store.save(&[record.clone()], &[]).unwrap();
+        store.save(&[record.clone()], &[], &[], &[]).unwrap();
         assert_eq!(
             store.records().unwrap()[0].attributes["title"].as_string(),
             Some("updated")
         );
-        store.save(&[], &[record.id]).unwrap();
+        store.save(&[], &[record.id], &[], &[]).unwrap();
         assert!(store.records().unwrap().is_empty());
         drop(store);
         assert!(Store::open(Some(&path), "model2").is_err());
         std::fs::remove_file(path).unwrap();
     }
     #[test]
+    fn failed_save_commits_neither_objects_nor_links() {
+        let path = std::env::temp_dir().join(format!(
+            "hyperhle-coredata-atomic-{}-{}.sqlite",
+            std::process::id(),
+            "4f06a002"
+        ));
+        let mut store = Store::open(Some(&path), "model-atomic").unwrap();
+        let parent = Record {
+            id: 0,
+            entity: "Parent".into(),
+            attributes: Dictionary::new(),
+        };
+        let child = Record {
+            id: 0,
+            entity: "Child".into(),
+            attributes: Dictionary::new(),
+        };
+        let ids = store
+            .save(&[parent, child], &[], &[-1], &[(-1, "children".to_owned(), -2)])
+            .unwrap();
+        // A record that no longer exists makes the whole save fail, including
+        // the link rows that were collected alongside it.
+        let stale = Record {
+            id: 9999,
+            entity: "Parent".into(),
+            attributes: Dictionary::new(),
+        };
+        let fresh = Record {
+            id: 0,
+            entity: "Child".into(),
+            attributes: Dictionary::new(),
+        };
+        assert!(store
+            .save(&[fresh, stale], &[], &[-1], &[(-1, "children".to_owned(), -2)])
+            .is_err());
+        assert_eq!(store.records().unwrap().len(), 2);
+        assert_eq!(
+            store.relationships().unwrap(),
+            vec![(ids[0], "children".to_owned(), ids[1])]
+        );
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn save_resolves_links_between_new_objects_in_one_transaction() {
+        let path = std::env::temp_dir().join(format!(
+            "hyperhle-coredata-link-{}-{}.sqlite",
+            std::process::id(),
+            "a3d72f8e"
+        ));
+        let mut store = Store::open(Some(&path), "model-link").unwrap();
+        let parent = Record {
+            id: 0,
+            entity: "Parent".into(),
+            attributes: Dictionary::new(),
+        };
+        let child = Record {
+            id: 0,
+            entity: "Child".into(),
+            attributes: Dictionary::new(),
+        };
+        // Both objects are new, so the link can only be written after the
+        // inserts have assigned their row ids. A single call must do both.
+        let ids = store
+            .save(
+                &[parent, child],
+                &[],
+                &[-1, -2],
+                &[(-1, "children".to_owned(), -2)],
+            )
+            .unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(
+            store.relationships().unwrap(),
+            vec![(ids[0], "children".to_owned(), ids[1])]
+        );
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn relationships_roundtrip_and_are_removed_with_either_end() {
         let path = std::env::temp_dir().join(format!(
-            "vetus-coredata-rel-{}-{}.sqlite",
+            "hyperhle-coredata-rel-{}-{}.sqlite",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -257,11 +360,11 @@ mod tests {
             entity: "Child".into(),
             attributes: Dictionary::new(),
         };
-        let ids = store.save(&[parent.clone(), child.clone()], &[]).unwrap();
+        let ids = store.save(&[parent.clone(), child.clone()], &[], &[], &[]).unwrap();
         parent.id = ids[0];
         child.id = ids[1];
         store
-            .save_relationships(&[parent.id], &[(parent.id, "children".into(), child.id)])
+            .save(&[], &[], &[parent.id], &[(parent.id, "children".into(), child.id)])
             .unwrap();
         assert_eq!(
             store.relationships().unwrap(),
@@ -269,11 +372,11 @@ mod tests {
         );
         // Saving the same source again replaces its rows rather than appending.
         store
-            .save_relationships(&[parent.id], &[(parent.id, "children".into(), child.id)])
+            .save(&[], &[], &[parent.id], &[(parent.id, "children".into(), child.id)])
             .unwrap();
         assert_eq!(store.relationships().unwrap().len(), 1);
         // Deleting either end drops the row, so no dangling ids survive.
-        store.save(&[], &[child.id]).unwrap();
+        store.save(&[], &[child.id], &[], &[]).unwrap();
         assert!(store.relationships().unwrap().is_empty());
         drop(store);
         std::fs::remove_file(path).unwrap();
