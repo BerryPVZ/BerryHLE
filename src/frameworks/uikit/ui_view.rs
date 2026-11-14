@@ -108,7 +108,6 @@ pub(crate) struct UIViewHostObject {
     delegate: id,
     animation_interval: f64,
     is_animating: bool,
-    clips_to_bounds: bool,
     is_uncontrolled: bool,
     /// Strong refs to attached `UIGestureRecognizer*` instances. Used by
     /// `addGestureRecognizer:` / `removeGestureRecognizer:` /
@@ -163,7 +162,6 @@ impl Default for UIViewHostObject {
             delegate: nil,
             animation_interval: 1.0 / 60.0,
             is_animating: false,
-            clips_to_bounds: false,
             is_uncontrolled: false,
             gesture_recognizers: Vec::new(),
             is_accessibility_element: false,
@@ -1791,8 +1789,16 @@ completion:(MutPtr<()>)completion {
     msg![env; layer setHidden:hidden]
 }
 
-- (bool)clipsToBounds { env.objc.borrow::<UIViewHostObject>(this).clips_to_bounds }
-- (())setClipsToBounds:(bool)clips { env.objc.borrow_mut::<UIViewHostObject>(this).clips_to_bounds = clips; }
+    // UIView forwards this to the layer, which is what actually clips.
+    // <https://developer.apple.com/documentation/uikit/uiview/clipstobounds>
+    - (bool)clipsToBounds {
+        let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+        msg![env; layer masksToBounds]
+    }
+    - (())setClipsToBounds:(bool)clips {
+        let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+        let _: () = msg![env; layer setMasksToBounds:clips];
+    }
 
 - (())setStyle:(u32)_style { }
 - (id)context { nil }

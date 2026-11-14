@@ -98,6 +98,10 @@ pub(crate) struct CALayerHostObject {
     pub(super) anonymous_animations: HashSet<id>,
     pub(super) name: Option<String>,
     pub(super) mask: id,
+    /// `masksToBounds` — clip this layer and its subtree to `bounds`,
+    /// rounded by `cornerRadius`. Defaults to false.
+    /// <https://developer.apple.com/documentation/quartzcore/calayer/maskstobounds>
+    pub(super) masks_to_bounds: bool,
     /// `contentsGravity` — one of the `kCAGravity*` strings. Defaults to
     /// `"resize"` per Apple's CALayer documentation:
     /// <https://developer.apple.com/documentation/quartzcore/calayer/1410933-contentsgravity>
@@ -290,6 +294,33 @@ impl CALayerHostObject {
     pub(crate) fn set_frame_metal(&mut self, frame: CGRect) {
         self.bounds = frame;
     }
+    /// A synthetic layer that fills `bounds` (rounded by `radius`) with
+    /// opaque white, used as the mask for `masksToBounds`.
+    pub(super) fn bounds_mask(bounds: CGRect, radius: CGFloat) -> Self {
+        Self {
+            bounds,
+            position: CGPoint {
+                x: bounds.origin.x + bounds.size.width * 0.5,
+                y: bounds.origin.y + bounds.size.height * 0.5,
+            },
+            anchor_point: CGPoint { x: 0.5, y: 0.5 },
+            transform_3d: CATransform3DIdentity,
+            // CGAffineTransform derives Default as all-zeroes, which would
+            // collapse the clip to a point, so spell the identity out.
+            affine_transform: CGAffineTransformIdentity,
+            opacity: 1.0,
+            corner_radius: radius,
+            background_color: Some(CGColorHostObject {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 1.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
     pub(super) fn superlayer_to_layer_transform(&self) -> CGAffineTransform {
         CGAffineTransform::make_translation(-self.bounds.origin.x, -self.bounds.origin.y)
             .concat(CGAffineTransform::make_translation(
@@ -620,6 +651,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         anonymous_animations: HashSet::new(),
         name: None,
         mask: nil,
+        masks_to_bounds: false,
         contents_gravity: kCAGravityResize.to_owned(),
         contents_rect: CGRect {
             origin: CGPoint { x: 0.0, y: 0.0 },
@@ -1146,6 +1178,12 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<CALayerHostObject>(this).name = name_str;
 }
 
+    // <https://developer.apple.com/documentation/quartzcore/calayer/maskstobounds>
+    - (bool)masksToBounds { env.objc.borrow::<CALayerHostObject>(this).masks_to_bounds }
+    - (())setMasksToBounds:(bool)clip {
+        env.objc.borrow_mut::<CALayerHostObject>(this).masks_to_bounds = clip;
+    }
+
 - (id)mask { env.objc.borrow::<CALayerHostObject>(this).mask }
 
 - (())setMask:(id)mask {
@@ -1632,5 +1670,22 @@ mod tests {
         assert_eq!(fit, rect(50.0, 0.0, 60.0, 60.0));
         let fill = contents_rect_for_gravity(kCAGravityResizeAspectFill, bounds, square);
         assert_eq!(fill, rect(0.0, -50.0, 160.0, 160.0));
+    }
+
+    /// `composite_layer_contents` translates by `bounds.origin` when it draws
+    /// a quad, and `superlayer_to_layer_transform` translates back by the
+    /// same amount, so the two cancel. The synthetic clip mask has to land
+    /// on exactly the layer's rectangle for both corners (including a
+    /// scrolled, non-zero origin) and must not double that offset.
+    #[test]
+    fn bounds_mask_sits_on_the_layer_rectangle() {
+        let bounds = rect(12.0, 34.0, 100.0, 40.0);
+        let mask = CALayerHostObject::bounds_mask(bounds, 8.0);
+        assert_eq!(mask.bounds, bounds);
+        assert_eq!(mask.corner_radius, 8.0);
+        assert_eq!(mask.opacity, 1.0);
+        // A scrolled layer carries a non-zero bounds origin; the mask must
+        // still map to an identity offset so it covers exactly that rect.
+        assert!(mask.superlayer_to_layer_transform().is_identity());
     }
 }

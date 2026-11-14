@@ -37,6 +37,10 @@ pub(super) struct State {
     recomposite_next: Option<Instant>,
     fps_counter: Option<FpsCounter>,
     misc_gl_objects: Option<MiscGlObjects>,
+    /// Offscreen `(texture, framebuffer, width, height)` targets used to
+    /// composite masked layers. Pooled across frames and nested masks so a
+    /// mask does not allocate a full-screen target every time.
+    mask_targets: Vec<(GLuint, GLuint, u32, u32)>,
 }
 
 struct MiscGlObjects {
@@ -649,6 +653,9 @@ pub(super) fn display_layers(env: &mut Environment, root_layer: id) {
         for &layer in &host_obj.sublayers {
             traverse(objc, layer, layers_needing_display);
         }
+        if host_obj.mask != nil {
+            traverse(objc, host_obj.mask, layers_needing_display);
+        }
     }
 
     let mut layers_needing_display = Vec::new();
@@ -685,7 +692,27 @@ unsafe fn composite_layer_recursive(
         None => 1.0,
     };
     // Fade the whole subtree, not just this layer's own quad.
-    let opacity = opacity * fade_in;
+    composite_layer_transformed(
+        env,
+        animation_state,
+        layer,
+        cumulative_transform,
+        opacity * fade_in,
+        local_transform,
+    );
+}
+
+/// Draw one layer: build its presentation copy, skip it if hidden, and
+/// send it either straight to the framebuffer or through an offscreen
+/// target when it clips.
+unsafe fn composite_layer_transformed(
+    env: &mut Environment,
+    animation_state: &mut animation::State,
+    layer: id,
+    cumulative_transform: Matrix<4>,
+    opacity: CGFloat,
+    local_transform: Matrix<4>,
+) {
     // TODO: this can't handle zPosition among other things, but it is not
     //       supported yet :)
     // TODO: back-to-front drawing is not efficient, could we use front-to-back?
@@ -716,6 +743,46 @@ unsafe fn composite_layer_recursive(
         return;
     }
 
+    // `mask` and `masksToBounds` both clip the composited subtree, so they go
+    // through an offscreen target instead of being drawn straight into the
+    // framebuffer.
+    // <https://developer.apple.com/documentation/quartzcore/calayer/mask>
+    if host_obj.mask != nil || host_obj.masks_to_bounds {
+        composite_masked_layer(
+            env,
+            animation_state,
+            layer,
+            cumulative_transform,
+            opacity,
+            local_transform,
+            host_obj,
+        );
+    } else {
+        composite_layer_contents(
+            env,
+            animation_state,
+            layer,
+            cumulative_transform,
+            opacity,
+            local_transform,
+            host_obj,
+        );
+    }
+}
+
+/// Draw a layer and its subtree into the current framebuffer: background,
+/// contents texture, then children back-to-front. `host_obj` is the
+/// presentation copy, and it is the only thing read here, so callers may
+/// pass a synthetic layer (see `CALayerHostObject::bounds_mask`).
+unsafe fn composite_layer_contents(
+    env: &mut Environment,
+    animation_state: &mut animation::State,
+    layer: id,
+    cumulative_transform: Matrix<4>,
+    opacity: CGFloat,
+    local_transform: Matrix<4>,
+    host_obj: CALayerHostObject,
+) {
     let window = env.window.as_mut().unwrap();
     let mut gles = window.make_internal_gl_ctx_current();
 
@@ -1065,8 +1132,7 @@ unsafe fn composite_layer_recursive(
     // We clone the sublayer list, sort by zPosition (stable sort preserves
     // order of equal elements), then composite each child.
     let sorted_sublayers = {
-        let original_host_obj = env.objc.borrow::<CALayerHostObject>(layer);
-        let mut sublayers_copy = original_host_obj.sublayers.clone();
+    let mut sublayers_copy = host_obj.sublayers.clone();
         sublayers_copy.sort_by(|&a, &b| {
             let z_a = env.objc.borrow::<CALayerHostObject>(a).z_position;
             let z_b = env.objc.borrow::<CALayerHostObject>(b).z_position;
@@ -1092,6 +1158,218 @@ const SQUARE_INDICES: [u8; 6] = [0, 1, 2, 2, 1, 3];
 const FLIPPED_SQUARE_POINTS: [f32; 4 * FLOATS_PER_POINT] = [0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0];
 const FLOATS_PER_9PATCH: usize = BASIC_SQUARE_POINTS.len() * 3 * 3;
 const INDICES_PER_9PATCH: usize = SQUARE_INDICES.len() * 3 * 3;
+
+/// Full-screen offscreen targets are pooled across frames and nested masks.
+/// The viewport is left alone so the caller's transform, including any
+/// rotation, still maps onto the target
+unsafe fn mask_target(env: &mut Environment) -> Option<(GLuint, GLuint, u32, u32)> {
+    let (_, _, width, height) = env
+        .framework_state
+        .core_animation
+        .composition
+        .texture_framebuffer
+        .unwrap();
+    let cached = env
+        .framework_state
+        .core_animation
+        .composition
+        .mask_targets
+        .pop();
+    let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
+    let (texture, framebuffer) = if let Some((t, f, w, h)) = cached {
+        if (w, h) == (width, height) {
+            gl.BindFramebufferOES(gles11::FRAMEBUFFER_OES, f);
+            return Some((t, f, w, h));
+        }
+        gl.DeleteTextures(1, &t);
+        gl.DeleteFramebuffersOES(1, &f);
+        (0, 0)
+    } else {
+        (0, 0)
+    };
+    let (mut texture, mut framebuffer) = (texture, framebuffer);
+    gl.GenTextures(1, &mut texture);
+    gl.BindTexture(gles11::TEXTURE_2D, texture);
+    gl.TexImage2D(
+        gles11::TEXTURE_2D,
+        0,
+        gles11::RGBA as _,
+        width as _,
+        height as _,
+        0,
+        gles11::RGBA,
+        gles11::UNSIGNED_BYTE,
+        std::ptr::null(),
+    );
+    for (name, value) in [
+        (gles11::TEXTURE_MIN_FILTER, gles11::LINEAR),
+        (gles11::TEXTURE_MAG_FILTER, gles11::LINEAR),
+        (gles11::TEXTURE_WRAP_S, gles11::CLAMP_TO_EDGE),
+        (gles11::TEXTURE_WRAP_T, gles11::CLAMP_TO_EDGE),
+    ] {
+        gl.TexParameteri(gles11::TEXTURE_2D, name, value as _);
+    }
+    gl.GenFramebuffersOES(1, &mut framebuffer);
+    gl.BindFramebufferOES(gles11::FRAMEBUFFER_OES, framebuffer);
+    gl.FramebufferTexture2DOES(
+        gles11::FRAMEBUFFER_OES,
+        gles11::COLOR_ATTACHMENT0_OES,
+        gles11::TEXTURE_2D,
+        texture,
+        0,
+    );
+    if gl.CheckFramebufferStatusOES(gles11::FRAMEBUFFER_OES)
+        != gles11::FRAMEBUFFER_COMPLETE_OES
+    {
+        log_dbg!("Could not create an offscreen target for a masked layer");
+        gl.DeleteTextures(1, &texture);
+        gl.DeleteFramebuffersOES(1, &framebuffer);
+        return None;
+    }
+    Some((texture, framebuffer, width, height))
+}
+
+/// Bind an offscreen target and wipe it to fully transparent, so the layer
+/// drawn into it starts from nothing rather than the previous frame.
+unsafe fn clear_mask_target(env: &mut Environment, framebuffer: GLuint) {
+    let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
+    gl.BindFramebufferOES(gles11::FRAMEBUFFER_OES, framebuffer);
+    gl.ClearColor(0.0, 0.0, 0.0, 0.0);
+    gl.Clear(gles11::COLOR_BUFFER_BIT);
+}
+
+/// Draw a full-screen target. With `multiply_alpha` the destination is scaled
+/// by the source's alpha instead of being blended over, which is how a mask
+/// target is applied to a content target.
+unsafe fn draw_target(env: &mut Environment, texture: GLuint, opacity: f32, multiply_alpha: bool) {
+    let misc = env
+        .framework_state
+        .core_animation
+        .composition
+        .misc_gl_objects
+        .as_ref()
+        .unwrap();
+    let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
+    gl.MatrixMode(gles11::PROJECTION);
+    gl.PushMatrix();
+    gl.LoadIdentity();
+    gl.MatrixMode(gles11::MODELVIEW);
+    gl.PushMatrix();
+    load_matrix(
+        gl.as_mut(),
+        Matrix::<4>::from(&Matrix::scale_2d(2.0, 2.0))
+            .multiply(&Matrix::translate_3d(-1.0, -1.0, 0.0)),
+    );
+    gl.Color4f(opacity, opacity, opacity, opacity);
+    gl.Enable(gles11::BLEND);
+    if multiply_alpha {
+        gl.BlendFunc(gles11::ZERO, gles11::SRC_ALPHA);
+    } else {
+        gl.BlendFunc(gles11::ONE, gles11::ONE_MINUS_SRC_ALPHA);
+    }
+    gl.Enable(gles11::TEXTURE_2D);
+    gl.BindTexture(gles11::TEXTURE_2D, texture);
+    gl.EnableClientState(gles11::VERTEX_ARRAY);
+    gl.BindBuffer(gles11::ARRAY_BUFFER, misc.basic_square_buffer);
+    gl.VertexPointer(2, gles11::FLOAT, 0, std::ptr::null());
+    gl.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
+    gl.TexCoordPointer(2, gles11::FLOAT, 0, std::ptr::null());
+    gl.BindBuffer(gles11::ELEMENT_ARRAY_BUFFER, misc.index_buffer);
+    gl.DrawElements(
+        gles11::TRIANGLES,
+        6,
+        gles11::UNSIGNED_BYTE,
+        std::ptr::null(),
+    );
+    gl.PopMatrix();
+    gl.MatrixMode(gles11::PROJECTION);
+    gl.PopMatrix();
+    gl.MatrixMode(gles11::MODELVIEW);
+}
+
+/// Apply the mask's alpha to the complete subtree, not just its image.
+/// <https://developer.apple.com/documentation/quartzcore/calayer/mask>
+unsafe fn composite_masked_layer(
+    env: &mut Environment,
+    state: &mut animation::State,
+    layer: id,
+    parent: Matrix<4>,
+    opacity: f32,
+    local: Matrix<4>,
+    mut host: CALayerHostObject,
+) {
+    let transform = local
+        .multiply(&<Matrix<4> as From<_>>::from(host.superlayer_to_layer_transform()))
+        .multiply(&parent);
+    let mask = host.mask;
+    let clip = host.masks_to_bounds;
+    let bounds = host.bounds;
+    let radius = host.corner_radius;
+    let group_opacity = opacity * host.opacity;
+    // Offscreen targets are best-effort: if the driver refuses them, draw
+    // the layer unmasked rather than dropping it from the frame.
+    let (content, alpha) = match (mask_target(env), mask_target(env)) {
+        (Some(content), Some(alpha)) => (content, alpha),
+        (content, alpha) => {
+            let mut spare = Vec::new();
+            spare.extend(content);
+            spare.extend(alpha);
+            env.framework_state
+                .core_animation
+                .composition
+                .mask_targets
+                .extend(spare);
+            composite_layer_contents(env, state, layer, parent, opacity, local, host);
+            return;
+        }
+    };
+    host.opacity = 1.0;
+    let mut previous = 0;
+    {
+        let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
+        gl.GetIntegerv(gles11::FRAMEBUFFER_BINDING_OES, &mut previous);
+    }
+    clear_mask_target(env, content.1);
+    composite_layer_contents(env, state, layer, parent, 1.0, local, host);
+    if mask != nil {
+        clear_mask_target(env, alpha.1);
+        composite_layer_recursive(env, state, mask, transform, 1.0);
+        {
+            let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
+            gl.BindFramebufferOES(gles11::FRAMEBUFFER_OES, content.1);
+        }
+        draw_target(env, alpha.0, 1.0, true);
+    }
+    if clip {
+        clear_mask_target(env, alpha.1);
+        let clipping = CALayerHostObject::bounds_mask(bounds, radius);
+        composite_layer_contents(
+            env,
+            state,
+            nil,
+            transform,
+            1.0,
+            Matrix::identity(),
+            clipping,
+        );
+        {
+            let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
+            gl.BindFramebufferOES(gles11::FRAMEBUFFER_OES, content.1);
+        }
+        draw_target(env, alpha.0, 1.0, true);
+    }
+    {
+        let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
+        gl.BindFramebufferOES(gles11::FRAMEBUFFER_OES, previous as _);
+    }
+    draw_target(env, content.0, group_opacity, false);
+    env.framework_state
+        .core_animation
+        .composition
+        .mask_targets
+        .extend([content, alpha]);
+}
+
 
 fn make_9patch_coords(x_edges: [f32; 4], y_edges: [f32; 4]) -> [f32; FLOATS_PER_9PATCH] {
     let mut out_points = [0.0; FLOATS_PER_9PATCH];

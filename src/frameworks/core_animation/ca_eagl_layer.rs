@@ -341,6 +341,8 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
             anchor_point,
             hidden,
             opacity,
+            mask,
+            clipped,
         ) = {
             let host = env.objc.borrow::<CALayerHostObject>(layer);
             (
@@ -350,6 +352,8 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
                 host.anchor_point,
                 host.hidden,
                 host.opacity,
+                host.mask,
+                host.masks_to_bounds && host.corner_radius > 0.0,
             )
         };
         let transform_kind = classify_fullscreen_layer_transform(affine_transform, orientation);
@@ -383,10 +387,12 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
             || hidden
             || opacity != 1.0
             || !transform_is_usable
+            || mask != nil
+            || clipped
         {
             if crate::env_flag_cached!("TOUCHHLE_TRACE_PRESENT") {
                 log!(
-                    "FULLSCREEN-DIAG layer {:?} rejected: frame={:?} screen={:?} frame_match={} bounds={:?} bounds_origin={:?} anchor={:?} hidden={} opacity={} transform={:?} sl2l={:?} orientation={:?} transform_kind={:?} transform_usable={}",
+                    "FULLSCREEN-DIAG layer {:?} rejected: frame={:?} screen={:?} frame_match={} bounds={:?} bounds_origin={:?} anchor={:?} hidden={} opacity={} transform={:?} sl2l={:?} orientation={:?} transform_kind={:?} transform_usable={} mask={:?} clipped={}",
                     layer,
                     layer_frame,
                     screen_bounds,
@@ -400,7 +406,9 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
                     superlayer_to_layer_transform,
                     orientation,
                     transform_kind,
-                    transform_is_usable
+                    transform_is_usable,
+                    mask,
+                    clipped,
                 );
             }
             return nil;
