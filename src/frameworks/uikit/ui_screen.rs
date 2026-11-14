@@ -296,7 +296,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - Scale
 
 - (CGFloat)scale {
-    env.window().screen_scale() as CGFloat
+    env.window.as_ref().map_or(1.0, |window| window.screen_scale() as CGFloat)
 }
 
 - (CGFloat)nativeScale {
@@ -305,7 +305,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // size their framebuffers; reporting 1.0 while `scale` reports 2.0
     // made such games allocate a half-resolution framebuffer and draw
     // zoomed / cropped.
-    env.window().screen_scale() as CGFloat
+    env.window.as_ref().map_or(1.0, |window| window.screen_scale() as CGFloat)
 }
 
 // MARK: - Brightness
