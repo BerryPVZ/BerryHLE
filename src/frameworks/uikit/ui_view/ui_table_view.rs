@@ -16,6 +16,10 @@ use crate::objc::{
     retain, ClassExports, NSZonePtr,
 };
 
+/// How many cells `-reloadData` keeps for reuse. A table only ever shows a
+/// screenful at a time, so a small pool covers every visible row.
+const REUSE_POOL_LIMIT: usize = 32;
+
 #[derive(Default)]
 struct UITableViewControllerHostObject {
     superclass: UIViewControllerHostObject,
@@ -40,6 +44,23 @@ pub struct UITableViewCellHostObject {
     text_label: id,
     detail_text_label: id,
     image_view: id,
+/// Whether the row is selected. Kept separately from the highlight
+/// view because `UITableViewCellSelectionStyleNone` still reports a
+/// selection even though nothing is drawn.
+selected: bool,
+/// `UITableViewCellSelectionStyle` (0 = none, 1 = blue, 2 = gray).
+selection_style: i32,
+/// `UITableViewCellAccessoryType` (0 = none, 1 = disclosure indicator,
+/// 2 = disclosure button, 3 = checkmark).
+accessory_type: i32,
+/// Custom accessory view, retained. Takes precedence over
+/// `accessory_type`.
+accessory_view: id,
+/// Label drawing a system accessory glyph, retained. Created on
+/// demand by `layout_cell_contents`.
+accessory_label: id,
+/// Reuse identifier from `-initWithStyle:reuseIdentifier:`, retained.
+reuse_identifier: id,
 }
 impl_HostObject_with_superclass!(UITableViewCellHostObject);
 impl Default for UITableViewCellHostObject {
@@ -52,6 +73,12 @@ impl Default for UITableViewCellHostObject {
             text_label: nil,
             detail_text_label: nil,
             image_view: nil,
+selected: false,
+selection_style: 1,
+accessory_type: 0,
+accessory_view: nil,
+accessory_label: nil,
+reuse_identifier: nil,
         }
     }
 }
@@ -75,9 +102,15 @@ pub struct UITableViewHostObject {
     section_views: Vec<id>,
     /// Header title per section, as reported by the data source.
     section_titles: Vec<String>,
-    /// Index path of the selected row, retained. `nil` when nothing is
-    /// selected.
-    selected_path: id,
+    /// Index paths of the selected rows, each retained. Empty when
+    /// nothing is selected. More than one entry only when
+    /// `-setAllowsMultipleSelection:YES` was used.
+    selected_paths: Vec<id>,
+    /// Whether taps add to the selection instead of replacing it.
+    allows_multiple_selection: bool,
+    /// Cells handed back by `-reloadData`, keyed by reuse identifier and
+    /// retained. `-dequeueReusableCellWithIdentifier:` takes one out.
+    reuse_pool: Vec<(String, id)>,
     /// Whether taps select rows. `-setAllowsSelection:` writes this.
     allows_selection: bool,
     /// Touch that started on a row, with its start point, so a drag can be
@@ -117,7 +150,9 @@ impl Default for UITableViewHostObject {
             style: 0,
             section_views: Vec::new(),
             section_titles: Vec::new(),
-            selected_path: nil,
+            selected_paths: Vec::new(),
+            allows_multiple_selection: false,
+            reuse_pool: Vec::new(),
             allows_selection: true,
             selection_touch: None,
             layout_width: 0.0,
@@ -186,6 +221,22 @@ fn clear_cells(env: &mut crate::Environment, this: id, remove_subviews: bool) {
         if remove_subviews {
             let _: () = msg![env; cell removeFromSuperview];
         }
+        // A cell that carries a reuse identifier goes back to the pool
+        // so the next reload can hand it out again instead of making the
+        // data source allocate a new one.
+        let identifier: id = msg![env; cell reuseIdentifier];
+        if identifier != nil {
+            let key = crate::frameworks::foundation::ns_string::to_rust_string(env, identifier)
+                .into_owned();
+            let pooled = env.objc.borrow::<UITableViewHostObject>(this).reuse_pool.len();
+            if pooled < REUSE_POOL_LIMIT {
+                env.objc
+                    .borrow_mut::<UITableViewHostObject>(this)
+                    .reuse_pool
+                    .push((key, cell));
+                continue;
+            }
+        }
         release(env, cell);
     }
     for path in paths {
@@ -244,7 +295,39 @@ fn layout_cell_contents(env: &mut crate::Environment, this: id) {
         }
     }
 
-    let text_w = (w - text_x - 10.0).max(0.0);
+    // A custom accessory view takes the right edge; a system accessory
+    // (disclosure indicator or checkmark) is drawn as a glyph in a
+    // narrower slot. Either way the text has to stop before it.
+    let (accessory_view, accessory_type) = {
+        let host = env.objc.borrow::<UITableViewCellHostObject>(this);
+        (host.accessory_view, host.accessory_type)
+    };
+    let mut accessory_w = 0.0;
+    if accessory_view != nil {
+        accessory_w = 44.0f32.min(w * 0.5);
+        () = msg![env; accessory_view setFrame:(make_rect(w - accessory_w, 0.0, accessory_w, h))];
+        // A custom view replaces the built-in glyph rather than
+        // drawing on top of it.
+        let label = env.objc.borrow::<UITableViewCellHostObject>(this).accessory_label;
+        if label != nil {
+            () = msg![env; label setHidden:true];
+        }
+    } else if accessory_type != 0 {
+        accessory_w = 22.0;
+        let label = ensure_cell_accessory_label(env, this);
+        let glyph = if accessory_type == 3 { "\u{2713}" } else { "\u{203a}" };
+        let text = get_static_str(env, glyph);
+        () = msg![env; label setText:text];
+        () = msg![env; label setHidden:false];
+        () = msg![env; label setFrame:(make_rect(w - accessory_w, 0.0, accessory_w, h))];
+    } else {
+        let label = env.objc.borrow::<UITableViewCellHostObject>(this).accessory_label;
+        if label != nil {
+            () = msg![env; label setHidden:true];
+        }
+    }
+
+    let text_w = (w - text_x - 10.0 - accessory_w).max(0.0);
     let style = env.objc.borrow::<UITableViewCellHostObject>(this).style;
     if text_label != nil && detail_label != nil && (style == 1 || style == 2) {
         // Value cells put the title and the detail on one line, the detail
@@ -278,6 +361,22 @@ fn layout_cell_contents(env: &mut crate::Environment, this: id) {
     } else if text_label != nil {
         () = msg![env; text_label setFrame:(make_rect(text_x, 0.0, text_w, h))];
     }
+}
+
+/// Lazily create the label that draws a system accessory glyph.
+fn ensure_cell_accessory_label(env: &mut crate::Environment, this: id) -> id {
+    let existing = env.objc.borrow::<UITableViewCellHostObject>(this).accessory_label;
+    if existing != nil {
+        return existing;
+    }
+    let label = ensure_cell_subview(env, this, "UILabel");
+    let font: id = msg_class![env; UIFont boldSystemFontOfSize:(20.0f32)];
+    () = msg![env; label setFont:font];
+    () = msg![env; label setTextAlignment:(1i32)];
+    let gray: id = msg_class![env; UIColor grayColor];
+    () = msg![env; label setTextColor:gray];
+    env.objc.borrow_mut::<UITableViewCellHostObject>(this).accessory_label = label;
+    label
 }
 
 /// Lazily create one of the cell's default subviews (a `UILabel` or
@@ -344,19 +443,78 @@ fn select_tapped_row(env: &mut crate::Environment, table: id, start: CGPoint, en
     }
     release(env, last);
     if path != nil {
-        () = msg![env; table selectRowAtIndexPath:path animated:false scrollPosition:(0i32)];
-        let selector = env.objc.register_host_selector(
-            "tableView:didSelectRowAtIndexPath:".to_string(),
-            &mut env.mem,
-        );
+        // With multiple selection a tap toggles the row, which is how
+        // mail-style lists behave.
+        let multiple = env
+            .objc
+            .borrow::<UITableViewHostObject>(table)
+            .allows_multiple_selection;
+        let already = if multiple {
+            let selected = env
+                .objc
+                .borrow::<UITableViewHostObject>(table)
+                .selected_paths
+                .clone();
+            let mut found = false;
+            for other in selected {
+                let equal: bool = msg![env; other isEqual:path];
+                if equal {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        } else {
+            false
+        };
+        if already {
+            () = msg![env; table deselectRowAtIndexPath:path animated:false];
+        } else {
+            () = msg![env; table selectRowAtIndexPath:path animated:false scrollPosition:(0i32)];
+        }
+        // A toggle that turned the row off reports a deselection, so the
+        // delegate sees the same pair of calls UIKit would send.
+        let name = if already {
+            "tableView:didDeselectRowAtIndexPath:"
+        } else {
+            "tableView:didSelectRowAtIndexPath:"
+        };
+        let selector = env
+            .objc
+            .register_host_selector(name.to_string(), &mut env.mem);
         if delegate != nil && msg![env; delegate respondsToSelector:selector] {
-            () = msg![env; delegate tableView:table didSelectRowAtIndexPath:path];
+            if already {
+                () = msg![env; delegate tableView:table didDeselectRowAtIndexPath:path];
+            } else {
+                () = msg![env; delegate tableView:table didSelectRowAtIndexPath:path];
+            }
         }
         release(env, path);
     }
     if delegate != nil {
         release(env, delegate);
     }
+}
+
+/// Vertical content offset that brings a row into view for a given
+/// `UITableViewScrollPosition` (0 = none, 1 = top, 2 = middle, 3 = bottom),
+/// clamped to the scrollable range.
+fn scroll_offset_for(
+    position: i32,
+    row_top: f32,
+    row_height: f32,
+    view_height: f32,
+    content_height: f32,
+    current: f32,
+) -> f32 {
+    let target = match position {
+        1 => row_top,
+        2 => row_top - (view_height - row_height) * 0.5,
+        3 => row_top + row_height - view_height,
+        _ => current,
+    };
+    let max_y = (content_height - view_height).max(0.0);
+    target.clamp(0.0, max_y)
 }
 
 pub const CLASSES: ClassExports = objc_classes! {
@@ -398,11 +556,21 @@ pub const CLASSES: ClassExports = objc_classes! {
     this
 }
 
-- (id)initWithStyle:(i32)style reuseIdentifier:(id)_identifier {
-    env.objc.borrow_mut::<UITableViewCellHostObject>(this).style = style;
-    let frame = <CGRect as Default>::default();
-    msg![env; this initWithFrame:frame]
-}
+- (id)initWithStyle:(i32)style reuseIdentifier:(id)identifier {
+        env.objc.borrow_mut::<UITableViewCellHostObject>(this).style = style;
+        if identifier != nil {
+            retain(env, identifier);
+            let replaced = {
+                let host = env.objc.borrow_mut::<UITableViewCellHostObject>(this);
+                std::mem::replace(&mut host.reuse_identifier, identifier)
+            };
+            if replaced != nil {
+                release(env, replaced);
+            }
+        }
+        let frame = <CGRect as Default>::default();
+        msg![env; this initWithFrame:frame]
+    }
 
 // `-[UITableViewCell initWithFrame:reuseIdentifier:]` is the iOS 2.x
 // designated initializer, deprecated in iOS 3.0 in favour of
@@ -413,9 +581,20 @@ pub const CLASSES: ClassExports = objc_classes! {
 // records the reuse identifier — the reuse identifier itself is held by
 // the cell so that `+[UITableView dequeueReusableCellWithIdentifier:]`
 // can later match it. <https://developer.apple.com/documentation/uikit/uitableviewcell/1623200-initwithframe>
-- (id)initWithFrame:(CGRect)frame reuseIdentifier:(id)_identifier {
-    msg![env; this initWithFrame:frame]
-}
+- (id)initWithFrame:(CGRect)frame reuseIdentifier:(id)identifier {
+        let this: id = msg![env; this initWithFrame:frame];
+        if identifier != nil {
+            retain(env, identifier);
+            let replaced = {
+                let host = env.objc.borrow_mut::<UITableViewCellHostObject>(this);
+                std::mem::replace(&mut host.reuse_identifier, identifier)
+            };
+            if replaced != nil {
+                release(env, replaced);
+            }
+        }
+        this
+    }
 
 - (id)initWithCoder:(id)coder {
     let this: id = msg_super![env; this initWithCoder:coder];
@@ -435,26 +614,43 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())dealloc {
-    let (content_view, text_label, detail_label, image_view, selected_background_view) = {
-        let host = env.objc.borrow::<UITableViewCellHostObject>(this);
-        (
-            host.content_view,
-            host.text_label,
-            host.detail_text_label,
-            host.image_view,
-            host.selected_background_view,
-        )
-    };
+let (
+    content_view,
+    text_label,
+    detail_label,
+    image_view,
+    selected_background_view,
+    accessory_view,
+    accessory_label,
+    reuse_identifier,
+) = {
+    let host = env.objc.borrow::<UITableViewCellHostObject>(this);
+    (
+        host.content_view,
+        host.text_label,
+        host.detail_text_label,
+        host.image_view,
+        host.selected_background_view,
+        host.accessory_view,
+        host.accessory_label,
+        host.reuse_identifier,
+    )
+};
     release(env, content_view);
     if text_label != nil { release(env, text_label); }
     if detail_label != nil { release(env, detail_label); }
     if image_view != nil { release(env, image_view); }
     if selected_background_view != nil { release(env, selected_background_view); }
+if accessory_view != nil { release(env, accessory_view); }
+if accessory_label != nil { release(env, accessory_label); }
+if reuse_identifier != nil { release(env, reuse_identifier); }
     
     msg_super![env; this dealloc]
 }
 
-- (id)reuseIdentifier { nil }
+- (id)reuseIdentifier {
+    env.objc.borrow::<UITableViewCellHostObject>(this).reuse_identifier
+}
 
 - (id)textLabel {
     let existing = env.objc.borrow::<UITableViewCellHostObject>(this).text_label;
@@ -625,24 +821,61 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow::<UITableViewCellHostObject>(this).content_view
 }
 
-- (id)accessoryView { nil }
-- (())setAccessoryView:(id)_view {}
-- (i32)accessoryType { 0 }
-- (())setAccessoryType:(i32)_type {}
-- (i32)selectionStyle { 0 }
-- (())setSelectionStyle:(i32)_style {}
-- (bool)isSelected {
-    let view = env.objc.borrow::<UITableViewCellHostObject>(this).selected_background_view;
-    if view == nil {
-        return false;
+- (id)accessoryView {
+    env.objc.borrow::<UITableViewCellHostObject>(this).accessory_view
+}
+- (())setAccessoryView:(id)view {
+        if view != nil {
+            retain(env, view);
+        }
+        let old = {
+            let host = env.objc.borrow_mut::<UITableViewCellHostObject>(this);
+            std::mem::replace(&mut host.accessory_view, view)
+        };
+        if old != nil {
+            () = msg![env; old removeFromSuperview];
+            release(env, old);
+        }
+        if view != nil {
+            () = msg![env; this addSubview:view];
+        }
+        layout_cell_contents(env, this);
     }
-    let hidden: bool = msg![env; view isHidden];
-    !hidden
+- (i32)accessoryType {
+    env.objc.borrow::<UITableViewCellHostObject>(this).accessory_type
+}
+- (())setAccessoryType:(i32)accessory_type {
+    env.objc.borrow_mut::<UITableViewCellHostObject>(this).accessory_type = accessory_type;
+    layout_cell_contents(env, this);
+}
+- (i32)selectionStyle {
+    env.objc.borrow::<UITableViewCellHostObject>(this).selection_style
+}
+- (())setSelectionStyle:(i32)style {
+    env.objc.borrow_mut::<UITableViewCellHostObject>(this).selection_style = style;
+    // Turning the highlight off while the row is selected has to remove
+    // the highlight that is already showing.
+    if style == 0 {
+        let view = env.objc.borrow::<UITableViewCellHostObject>(this).selected_background_view;
+        if view != nil {
+            () = msg![env; view setHidden:true];
+        }
+    }
+}
+- (bool)isSelected {
+    env.objc.borrow::<UITableViewCellHostObject>(this).selected
 }
 - (())setSelected:(bool)selected {
     () = msg![env; this setSelected:selected animated:false];
 }
 - (())setSelected:(bool)selected animated:(bool)_animated {
+    env.objc.borrow_mut::<UITableViewCellHostObject>(this).selected = selected;
+    // `UITableViewCellSelectionStyleNone` keeps the state but draws no
+    // highlight, which is how a cell with a custom background opts out.
+    let style = env.objc.borrow::<UITableViewCellHostObject>(this).selection_style;
+    if style == 0 {
+        return;
+    }
     let view: id = msg![env; this selectedBackgroundView];
     let hidden = !selected;
     () = msg![env; view setHidden:hidden];
@@ -650,7 +883,18 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (bool)isHighlighted { false }
 - (())setHighlighted:(bool)_highlighted {}
 - (())setHighlighted:(bool)_highlighted animated:(bool)_animated {}
-- (())prepareForReuse {}
+- (())prepareForReuse {
+    // UIKit resets the per-row state here, because the cell is about to be
+    // handed to a different row. Without this a recycled cell keeps the
+    let view = {
+        let host = env.objc.borrow_mut::<UITableViewCellHostObject>(this);
+        host.selected = false;
+        host.selected_background_view
+    };
+    if view != nil {
+        () = msg![env; view setHidden:true];
+    }
+}
 - (id)backgroundView { nil }
 - (())setBackgroundView:(id)_view {}
 - (id)selectedBackgroundView {
@@ -778,6 +1022,18 @@ pub const CLASSES: ClassExports = objc_classes! {
     if header != nil { release(env, header); }
     if footer != nil { release(env, footer); }
     if separator_color != nil { release(env, separator_color); }
+        let selected = std::mem::take(
+            &mut env.objc.borrow_mut::<UITableViewHostObject>(this).selected_paths,
+        );
+        for path in selected {
+            release(env, path);
+        }
+        let pooled = std::mem::take(
+            &mut env.objc.borrow_mut::<UITableViewHostObject>(this).reuse_pool,
+        );
+        for (_, cell) in pooled {
+            release(env, cell);
+        }
     msg_super![env; this dealloc]
 }
 
@@ -967,10 +1223,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     // A reload throws the cell views away, so put the highlight back on
-    // whichever row is still selected.
-    let selected = env.objc.borrow::<UITableViewHostObject>(this).selected_path;
-    if selected != nil {
-        () = msg![env; this selectRowAtIndexPath:selected animated:false scrollPosition:(0i32)];
+    // every row that is still selected.
+    let selected = env.objc.borrow::<UITableViewHostObject>(this).selected_paths.clone();
+    for path in selected {
+        let cell: id = msg![env; this cellForRowAtIndexPath:path];
+        if cell != nil {
+            () = msg![env; cell setSelected:true animated:false];
+        }
     }
 
     let content_size = CGSize { width, height: y };
@@ -1010,11 +1269,32 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     nil
 }
-- (id)dequeueReusableCellWithIdentifier:(id)_identifier {
-    // We don't keep a reuse pool; returning nil forces the data source to
-    // create a fresh cell, which is always valid per Apple's API.
-    nil
-}
+- (id)dequeueReusableCellWithIdentifier:(id)identifier {
+        if identifier == nil {
+            return nil;
+        }
+        let key = crate::frameworks::foundation::ns_string::to_rust_string(env, identifier)
+            .into_owned();
+        let found = {
+            let host = env.objc.borrow::<UITableViewHostObject>(this);
+            host.reuse_pool.iter().position(|(k, _)| *k == key)
+        };
+        let Some(index) = found else {
+            return nil;
+        };
+        let cell = env
+            .objc
+            .borrow_mut::<UITableViewHostObject>(this)
+            .reuse_pool
+            .remove(index)
+            .1;
+        () = msg![env; cell prepareForReuse];
+        // The pool's reference is handed to the caller, which returns the
+        // cell from `tableView:cellForRowAtIndexPath:`; `-reloadData`
+        // retains it there. Autoreleasing keeps it alive until then.
+        () = msg![env; cell autorelease];
+        cell
+    }
 - (id)indexPathForCell:(id)cell {
     if cell == nil { return nil; }
     let host = env.objc.borrow::<UITableViewHostObject>(this);
@@ -1026,42 +1306,108 @@ pub const CLASSES: ClassExports = objc_classes! {
     nil
 }
 - (id)indexPathForSelectedRow {
-    env.objc.borrow::<UITableViewHostObject>(this).selected_path
-}
-- (id)indexPathsForSelectedRows {
-    let path = env.objc.borrow::<UITableViewHostObject>(this).selected_path;
-    if path == nil {
-        nil
-    } else {
-        msg_class![env; NSArray arrayWithObject:path]
+        let host = env.objc.borrow::<UITableViewHostObject>(this);
+        host.selected_paths.first().copied().unwrap_or(nil)
     }
-}
-- (())selectRowAtIndexPath:(id)path animated:(bool)_animated scrollPosition:(i32)_pos {
-    retain(env, path);
-    let old = std::mem::replace(
-        &mut env.objc.borrow_mut::<UITableViewHostObject>(this).selected_path,
-        path,
-    );
-    if old != nil {
-        let cell: id = msg![env; this cellForRowAtIndexPath:old];
-        if cell != nil {
-            () = msg![env; cell setSelected:false animated:false];
+    - (id)indexPathsForSelectedRows {
+        let selected = env.objc.borrow::<UITableViewHostObject>(this).selected_paths.clone();
+        if selected.is_empty() {
+            return nil;
         }
+        let array: id = msg_class![env; NSMutableArray array];
+        for path in selected {
+            () = msg![env; array addObject:path];
+        }
+        array
     }
-    release(env, old);
-    if path != nil {
+- (())selectRowAtIndexPath:(id)path animated:(bool)_animated scrollPosition:(i32)scroll_position {
+        let multiple = env.objc.borrow::<UITableViewHostObject>(this).allows_multiple_selection;
+        if path == nil {
+            let old = std::mem::take(
+                &mut env.objc.borrow_mut::<UITableViewHostObject>(this).selected_paths,
+            );
+            for other in old {
+                let cell: id = msg![env; this cellForRowAtIndexPath:other];
+                if cell != nil {
+                    () = msg![env; cell setSelected:false animated:false];
+                }
+                release(env, other);
+            }
+            return;
+        }
+        let already = {
+            let selected = env.objc.borrow::<UITableViewHostObject>(this).selected_paths.clone();
+            let mut found = false;
+            for other in selected {
+                let equal: bool = msg![env; other isEqual:path];
+                if equal {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if already {
+            // Already selected: nothing to add, but the caller may still
+            // have asked for the row to be scrolled into view.
+            if scroll_position != 0 {
+                () = msg![env; this scrollToRowAtIndexPath:path atScrollPosition:scroll_position animated:false];
+            }
+            return;
+        }
+        retain(env, path);
+        if !multiple {
+            let old = std::mem::take(
+                &mut env.objc.borrow_mut::<UITableViewHostObject>(this).selected_paths,
+            );
+            for other in old {
+                let cell: id = msg![env; this cellForRowAtIndexPath:other];
+                if cell != nil {
+                    () = msg![env; cell setSelected:false animated:false];
+                }
+                release(env, other);
+            }
+        }
+        env.objc
+            .borrow_mut::<UITableViewHostObject>(this)
+            .selected_paths
+            .push(path);
         let cell: id = msg![env; this cellForRowAtIndexPath:path];
         if cell != nil {
             () = msg![env; cell setSelected:true animated:false];
         }
+        if scroll_position != 0 {
+            () = msg![env; this scrollToRowAtIndexPath:path atScrollPosition:scroll_position animated:false];
+        }
     }
-}
-- (())deselectRowAtIndexPath:(id)path animated:(bool)animated {
-    let selected = env.objc.borrow::<UITableViewHostObject>(this).selected_path;
-    if selected != nil && msg![env; selected isEqual:path] {
-        () = msg![env; this selectRowAtIndexPath:nil animated:animated scrollPosition:(0i32)];
+- (())deselectRowAtIndexPath:(id)path animated:(bool)_animated {
+        if path == nil {
+            return;
+        }
+        let selected = env.objc.borrow::<UITableViewHostObject>(this).selected_paths.clone();
+        let mut index = None;
+        for (i, other) in selected.iter().enumerate() {
+            let other_path: id = *other;
+            let equal: bool = msg![env; other_path isEqual:path];
+            if equal {
+                index = Some(i);
+                break;
+            }
+        }
+        let Some(index) = index else {
+            return;
+        };
+        let old = env
+            .objc
+            .borrow_mut::<UITableViewHostObject>(this)
+            .selected_paths
+            .remove(index);
+        let cell: id = msg![env; this cellForRowAtIndexPath:old];
+        if cell != nil {
+            () = msg![env; cell setSelected:false animated:false];
+        }
+        release(env, old);
     }
-}
 - (id)indexPathForRowAtPoint:(CGPoint)point {
     let (cells, paths) = {
         let host = env.objc.borrow::<UITableViewHostObject>(this);
@@ -1079,7 +1425,32 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     nil
 }
-- (())scrollToRowAtIndexPath:(id)_path atScrollPosition:(i32)_pos animated:(bool)_animated {}
+- (())scrollToRowAtIndexPath:(id)path atScrollPosition:(i32)position animated:(bool)_animated {
+        let cell: id = msg![env; this cellForRowAtIndexPath:path];
+        if cell == nil {
+            return;
+        }
+        let frame: CGRect = msg![env; cell frame];
+        let bounds: CGRect = msg![env; this bounds];
+        let content: CGSize = msg![env; this contentSize];
+        let view_h = bounds.size.height;
+        let current = bounds.origin.y;
+        // UITableViewScrollPosition: 0 = none, 1 = top, 2 = middle,
+        // 3 = bottom.
+        let y = scroll_offset_for(
+            position,
+            frame.origin.y,
+            frame.size.height,
+            view_h,
+            content.height,
+            current,
+        );
+        let offset = CGPoint {
+            x: bounds.origin.x,
+            y,
+        };
+        () = msg![env; this setContentOffset:offset];
+    }
 - (())setEditing:(bool)_editing animated:(bool)_animated {}
 - (bool)isEditing { false }
 - (())setAllowsSelection:(bool)allows {
@@ -1088,7 +1459,34 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (bool)allowsSelection {
     env.objc.borrow::<UITableViewHostObject>(this).allows_selection
 }
-- (())setAllowsMultipleSelection:(bool)_allows {}
+- (())setAllowsMultipleSelection:(bool)allows {
+        env.objc
+            .borrow_mut::<UITableViewHostObject>(this)
+            .allows_multiple_selection = allows;
+        if !allows {
+            // Dropping back to single selection keeps the first row.
+            let extra = {
+                let host = env.objc.borrow_mut::<UITableViewHostObject>(this);
+                if host.selected_paths.len() > 1 {
+                    host.selected_paths.split_off(1)
+                } else {
+                    Vec::new()
+                }
+            };
+            for path in extra {
+                let cell: id = msg![env; this cellForRowAtIndexPath:path];
+                if cell != nil {
+                    () = msg![env; cell setSelected:false animated:false];
+                }
+                release(env, path);
+            }
+        }
+    }
+    - (bool)allowsMultipleSelection {
+        env.objc
+            .borrow::<UITableViewHostObject>(this)
+            .allows_multiple_selection
+    }
 - (())touchesBegan:(id)touches withEvent:(id)event {
     let touch: id = msg![env; touches anyObject];
     let point: CGPoint = msg![env; touch locationInView:this];
@@ -1231,7 +1629,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 #[cfg(test)]
 mod tests {
-    use super::is_tap;
+    use super::{is_tap, scroll_offset_for};
     use crate::frameworks::core_graphics::CGPoint;
 
     fn point(x: f32, y: f32) -> CGPoint {
@@ -1248,5 +1646,36 @@ mod tests {
     fn a_touch_that_moves_ten_points_is_a_drag() {
         assert!(!is_tap(point(10.0, 10.0), point(10.0, 20.0)));
         assert!(!is_tap(point(10.0, 10.0), point(16.0, 18.0)));
+    }
+
+    #[test]
+    fn scroll_position_top_puts_the_row_at_the_top() {
+        assert_eq!(scroll_offset_for(1, 300.0, 44.0, 480.0, 2000.0, 0.0), 300.0);
+    }
+
+    #[test]
+    fn scroll_position_middle_centres_the_row() {
+        // 480pt view, 44pt row: the row's centre lands on the view's centre.
+        assert_eq!(scroll_offset_for(2, 300.0, 44.0, 480.0, 2000.0, 0.0), 82.0);
+    }
+
+    #[test]
+    fn scroll_position_bottom_puts_the_row_at_the_bottom() {
+        assert_eq!(scroll_offset_for(3, 1000.0, 44.0, 480.0, 2000.0, 0.0), 564.0);
+    }
+
+    #[test]
+    fn scroll_position_none_keeps_the_current_offset() {
+        assert_eq!(scroll_offset_for(0, 300.0, 44.0, 480.0, 2000.0, 120.0), 120.0);
+    }
+
+    #[test]
+    fn scroll_offsets_are_clamped_to_the_scrollable_range() {
+        // A row near the top cannot scroll above the content start.
+        assert_eq!(scroll_offset_for(1, -50.0, 44.0, 480.0, 2000.0, 0.0), 0.0);
+        // A row near the bottom cannot scroll past the last screenful.
+        assert_eq!(scroll_offset_for(1, 1900.0, 44.0, 480.0, 2000.0, 0.0), 1520.0);
+        // Content shorter than the view has no scrollable range at all.
+        assert_eq!(scroll_offset_for(1, 100.0, 44.0, 480.0, 200.0, 0.0), 0.0);
     }
 }
