@@ -660,7 +660,7 @@ crate::frameworks::core_animation::view_transition::expire(env);
 }
 
 // `setAnimationCurve:` and `setAnimationTransition:forView:cache:` drive the
-// legacy flip transition. The remaining visual properties of animation blocks
+// legacy flip and curl transitions. The remaining visual properties of blocks
 // are not animated; they stay as no-ops so the calls do not fall through to
 // the dispatcher's "unimplemented selector" path.
 + (())setAnimationCurve:(NSInteger)curve {
@@ -800,12 +800,13 @@ crate::frameworks::core_animation::view_transition::expire(env);
 // `+transitionWithView:duration:options:animations:completion:` and
 // `+transitionFromView:toView:duration:options:completion:` ship in
 // iOS 4 too. `transitionWithView:` honours the transition bits of
-// `options`: a cross-dissolve or a horizontal flip is rendered through
-// the same machinery as `setAnimationTransition:forView:cache:`. Curl
-// and the vertical flips are not rendered yet and fall back to an
-// instant swap. `transitionFromView:toView:` still swaps the hierarchy
-// instantly, since the container it would have to animate is the views'
-// shared superview rather than either argument.
+// `options`: a cross-dissolve, a horizontal flip or a page curl is
+// rendered through the same machinery as
+// `setAnimationTransition:forView:cache:`. The vertical flips are
+// not rendered yet and fall back to an instant swap.
+// `transitionFromView:toView:` still swaps the hierarchy instantly,
+// since the container it would have to animate is the views' shared
+// superview rather than either argument.
 // Either way the completion block still fires, which keeps games whose
 // state machine waits on it (e.g. Bubble Witch's level transition) from
 // deadlocking.
@@ -820,11 +821,11 @@ completion:(MutPtr<()>)completion {
     // https://developer.apple.com/documentation/uikit/uiview/animationoptions
     const TRANSITION_MASK: u32 = 0xF << 20;
     let transition = ((options & TRANSITION_MASK) >> 20) as NSInteger;
-    // 1 and 2 are the horizontal flips, 5 is the cross-dissolve. The
-    // curl kinds (3, 4) and the vertical flips (6, 7) are not rendered
-    // yet, so they fall back to the instant swap below.
+    // 1 and 2 are the horizontal flips, 3 and 4 the page curls,
+    // 5 is the cross-dissolve. The vertical flips (6, 7) are not
+    // rendered yet, so they fall back to the instant swap below.
     let kind: NSInteger = match transition {
-        1 | 2 => transition,
+        1 | 2 | 3 | 4 => transition,
         5 => -1,
         _ => 0,
     };

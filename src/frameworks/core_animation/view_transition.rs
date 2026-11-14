@@ -3,7 +3,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-//! Core Animation transitions: legacy UIView flips and CATransition. The
+//! Core Animation transitions: legacy UIView flips, curls and CATransition. The
 //! outgoing hierarchy must survive removal from the container until the
 //! animation finishes.
 //! https://developer.apple.com/documentation/uikit/uiview/setanimationtransition(_:for:cache:)
@@ -45,7 +45,7 @@ struct Active {
 /// the caller replaces or removes its contents. `kind` is a
 /// `UIViewAnimationTransition`, or a negative `CATransition` style code.
 pub(crate) fn prepare(env: &mut Environment, layer: id, kind: i32, cache: bool) -> Option<Pending> {
-    if layer.is_null() || (kind > 0 && !matches!(kind, 1 | 2)) {
+        if layer.is_null() || (kind > 0 && !matches!(kind, 1..=4)) {
         return None;
     }
     composition::display_layers(env, layer);
@@ -195,7 +195,7 @@ pub(super) fn fade(env: &mut Environment, layer: id) -> Option<(id, f32, f32)> {
 }
 
 /// The layer that should actually be drawn in `layer`'s place this frame,
-/// and the extra model-view transform needed for a flip.
+/// and the extra model-view transform needed for a flip or a curl.
 pub(super) fn presentation(env: &mut Environment, layer: id) -> Option<(id, Matrix<4>)> {
     let (kind, start, duration, curve, outgoing, incoming) = {
         let a = env
@@ -227,7 +227,14 @@ pub(super) fn presentation(env: &mut Environment, layer: id) -> Option<(id, Matr
         incoming.unwrap_or(layer)
     };
     let bounds = env.objc.borrow::<CALayerHostObject>(source).bounds;
-    Some((source, flip_transform(bounds, kind, progress)))
+    Some((
+        source,
+        if matches!(kind, 3 | 4) {
+            curl_transform(bounds, kind, progress)
+        } else {
+            flip_transform(bounds, kind, progress)
+        },
+    ))
 }
 
 fn flip_transform(bounds: CGRect, kind: i32, progress: f32) -> Matrix<4> {
@@ -261,6 +268,53 @@ fn flip_transform(bounds: CGRect, kind: i32, progress: f32) -> Matrix<4> {
             [0.0, 0.0, 0.0, 1.0],
         ]))
         .multiply(&Matrix::translate_3d(cx, cy, 0.0))
+}
+
+/// Page-curl approximation for `UIViewAnimationTransitionCurl{Up,Down}`.
+///
+/// A real curl peels one half of the page and masks the half that has
+/// already turned away. The software compositor draws unclipped quads,
+/// so this rotates the whole page about the edge it would peel from and
+/// leaves the masking out. The result is a page turn hinged on that
+/// edge, not a true curl, but it is far closer than the hard cut the
+/// old code produced.
+///
+/// The hinge is the top edge for a curl up and the bottom edge for a
+/// curl down, which is the edge a page turn in a book pivots on.
+fn curl_transform(bounds: CGRect, kind: i32, progress: f32) -> Matrix<4> {
+    if progress <= 0.0 || progress >= 1.0 {
+        return Matrix::identity();
+    }
+    let angle = if progress < 0.5 {
+        progress
+    } else {
+        progress - 1.0
+    } * std::f32::consts::PI
+        * if kind == 3 { 1.0 } else { -1.0 };
+    let cx = bounds.origin.x + bounds.size.width * 0.5;
+    let hinge_y = if kind == 3 {
+        bounds.origin.y
+    } else {
+        bounds.origin.y + bounds.size.height
+    };
+    let distance = bounds.size.width.max(bounds.size.height).max(1.0) * 2.0;
+    let perspective = Matrix::from_columns([
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, -1.0 / distance],
+        [0.0, 0.0, 0.0, 1.0],
+    ]);
+    Matrix::translate_3d(-cx, -hinge_y, 0.0)
+        .multiply(&Matrix::<4>::from(&Matrix::<3>::x_rotation(angle)))
+        .multiply(&perspective)
+        // Same orthographic depth clip volume as the flip.
+        .multiply(&Matrix::from_columns([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0 / distance, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]))
+        .multiply(&Matrix::translate_3d(cx, hinge_y, 0.0))
 }
 
 /// Start a `CATransition` added to `layer`. The caller has already
@@ -367,6 +421,46 @@ mod tests {
     }
 
     #[test]
+#[test]
+fn curl_keeps_its_hinge_edge_fixed() {
+    let bounds = CGRect {
+        origin: CGPoint { x: 10.0, y: 20.0 },
+        size: CGSize {
+            width: 320.0,
+            height: 480.0,
+        },
+    };
+    for kind in [3, 4] {
+        for progress in [0.0, 1.0] {
+            assert_eq!(curl_transform(bounds, kind, progress), Matrix::identity());
+        }
+        // The edge the page turns about must not move at all.
+        let hinge_y = if kind == 3 { 20.0 } else { 500.0 };
+        let m = curl_transform(bounds, kind, 0.25);
+        for x in [10.0, 170.0, 330.0] {
+            let v = m.transform([x, hinge_y, 0.0, 1.0]);
+            assert!((v[0] / v[3] - x).abs() < 0.001);
+            assert!((v[1] / v[3] - hinge_y).abs() < 0.001);
+        }
+    }
+}
+
+#[test]
+fn curl_lifts_the_free_edge_toward_the_viewer() {
+    let bounds = CGRect {
+        origin: CGPoint::default(),
+        size: CGSize {
+            width: 320.0,
+            height: 480.0,
+        },
+    };
+    // A curl up peels from the bottom, a curl down from the top.
+    let up = curl_transform(bounds, 3, 0.25).transform([160.0, 480.0, 0.0, 1.0]);
+    let down = curl_transform(bounds, 4, 0.25).transform([160.0, 0.0, 0.0, 1.0]);
+    assert!(up[2] / up[3] > 0.0);
+    assert!(down[2] / down[3] > 0.0);
+}
+
     fn cross_dissolve_sums_to_one_and_never_shows_background() {
         for progress in [0.0, 0.25, 0.5, 0.75, 1.0] {
             let (outgoing, incoming) = cross_dissolve(progress);
