@@ -896,6 +896,10 @@ pub(super) fn UIApplicationMain(
     principal_class_name: id, // NSString*
     delegate_class_name: id,  // NSString*
 ) {
+    // UIKit applies the initial interface rotation after the launch
+    // delegate returns, not while the delegate is still building and
+    // sizing its views.
+    env.framework_state.uikit.ui_view.ui_window.defer_autorotation = true;
     let ui_application = {
         let pool: id = msg_class![env; NSAutoreleasePool new];
 
@@ -1067,6 +1071,9 @@ pub(super) fn UIApplicationMain(
         let _: () = msg![env; pool drain];
     }
 
+    // The delegate has returned, so the root views exist at their final
+    // sizes: apply the launch rotation now and lay out afterwards.
+    super::ui_view::ui_window::finish_launch_autorotation(env);
     let views = env.framework_state.uikit.ui_view.views.clone();
     for view in views {
         () = msg![env; view layoutSubviews];

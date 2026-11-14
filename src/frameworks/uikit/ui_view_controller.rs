@@ -86,6 +86,13 @@ pub(crate) struct UIViewControllerHostObject {
     editing: bool,
     is_being_presented: bool,
     is_being_dismissed: bool,
+    /// Interface orientation the controller last rotated to, kept so
+    /// `-willRotateToInterfaceOrientation:duration:` can be told the
+    /// orientation being left. `None` until the first rotation.
+    pub(crate) interface_orientation: Option<UIInterfaceOrientation>,
+    /// Guards against a rotation re-entering itself: the rotation callbacks
+    /// can mount (and thus try to rotate) the controller's view again.
+    pub(crate) autorotation_in_progress: bool,
     /// When non-empty, the path (relative to the bundle resource path)
     /// at which the storyboardc directory lives. Storyboard-instantiated
     /// view controllers store the path so `-loadView` knows to load the
@@ -404,6 +411,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     if new_view != nil {
         retain(env, new_view);
+    }
+    // The window owns and sizes the controller's current view, so replacing
+    // the view (including replacing the placeholder after launch) has to swap
+    // it in the window's subviews and carry the rotation transform over.
+    // https://developer.apple.com/documentation/uikit/uiwindow/rootviewcontroller
+    if old_view != new_view {
+        super::ui_view::ui_window::replace_controller_root_view(env, this, old_view, new_view);
     }
     if old_view != nil {
         release(env, old_view);
@@ -1032,6 +1046,9 @@ pub const CLASSES: ClassExports = objc_classes! {
                               duration:(f64)_duration {
 }
 
+- (())willAnimateRotationToInterfaceOrientation:(UIInterfaceOrientation)_orientation
+                                       duration:(f64)_duration {
+}
 - (())didRotateFromInterfaceOrientation:(UIInterfaceOrientation)_orientation {
 }
 

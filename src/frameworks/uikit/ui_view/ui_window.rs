@@ -17,13 +17,10 @@ use crate::frameworks::core_graphics::cg_affine_transform::{
 use crate::frameworks::core_graphics::{CGPoint, CGRect};
 use crate::frameworks::foundation::ns_string;
 use crate::frameworks::uikit::ui_application::{
-    UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight,
-    UIInterfaceOrientationPortraitUpsideDown,
+    UIInterfaceOrientation, UIInterfaceOrientationLandscapeLeft,
+    UIInterfaceOrientationLandscapeRight, UIInterfaceOrientationPortraitUpsideDown,
 };
-use crate::frameworks::uikit::ui_device::{
-    UIDeviceOrientationLandscapeLeft, UIDeviceOrientationLandscapeRight,
-    UIDeviceOrientationPortraitUpsideDown,
-};
+use crate::frameworks::uikit::ui_view_controller::UIViewControllerHostObject;
 use crate::objc::{
     id, msg, msg_class, msg_super, nil, objc_classes, release, retain, ClassExports,
 };
@@ -46,6 +43,14 @@ pub struct State {
     /// is retained while the window holds it, mirroring Apple's documented
     /// strong-property semantics.
     pub root_view_controllers: HashMap<id, id>,
+    /// While true, mounting a controller view records the rotation it
+    /// needs instead of applying it. UIKit rotates the initial interface
+    /// after the launch delegate returns, not while the delegate is still
+    /// building and sizing its views.
+    pub defer_autorotation: bool,
+    /// `(window, view)` pairs mounted while `defer_autorotation` was set.
+    /// Both are retained until `finish_launch_autorotation` drains the list.
+    pending_autorotation: Vec<(id, id)>,
 }
 
 pub const CLASSES: ClassExports = objc_classes! {
@@ -403,114 +408,26 @@ pub const CLASSES: ClassExports = objc_classes! {
         () = msg![env; vc viewDidAppear:false];
     }
 
-    // Support auto-rotation. This is currently only for apps that request a
-    // non-portrait interface orientation via Info.plist, as we do not yet
-    // support changes of orientation caused by device rotation (TODO).
-    // FIXME: It's unclear when and where this auto-rotation is supposed to
-    //        happen. It must have something to do with mounting the view
-    //        controller to a window, so we do it here. QA1688 (see top of file)
-    //        mentions a breaking behaviour change in iOS 6 that makes
-    //        auto-rotation rely on rootViewController (a property only found in
-    //        iOS 6), so the current implementation is specific to iOS <= 5.
-    // FIXME: Are we supposed to notify the view somehow of the rotation?
-    // FIXME: What do we do if shouldAutorotateToInterfaceOrientation:
-    //        returns false? The status bar has already been rotated…
-    // FIXME: The device orientation stored on env.window can come from one of
-    //        three places (user/default options, setStatusBarOrientation: etc,
-    //        Info.plist UIInterfaceOrientation etc). It's not clear if these
-    //        are really equivalent and should all trigger autorotation.
-    // `env.window` is `None` in headless mode; skip autorotation instead of
-    // unwrapping (which would panic the host).
-    let rotation = env.window.as_ref().map(|window| window.current_rotation());
-    if let Some(orientation) = rotation.and_then(|rotation| match rotation {
-        crate::window::DeviceOrientation::LandscapeLeft => Some(UIDeviceOrientationLandscapeLeft),
-        crate::window::DeviceOrientation::LandscapeRight => Some(UIDeviceOrientationLandscapeRight),
-        crate::window::DeviceOrientation::PortraitUpsideDown => {
-            Some(UIDeviceOrientationPortraitUpsideDown)
-        }
-        // Portrait is the default so we don't do anything here.
-        crate::window::DeviceOrientation::Portrait => None,
-    }) {
-        // (UIInterfaceOrientation and UIDeviceOrientation are compatible enums,
-        //  here we use whichever is clearer contextually.)
-        let should = msg![env; vc shouldAutorotateToInterfaceOrientation:orientation];
-        log_dbg!("[{:?} shouldAutorotateToInterfaceOrientation:{:?}] => {:?}", vc, orientation, should);
-        if should
-            && env.options.landscape_uiscreen_bounds_enabled()
-            && env.options.present_rotate == Some(0)
-        {
-            // The app is set up to report the *interface-oriented* screen size
-            // (landscape UIScreen.bounds) and its presentation is not rotated
-            // (`--present-rotate=0`), so the app builds its whole view
-            // hierarchy in the orientation it draws in and there is nothing to
-            // rotate: its window already has the landscape size, its views are
-            // laid out from UIScreen.bounds in that same space, and the
-            // renderbuffer matches.
-            //
-            // Rotating here anyway is what broke Asphalt Xtreme's hit-testing:
-            // the transform (plus the frame the rotation re-applies) swapped
-            // the root view's bounds to portrait while the app kept laying its
-            // UI out for 480x320, so every tap was converted into a rotated
-            // 320x480 space and landed on the wrong control.
-            log!(
-                "TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS=1 with --present-rotate=0: \
-                 interface is already upright, skipping autorotation of view {:?}.",
-                view
-            );
-        } else if should {
-            log_dbg!("App requested autorotation; applying orientation transform to view {:?}.", view);
-            let transform = match orientation {
-                UIInterfaceOrientationLandscapeLeft => CGAffineTransform::make_rotation(-std::f32::consts::FRAC_PI_2),
-                UIInterfaceOrientationLandscapeRight => CGAffineTransform::make_rotation(std::f32::consts::FRAC_PI_2),
-                UIInterfaceOrientationPortraitUpsideDown => CGAffineTransform::make_rotation(std::f32::consts::PI),
-                other => {
-                    // UIInterfaceOrientation has Portrait/PortraitUpsideDown/
-                    // LandscapeLeft/LandscapeRight; the first two are filtered
-                    // out earlier (Portrait => None and PortraitUpsideDown
-                    // isn't reachable from window::DeviceOrientation today).
-                    // Fall back to the identity transform so an unexpected
-                    // orientation can't take down the host.
-                    log!(
-                        "Warning: UIWindow autorotation: unsupported interface orientation {}; using identity transform.",
-                        other
-                    );
-                    CGAffineTransformIdentity
-                }
-            };
-
-            let window_frame: CGRect = msg![env; this frame];
-            log_dbg!("Window frame: {window_frame:?}");
-            let view_frame: CGRect = msg![env; view frame];
-            log_dbg!("Old view frame: {view_frame:?}");
-
-            () = msg![env; view setTransform:transform];
-            env.framework_state.uikit.autorotation_transform_applied = true;
-
-            // Re-apply the view's old frame to compensate for the rotation
-            // effectively offseting its center position and changing the size.
-            // FIXME: I have no idea if this is how this should be solved, but
-            //        it works for DMC4 Refrain at least.
-
-            let view_frame: CGRect = msg![env; view frame];
-            log_dbg!("Old view frame after transform: {view_frame:?}");
-
-            () = msg![env; view setFrame:window_frame];
-
-            let view_frame: CGRect = msg![env; view frame];
-            log_dbg!("New view frame after re-applying old view frame: {view_frame:?}");
-
-            // The rotation swapped the view's bounds to landscape. UIKit lays
-            // the root view controller's view out again when it rotates, and
-            // apps depend on it: SDL 2's GL view recreates its renderbuffer
-            // from the new layer bounds in -layoutSubviews, and its view
-            // controller reports the new size to the game in
-            // -viewDidLayoutSubviews. Without this, Costume Quest kept a
-            // portrait renderbuffer and squeezed its landscape scene into it.
-            () = msg![env; vc viewWillLayoutSubviews];
-            () = msg![env; view layoutSubviews];
-            () = msg![env; vc viewDidLayoutSubviews];
-        }
-    }
+        // Support auto-rotation. This is currently only for apps that request a
+        // non-portrait interface orientation via Info.plist, as we do not yet
+        // support changes of orientation caused by device rotation (TODO).
+        // FIXME: It's unclear when and where this auto-rotation is supposed to
+        // happen. It must have something to do with mounting the view
+        // controller to a window, so we do it here. QA1688 (see top of file)
+        // mentions a breaking behaviour change in iOS 6 that makes
+        // auto-rotation rely on rootViewController (a property only found in
+        // iOS 6), so the current implementation is specific to iOS <= 5.
+        // FIXME: Are we supposed to notify the view somehow of the rotation?
+        // FIXME: What do we do if shouldAutorotateToInterfaceOrientation:
+        // returns false? The status bar has already been rotated…
+        // FIXME: The device orientation stored on env.window can come from one of
+        // three places (user/default options, setStatusBarOrientation: etc,
+        // Info.plist UIInterfaceOrientation etc). It's not clear if these
+        // are really equivalent and should all trigger autorotation.
+        // `env.window` is `None` in headless mode; skip autorotation instead of
+        // unwrapping (which would panic the host).
+        let rotation = env.window.as_ref().map(|window| window.current_rotation());
+        queue_or_autorotate_view(env, this, view, rotation);
 }
 
 - (CGPoint)convertPoint:(CGPoint)point
@@ -550,6 +467,339 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+
+/// Keep a window's root hierarchy synchronized when its controller replaces
+/// its view, including replacing a placeholder during launch. The window
+/// continues to own the same controller; it owns and sizes the current view.
+/// https://developer.apple.com/documentation/uikit/uiwindow/rootviewcontroller
+pub(crate) fn replace_controller_root_view(
+    env: &mut crate::Environment,
+    controller: id,
+    old_view: id,
+    new_view: id,
+) {
+    if old_view == nil || new_view == nil || old_view == new_view {
+        return;
+    }
+    let windows: Vec<id> = env
+        .framework_state
+        .uikit
+        .ui_view
+        .ui_window
+        .root_view_controllers
+        .iter()
+        .filter_map(|(&window, &root)| (root == controller).then_some(window))
+        .collect();
+    for window in windows {
+        retain(env, window);
+        // Only a view that is actually mounted in this window can be
+        // replaced. A controller that has not been added to its window yet
+        // gets rotated when it is, by -[UIWindow addSubview:].
+        let mounted = env.objc.borrow::<UIViewHostObject>(old_view).superview;
+        if mounted != window {
+            release(env, window);
+            continue;
+        }
+        let index = env
+            .objc
+            .borrow::<UIViewHostObject>(window)
+            .subviews
+            .iter()
+            .position(|&view| view == old_view)
+            .unwrap_or(0) as i32;
+        let transform: CGAffineTransform = msg![env; old_view transform];
+        () = msg![env; old_view removeFromSuperview];
+        let bounds: CGRect = msg![env; window bounds];
+        () = msg![env; new_view setTransform:transform];
+        () = msg![env; new_view setFrame:bounds];
+        // Preserve overlays above the root. Insertion also avoids repeating
+        // controller appearance events for a view replacement.
+        () = msg![env; window insertSubview:new_view atIndex:index];
+        let rotation = env.window.as_ref().map(|window| window.current_rotation());
+        queue_or_autorotate_view(env, window, new_view, rotation);
+        release(env, window);
+    }
+}
+
+fn queue_or_autorotate_view(
+    env: &mut crate::Environment,
+    window: id,
+    view: id,
+    rotation: Option<crate::window::DeviceOrientation>,
+) {
+    if env
+        .framework_state
+        .uikit
+        .ui_view
+        .ui_window
+        .defer_autorotation
+    {
+        retain(env, window);
+        retain(env, view);
+        env.framework_state
+            .uikit
+            .ui_view
+            .ui_window
+            .pending_autorotation
+            .push((window, view));
+    } else if let Some(rotation) = rotation {
+        autorotate_view(env, window, view, rotation, None);
+    }
+}
+
+/// UIKit rotates the initial interface after the launch delegate returns, not
+/// while the delegate is still constructing and sizing its child views.
+/// https://developer.apple.com/documentation/uikit/uiviewcontroller
+pub(crate) fn finish_launch_autorotation(env: &mut crate::Environment) {
+    let rotation = env.window.as_ref().map(|window| window.current_rotation());
+    let screen_bounds: Option<CGRect> =
+        match env.framework_state.uikit.ui_screen.main_screen {
+            Some(screen) => Some(msg![env; screen bounds]),
+            None => None,
+        };
+    finish_launch_autorotation_with_rotation(env, rotation, screen_bounds);
+}
+
+fn finish_launch_autorotation_with_rotation(
+    env: &mut crate::Environment,
+    rotation: Option<crate::window::DeviceOrientation>,
+    screen_bounds: Option<CGRect>,
+) {
+    env.framework_state
+        .uikit
+        .ui_view
+        .ui_window
+        .defer_autorotation = false;
+    let pending = std::mem::take(
+        &mut env
+            .framework_state
+            .uikit
+            .ui_view
+            .ui_window
+            .pending_autorotation,
+    );
+    for (window, view) in pending {
+        let parent: id = msg![env; view superview];
+        if parent == window {
+            if let Some(rotation) = rotation {
+                autorotate_view(env, window, view, rotation, screen_bounds);
+            }
+        }
+        release(env, view);
+        release(env, window);
+    }
+}
+
+/// The interface orientation a window should adopt for a given device
+/// orientation. Portrait is the default layout, so there is nothing to rotate
+/// to and the caller does nothing.
+fn interface_orientation_for(
+    rotation: crate::window::DeviceOrientation,
+) -> Option<UIInterfaceOrientation> {
+    match rotation {
+        crate::window::DeviceOrientation::LandscapeLeft => Some(UIInterfaceOrientationLandscapeLeft),
+        crate::window::DeviceOrientation::LandscapeRight => {
+            Some(UIInterfaceOrientationLandscapeRight)
+        }
+        crate::window::DeviceOrientation::PortraitUpsideDown => {
+            Some(UIInterfaceOrientationPortraitUpsideDown)
+        }
+        crate::window::DeviceOrientation::Portrait => None,
+    }
+}
+
+fn autorotate_view(
+    env: &mut crate::Environment,
+    window: id,
+    view: id,
+    rotation: crate::window::DeviceOrientation,
+    screen_bounds: Option<CGRect>,
+) {
+    let vc = env.objc.borrow::<UIViewHostObject>(view).view_controller;
+    if vc == nil {
+        return;
+    }
+    if env
+        .objc
+        .borrow::<UIViewControllerHostObject>(vc)
+        .autorotation_in_progress
+    {
+        return;
+    }
+    // Apply the legacy controller orientation policy once its view is mounted
+    // and launch construction is complete. Runtime sensor-driven autorotation
+    // and the iOS 6 supportedInterfaceOrientations policy are not handled here.
+    // The caller supplies the orientation so headless tests can exercise the
+    // same geometry and launch-order behavior without a host GL window.
+    if let Some(orientation) = interface_orientation_for(rotation) {
+        let should: bool = msg![env; vc shouldAutorotateToInterfaceOrientation:orientation];
+        log_dbg!(
+            "[{:?} shouldAutorotateToInterfaceOrientation:{:?}] => {:?}",
+            vc,
+            orientation,
+            should
+        );
+        if !should {
+            return;
+        }
+        if env.options.landscape_uiscreen_bounds_enabled() && env.options.present_rotate == Some(0) {
+            // The app is set up to report the *interface-oriented* screen size
+            // (landscape UIScreen.bounds) and its presentation is not rotated
+            // (`--present-rotate=0`), so the app builds its whole view
+            // hierarchy in the orientation it draws in and there is nothing to
+            // rotate: its window already has the landscape size, its views are
+            // laid out from UIScreen.bounds in that same space, and the
+            // renderbuffer matches.
+            //
+            // Rotating here anyway is what broke Asphalt Xtreme's hit-testing:
+            // the transform (plus the frame the rotation re-applies) swapped
+            // the root view's bounds to portrait while the app kept laying its
+            // UI out for 480x320, so every tap was converted into a rotated
+            // 320x480 space and landed on the wrong control.
+            log!(
+                "TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS=1 with --present-rotate=0: \
+                interface is already upright, skipping autorotation of view {:?}.",
+                view
+            );
+            return;
+        }
+        // Launch rotation is synchronous. UIKit brackets the bounds change
+        // with legacy rotation callbacks for visible controllers. Keep the old
+        // orientation visible until willRotate returns.
+        // https://developer.apple.com/documentation/uikit/uiviewcontroller
+        let old_orientation = env
+            .objc
+            .borrow::<UIViewControllerHostObject>(vc)
+            .interface_orientation
+            .unwrap_or(1);
+        let visible: bool = !msg![env; window isHidden] && !msg![env; view isHidden];
+        let notify = visible && old_orientation != orientation;
+        retain(env, vc);
+        retain(env, window);
+        retain(env, view);
+        {
+            let controller = env.objc.borrow_mut::<UIViewControllerHostObject>(vc);
+            controller.interface_orientation = Some(old_orientation);
+            controller.autorotation_in_progress = true;
+        }
+        if notify {
+            () = msg![env; vc willRotateToInterfaceOrientation:orientation duration:0.0f64];
+        }
+        // willRotate may replace the controller's view. Rotate that view and
+        // suppress a nested rotation initiated by its mounting.
+        let current_view: id = msg![env; vc view];
+        retain(env, current_view);
+        release(env, view);
+        let view = current_view;
+        if view == nil {
+            // The controller dropped its view while handling willRotate.
+            // There is nothing to rotate, and leaving the flag set would
+            // block every later rotation.
+            env.objc
+                .borrow_mut::<UIViewControllerHostObject>(vc)
+                .autorotation_in_progress = false;
+            release(env, window);
+            release(env, vc);
+            return;
+        }
+        env.objc
+            .borrow_mut::<UIViewControllerHostObject>(vc)
+            .interface_orientation = Some(orientation);
+        if matches!(
+            rotation,
+            crate::window::DeviceOrientation::LandscapeLeft
+                | crate::window::DeviceOrientation::LandscapeRight
+        ) {
+            if let Some(screen) = screen_bounds {
+                let frame: CGRect = msg![env; window frame];
+                // Window geometry remains in the screen's base coordinate
+                // space. A full-screen landscape rectangle supplied during
+                // launch must fit that screen before the controller's
+                // orientation transform is applied. Leave partial windows and
+                // windows positioned away from the screen origin alone.
+                // https://developer.apple.com/library/archive/documentation/WindowsViews/Conceptual/ViewPG_iPhoneOS/CreatingWindows/CreatingWindows.html
+                if frame.origin == screen.origin
+                    && frame.size.width == screen.size.height
+                    && frame.size.height == screen.size.width
+                {
+                    () = msg![env; window setFrame:screen];
+                }
+            }
+        }
+
+        log_dbg!(
+            "App requested autorotation; applying orientation transform to view {:?}.",
+            view
+        );
+        let transform = match orientation {
+            UIInterfaceOrientationLandscapeLeft => {
+                CGAffineTransform::make_rotation(-std::f32::consts::FRAC_PI_2)
+            }
+            UIInterfaceOrientationLandscapeRight => {
+                CGAffineTransform::make_rotation(std::f32::consts::FRAC_PI_2)
+            }
+            UIInterfaceOrientationPortraitUpsideDown => {
+                CGAffineTransform::make_rotation(std::f32::consts::PI)
+            }
+            other => {
+                // Portrait is filtered out by interface_orientation_for and
+                // the other three are handled above, so this arm is
+                // unreachable. Fall back to the identity transform rather
+                // than panicking if a new orientation is ever added.
+                log!(
+                    "Warning: UIWindow autorotation: unsupported interface orientation {}; using identity transform.",
+                    other
+                );
+                CGAffineTransformIdentity
+            }
+        };
+
+        let window_frame: CGRect = msg![env; window frame];
+        log_dbg!("Window frame: {window_frame:?}");
+        let view_frame: CGRect = msg![env; view frame];
+        log_dbg!("Old view frame: {view_frame:?}");
+
+        () = msg![env; view setTransform:transform];
+        env.framework_state.uikit.autorotation_transform_applied = true;
+
+        // Re-apply the view's old frame to compensate for the rotation
+        // effectively offsetting its center position and changing the size.
+        // FIXME: I have no idea if this is how this should be solved, but it
+        // works for DMC4 Refrain at least.
+
+        let view_frame: CGRect = msg![env; view frame];
+        log_dbg!("Old view frame after transform: {view_frame:?}");
+
+        () = msg![env; view setFrame:window_frame];
+
+        let view_frame: CGRect = msg![env; view frame];
+        log_dbg!("New view frame after re-applying old view frame: {view_frame:?}");
+
+        if notify {
+            () = msg![env; vc willAnimateRotationToInterfaceOrientation:orientation duration:0.0f64];
+        }
+
+        // The rotation swapped the view's bounds to landscape. UIKit lays the
+        // root view controller's view out again when it rotates, and apps
+        // depend on it: SDL 2's GL view recreates its renderbuffer from the new
+        // layer bounds in -layoutSubviews, and its view controller reports the
+        // new size to the game in -viewDidLayoutSubviews. Without this,
+        // Costume Quest kept a portrait renderbuffer and squeezed its
+        // landscape scene into it.
+        () = msg![env; vc viewWillLayoutSubviews];
+        () = msg![env; view layoutSubviews];
+        () = msg![env; vc viewDidLayoutSubviews];
+        if notify {
+            () = msg![env; vc didRotateFromInterfaceOrientation:old_orientation];
+        }
+        env.objc
+            .borrow_mut::<UIViewControllerHostObject>(vc)
+            .autorotation_in_progress = false;
+        release(env, view);
+        release(env, window);
+        release(env, vc);
+    }
+}
 
 /// Window life-cycle notifications.
 ///
@@ -595,3 +845,32 @@ pub const CONSTANTS: ConstantExports = &[
     // _UIKeyboardBoundsUserInfoKey are exported from
     // uikit::ui_keyboard::CONSTANTS; not duplicated here.
 ];
+
+#[cfg(test)]
+mod autorotation_tests {
+    use super::*;
+
+    #[test]
+    fn launch_rotation_maps_to_the_interface_orientation_it_draws_in() {
+        // A game that launches landscape has to end up with the landscape
+        // interface orientation, otherwise its renderbuffer is presented a
+        // quarter turn away from the UI.
+        assert_eq!(
+            interface_orientation_for(crate::window::DeviceOrientation::LandscapeLeft),
+            Some(UIInterfaceOrientationLandscapeLeft)
+        );
+        assert_eq!(
+            interface_orientation_for(crate::window::DeviceOrientation::LandscapeRight),
+            Some(UIInterfaceOrientationLandscapeRight)
+        );
+        assert_eq!(
+            interface_orientation_for(crate::window::DeviceOrientation::PortraitUpsideDown),
+            Some(UIInterfaceOrientationPortraitUpsideDown)
+        );
+        // Portrait is already the default layout, so no rotation is queued.
+        assert_eq!(
+            interface_orientation_for(crate::window::DeviceOrientation::Portrait),
+            None
+        );
+    }
+}

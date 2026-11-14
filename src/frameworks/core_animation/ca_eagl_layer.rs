@@ -749,9 +749,12 @@ pub fn clear_presented_pixels(env: &mut Environment, layer: id) {
 /// Records that `EAGLContext presentRenderbuffer:` presented this layer's
 /// drawable directly to the window, bypassing `presented_pixels`.
 pub fn mark_presented_directly(env: &mut Environment, layer: id) {
-    env.objc
-        .borrow_mut::<CALayerHostObject>(layer)
-        .presented_directly = true;
+    let host = env.objc.borrow_mut::<CALayerHostObject>(layer);
+    host.presented_directly = true;
+    // Retire the old readback when presentation changes back to the GPU.
+    // Otherwise run-loop composition keeps swapping the cached frame over
+    // the newer direct frames, including stale text and control state.
+    host.presented_pixels = None;
 }
 
 /// Stores the new rendered frame in the layer and marks the GLES texture as

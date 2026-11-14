@@ -27,7 +27,7 @@ pub const CONSTANTS: ConstantExports = &[
 
 #[derive(Default)]
 pub struct State {
-    main_screen: Option<id>,
+    pub(crate) main_screen: Option<id>,
     current_mode: Option<id>,
     /// `-brightness`, clamped to the documented 0.0-1.0 range.
     brightness: CGFloat,
