@@ -65,14 +65,6 @@ if [ -z "$linux_bin" ]; then
     echo "Missing build artifact (all platform builds must succeed): artifacts/linux/touchHLE" >&2
     exit 1
 fi
-ios_ipas="BerryHLE-iOS-unsigned.ipa BerryHLE-iOS-trollstore.ipa BerryHLE-iOS-trollstore-permanent-jit.ipa"
-for ipa in $ios_ipas; do
-    if [ ! -f "artifacts/ios/$ipa" ]; then
-        echo "Missing build artifact (all platform builds must succeed): artifacts/ios/$ipa" >&2
-        exit 1
-    fi
-done
-
 if [ -z "$CHANGELOG_FROM" ]; then
     # The newest release tag older than VERSION (versions roll over at 12, see
     # hyperhle-should-release.sh, so it can't simply be computed).
@@ -171,7 +163,3 @@ prefix="BerryHLE"
     -o "$ROOT/release/${prefix}_Linux_x86_64.zip"
 # The Windows installer is attached as it is (see build-win).
 cp "$ROOT/$windows_installer" "$ROOT/release/BerryHLE_Windows_x86_64_Setup.exe"
-# The iOS IPAs are attached as they are (see build-ios in HyperHLE_release.yml).
-for ipa in $ios_ipas; do
-    cp "$ROOT/artifacts/ios/$ipa" "$ROOT/release/$ipa"
-done

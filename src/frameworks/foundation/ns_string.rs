@@ -1709,22 +1709,17 @@ pub const CLASSES: ClassExports = objc_classes! {
     string_bool_value(&to_rust_string(env, this))
 }
 
-- (i64)longLongValue {
-    string_long_long_value(&to_rust_string(env, this))
-}
-
 - (NSInteger)integerValue { msg![env; this intValue] }
 
 - (i32)intValue {
     let st = to_rust_string(env, this);
-    let st = st.trim_start_matches(|c: char| c.is_ascii_whitespace());
-    let (sign, rest) = match st.strip_prefix('-') {
-        Some(r) => (-1i64, r),
-        None    => (1i64, st.strip_prefix('+').unwrap_or(st)),
-    };
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    let magnitude: i64 = digits.parse().unwrap_or(0);
-    (sign * magnitude).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+    decimal_prefix_value(&st).clamp(i32::MIN.into(), i32::MAX.into()) as i32
+}
+
+// https://developer.apple.com/documentation/foundation/nsstring/1414309-longlongvalue
+- (i64)longLongValue {
+    let st = to_rust_string(env, this);
+    decimal_prefix_value(&st)
 }
 
 - (id)lowercaseString {
@@ -2093,8 +2088,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)initWithCoder:(id)coder {
     let class: Class = msg![env; coder class];
     let nib_archive_class: Class = msg_class![env; _touchHLE_NIBArchiveDecoder class];
+    let keyed_unarchiver_class: Class = msg_class![env; NSKeyedUnarchiver class];
     let new_str = if env.objc.class_is_subclass_of(class, nib_archive_class) {
         _nib_archive_decoder::decode_current_string(env, coder)
+    } else if env.objc.class_is_subclass_of(class, keyed_unarchiver_class) {
+        super::ns_keyed_unarchiver::decode_current_string(env, coder)
     } else {
         println!("Warning: _touchHLE_NSString initWithCoder: unsupported coder class, returning empty string");
         get_static_str(env, "")
@@ -2437,12 +2435,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 
-- (bool)boolValue {
-    let string = to_rust_string(env, this);
-    let string = string.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '-' || c == '+' || c == '0');
-    let matching_values = "YyTt123456789";
-    string.chars().next().map(|c| matching_values.contains(c)).unwrap_or(false)
-}
 
 - (id)dataUsingEncoding:(NSStringEncoding)encoding allowLossyConversion:(bool)lossy {
     data_using_encoding_lossy_inner(env, this, encoding, lossy)
@@ -2605,22 +2597,21 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)initWithCapacity:(NSUInteger)_capacity { msg![env; this init] }
 
 - (id)initWithCoder:(id)coder {
-    // NIB archives store some UI strings (placeholder text, default
-    // contents of UITextField, IASK setting titles, etc.) as
-    // NSMutableString instances. Without this method, NIB decoding warns
-    // "does not respond to selector initWithCoder:" and the property
-    // becomes nil, which on Minecraft PE shows up as empty Create World
-    // text fields and a non-functional keyboard.
+    // NIB and keyed archives store some UI strings as NSMutableString.
     let class: Class = msg![env; coder class];
     let nib_archive_class: Class = msg_class![env; _touchHLE_NIBArchiveDecoder class];
-    if env.objc.class_is_subclass_of(class, nib_archive_class) {
-        let decoded = _nib_archive_decoder::decode_current_string(env, coder);
-        if decoded != nil {
-            () = msg![env; this setString:decoded];
-            release(env, decoded);
-        }
+    let keyed_unarchiver_class: Class = msg_class![env; NSKeyedUnarchiver class];
+    let decoded = if env.objc.class_is_subclass_of(class, nib_archive_class) {
+        _nib_archive_decoder::decode_current_string(env, coder)
+    } else if env.objc.class_is_subclass_of(class, keyed_unarchiver_class) {
+        super::ns_keyed_unarchiver::decode_current_string(env, coder)
     } else {
         println!("Warning: _touchHLE_NSMutableString initWithCoder: unsupported coder class, returning empty string");
+        return this;
+    };
+    if decoded != nil {
+        () = msg![env; this setString:decoded];
+        release(env, decoded);
     }
     this
 }
@@ -2918,6 +2909,34 @@ fn is_match_at_position<F: Fn(u16, u16) -> bool>(
     })
 }
 
+/// The value of the decimal integer at the start of `s`, after leading
+/// whitespace and an optional sign, as read by `-intValue` and
+/// `-longLongValue`. Returns 0 if there is none and saturates on overflow
+/// (Apple: "Returns LLONG_MAX or LLONG_MIN on overflow").
+fn decimal_prefix_value(s: &str) -> i64 {
+    let s = s.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let (negative, rest) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let mut value: i64 = 0;
+    for digit in rest.bytes().take_while(u8::is_ascii_digit) {
+        let digit = i64::from(digit - b'0');
+        let next = value.checked_mul(10).and_then(|v| {
+            if negative {
+                v.checked_sub(digit)
+            } else {
+                v.checked_add(digit)
+            }
+        });
+        match next {
+            Some(next) => value = next,
+            None => return if negative { i64::MIN } else { i64::MAX },
+        }
+    }
+    value
+}
+
 fn float_value_common<F: std::str::FromStr + Default>(env: &mut Environment, string: id) -> F {
     let st = to_rust_string(env, string);
     let st = st.trim_start();
@@ -3018,6 +3037,17 @@ fn line_range_helper(
 #[cfg(test)]
 mod ns_string_tests {
     use super::*;
+    #[test]
+    fn decimal_prefix_value_matches_long_long_value() {
+        assert_eq!(decimal_prefix_value(""), 0);
+        assert_eq!(decimal_prefix_value("abc"), 0);
+        assert_eq!(decimal_prefix_value("  \t-42xyz"), -42);
+        assert_eq!(decimal_prefix_value("+1700000000123"), 1_700_000_000_123);
+        assert_eq!(decimal_prefix_value("9223372036854775807"), i64::MAX);
+        assert_eq!(decimal_prefix_value("-9223372036854775808"), i64::MIN);
+        assert_eq!(decimal_prefix_value("99999999999999999999"), i64::MAX);
+        assert_eq!(decimal_prefix_value("-99999999999999999999"), i64::MIN);
+    }
     #[test]
     fn linerange_tests() {
         let range = |x, y| NSRange {
@@ -3238,19 +3268,6 @@ mod resource_path_normalization_tests {
     }
 }
 
-// NSString's numeric conversions consume a decimal prefix, ignoring suffixes.
-// https://developer.apple.com/documentation/foundation/nsstring/longlongvalue
-fn string_long_long_value(string: &str) -> i64 {
-    let string = string.trim_start();
-    let (negative, rest) = if let Some(rest) = string.strip_prefix('-') {
-        (true, rest)
-    } else { (false, string.strip_prefix('+').unwrap_or(string)) };
-    let limit = i64::MAX as u64 + u64::from(negative);
-    let magnitude = rest.bytes().take_while(u8::is_ascii_digit)
-        .fold(0u64, |n, digit| n.saturating_mul(10).saturating_add((digit - b'0') as u64).min(limit));
-    if negative { (-(magnitude as i128)) as i64 } else { magnitude as i64 }
-}
-
 fn string_bool_value(string: &str) -> bool {
     let string = string.trim_start();
     if matches!(string.as_bytes().first(), Some(b'Y' | b'y' | b'T' | b't')) { return true; }
@@ -3268,7 +3285,7 @@ mod numeric_value_tests {
         for (text, expected) in [("-9223372036854775808", i64::MIN),
             ("9223372036854775807", i64::MAX), ("99999999999999999999999999999", i64::MAX),
             ("-99999999999999999999999999999", i64::MIN), (" +1234ms", 1234), ("hello", 0)] {
-            assert_eq!(string_long_long_value(text), expected);
+            assert_eq!(decimal_prefix_value(text), expected);
         }
     }
     #[test]

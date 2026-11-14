@@ -279,10 +279,6 @@ pub const CONSTANTS: &[(&str, HostConstant)] = &[
         HostConstant::NSString("UIImagePickerControllerReferenceURL"),
     ),
     (
-        "_UIScreenDidConnectNotification",
-        HostConstant::NSString("UIScreenDidConnectNotification"),
-    ),
-    (
         "_UIPageViewControllerOptionSpineLocationKey",
         HostConstant::NSString("UIPageViewControllerOptionSpineLocationKey"),
     ),
@@ -413,15 +409,6 @@ pub const CONSTANTS: &[(&str, HostConstant)] = &[
     (
         "_UIScrollViewDecelerationRateFast",
         HostConstant::Custom(ui_scroll_view_deceleration_rate_fast),
-    ),
-    // -----------------------------------------------------------------
-    // UIScreen disconnect notification (paired with the existing
-    // UIScreenDidConnectNotification above), per
-    // <https://developer.apple.com/documentation/uikit/uiscreen/1617835-disconnect>.
-    // -----------------------------------------------------------------
-    (
-        "_UIScreenDidDisconnectNotification",
-        HostConstant::NSString("UIScreenDidDisconnectNotification"),
     ),
     (
         "_UIScreenModeDidChangeNotification",
@@ -998,6 +985,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
     constant_exports: &[
         ui_application::CONSTANTS,
         ui_device::CONSTANTS,
+        ui_screen::CONSTANTS,
         ui_geometry::CONSTANTS,
         ui_keyboard::CONSTANTS,
         ui_local_notification::CONSTANTS,
@@ -1020,6 +1008,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
 pub struct State {
     globbert_debug: globbert_debug::State,
     ui_accelerometer: ui_accelerometer::State,
+    ui_alert_view: ui_view::ui_alert_view::State,
     ui_application: ui_application::State,
     ui_color: ui_color::State,
     ui_device: ui_device::State,

@@ -85,6 +85,7 @@ public class MainActivity extends SDLActivity {
     // .ipa file picker. Must match window.rs ADD_IPA_COMMAND.
     private static final int MSG_ADD_IPA = 0x8000;
     private static final int MSG_WALLPAPER = 0x8002;
+    private static final int MSG_TILT_HAPTIC = 0x8003;
     private static final int REQUEST_WALLPAPER = 3;
 
     // Message ID sent from the Rust WebView bridge (see android_web_view.rs)
@@ -440,6 +441,11 @@ public class MainActivity extends SDLActivity {
 
     @Override
     protected boolean onUnhandledMessage(int message, Object data) {
+        if (message == MSG_TILT_HAPTIC) {
+            getWindow().getDecorView().performHapticFeedback(
+                    android.view.HapticFeedbackConstants.KEYBOARD_TAP);
+            return true;
+        }
         if (message == MSG_WALLPAPER) {
             runOnUiThread(() -> {
                 Intent intent = new Intent(Intent.ACTION_GET_CONTENT);

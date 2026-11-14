@@ -28,6 +28,7 @@ use sdl2::mouse::MouseButton;
 use sdl2::pixels::PixelFormatEnum;
 use sdl2::surface::Surface;
 use sdl2_sys::SDL_PowerState;
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::f32::consts::{FRAC_PI_2, PI};
@@ -982,6 +983,8 @@ pub struct Window {
     gyroscope: Option<sdl2::sensor::Sensor>,
     virtual_cursor_last: Option<(f32, f32, bool, bool)>,
     virtual_cursor_last_unsticky: Option<(f32, f32, Instant)>,
+    arrow_tilt_sample: Cell<(i8, i8)>,
+    arrow_tilt_feedback: Cell<bool>,
     virtual_accelerometer_last: Option<(f32, f32, bool)>,
     /// Host scheduling / power-management hints for the emulator thread
     /// (Android). Fed once per presented frame from [Window::swap_window].
@@ -1409,6 +1412,8 @@ impl Window {
             gyroscope,
             virtual_cursor_last: None,
             virtual_cursor_last_unsticky: None,
+            arrow_tilt_sample: Cell::new((0, 0)),
+            arrow_tilt_feedback: Cell::new(false),
             virtual_accelerometer_last: None,
             perf_hints: crate::perf_hints::PerfHints::new(
                 options.perf_hints,
@@ -1587,6 +1592,20 @@ impl Window {
         }
         self.last_polled = now;
 
+        if self.keyboard_tilt() == (0, 0) {
+            self.arrow_tilt_sample.set((0, 0));
+        }
+        if self.arrow_tilt_feedback.replace(false) && self.window.has_input_focus() {
+            if !self.controllers.iter_mut().any(|controller| {
+                controller.set_rumble(0, 12_000, 30).is_ok()
+            }) {
+                #[cfg(target_os = "android")]
+                unsafe {
+                    SDL_AndroidSendMessage(TILT_HAPTIC_COMMAND, 0);
+                }
+            }
+        }
+
         fn transform_input_coords(
             window: &Window,
             options: &Options,
@@ -1613,6 +1632,18 @@ impl Window {
                 return geometry::normalized_to_screen((x, y), (height, width));
             }
 
+            // `TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS=1` (e.g. Asphalt Xtreme) makes
+            // UIScreen.bounds report the interface-oriented size, and the window
+            // it is forced to match is landscape too. The presenter's device
+            // rotation is cancelled by the autorotation transform the window
+            // applies to the view, so the presented image is already in
+            // interface space: the touch must be mapped into that same space,
+            // without the portrait-space rotation below, and scaled by the
+            // interface size rather than the portrait one.
+            let interface_space = crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS");
+            if interface_space {
+                log_once!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS=1: mapping touches in interface space");
+            }
             // rotate
             //
             // If the final EAGL presentation is not being rotated, the touch
@@ -1623,12 +1654,13 @@ impl Window {
             // PERF: cache the read-once debug toggles; this runs per SDL
             // touch event, and each std::env::var_os is a global-lock environ
             // scan with allocation.
-            let [x, y] = if crate::env_flag_cached!("TOUCHHLE_DISABLE_PRESENT_ROTATION")
+            let [x, y] = if interface_space {
+                // Logged above; the presented frame is already in interface space.
+                [x, y]
+            } else if crate::env_flag_cached!("TOUCHHLE_DISABLE_PRESENT_ROTATION")
                 || crate::env_flag_cached!("TOUCHHLE_DISABLE_TOUCH_ROTATION")
             {
-                log_once!(
-                    "TOUCHHLE_DISABLE_TOUCH_ROTATION: not rotating touch hit-test coordinates [this log will only be shown once]"
-                );
+                log_once!("TOUCHHLE_DISABLE_TOUCH_ROTATION: not rotating touch hit-test coordinates");
                 [x, y]
             } else {
                 let matrix = window.rotation_matrix().inverse().unwrap();
@@ -1636,7 +1668,15 @@ impl Window {
             };
 
             // back to pixels
-            let (out_w, out_h) = window.size_unrotated_unscaled();
+            let (out_w, out_h) = if interface_space {
+                size_for_orientation_from_size(
+                    window.screen_size(),
+                    window.device_orientation,
+                    NonZeroU32::new(1).unwrap(),
+                )
+            } else {
+                window.size_unrotated_unscaled()
+            };
             let mut out_x = (x + 0.5) * out_w as f32;
             let mut out_y = (y + 0.5) * out_h as f32;
 
@@ -2285,7 +2325,7 @@ impl Window {
         log!("Warning: Controller disconnected: {}", controller.name());
     }
     pub fn print_accelerometer_notice(&self, options: &Options) {
-        log!("This app uses the accelerometer.");
+        log!("This app uses the accelerometer. Use the arrow keys to simulate tilt.");
 
         if !self.controllers.is_empty() && options.analog_stick_tilt_controls {
             log!("Your connected controller's left analog stick will be used for accelerometer simulation.");
@@ -2313,10 +2353,31 @@ impl Window {
         }
     }
 
+    fn keyboard_tilt(&self) -> (i8, i8) {
+        use sdl2::keyboard::Scancode;
+
+        if !self.window.has_input_focus() {
+            return (0, 0);
+        }
+        let keys = self.event_pump.keyboard_state();
+        let pressed = |key| i8::from(keys.is_scancode_pressed(key));
+        (
+            pressed(Scancode::Right) - pressed(Scancode::Left),
+            pressed(Scancode::Down) - pressed(Scancode::Up),
+        )
+    }
+
     /// Get the real or simulated accelerometer output.
     /// See also [crate::frameworks::uikit::ui_accelerometer].
     pub fn get_acceleration(&self, options: &Options) -> (f32, f32, f32) {
-        if self.controllers.is_empty() || !options.analog_stick_tilt_controls {
+        let keyboard_tilt = self.keyboard_tilt();
+        let previous = self.arrow_tilt_sample.replace(keyboard_tilt);
+        if keyboard_tilt != (0, 0) && keyboard_tilt != previous {
+            self.arrow_tilt_feedback.set(true);
+        }
+        if keyboard_tilt == (0, 0)
+            && (self.controllers.is_empty() || !options.analog_stick_tilt_controls)
+        {
             if let Some(ref accelerometer) = self.accelerometer {
                 let data = accelerometer.get_data().unwrap();
                 let sdl2::sensor::SensorData::Accel(data) = data else {
@@ -2343,7 +2404,9 @@ impl Window {
             }
         }
 
-        let (x, y) = if self
+        let (x, y) = if keyboard_tilt != (0, 0) {
+            (f32::from(keyboard_tilt.0), f32::from(keyboard_tilt.1))
+        } else if self
             .virtual_accelerometer_last
             .is_some_and(|(_x, _y, right_click_hold)| right_click_hold)
         {
@@ -3103,6 +3166,9 @@ pub fn open_file_manager_url(env: &mut Environment, url: &str) -> Result<(), Str
 /// picker for adding an .ipa file. Must be >= 0x8000 (see SDLActivity.java).
 #[cfg(target_os = "android")]
 const ADD_IPA_COMMAND: u32 = 0x8000;
+
+#[cfg(target_os = "android")]
+const TILT_HAPTIC_COMMAND: u32 = 0x8003;
 
 // SDL_AndroidSendMessage is only available in SDL builds for Android.
 #[cfg(target_os = "android")]

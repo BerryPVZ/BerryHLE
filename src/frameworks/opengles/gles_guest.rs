@@ -1576,17 +1576,42 @@ fn glCompressedTexSubImage2D(
                     }
                 }
                 // PVRTC compressed subimages may only replace a complete level.
-                gles.TexSubImage2D(
-                    target,
-                    level,
-                    xoffset,
-                    yoffset,
-                    width,
-                    height,
-                    gles11::RGBA,
-                    gles11::UNSIGNED_BYTE,
-                    pixels.as_ptr().cast(),
-                );
+                // If the level's RGBA storage was never materialized (because
+                // `glTexStorage2D` immutable storage was emulated away — see
+                // `glTexStorage2D`), the first upload must allocate it via
+                // `glTexImage2D`; a plain `glTexSubImage2D` onto unallocated
+                // storage fails with `GL_INVALID_OPERATION`.
+                let level_unallocated = bound_texture
+                    .map(|texture| shadow.pvrtc_level_unallocated(target, texture, level))
+                    .unwrap_or(false);
+                if level_unallocated {
+                    gles.TexImage2D(
+                        target,
+                        level,
+                        gles11::RGBA as GLint,
+                        width,
+                        height,
+                        0,
+                        gles11::RGBA,
+                        gles11::UNSIGNED_BYTE,
+                        pixels.as_ptr().cast(),
+                    );
+                    if let Some(texture) = bound_texture {
+                        shadow.mark_pvrtc_level_allocated(target, texture, level);
+                    }
+                } else {
+                    gles.TexSubImage2D(
+                        target,
+                        level,
+                        xoffset,
+                        yoffset,
+                        width,
+                        height,
+                        gles11::RGBA,
+                        gles11::UNSIGNED_BYTE,
+                        pixels.as_ptr().cast(),
+                    );
+                }
                 log_once!(
                     "Software-decoded a full PVRTC glCompressedTexSubImage2D update into RGBA storage"
                 );
@@ -3430,6 +3455,10 @@ fn glCompressedTexImage2D(
                         height,
                         internalformat,
                     );
+                    // This full-image upload allocated the level's storage via
+                    // glTexImage2D, so any pending unallocated marker from the
+                    // glTexStorage2D PVRTC emulation is now satisfied.
+                    shadow.mark_pvrtc_level_allocated(target, texture, level);
                 }
             }
             if fix_filter {
@@ -3464,6 +3493,10 @@ fn glCompressedTexImage2D(
                             height,
                             internalformat,
                         );
+                        // This full-image upload allocated the level's storage
+                        // via glTexImage2D, so any pending unallocated marker
+                        // from the glTexStorage2D PVRTC emulation is satisfied.
+                        shadow.mark_pvrtc_level_allocated(target, texture, level);
                         crate::gles::perf_overlay::record_gl_image_allocation(
                             shadow.resource_group_token,
                             target,
@@ -3720,7 +3753,36 @@ fn glIsRenderbufferOES(env: &mut Environment, renderbuffer: GLuint) -> GLboolean
         gles.IsRenderbufferOES(renderbuffer)
     })
 }
+/// BioShock's framebuffer bind in `[EAGLView CreateFramebuffer:]` returns here.
+const BIOSHOCK_CREATE_FRAMEBUFFER_RETURN: u32 = 0x187ff6c;
+/// `FES2RHI::SetRenderTarget`'s tail call for the default framebuffer, and the
+/// instruction expected at that address (`b _glBindFramebuffer`).
+const BIOSHOCK_BIND_DEFAULT_FRAMEBUFFER: (u32, u32) = (0x17bf528, 0xea04c912);
+
+/// BioShock renders to the default framebuffer unless it uses multisampling,
+/// which we don't advertise. It finds that framebuffer by querying the binding,
+/// but only after already having bound 0, which isn't a usable target on iOS.
+/// Remember the framebuffer its EAGLView made and use that instead of 0.
+fn bioshock_framebuffer(env: &mut Environment, framebuffer: GLuint) -> GLuint {
+    if env.bundle.bundle_identifier() != "com.2k.bioshock" {
+        return framebuffer;
+    }
+    let (address, instruction) = BIOSHOCK_BIND_DEFAULT_FRAMEBUFFER;
+    if env.mem.read(ConstPtr::<u32>::from_bits(address)) != instruction {
+        return framebuffer;
+    }
+    let state = &mut env.framework_state.opengles;
+    if framebuffer == 0 {
+        return state.bioshock_view_framebuffer;
+    }
+    if env.cpu.regs()[crate::cpu::Cpu::LR] == BIOSHOCK_CREATE_FRAMEBUFFER_RETURN {
+        state.bioshock_view_framebuffer = framebuffer;
+    }
+    framebuffer
+}
+
 fn glBindFramebufferOES(env: &mut Environment, target: GLenum, framebuffer: GLuint) {
+    let framebuffer = bioshock_framebuffer(env, framebuffer);
     let thread = env.current_thread;
     env.framework_state
         .opengles
@@ -7295,6 +7357,41 @@ fn glTexStorage2D(
 ) {
     with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
         let bound_texture = current_bound_texture(gles, target);
+        // Apps that moved to the ES 3.0 API (Gameloft games such as Asphalt 8
+        // v1.2.0+) allocate their PVRTC texture atlases via immutable storage:
+        // `glTexStorage2D` with a PVRTC internalformat, then per-level
+        // `glCompressedTexSubImage2D` uploads. A host driver without
+        // `GL_IMG_texture_compression_pvrtc` rejects the internalformat with
+        // `GL_INVALID_ENUM`, the storage is never created, and every subsequent
+        // compressed upload fails with `GL_INVALID_OPERATION` — leaving all
+        // atlases black while UI text (uploaded uncompressed) still renders.
+        //
+        // When the host can't do PVRTC, skip immutable storage and instead
+        // pre-record every mip level as a PVRTC level (dimensions halving per
+        // level) whose RGBA storage is materialized lazily by the
+        // `glCompressedTexSubImage2D` / `glCompressedTexImage2D` software-decode
+        // paths below.
+        if crate::gles::util::pvrtc_format_properties(internalformat).is_some()
+            && !gles.pvrtc_native()
+        {
+            if let Some(texture) = bound_texture {
+                for level in 0..levels.max(0) {
+                    let level_width = (width >> level).max(1);
+                    let level_height = (height >> level).max(1);
+                    shadow.record_pvrtc_texture_level(
+                        target,
+                        texture,
+                        level,
+                        level_width,
+                        level_height,
+                        internalformat,
+                    );
+                    shadow.record_pvrtc_unallocated_level(target, texture, level);
+                }
+            }
+            log_once!("Emulating glTexStorage2D for a PVRTC internalformat: immutable storage skipped, uploads will be software-decoded to RGBA");
+            return;
+        }
         gles.TexStorage2D(target, levels, internalformat, width, height);
         if let Some(texture) = bound_texture {
             shadow.forget_pvrtc_texture(texture);

@@ -5,6 +5,7 @@
  */
 //! `UIScreen`.
 
+use crate::dyld::{ConstantExports, HostConstant};
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::NSInteger;
 use crate::frameworks::uikit::ui_geometry::UIEdgeInsets;
@@ -12,6 +13,17 @@ use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, ClassExports, HostObject,
     TrivialHostObject, SEL,
 };
+
+pub const CONSTANTS: ConstantExports = &[
+    (
+        "_UIScreenDidConnectNotification",
+        HostConstant::NSString("UIScreenDidConnectNotification"),
+    ),
+    (
+        "_UIScreenDidDisconnectNotification",
+        HostConstant::NSString("UIScreenDidDisconnectNotification"),
+    ),
+];
 
 #[derive(Default)]
 pub struct State {
@@ -166,6 +178,31 @@ fn new_trait_collection(
     autorelease(env, collection)
 }
 
+/// Backing object for the `id<UICoordinateSpace>` values that `UIScreen`
+/// returns. It only needs `bounds`, because conversions between the screen's
+/// own coordinate spaces are the identity.
+#[derive(Default)]
+struct UICoordinateSpaceHostObject {
+    bounds: CGRect,
+}
+impl HostObject for UICoordinateSpaceHostObject {}
+
+/// Create the coordinate-space object for `screen`. Apple returns a
+/// long-lived object here; we return an autoreleased one because nothing in
+/// the emulator retains it.
+fn new_screen_coordinate_space(env: &mut crate::Environment, screen: id) -> id {
+    let bounds: CGRect = msg![env; screen bounds];
+    let class = env
+        .objc
+        .get_known_class("UICoordinateSpace", &mut env.mem);
+    let object = env.objc.alloc_object(
+        class,
+        Box::new(UICoordinateSpaceHostObject { bounds }),
+        &mut env.mem,
+    );
+    autorelease(env, object)
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -209,12 +246,18 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (CGRect)bounds {
     let (width, height) = screen_size_for_current_orientation(env);
-    if env.options.landscape_uiscreen_bounds {
-        log_dbg!(
-            "Landscape UIScreen bounds reporting {}x{}",
-            width,
-            height
-        );
+    if env.options.landscape_uiscreen_bounds || crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS") {
+        // `-bounds` is called hundreds of times during app launch, and every
+        // `log!` costs a logcat round trip plus a write to the log file, so
+        // report the override once instead of on every call.
+        static REPORTED: std::sync::Once = std::sync::Once::new();
+        REPORTED.call_once(|| {
+            log!(
+                "Landscape UIScreen bounds reporting {}x{}",
+                width,
+                height
+            );
+        });
     }
     CGRect {
         origin: CGPoint { x: 0.0, y: 0.0 },
@@ -408,6 +451,50 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)displayLinkWithTarget:(id)target selector:(SEL)selector {
     msg_class![env; CADisplayLink displayLinkWithTarget:target selector:selector]
+}
+
+// Apple's
+// <https://developer.apple.com/documentation/uikit/uiscreen/1617810-coordinatespace>:
+// "The current coordinate space of the screen. ... use this coordinate space
+// with the `UICoordinateSpace` protocol methods to convert between the
+// screen's coordinate system and other coordinate systems." The screen space
+// always has its origin at the top-left corner and `bounds` as its extent.
+- (id)coordinateSpace {
+    new_screen_coordinate_space(env, this)
+}
+
+// Apple's
+// <https://developer.apple.com/documentation/uikit/uiscreen/1617823-fixedcoordinatespace>:
+// "The fixed coordinate space of the screen. ... unlike the coordinateSpace
+// property, this coordinate space does not change when the interface
+// rotates." The built-in screen always reports portrait-oriented bounds, so
+// both properties describe the same space.
+- (id)fixedCoordinateSpace {
+    new_screen_coordinate_space(env, this)
+}
+
+@end
+
+@implementation UICoordinateSpace: NSObject
+
+- (CGRect)bounds {
+    env.objc.borrow::<UICoordinateSpaceHostObject>(this).bounds
+}
+
+// The only coordinate spaces this emulator hands out describe the same
+// screen-sized, origin-at-zero space, so converting between them, or between
+// them and themselves, never changes the value.
+- (CGPoint)convertPoint:(CGPoint)point toCoordinateSpace:(id)_space {
+    point
+}
+- (CGPoint)convertPoint:(CGPoint)point fromCoordinateSpace:(id)_space {
+    point
+}
+- (CGRect)convertRect:(CGRect)rect toCoordinateSpace:(id)_space {
+    rect
+}
+- (CGRect)convertRect:(CGRect)rect fromCoordinateSpace:(id)_space {
+    rect
 }
 
 @end
