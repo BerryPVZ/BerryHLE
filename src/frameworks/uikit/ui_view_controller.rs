@@ -21,7 +21,9 @@ use crate::objc::{
 };
 use crate::Environment;
 
+pub mod modal_transition;
 pub mod ui_navigation_controller;
+
 
 pub type UIModalTransitionStyle = i32;
 pub type UIModalPresentationStyle = i32;
@@ -83,6 +85,7 @@ pub(crate) struct UIViewControllerHostObject {
     modal_presentation_style: UIModalPresentationStyle,
     editing: bool,
     is_being_presented: bool,
+    is_being_dismissed: bool,
     /// When non-empty, the path (relative to the bundle resource path)
     /// at which the storyboardc directory lives. Storyboard-instantiated
     /// view controllers store the path so `-loadView` knows to load the
@@ -478,6 +481,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (bool)isBeingPresented {
     env.objc.borrow::<UIViewControllerHostObject>(this).is_being_presented
 }
+- (bool)isBeingDismissed {
+ env.objc.borrow::<UIViewControllerHostObject>(this).is_being_dismissed
+}
 
 - (())setWantsFullScreenLayout:(bool)_wants {
     // Apple docs: When set to YES, the view controller's view extends
@@ -777,11 +783,18 @@ pub const CLASSES: ClassExports = objc_classes! {
     // view has an associated UIViewController and posts the appropriate
     // appearance hooks for the new view, so we route through the window
     // directly instead of adding the view to the presenter's view.
-    () = msg![env; window addSubview:modal_view];
-    () = msg![env; modal_vc viewDidAppear:animated];
-    env.objc
-        .borrow_mut::<UIViewControllerHostObject>(modal_vc)
-        .is_being_presented = false;
+   () = msg![env; window addSubview:modal_view];
+   if animated
+   && env
+   .objc
+   .borrow::<UIViewControllerHostObject>(modal_vc)
+   .modal_transition_style
+   == 0
+   {
+   modal_transition::animate(env, this, modal_vc, false);
+   } else {
+   modal_transition::complete(env, this, modal_vc, false, animated);
+   }
 
 
     // The modal hierarchy is now fully attached to a window. Any UIWebView
@@ -841,23 +854,29 @@ pub const CLASSES: ClassExports = objc_classes! {
         return;
     }
 
-    () = msg![env; presented viewWillDisappear:animated];
-
-    let presented_view: id = msg![env; presented view];
-    if presented_view != nil {
-        () = msg![env; presented_view removeFromSuperview];
-    }
-
-    () = msg![env; presented viewDidDisappear:animated];
-
-    env.objc
-        .borrow_mut::<UIViewControllerHostObject>(presented)
-        .presenting_view_controller = nil;
-    env.objc
-        .borrow_mut::<UIViewControllerHostObject>(this)
-        .presented_view_controller = nil;
-    release(env, presented);
-    invoke_void_block(env, completion);
+   if env
+   .objc
+   .borrow::<UIViewControllerHostObject>(presented)
+   .is_being_dismissed
+   {
+   return;
+   }
+   env.objc
+   .borrow_mut::<UIViewControllerHostObject>(presented)
+   .is_being_dismissed = true;
+   () = msg![env; presented viewWillDisappear:animated];
+   if animated
+   && env
+   .objc
+   .borrow::<UIViewControllerHostObject>(presented)
+   .modal_transition_style
+   == 0
+   {
+   modal_transition::animate(env, this, presented, true);
+   } else {
+   modal_transition::complete(env, this, presented, true, animated);
+   }
+   invoke_void_block(env, completion);
 }
 
 // Apple docs: The style used to transition the receiver's modal view controller

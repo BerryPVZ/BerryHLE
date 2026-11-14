@@ -22,6 +22,7 @@ pub mod ca_transform3d; // <-- НАШ НОВЫЙ МОДУЛЬ ДЛЯ ТРАНС�
 
 mod animation;
 mod composition;
+pub mod view_transition;
 
 pub use composition::recomposite_if_necessary;
 
@@ -66,6 +67,7 @@ pub struct State {
     ca_media_timing_function: ca_media_timing_function::State,
     ca_transaction: ca_transaction::State,
     composition: composition::State,
+ view_transition: view_transition::State,
     gradients: ca_gradient_layer::State,
 }
 

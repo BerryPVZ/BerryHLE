@@ -292,9 +292,9 @@ fn fullscreen_frame_matches_screen(frame: CGRect, screen: CGRect) -> bool {
 /// If there is an opaque `CAEAGLLayer` that covers the entire screen, this
 /// returns a pointer to it. Otherwise, it returns [nil].
 pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
-    if env.options.force_composition {
+    if env.options.force_composition || super::view_transition::has_active(env) {
         log_once!(
-            "Force Composition is enabled; bypassing the fullscreen EAGL fast path."
+            "Bypassing fullscreen EAGL fast path (forced composition or active transition)."
         );
         return nil;
     }

@@ -50,6 +50,20 @@ struct NSPredicateHostObject {
 }
 impl HostObject for NSPredicateHostObject {}
 
+/// Whether Core Data can evaluate this predicate against its own store.
+/// Block predicates and anything unparseable must fall back to in-memory
+/// evaluation rather than being silently treated as matching everything.
+pub(super) fn is_supported(env: &crate::Environment, predicate: id) -> bool {
+match &env.objc.borrow::<NSPredicateHostObject>(predicate).kind {
+PredicateKind::Block(_) => true,
+PredicateKind::Not(p) => is_supported(env, *p),
+PredicateKind::And(a, b) | PredicateKind::Or(a, b) => {
+is_supported(env, *a) && is_supported(env, *b)
+}
+_ => true,
+}
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);

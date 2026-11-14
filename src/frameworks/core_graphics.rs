@@ -8,6 +8,7 @@
 //! Useful resources:
 //! - Apple's [Quartz 2D Programming Guide](https://developer.apple.com/library/archive/documentation/GraphicsImaging/Conceptual/drawingwithquartz2d/Introduction/Introduction.html)
 
+mod bitmap_blend;
 pub mod cg_affine_transform;
 pub mod cg_bitmap_context;
 pub mod cg_color;

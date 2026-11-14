@@ -1293,6 +1293,22 @@ impl Fs {
         self.lookup_node(path).is_some()
     }
 
+/// Resolve a writable sandbox file for a native library (such as SQLite).
+/// Create it through the VFS first so mount permissions and the directory
+/// inventory remain authoritative; never derive a host path from text.
+    pub fn writable_host_path(&mut self, path: &GuestPath) -> Result<PathBuf, ()> {
+        let mut options = GuestOpenOptions::new();
+        options.write().create();
+        drop(self.open_with_options(path, options)?);
+        match self.lookup_node(path) {
+            Some(FsNode::File {
+                location: FileLocation::Path(path),
+                writeable: true,
+            }) => Ok(path.clone()),
+            _ => Err(()),
+        }
+    }
+
     /// Resolve an existing guest path using the case-insensitive semantics of
     /// the iPhone OS application volume.
     ///

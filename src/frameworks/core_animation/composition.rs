@@ -68,6 +68,7 @@ unsafe fn load_matrix(gles: &mut dyn GLES, matrix: Matrix<4>) {
 ///
 /// Returns the time a recomposite is due, if any.
 pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<Instant> {
+    super::view_transition::expire(env);
     // Compositing requires a window/render target. In headless mode there is
     // none, so there is nothing to composite; skip rather than touching the
     // absent window further down.
@@ -92,6 +93,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
 
     // Advance any UIImageView frame animations before compositing.
     crate::frameworks::uikit::ui_view::ui_image_view::update_animations(env);
+     super::view_transition::display_outgoing(env);
 
     let fullscreen_eagl_layer = find_fullscreen_eagl_layer(env);
     if fullscreen_eagl_layer != nil {
@@ -633,7 +635,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
 
 /// Call `displayIfNeeded` on all relevant layers in the tree, so their bitmaps
 /// are up to date before compositing.
-fn display_layers(env: &mut Environment, root_layer: id) {
+pub(super) fn display_layers(env: &mut Environment, root_layer: id) {
     // Tell layers to redraw themselves if needed.
 
     fn traverse(objc: &ObjC, layer: id, layers_needing_display: &mut Vec<id>) {
@@ -665,6 +667,8 @@ unsafe fn composite_layer_recursive(
     cumulative_transform: Matrix<4>,
     opacity: CGFloat,
 ) {
+    let (layer, local_transform) =
+     super::view_transition::presentation(env, layer).unwrap_or((layer, Matrix::identity()));
     // TODO: this can't handle zPosition among other things, but it is not
     //       supported yet :)
     // TODO: back-to-front drawing is not efficient, could we use front-to-back?
@@ -703,9 +707,9 @@ unsafe fn composite_layer_recursive(
         let CALayerHostObject { bounds, .. } = host_obj;
 
         // Update the transform to match this layer's co-ordinate space.
-        let cumulative_transform =
-            <Matrix<4> as From<_>>::from(host_obj.superlayer_to_layer_transform())
-                .multiply(&cumulative_transform);
+                let cumulative_transform = local_transform
+                 .multiply(&<Matrix<4> as From<_>>::from(host_obj.superlayer_to_layer_transform()))
+                 .multiply(&cumulative_transform);
 
         // Reposition and scale the unit quad (see ARRAY_BUFFER binding)
         // so it will have the right size in this layer's co-ordinate space.

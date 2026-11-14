@@ -979,6 +979,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ui_view_controller::CLASSES,
         ui_page_view_controller::CLASSES,
         ui_view_controller::ui_navigation_controller::CLASSES,
+   ui_view_controller::modal_transition::CLASSES,
     ],
     constant_exports: &[
         ui_application::CONSTANTS,

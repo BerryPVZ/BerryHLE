@@ -58,6 +58,8 @@ pub(super) struct AnimationBlockState {
     pub(super) delegate: id,
     pub(super) did_stop_selector: Option<SEL>,
     pub(super) will_start_selector: Option<SEL>,
+    transition: Option<crate::frameworks::core_animation::view_transition::Pending>,
+    curve: i32,
 }
 impl Default for AnimationBlockState {
     fn default() -> AnimationBlockState {
@@ -70,6 +72,8 @@ impl Default for AnimationBlockState {
             delegate: nil,
             did_stop_selector: None,
             will_start_selector: None,
+            transition: None,
+            curve: 0,
         }
     }
 }
@@ -492,6 +496,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         );
         if block.delegate != nil { release(env, block.delegate); }
         if block.animation_id != nil { release(env, block.animation_id); }
+        if let Some(transition) = block.transition {
+         crate::frameworks::core_animation::view_transition::discard(env, transition);
+        }
     }
     if animationID != nil { let _: id = msg![env; animationID retain]; }
     env.framework_state.uikit.ui_view.animation_block = AnimationBlockState {
@@ -533,8 +540,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (())commitAnimations {
-    let block = std::mem::take(&mut env.framework_state.uikit.ui_view.animation_block);
+    let mut block = std::mem::take(&mut env.framework_state.uikit.ui_view.animation_block);
     if !block.in_block { return; }
+    
+    if let Some(transition) = block.transition.take() {
+     crate::frameworks::core_animation::view_transition::start(
+      env, transition, block.duration, block.delay, block.curve,
+     );
+    }
 
     // Fire `setAnimationWillStartSelector:` synchronously. This is good enough
     // for the apps that touchHLE supports; iOS would normally fire it at the
@@ -609,6 +622,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (())_touchHLE_animationDidStopFireMethod:(id)which_timer {
+crate::frameworks::core_animation::view_transition::expire(env);
     let dict: id = msg![env; which_timer userInfo];
     let key_delegate: id = get_static_str(env, "_touchHLE_uiview_anim_delegate");
     let key_sel: id = get_static_str(env, "_touchHLE_uiview_anim_sel");
@@ -645,16 +659,30 @@ pub const CLASSES: ClassExports = objc_classes! {
     let _: () = msg_send_no_type_checking(env, (delegate, sel, animation_id, finished, context));
 }
 
-// Visual properties of animation blocks that touchHLE does not animate.
-// These are intentionally no-ops, but they must remain present so that the
-// app's calls don't fall through to the dynamic dispatcher's "unimplemented
-// selector" path.
-+ (())setAnimationCurve:(NSInteger)_curve { }
+// `setAnimationCurve:` and `setAnimationTransition:forView:cache:` drive the
+// legacy flip transition. The remaining visual properties of animation blocks
+// are not animated; they stay as no-ops so the calls do not fall through to
+// the dispatcher's "unimplemented selector" path.
++ (())setAnimationCurve:(NSInteger)curve {
+ if !env.framework_state.uikit.ui_view.animation_block.in_block { return; }
+ env.framework_state.uikit.ui_view.animation_block.curve = curve;
+}
 + (())setAnimationBeginsFromCurrentState:(bool)_from { }
 + (())setAnimationRepeatAutoreverses:(bool)_autoreverses { }
 + (())setAnimationRepeatCount:(f32)_count { }
 + (())setAnimationsEnabled:(f32)_enabled { }
-+ (())setAnimationTransition:(NSInteger)_transition forView:(id)_view cache:(bool)_cache { }
++ (())setAnimationTransition:(NSInteger)transition forView:(id)view cache:(bool)cache {
+ if !env.framework_state.uikit.ui_view.animation_block.in_block { return; }
+ if let Some(old) = env.framework_state.uikit.ui_view.animation_block.transition.take() {
+  crate::frameworks::core_animation::view_transition::discard(env, old);
+ }
+ () = msg![env; view layoutIfNeeded];
+ let layer: id = msg![env; view layer];
+ let pending = crate::frameworks::core_animation::view_transition::prepare(
+  env, layer, transition, cache,
+ );
+ env.framework_state.uikit.ui_view.animation_block.transition = pending;
+}
 + (())setAnimationStartDate:(id)_date { }
 + (())setAnimationPosition:(CGPoint)_position { }
 + (bool)areAnimationsEnabled { true }

@@ -84,6 +84,7 @@ pub fn CGBitmapContextCreate(
         };
         let total_size = bytes_per_row.checked_mul(height).unwrap();
         let data = env.mem.alloc(total_size);
+        env.mem.bytes_at_mut(data.cast(), total_size).fill(0);
         (data, true, bytes_per_row)
     } else {
         (data, false, bytes_per_row)
@@ -203,9 +204,14 @@ pub fn CGBitmapContextCreateImage(env: &mut Environment, context: CGContextRef) 
                 255
             };
 
-            normalized_pixels.push(r);
-            normalized_pixels.push(g);
-            normalized_pixels.push(b);
+            // Image owns RGBA8 with premultiplied alpha, including when the
+            // source bitmap context uses straight alpha.
+            let factor = if matches!(bitmap_data.alpha_info, kCGImageAlphaLast | kCGImageAlphaFirst) {
+                a as f32 / 255.0
+            } else { 1.0 };
+            normalized_pixels.push((r as f32 * factor).round() as u8);
+            normalized_pixels.push((g as f32 * factor).round() as u8);
+            normalized_pixels.push((b as f32 * factor).round() as u8);
             normalized_pixels.push(a);
         }
     }
@@ -345,31 +351,13 @@ fn get_pixels<'a>(data: &CGBitmapContextData, mem: &'a mut Mem) -> &'a mut [u8] 
     mem.bytes_at_mut(data.data.cast(), pixel_data_size)
 }
 
-fn blend_alpha(bg: f32, fg: f32) -> f32 {
-    fg + bg * (1.0 - fg)
-}
-
-fn blend_straight(bg: (f32, f32, f32, f32), fg: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
-    if fg.3 == 0.0 {
-        bg
-    } else {
-        let new_a = blend_alpha(bg.3, fg.3);
-        (
-            (fg.0 * fg.3 + bg.0 * bg.3 * (1.0 - fg.3)) / new_a,
-            (fg.1 * fg.3 + bg.1 * bg.3 * (1.0 - fg.3)) / new_a,
-            (fg.2 * fg.3 + bg.2 * bg.3 * (1.0 - fg.3)) / new_a,
-            new_a,
-        )
-    }
-}
-
-fn blend_premultiplied(bg: (f32, f32, f32, f32), fg: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
-    (
-        fg.0 + bg.0 * (1.0 - fg.3),
-        fg.1 + bg.1 * (1.0 - fg.3),
-        fg.2 + bg.2 * (1.0 - fg.3),
-        blend_alpha(bg.3, fg.3),
-    )
+// Storage is sRGB, but compositing uses linear premultiplied RGBA, as in
+// touchHLE. Unpremultiply before the nonlinear gamma conversion, and multiply
+// afterwards; gamma_decode(encoded * alpha) is not gamma_decode(encoded)*alpha.
+fn decode_component(encoded: f32, alpha: f32, premultiplied: bool) -> f32 {
+    if alpha <= 0.0 { return 0.0; }
+    let straight = if premultiplied { encoded / alpha } else { encoded };
+    gamma_decode(straight.clamp(0.0, 1.0)) * alpha
 }
 
 // ИСПРАВЛЕНИЕ: Убраны все `unreachable!()` и `unimplemented!()`
@@ -440,9 +428,9 @@ fn get_pixel(
         },
     );
     (
-        gamma_decode(pixel.0),
-        gamma_decode(pixel.1),
-        gamma_decode(pixel.2),
+        decode_component(pixel.0, pixel.3, matches!(data.alpha_info, kCGImageAlphaPremultipliedLast | kCGImageAlphaPremultipliedFirst)),
+        decode_component(pixel.1, pixel.3, matches!(data.alpha_info, kCGImageAlphaPremultipliedLast | kCGImageAlphaPremultipliedFirst)),
+        decode_component(pixel.2, pixel.3, matches!(data.alpha_info, kCGImageAlphaPremultipliedLast | kCGImageAlphaPremultipliedFirst)),
         pixel.3,
     )
 }
@@ -453,6 +441,7 @@ fn put_pixel(
     coords: (i32, i32),
     pixel: (CGFloat, CGFloat, CGFloat, CGFloat),
     blend: bool,
+    blend_mode: i32,
 ) {
     let (x, y) = coords;
     if x < 0 || y < 0 {
@@ -469,18 +458,14 @@ fn put_pixel(
 
     let bg_pixel = get_pixel(data, pixels, first_component_idx);
     let (r, g, b, a) = if blend {
-        match data.alpha_info {
-            kCGImageAlphaLast | kCGImageAlphaFirst => blend_straight(bg_pixel, pixel),
-            kCGImageAlphaPremultipliedLast | kCGImageAlphaPremultipliedFirst => {
-                blend_premultiplied(bg_pixel, pixel)
-            }
-            kCGImageAlphaOnly => (pixel.0, pixel.1, pixel.2, blend_alpha(bg_pixel.3, pixel.3)),
-            _ => pixel,
-        }
+        super::bitmap_blend::composite(bg_pixel, pixel, blend_mode)
     } else {
         pixel
     };
-    let (r, g, b) = (gamma_encode(r), gamma_encode(g), gamma_encode(b));
+    let a = a.clamp(0.0, 1.0);
+    let factor = if matches!(data.alpha_info, kCGImageAlphaLast | kCGImageAlphaFirst) { 1.0 } else { a };
+    let encode = |v: f32| if a > 0.0 { gamma_encode((v / a).clamp(0.0, 1.0)) * factor } else { 0.0 };
+    let (r, g, b) = (encode(r), encode(g), encode(b));
     if is_rgb555(data) {
         let rgb = ((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8);
         write_rgb555(data, pixels, first_component_idx, rgb);
@@ -505,6 +490,8 @@ fn put_pixel(
 pub struct CGBitmapContextDrawer<'a> {
     bitmap_info: CGBitmapContextData,
     rgb_fill_color: (CGFloat, CGFloat, CGFloat, CGFloat),
+    alpha: CGFloat,
+    blend_mode: i32,
     transform: CGAffineTransform,
     pixels: &'a mut [u8],
 }
@@ -517,6 +504,8 @@ impl CGBitmapContextDrawer<'_> {
         let &CGContextHostObject {
             subclass: CGContextSubclass::CGBitmapContext(bitmap_info),
             rgb_fill_color,
+            alpha,
+            blend_mode,
             transform,
             ..
         } = objc.borrow(context);
@@ -525,6 +514,8 @@ impl CGBitmapContextDrawer<'_> {
         CGBitmapContextDrawer {
             bitmap_info,
             rgb_fill_color,
+            alpha,
+            blend_mode,
             transform,
             pixels,
         }
@@ -537,17 +528,12 @@ impl CGBitmapContextDrawer<'_> {
         self.bitmap_info.height
     }
     pub fn rgb_fill_color(&self) -> (CGFloat, CGFloat, CGFloat, CGFloat) {
-        let multiply_by = match self.bitmap_info.alpha_info {
-            kCGImageAlphaPremultipliedLast | kCGImageAlphaPremultipliedFirst => {
-                self.rgb_fill_color.3
-            }
-            _ => 1.0,
-        };
+        let a = self.rgb_fill_color.3.clamp(0.0, 1.0);
         (
-            gamma_decode(self.rgb_fill_color.0 * multiply_by),
-            gamma_decode(self.rgb_fill_color.1 * multiply_by),
-            gamma_decode(self.rgb_fill_color.2 * multiply_by),
-            self.rgb_fill_color.3,
+            gamma_decode(self.rgb_fill_color.0) * a,
+            gamma_decode(self.rgb_fill_color.1) * a,
+            gamma_decode(self.rgb_fill_color.2) * a,
+            a,
         )
     }
     pub fn put_pixel(
@@ -556,7 +542,13 @@ impl CGBitmapContextDrawer<'_> {
         color: (CGFloat, CGFloat, CGFloat, CGFloat),
         blend: bool,
     ) {
-        put_pixel(&self.bitmap_info, self.pixels, coords, color, blend)
+        // Apple's global alpha multiplies the paint/image alpha. Apply it
+        // once here for every primitive. ClearRect bypasses painting state.
+        // https://developer.apple.com/library/archive/documentation/GraphicsImaging/Conceptual/drawingwithquartz2d/dq_color/dq_color.html
+        let (r, g, b, a) = color;
+        let alpha = if blend { self.alpha } else { 1.0 };
+        put_pixel(&self.bitmap_info, self.pixels, coords,
+            (r * alpha, g * alpha, b * alpha, a * alpha), blend, self.blend_mode)
     }
 
     /// Convert a straight sRGB source into the representation used by this
@@ -569,14 +561,10 @@ impl CGBitmapContextDrawer<'_> {
     ) {
         let (r, g, b, a) = color;
         let a = a.clamp(0.0, 1.0);
-        let factor = match self.bitmap_info.alpha_info {
-            kCGImageAlphaPremultipliedLast | kCGImageAlphaPremultipliedFirst => a,
-            _ => 1.0,
-        };
         self.put_pixel(coords, (
-            gamma_decode(r.clamp(0.0, 1.0) * factor),
-            gamma_decode(g.clamp(0.0, 1.0) * factor),
-            gamma_decode(b.clamp(0.0, 1.0) * factor),
+            gamma_decode(r.clamp(0.0, 1.0)) * a,
+            gamma_decode(g.clamp(0.0, 1.0)) * a,
+            gamma_decode(b.clamp(0.0, 1.0)) * a,
             a,
         ), blend);
     }
@@ -638,11 +626,44 @@ pub(super) fn draw_image(
     let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
 
     let (image_width, image_height) = image.dimensions();
+    let mut visited = 0usize;
+    let mut src_nonzero = 0usize;
     for ((x, y), (texel_x, texel_y)) in drawer.iter_transformed_pixels(rect) {
         let texel_x = (image_width as f32 * texel_x) as i32;
         let texel_y = (image_height as f32 * (1.0 - texel_y)) as i32;
-        if let Some(color) = image.get_pixel((texel_x, texel_y)) {
+        if texel_x >= 0 && texel_x < image_width as i32 && texel_y >= 0 && texel_y < image_height as i32 {
+            let at = (texel_y as usize * image_width as usize + texel_x as usize) * 4;
+            let rgba = &image.pixels()[at..at + 4];
+            let a = rgba[3] as f32 / 255.0;
+            let color = (decode_component(rgba[0] as f32 / 255.0, a, true),
+                         decode_component(rgba[1] as f32 / 255.0, a, true),
+                         decode_component(rgba[2] as f32 / 255.0, a, true), a);
+            visited += 1;
+            if color.3 > 0.0 {
+                src_nonzero += 1;
+            }
             drawer.put_pixel((x, y), color, true)
+        }
+    }
+    {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 12 {
+            log!(
+                "DRAW-DIAG #{n} ctx={}x{} bpc={} bpr={} alpha={:#x} order={:#x} ctm={:?} rect={:?} image={}x{} visited={} src_alpha_nonzero={}",
+                drawer.bitmap_info.width,
+                drawer.bitmap_info.height,
+                drawer.bitmap_info.bits_per_component,
+                drawer.bitmap_info.bytes_per_row,
+                drawer.bitmap_info.alpha_info,
+                drawer.bitmap_info.byte_order,
+                drawer.transform,
+                rect,
+                image_width,
+                image_height,
+                visited,
+                src_nonzero
+            );
         }
     }
 }

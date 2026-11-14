@@ -53,6 +53,20 @@ struct CAMediaTimingFunctionHostObject {
     control_points: [[f32; 2]; 2],
 }
 impl HostObject for CAMediaTimingFunctionHostObject {}
+
+/// UIView's legacy curve values use the same cubic Beziers as the named
+/// Core Animation timing functions below.
+pub(super) fn solve_view_curve(curve: i32, input: f32) -> f32 {
+    if input <= 0.0 || input >= 1.0 || curve == 3 {
+        return input;
+    }
+    let control_points = match curve {
+        1 => [[0.42, 0.0], [1.0, 1.0]],
+        2 => [[0.0, 0.0], [0.58, 1.0]],
+        _ => [[0.42, 0.0], [0.58, 1.0]],
+    };
+    CAMediaTimingFunctionHostObject { control_points }.solve_for_input(input)
+}
 impl CAMediaTimingFunctionHostObject {
     fn solve_for_input(&self, input: f32) -> f32 {
         // My math is kinda rusty so i couldnt solve the equation
