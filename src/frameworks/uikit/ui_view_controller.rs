@@ -477,11 +477,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())setTitle:(id)title {
     let old_title = env.objc.borrow::<UIViewControllerHostObject>(this).title;
-    if old_title != nil {
-        release(env, old_title);
-    }
+    // Retain before releasing: a screen may set the title it already has, and
+    // releasing first would free the object before the retain.
     if title != nil {
         retain(env, title);
+    }
+    if old_title != nil {
+        release(env, old_title);
     }
     let (item, tab_item) = {
         let host = env.objc.borrow_mut::<UIViewControllerHostObject>(this);

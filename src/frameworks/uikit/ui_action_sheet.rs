@@ -227,8 +227,9 @@ destructiveButtonTitle:(id)destructive_title // NSString*
 
 - (())setTitle:(id)title {
     let old = env.objc.borrow::<UIActionSheetHostObject>(this).title;
-    release(env, old);
+    // Retain before releasing: a caller may set the title it already has.
     retain(env, title);
+    release(env, old);
     env.objc.borrow_mut::<UIActionSheetHostObject>(this).title = title;
 }
 

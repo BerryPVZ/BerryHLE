@@ -71,7 +71,8 @@ fn invalidate_item_bars(env: &mut crate::Environment, item: id) {
         if msg![env; view isKindOfClass:class] {
             let items = env.objc.borrow::<UINavigationBarHostObject>(view).items;
             if msg![env; items containsObject:item] {
-                () = msg![env; view setNeedsLayout];
+                // `setNeedsLayout` is a no-op in this tree, so lay the bar out now.
+                () = msg![env; view layoutSubviews];
             }
         }
     }
@@ -264,7 +265,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let new_items: id = msg![env; new_items initWithArray:items];
     release(env, old_items);
     env.objc.borrow_mut::<UINavigationBarHostObject>(this).items = new_items;
-    () = msg![env; this setNeedsLayout];
+    () = msg![env; this layoutSubviews];
 }
 
 - (())setItems:(id)items animated:(bool)_animated {
@@ -333,7 +334,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     retain(env, top);
     () = msg![env; items removeLastObject];
-    () = msg![env; this setNeedsLayout];
+    () = msg![env; this layoutSubviews];
 
     if delegate != nil {
         let sel = env.objc.register_host_selector(
@@ -654,3 +655,58 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::environment::Environment;
+
+    fn label_texts(env: &mut Environment, bar: id) -> Vec<String> {
+        let subviews: id = msg![env; bar subviews];
+        let count: u32 = msg![env; subviews count];
+        let mut texts = Vec::new();
+        for i in 0..count {
+            let view: id = msg![env; subviews objectAtIndex:i];
+            let class: id = msg_class![env; UILabel class];
+            if msg![env; view isKindOfClass:class] {
+                let text: id = msg![env; view text];
+                if text != nil {
+                    texts.push(
+                        crate::frameworks::foundation::ns_string::to_rust_string(env, text)
+                            .into_owned(),
+                    );
+                }
+            }
+        }
+        texts
+    }
+
+    #[test]
+    fn item_title_changes_reach_the_bar() {
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let bar: id = msg_class![env; UINavigationBar alloc];
+        let frame = CGRect {
+            origin: CGPoint::default(),
+            size: CGSize {
+                width: 320.0,
+                height: 44.0,
+            },
+        };
+        let bar: id = msg![env; bar initWithFrame:frame];
+        let item: id = msg_class![env; UINavigationItem new];
+        let title = get_static_str(env, "Settings");
+        () = msg![env; item setTitle:title];
+        let items: id = msg_class![env; NSArray arrayWithObject:item];
+        () = msg![env; bar setItems:items];
+        assert_eq!(label_texts(env, bar), vec!["Settings".to_string()]);
+
+        // A title set after the bar has laid out must still reach the screen.
+        let later = get_static_str(env, "Advanced");
+        () = msg![env; item setTitle:later];
+        assert_eq!(label_texts(env, bar), vec!["Advanced".to_string()]);
+
+        release(env, pool);
+    }
+}
+
