@@ -1,52 +1,136 @@
 # AGENTS.md
 
-## Rules for emulator changes
-
-These rules come from bugs that reached trunk. They apply to every agent and environment.
-
-1. **Run the full test suite.** Run `cargo test` with `test_app` before you open a PR. TestApp needs LLVM 12 in `tests/llvm` and the common-3.0 SDK in `tests/common-3.0.sdk`; the macOS job in `.github/workflows/HyperHLE_release.yml` shows where to get them. If you cannot run TestApp, write "TestApp not run" in the PR. Never delete, skip or weaken a failing test or CI step to get a green run: fix the cause, or leave it failing and report it.
-2. **Do not change shared behavior for one game.** A change that affects every app must match real iOS. If one game needs different behavior, add a general option in `src/options.rs` and enable it for that bundle ID in `touchHLE_default_options.txt`. Do not add new `bundle_identifier()` checks in code.
-3. **When a game crashes, find and fix the root cause first.**
-   - Investigate the last emulated API calls, loader, CPU, memory, audio or graphics state against Apple's documentation before considering any fallback.
-   - If the emulator is wrong, fix the underlying API or subsystem and add a regression test (`TestApp` where possible, otherwise a Rust unit test).
-   - Keep `--headless` (and `TestApp`) strict: headless runs must never mask guest `exit`, `abort`, uncaught exceptions or fatal signals, so automated tests always surface regressions immediately.
-   - GUI compatibility fallbacks (such as surviving legacy DRM/anti-tamper `exit()`/`abort()` checks or ignoring unhandled `SIGPIPE` from old ad SDKs) must remain scoped to non-headless sessions and must never replace fixing an actual HLE bug.
-4. **Match iOS and cite the source.** Before you implement or change an API, check Apple's documentation (old references are on web.archive.org) and touchHLE. Link the source in the commit message or the test.
-5. **Search before adding.** Before you add a class, method, function or constant, search for an existing one. The `no_duplicate_*` tests fail on duplicates.
-
-## Cursor Cloud specific instructions
-
-### Overview
-
 This repo contains two products:
 1. **touchHLE emulator** (Rust) — an HLE iPhone OS app emulator
 2. **AppDB** (Python/FastAPI) — a compatibility report web app at `appdb/`
 
-### Building the Rust emulator
+The emulator is the main one: a Rust host reimplements iOS frameworks and runs
+the guest ARM code (Dynarmic JIT, with an interpreter fallback).
 
-- **Git submodules must be initialized** before building: `git submodule update --init`
-- The build requires `libboost-dev`, `libstdc++-14-dev`, `libsndio-dev`, and X11 development headers (`libxext-dev`, `libx11-dev`, etc.) on Linux.
-- On this Cloud Agent VM (x86_64 Linux with clang), you **must** set `RUSTFLAGS="-C link-arg=-latomic"` for linking to succeed. OpenAL Soft's static build uses `std::atomic` operations that require `libatomic`, but the build scripts don't link it automatically.
-- Build: `RUSTFLAGS="-C link-arg=-latomic" cargo build`
-- The emulator binary requires a display/window system (SDL2) to run graphically. In headless environments, use `--help`, `--copyright`, or `--info` flags to verify the binary works.
+## Overview
 
-### Linting and testing
+Beyond the two main products, the tree also carries `telegram_bot/` (an app-fix
+request bot), `android/` (the Gradle app) and `platform/ios/` (the Applesauce
+host app).
 
-- Lint: `dev-scripts/lint.sh` (runs comment-length check + `cargo clippy -- --deny warnings` + `cargo doc`). Note: the `t` branch has pre-existing long comment lines and clippy warnings with Rust 1.95+, so the full lint script will fail. Running `cargo clippy` alone (without `--deny warnings`) confirms no hard errors.
-- Tests: `RUSTFLAGS="-C link-arg=-latomic" cargo test -- --skip test_app` (the `test_app` integration tests require a custom LLVM/SDK toolchain not available in the Cloud VM). This is not a full check: say in the PR that TestApp was not run. CI runs it on macOS.
-- Format: `dev-scripts/format.sh` (requires `clang-format` for C/C++ files).
+## Rules for emulator changes
 
-### Running the AppDB
+These come from bugs that reached trunk. They apply to every agent and environment.
 
-- Setup: `cd appdb && python3 -m venv .venv && source .venv/bin/activate && pip install -e .`
-- Run: `cd appdb && source .venv/bin/activate && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload`
-- The SQLite DB is auto-created and seeded with demo data on first startup.
-- Submitting reports requires GitHub OAuth (`GITHUB_OAUTH_CLIENT_ID` / `GITHUB_OAUTH_CLIENT_SECRET` env vars); without these, the app works in read-only mode.
-- The triage JSON API requires `APPDB_TRIAGE_TOKEN` env var.
+1. **Run the test suite.** `cargo test` runs the unit tests and the TestApp
+   integration tests. If you cannot run TestApp, write "TestApp not run" and why.
+   Never delete, skip or weaken a failing test or CI step to get a green run: fix
+   the cause, or leave it failing and report it.
+2. **Do not change shared behavior for one game.** A change that affects every app
+   must match real iOS. If one game needs different behavior, add a general option
+   in `src/options.rs` and enable it for that bundle ID in
+   `touchHLE_default_options.txt`. Do not add new `bundle_identifier()` checks in
+   code.
+3. **When a game crashes, find and fix the root cause first.** Check the last
+   emulated API calls, loader, CPU, memory, audio and graphics state against
+   Apple's documentation before considering a fallback. If the emulator is wrong,
+   fix the subsystem and add a regression test (TestApp where possible, otherwise
+   a Rust unit test). Keep `--headless` and TestApp strict: they must never mask
+   guest `exit`, `abort`, uncaught exceptions or fatal signals. GUI compatibility
+   fallbacks (legacy DRM/anti-tamper `exit()`/`abort()`, unhandled `SIGPIPE` from
+   old ad SDKs) stay scoped to non-headless sessions and never replace a real fix.
+4. **Match iOS and cite the source.** Check Apple's documentation (old references
+   are on web.archive.org) and touchHLE before implementing or changing an API.
+   Link the source in the commit message or the test.
+5. **Search before adding.** Before adding a class, method, function or constant,
+   search for an existing one. The `no_duplicate_*` tests fail on duplicates.
 
-## Session notes
+## Where things live
 
-There is a dated handoff for the in-flight CI/graphics work in `HANDOFF.md`
-(Minigore render investigation, release-workflow measurements, environment
-gotchas). It is session context rather than project documentation - update or
-delete it once it is stale.
+- `src/lib.rs` — `main()` and the module list. `src/environment.rs` —
+  `Environment`, threads, the run loop.
+- `src/environment/app_picker.rs` (~8.8k lines) — the native app picker and the
+  whole Settings screen. Most settings/UI work lands here, not in `frameworks/`.
+- `src/frameworks/<framework>/` — HLE implementations (`uikit/`, `foundation/`,
+  `core_animation/`, `opengles/`, ...). `src/libc/` and `src/dyld/` — C runtime
+  and loader. `src/objc/` — Objective-C runtime and the `msg!`, `msg_super!`,
+  `msg_class!` and `objc_classes!` macros. `src/window.rs` — SDL window, input,
+  device profiles.
+- Guest pointers are 32-bit and host pointers 64-bit; use `Ptr`/`MutPtr` from
+  `src/mem.rs`, never raw host pointers, for anything the guest can see.
+- Other products in the tree: `appdb/` (FastAPI compatibility database,
+  `cd appdb && pip install -e . && uvicorn app.main:app`), `telegram_bot/`,
+  `android/` (Gradle app), `platform/ios/` (Applesauce host app).
+
+## Adding an iOS API
+
+- Implement it in the framework module. Classes go in an `objc_classes!` block as
+  `@implementation Class: Superclass`; C functions use `export_c_func!`; constants
+  use `HostConstant`.
+- Export it through the module's `FUNCTIONS`/`CLASSES`/`CONSTANTS`, wired via that
+  module's `DYLIB` const and listed in `DYLIB_LIST` in `src/dyld/dylib_list.rs`.
+  Nothing resolves until it is in that list.
+- `no_duplicate_classes`, `no_duplicate_functions` and `no_duplicate_constants`
+  (`src/dyld/dylib_list.rs`) fail on duplicates.
+- `objc_classes!` requires all `+` class methods before the first `-` instance
+  method.
+- `msg!` arguments must each be a single token tree, so bind complex expressions
+  first: `let hidden = !selected;` then `msg![env; this setHidden:hidden]`.
+  `msg_super!` only works inside `objc_classes!`.
+- In `-dealloc`, `std::mem::take` on a host object resets the embedded superclass
+  host object. Copy `superclass` back before `msg_super![env; this dealloc]`
+  (pattern at `src/frameworks/uikit/ui_view/ui_scroll_view/ui_text_view.rs:158`),
+  or the superclass's retained fields leak.
+
+## Options and the Settings screen
+
+- Options live in `src/options.rs` (fields, parsing, and a large `#[cfg(test)]`
+  suite). Help text is `OPTIONS_HELP.txt`, `include_str!`'d, so `--help` and the
+  on-disk copy change together.
+- A new setting touches three places: `src/options.rs`, `OPTIONS_HELP.txt`, and a
+  row in the Settings screen in `src/environment/app_picker.rs`.
+- Per-app defaults go in `touchHLE_default_options.txt`, one line per bundle ID.
+  Read its header before editing.
+
+## Build, test, lint
+
+`cargo` and `rustc` are not on `PATH` in this environment:
+
+```sh
+export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
+```
+
+- Submodules first: `git submodule update --init` (`vendor/SDL`, `dynarmic`,
+  `openal-soft`, `libxml2`, `stb`).
+- Fresh builds need `export CMAKE_POLICY_VERSION_MINIMUM=3.5`: the installed
+  CMake 4.4 rejects `sdl2-sys`'s old `cmake_minimum_required`.
+- `cargo test` — 652 tests in 5 suites (649 unit, 2 in `tests/integration.rs`,
+  1 trainer atlas), 12 ignored doc-tests, ~25 s warm. TestApp needs `tests/llvm`
+  (LLVM 12; its `clang` is x86_64, so Rosetta on Apple Silicon) and
+  `tests/common-3.0.sdk`; both are present here.
+- One test: `cargo test --lib <name>`. TestApp only:
+  `cargo test --test integration test_app`.
+- Run an app: `cargo run --release -- path/to/app.app`, with the bundle in
+  `touchHLE_apps/`. That directory, `touchHLE_sandbox/` and the `touchHLE_*.txt`
+  runtime files are gitignored.
+- Android: the `android/` Gradle project builds the core with
+  `--no-default-features` and `sdl2/bundled` plus the two static wrappers, not
+  the default feature set (see the `extraCargoBuildArguments` in
+  `android/app/build.gradle`).
+
+## Never run `cargo fmt`
+
+`cargo fmt --check` reports 986 files: the tree is hand-formatted (4-space indent,
+wrapped by hand). Running it buries a real change in an unreviewable diff. Follow
+the surrounding style instead.
+
+## Lint baseline
+
+`dev-scripts/lint.sh` cannot pass on this tree: 351 pre-existing comment lines
+over 80 columns, and ~1000 pre-existing clippy warnings that `--deny warnings`
+turns into a failure. Use it as a delta check only: keep new comments within 80
+columns and add no new warnings. `cargo clippy` needs the `PATH` above, or it
+reports "no such command: clippy".
+
+## Commits and docs
+
+- Subject style is a lowercase area prefix: `uikit:`, `renderer:`, `settings:`,
+  `libc:`, `opengles:`.
+- A user-visible change updates `README.md`, `CHANGELOG.md` and
+  `OPTIONS_HELP.txt` where relevant.
+- Commit messages and tests cite the iOS behaviour they match (rule 4 above).
