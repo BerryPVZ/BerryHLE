@@ -4755,15 +4755,22 @@ mod present_rotation_tests {
     }
 
     #[test]
-    fn an_autorotated_root_is_not_turned_twice() {
+    fn an_autorotated_root_is_presented_upright() {
         // A landscape game on a phone held in landscape: UIKit autorotated the
-        // root view by a quarter turn, and the device orientation would add the
-        // same quarter turn again. The frame must come out with one quarter
-        // turn, not two. Two is the 180-degree-upside-down presentation.
+        // root view by a quarter turn, and the device orientation reports the
+        // same quarter turn. The renderbuffer is already upright in the layer's
+        // own space, so presenting it must add nothing. Replacing the device
+        // rotation with the layer turn left it a quarter turn out; adding the
+        // two left it 180 degrees out.
         let device = turn(std::f32::consts::FRAC_PI_2);
         let layer = std::f32::consts::FRAC_PI_2;
         let result = present_rotation_matrix(device, false, layer, false);
-        assert_eq!(quarter_turns(result), 1);
+        assert_eq!(quarter_turns(result), 0);
+        // The two turns are measured from the same place, so when the guest
+        // never reported an orientation the layer turn is the only one left to
+        // undo.
+        let result = present_rotation_matrix(turn(0.0), false, layer, false);
+        assert_eq!(quarter_turns(result), 3);
     }
 
     #[test]

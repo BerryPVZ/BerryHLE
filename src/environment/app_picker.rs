@@ -6198,7 +6198,7 @@ fn setup_settings(
     // (either way) is an explicit override for every later launch.
     display_rows.push(SettingsRow::Toggle(
         "Rotation fix",
-        "Moves the game image if it starts out turned the wrong way. iPad games need it most; other games can come out turned if it is on, so leave it off unless you need it.",
+        "Turns the game image to match the app's own autorotation instead of the old iPad guess. Turn it on if the image comes out upside down or a quarter turn off.",
         "rotationFix:",
         picker_settings.rotation_fix.unwrap_or(false),
         true,

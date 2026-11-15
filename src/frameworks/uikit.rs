@@ -1032,6 +1032,9 @@ pub struct State {
     ui_touch: ui_touch::State,
     pub ui_view: ui_view::State,
     ui_responder: ui_responder::State,
+    /// Set once UIKit has autorotated the root view. The presenter measures the
+    /// rotation from the layer tree instead, so this is only used to stop a
+    /// later portrait `setStatusBarOrientation:` from undoing the autorotation.
     pub autorotation_transform_applied: bool,
 }
 
