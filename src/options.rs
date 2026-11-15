@@ -224,9 +224,9 @@ pub struct Options {
     pub trainer_disabled: bool,
     /// `--quick-menu`: show a pause button in the top-left corner of the
     /// emulated screen while an app runs. It opens a menu with the settings
-    /// that are worth changing mid-game (scale hack, trainer, network access,
-    /// performance display, FPS limiter, RAM limiter) and an "Exit emulator"
-    /// button that goes back to the app picker.
+    /// that are worth changing mid-game (performance display, FPS limiter,
+    /// RAM limiter, Cheat Engine) and an "Exit emulator" button that goes
+    /// back to the app picker.
     pub quick_menu: bool,
     pub initial_orientation: DeviceOrientation,
     /// iOS version reported to guest applications. `None` uses the latest compatibility version.

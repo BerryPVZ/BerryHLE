@@ -50,7 +50,9 @@ These come from bugs that reached trunk. They apply to every agent and environme
   `core_animation/`, `opengles/`, ...). `src/libc/` and `src/dyld/` — C runtime
   and loader. `src/objc/` — Objective-C runtime and the `msg!`, `msg_super!`,
   `msg_class!` and `objc_classes!` macros. `src/window.rs` — SDL window, input,
-  device profiles.
+  device profiles. `src/quick_menu.rs` and `src/trainer_ui.rs` — the two
+  in-game overlays, drawn last in `src/gles/present.rs` and fed touches before
+  the guest in `src/window.rs`.
 - Guest pointers are 32-bit and host pointers 64-bit; use `Ptr`/`MutPtr` from
   `src/mem.rs`, never raw host pointers, for anything the guest can see.
 - Other products in the tree: `appdb/` (FastAPI compatibility database,
