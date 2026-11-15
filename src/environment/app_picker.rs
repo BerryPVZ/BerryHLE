@@ -5680,7 +5680,7 @@ enum SettingsRow {
     /// Renderer mode dropdown.
     RendererDropdown(&'static str, &'static str),
     /// The "RAM Limiter" row (its dropdown is a root-level overlay).
-    MemoryLimitDropdown,
+    MemoryLimitDropdown(&'static str, &'static str),
     /// A full-width action row with centered red text, like the old-iOS
     /// "Delete Account" cell.
     Button {
@@ -5735,6 +5735,31 @@ fn settings_text_height(
     size.height
 }
 
+/// Height of a row whose title sits beside a control and whose description
+/// runs the full width underneath both. `setup_settings` lays the same row out
+/// with the same numbers, so the two must stay in step.
+fn control_row_height(
+    env: &mut Environment,
+    title: &str,
+    description: &str,
+    inner_width: CGFloat,
+    title_font_size: CGFloat,
+    control_width: CGFloat,
+    control_height: CGFloat,
+) -> CGFloat {
+    let side = SETTINGS_ROW_SIDE_INSET;
+    let title_width = inner_width - 2.0 * side - control_width - 8.0;
+    let description_width = inner_width - 2.0 * side;
+    settings_text_height(env, title, title_font_size, title_width).max(control_height)
+        + settings_text_height(
+            env,
+            description,
+            SETTINGS_DESCRIPTION_FONT_SIZE,
+            description_width,
+        )
+        + 20.0
+}
+
 fn settings_row_height(env: &mut Environment, row: &SettingsRow, inner_width: CGFloat) -> CGFloat {
     let side = SETTINGS_ROW_SIDE_INSET;
     match row {
@@ -5753,61 +5778,23 @@ fn settings_row_height(env: &mut Environment, row: &SettingsRow, inner_width: CG
                 + 8.0
         }
         SettingsRow::Toggle(title, description, _, _, _) => {
-            let text_width = inner_width - 2.0 * side - 94.0 - 8.0;
-            (settings_text_height(env, *title, 16.0, text_width)
-                + settings_text_height(
-                    env,
-                    *description,
-                    SETTINGS_DESCRIPTION_FONT_SIZE,
-                    text_width,
-                )
-                + 12.0)
-                .max(27.0)
-                + 16.0
+            control_row_height(env, title, description, inner_width, 16.0, 94.0, 27.0)
         }
         SettingsRow::DeviceDropdown(title, description) => {
-            let text_width = inner_width - 2.0 * side - 190.0 - 8.0;
-            (settings_text_height(env, *title, 14.0, text_width)
-                + settings_text_height(
-                    env,
-                    *description,
-                    SETTINGS_DESCRIPTION_FONT_SIZE,
-                    text_width,
-                )
-                + 12.0)
-                .max(30.0)
-                + 16.0
+            control_row_height(env, title, description, inner_width, 14.0, 160.0, 30.0)
         }
         SettingsRow::LanguageDropdown(title, description) => {
-            let text_width = inner_width - 2.0 * side - 170.0 - 8.0;
-            (settings_text_height(env, *title, 16.0, text_width)
-                + settings_text_height(
-                    env,
-                    *description,
-                    SETTINGS_DESCRIPTION_FONT_SIZE,
-                    text_width,
-                )
-                + 12.0)
-                .max(30.0)
-                + 16.0
+            control_row_height(env, title, description, inner_width, 16.0, 140.0, 30.0)
         }
         SettingsRow::RendererDropdown(title, description) => {
-            let text_width = inner_width - 2.0 * side - 130.0 - 8.0;
-            (settings_text_height(env, *title, 14.0, text_width)
-                + settings_text_height(
-                    env,
-                    *description,
-                    SETTINGS_DESCRIPTION_FONT_SIZE,
-                    text_width,
-                )
-                + 12.0)
-                .max(30.0)
-                + 16.0
+            control_row_height(env, title, description, inner_width, 14.0, 120.0, 30.0)
         }
         SettingsRow::Button { title, .. } => {
             settings_text_height(env, title, 16.0, inner_width - 2.0 * side) + 24.0
         }
-            SettingsRow::MemoryLimitDropdown => 58.0,
+        SettingsRow::MemoryLimitDropdown(title, description) => {
+            control_row_height(env, title, description, inner_width, 14.0, 120.0, 30.0)
+        }
         SettingsRow::ManualValue {
             title, description, ..
         } => {
@@ -6117,19 +6104,19 @@ fn setup_settings(
     () = msg![env; scroll setClipsToBounds:true];
     // Rows are laid out for the list's width, so sideways scrolling only
     // wobbles the list under a diagonal drag. Directional lock keeps a
- // slightly sideways vertical drag on the vertical axis.
+    // slightly sideways vertical drag on the vertical axis.
     () = msg![env; scroll setAlwaysBounceHorizontal:false];
     () = msg![env; scroll setShowsHorizontalScrollIndicator:false];
- () = msg![env; scroll setDirectionalLockEnabled:true];
+    () = msg![env; scroll setDirectionalLockEnabled:true];
     () = msg![env; settings_view addSubview:scroll];
     // A scrollbar down the right edge, like the ones beside the dropdown
     // lists, so a long list of settings shows where you are in it. Dragging
     // it scrolls the list; `settingsScroll:forEvent:` reports the drag.
     let track_button: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
     () = msg![env; track_button setFrame:(rect(
-        scrollbar_x,
+        width - SETTINGS_SCROLLBAR_HIT_WIDTH,
         list_top,
-        SETTINGS_SCROLLBAR_WIDTH,
+        SETTINGS_SCROLLBAR_HIT_WIDTH,
         list_height,
     ))];
     () = msg![env; track_button setBackgroundColor:clear];
@@ -6519,7 +6506,10 @@ fn setup_settings(
     sections.push((
         "EMULATION",
         vec![
-            SettingsRow::MemoryLimitDropdown,
+            SettingsRow::MemoryLimitDropdown(
+                "RAM Limiter",
+                "Caps the memory the game can allocate, so it behaves like a device that has run out. Default follows the Device model.",
+            ),
             SettingsRow::Toggle(
                 "Cheat Engine",
                 "Allows the in-game trainer to be used where a game expects one. Leave off unless a game needs it.",
@@ -6539,6 +6529,13 @@ fn setup_settings(
                 "Lets a game reach the network. Most single-player games do not need it, and it can make a game wait on servers that no longer exist.",
                 "network:",
                 picker_settings.network,
+                true,
+            ),
+            SettingsRow::Toggle(
+                "Local Game Center sign-in",
+                "Tells the game that a local player is signed in. Online Game Center services are not provided.",
+                "gameCenterAuthenticated:",
+                picker_settings.game_center_authenticated,
                 true,
             ),
         ],
@@ -6686,18 +6683,20 @@ fn setup_settings(
                     }
                 }
                 SettingsRow::DeviceDropdown(title, description) => {
-                    let dropdown_width: CGFloat = 190.0;
-                    let label_width = (inner_width - 2.0 * side - dropdown_width - 8.0).max(0.0);
-                    let title_height = settings_text_height(env, title, 14.0, label_width);
+                    let dropdown_width: CGFloat = 160.0;
+                    let title_width = inner_width - 2.0 * side - dropdown_width - 8.0;
+                    let description_width = inner_width - 2.0 * side;
+                    let title_height = settings_text_height(env, title, 14.0, title_width);
+                    let band_height = title_height.max(30.0);
                     let description_height = settings_text_height(
                         env,
                         description,
                         SETTINGS_DESCRIPTION_FONT_SIZE,
-                        label_width,
+                        description_width,
                     );
                     let title_view = new_setting_title_label(
                         env,
-                        rect(side, row_y + 8.0, label_width, title_height),
+                        rect(side, row_y + 8.0, title_width, title_height),
                         title,
                         14.0,
                         black,
@@ -6707,8 +6706,8 @@ fn setup_settings(
                         env,
                         rect(
                             side,
-                            row_y + 8.0 + title_height + 4.0,
-                            label_width,
+                            row_y + 8.0 + band_height + 4.0,
+                            description_width,
                             description_height,
                         ),
                         description,
@@ -6722,7 +6721,7 @@ fn setup_settings(
                         settings_view,
                         rect(
                             inner_width - side - dropdown_width,
-                            row_y + (row_height - 30.0) / 2.0,
+                            row_y + 8.0 + (band_height - 30.0) / 2.0,
                             dropdown_width,
                             30.0,
                         ),
@@ -6730,29 +6729,38 @@ fn setup_settings(
                         device_model_dropdown_spec(),
                     ));
                 }
-        SettingsRow::LanguageDropdown(title, description) => {
-            let dropdown_width: CGFloat = 170.0;
-            let label_width = inner_width - 2.0 * side - dropdown_width;
-            let title_height =
-                settings_text_height(env, title, 16.0, label_width);
-            let description_height = settings_text_height(
-                env,
-                description,
-                SETTINGS_DESCRIPTION_FONT_SIZE,
-                label_width,
-            );
-            let label_frame = rect(side, row_y + 8.0 + title_height + 4.0, label_width, description_height);
-            let description_label: id =
-                new_label(env, label_frame, description, SETTINGS_DESCRIPTION_FONT_SIZE, false, gray_text);
-            () = msg![env; group addSubview:description_label];
-            let title_view = new_setting_title_label(
-                env,
-                rect(side, row_y + 8.0, label_width, title_height),
-                title,
-                16.0,
-                black,
-            );
-            () = msg![env; group addSubview:title_view];
+                SettingsRow::LanguageDropdown(title, description) => {
+                    let dropdown_width: CGFloat = 140.0;
+                    let title_width = inner_width - 2.0 * side - dropdown_width - 8.0;
+                    let description_width = inner_width - 2.0 * side;
+                    let title_height = settings_text_height(env, title, 16.0, title_width);
+                    let band_height = title_height.max(30.0);
+                    let description_height = settings_text_height(
+                        env,
+                        description,
+                        SETTINGS_DESCRIPTION_FONT_SIZE,
+                        description_width,
+                    );
+                    let title_view = new_setting_title_label(
+                        env,
+                        rect(side, row_y + 8.0, title_width, title_height),
+                        title,
+                        16.0,
+                        black,
+                    );
+                    () = msg![env; group addSubview:title_view];
+                    let description_view = new_setting_description_label(
+                        env,
+                        rect(
+                            side,
+                            row_y + 8.0 + band_height + 4.0,
+                            description_width,
+                            description_height,
+                        ),
+                        description,
+                        gray_text,
+                    );
+                    () = msg![env; group addSubview:description_view];
                     language_dropdown = Some(make_settings_dropdown(
                         env,
                         delegate,
@@ -6760,7 +6768,7 @@ fn setup_settings(
                         settings_view,
                         rect(
                             inner_width - side - dropdown_width,
-                            row_y + (row_height - 30.0) / 2.0,
+                            row_y + 8.0 + (band_height - 30.0) / 2.0,
                             dropdown_width,
                             30.0,
                         ),
@@ -6768,39 +6776,21 @@ fn setup_settings(
                         language_dropdown_spec(),
                     ));
                 }
-                SettingsRow::MemoryLimitDropdown => {
-                    let label_view = new_label(
-                        env,
-                        rect(side, row_y + 11.0, 150.0, 22.0),
-                        "RAM Limiter",
-                        16.0,
-                        false,
-                        black,
-                    );
-                    () = msg![env; group addSubview:label_view];
-                    memory_limit_dropdown = Some(make_settings_dropdown(
-                        env,
-                        delegate,
-                        group,
-                        settings_view,
-                        rect(inner_width - side - 170.0, row_y + 7.0, 170.0, 30.0),
-                        menu_origin,
-                        memory_limit_dropdown_spec(),
-                    ));
-                }
-                SettingsRow::RendererDropdown(title, description) => {
-                    let dropdown_width: CGFloat = 130.0;
-                    let label_width = inner_width - 2.0 * side - dropdown_width - 8.0;
-                    let title_height = settings_text_height(env, title, 14.0, label_width);
+                SettingsRow::MemoryLimitDropdown(title, description) => {
+                    let dropdown_width: CGFloat = 120.0;
+                    let title_width = inner_width - 2.0 * side - dropdown_width - 8.0;
+                    let description_width = inner_width - 2.0 * side;
+                    let title_height = settings_text_height(env, title, 14.0, title_width);
+                    let band_height = title_height.max(30.0);
                     let description_height = settings_text_height(
                         env,
                         description,
                         SETTINGS_DESCRIPTION_FONT_SIZE,
-                        label_width,
+                        description_width,
                     );
                     let title_view = new_setting_title_label(
                         env,
-                        rect(side, row_y + 8.0, label_width, title_height),
+                        rect(side, row_y + 8.0, title_width, title_height),
                         title,
                         14.0,
                         black,
@@ -6810,8 +6800,55 @@ fn setup_settings(
                         env,
                         rect(
                             side,
-                            row_y + 8.0 + title_height + 4.0,
-                            label_width,
+                            row_y + 8.0 + band_height + 4.0,
+                            description_width,
+                            description_height,
+                        ),
+                        description,
+                        gray_text,
+                    );
+                    () = msg![env; group addSubview:description_view];
+                    memory_limit_dropdown = Some(make_settings_dropdown(
+                        env,
+                        delegate,
+                        group,
+                        settings_view,
+                        rect(
+                            inner_width - side - dropdown_width,
+                            row_y + 8.0 + (band_height - 30.0) / 2.0,
+                            dropdown_width,
+                            30.0,
+                        ),
+                        menu_origin,
+                        memory_limit_dropdown_spec(),
+                    ));
+                }
+                SettingsRow::RendererDropdown(title, description) => {
+                    let dropdown_width: CGFloat = 120.0;
+                    let title_width = inner_width - 2.0 * side - dropdown_width - 8.0;
+                    let description_width = inner_width - 2.0 * side;
+                    let title_height = settings_text_height(env, title, 14.0, title_width);
+                    let band_height = title_height.max(30.0);
+                    let description_height = settings_text_height(
+                        env,
+                        description,
+                        SETTINGS_DESCRIPTION_FONT_SIZE,
+                        description_width,
+                    );
+                    let title_view = new_setting_title_label(
+                        env,
+                        rect(side, row_y + 8.0, title_width, title_height),
+                        title,
+                        14.0,
+                        black,
+                    );
+                    () = msg![env; group addSubview:title_view];
+                    let description_view = new_setting_description_label(
+                        env,
+                        rect(
+                            side,
+                            row_y + 8.0 + band_height + 4.0,
+                            description_width,
                             description_height,
                         ),
                         description,
@@ -6825,7 +6862,7 @@ fn setup_settings(
                         settings_view,
                         rect(
                             inner_width - side - dropdown_width,
-                            row_y + (row_height - 30.0) / 2.0,
+                            row_y + 8.0 + (band_height - 30.0) / 2.0,
                             dropdown_width,
                             30.0,
                         ),
@@ -6836,21 +6873,23 @@ fn setup_settings(
                     renderer_dropdown = Some(dropdown);
                 }
                 SettingsRow::Toggle(title, description, selector_name, default_state, enabled) => {
-                    // Keep every switch the same size; let long labels wrap
-                    // within the remaining row width instead of shrinking the
-                    // control or drawing text underneath it.
+                    // Keep every switch the same size; the title gives way to
+                    // it, while the description runs the full width under the
+                    // title instead of being squeezed into a narrow column.
                     let switch_width: CGFloat = 94.0;
-                    let text_width = inner_width - 2.0 * side - switch_width - 8.0;
-                    let title_height = settings_text_height(env, title, 16.0, text_width);
+                    let title_width = inner_width - 2.0 * side - switch_width - 8.0;
+                    let description_width = inner_width - 2.0 * side;
+                    let title_height = settings_text_height(env, title, 16.0, title_width);
+                    let band_height = title_height.max(27.0);
                     let description_height = settings_text_height(
                         env,
                         description,
                         SETTINGS_DESCRIPTION_FONT_SIZE,
-                        text_width,
+                        description_width,
                     );
                     let title_view = new_setting_title_label(
                         env,
-                        rect(side, row_y + 8.0, text_width, title_height),
+                        rect(side, row_y + 8.0, title_width, title_height),
                         title,
                         16.0,
                         black,
@@ -6860,8 +6899,8 @@ fn setup_settings(
                         env,
                         rect(
                             side,
-                            row_y + 8.0 + title_height + 4.0,
-                            text_width,
+                            row_y + 8.0 + band_height + 4.0,
+                            description_width,
                             description_height,
                         ),
                         description,
@@ -6872,7 +6911,7 @@ fn setup_settings(
                     let switch: id = msg_class![env; UISwitch alloc];
                     let switch: id = msg![env; switch initWithFrame:(rect(
                         inner_width - side - switch_width,
-                        row_y + (row_height - 27.0) / 2.0,
+                        row_y + 8.0 + (band_height - 27.0) / 2.0,
                         switch_width,
                         27.0,
                     ))];
@@ -6880,8 +6919,8 @@ fn setup_settings(
                     () = msg![env; switch setEnabled:enabled];
                     let selector = env.objc.lookup_selector(selector_name).unwrap();
                     () = msg![env; switch addTarget:delegate
-                                             action:selector
-                                   forControlEvents:UIControlEventValueChanged];
+                        action:selector
+                        forControlEvents:UIControlEventValueChanged];
                     () = msg![env; group addSubview:switch];
                     toggle_switches.push((selector_name, switch));
                 }
@@ -7065,6 +7104,10 @@ const DEVICE_MENU_VISIBLE_ITEMS: usize = 6;
 const DEVICE_MENU_ITEM_HEIGHT: CGFloat = 30.0;
 /// Width of the scrollbar down the right edge of the settings list.
 const SETTINGS_SCROLLBAR_WIDTH: CGFloat = 10.0;
+/// How wide the scrollbar's touch area is. The visible track stays
+/// narrow, but the strip you can grab is wider so it is easy to hit
+/// on a phone.
+const SETTINGS_SCROLLBAR_HIT_WIDTH: CGFloat = 28.0;
 
 /// The choices shown in the device-model dropdown, in display order, as
 /// `(title, tag)` pairs: "Default" (no override), "Auto" (match host screen),
