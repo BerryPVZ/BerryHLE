@@ -491,7 +491,16 @@ pub(super) fn interpolate(from: CATransform3D, to: CATransform3D, amount: f32) -
             *value += (target - *value) * amount;
         }
     }
-    if let (Some((qa, sa)), Some((mut qb, sb))) = (rotation_and_scale(a), rotation_and_scale(b)) {
+    // A transform that collapses to a plane or a point has no observable
+    // orientation. Reuse the other end's rotation rather than dropping the
+    // slerp and halving the turn.
+    let decomposed = match (rotation_and_scale(a), rotation_and_scale(b)) {
+        (Some(first), Some(second)) => Some((first, second)),
+        (Some((q, s)), None) => Some(((q, s), (q, scale_of(b)))),
+        (None, Some((q, s))) => Some(((q, scale_of(a)), (q, s))),
+        (None, None) => None,
+    };
+    if let Some(((qa, sa), (mut qb, sb))) = decomposed {
         let mut dot: f32 = qa.iter().zip(qb).map(|(a, b)| a * b).sum();
         if dot < 0.0 {
             qb = qb.map(|x| -x);
@@ -537,6 +546,20 @@ pub(super) fn interpolate(from: CATransform3D, to: CATransform3D, amount: f32) -
         }
     }
     Matrix::from_columns(result).into()
+}
+
+/// Column norms, used for the end of an animation that cannot be fully
+/// decomposed. Its orientation is unobservable, but its scale is not.
+fn scale_of(matrix: Matrix<4>) -> [f32; 3] {
+    let mut scale = [0.0; 3];
+    for (col, value) in scale.iter_mut().enumerate() {
+        *value = matrix.columns()[col][..3]
+            .iter()
+            .map(|x| x * x)
+            .sum::<f32>()
+            .sqrt();
+    }
+    scale
 }
 
 fn rotation_and_scale(matrix: Matrix<4>) -> Option<([f32; 4], [f32; 3])> {
@@ -630,7 +653,20 @@ mod tests {
         assert!(interpolate(from, to, 1.0).equal_to(to));
     }
 
-    fn approx_eq(a: CATransform3D, b: CATransform3D, eps: f32) -> bool {
+    #[test]
+    fn interpolation_borrows_rotation_from_the_decomposable_end() {
+        // A layer that grows from nothing while it turns. The collapsed end has no
+        // observable orientation, so the target rotation applies from the start
+        // instead of the turn being halved.
+        let from = CATransform3D::make_scale(0.01, 0.01, 0.0);
+        let to = CATransform3D::make_rotation(std::f32::consts::FRAC_PI_2, 0.0, 1.0, 0.0);
+        let mid = interpolate(from, to, 0.5);
+        let (m11, m13) = (mid.m11, mid.m13);
+        assert!(m11.abs() < 1e-5, "{}", m11);
+        assert!((m13 + 0.505).abs() < 1e-5, "{}", m13);
+    }
+
+fn approx_eq(a: CATransform3D, b: CATransform3D, eps: f32) -> bool {
         let fields = [
             (a.m11, b.m11),
             (a.m12, b.m12),
