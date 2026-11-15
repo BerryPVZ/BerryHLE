@@ -5,13 +5,17 @@
  */
 //! `UIActionSheet`.
 
+use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::NSUInteger;
 use crate::objc::{
-    id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
+    id, impl_HostObject_with_superclass, msg, msg_class, msg_super, nil, objc_classes, release,
+    retain, ClassExports, NSZonePtr,
 };
+use crate::Environment;
 
 #[derive(Default)]
 struct UIActionSheetHostObject {
+    superclass: super::ui_view::UIViewHostObject,
     delegate: id,
     title: id,
     /// NSMutableArray* of NSString* button titles
@@ -23,7 +27,105 @@ struct UIActionSheetHostObject {
     visible: bool,
     action_sheet_style: i32,
 }
-impl HostObject for UIActionSheetHostObject {}
+impl_HostObject_with_superclass!(UIActionSheetHostObject);
+
+fn notify(env: &mut Environment, sheet: id, name: &str, index: Option<i32>) {
+    let delegate = env.objc.borrow::<UIActionSheetHostObject>(sheet).delegate;
+    let selector = env.objc.register_host_selector(name.into(), &mut env.mem);
+    if delegate != nil && msg![env; delegate respondsToSelector:selector] {
+        if let Some(index) = index {
+            let _: () = crate::objc::msg_send(env, (delegate, selector, sheet, index));
+        } else {
+            let _: () = crate::objc::msg_send(env, (delegate, selector, sheet));
+        }
+    }
+}
+
+fn present(env: &mut Environment, sheet: id, view: id) {
+    if env.objc.borrow::<UIActionSheetHostObject>(sheet).visible {
+        return;
+    }
+    let app: id = msg_class![env; UIApplication sharedApplication];
+    let window: id = msg![env; app keyWindow];
+    let parent = if window != nil { window } else { view };
+    if parent == nil {
+        return;
+    }
+    let bounds: CGRect = msg![env; parent bounds];
+    let _: () = msg![env; sheet setFrame:bounds];
+    let dim: id = msg_class![env; UIColor colorWithWhite:0.0f32 alpha:0.55f32];
+    let _: () = msg![env; sheet setBackgroundColor:dim];
+    let (titles, title, cancel, destructive) = {
+        let h = env.objc.borrow::<UIActionSheetHostObject>(sheet);
+        (
+            h.button_titles,
+            h.title,
+            h.cancel_button_index,
+            h.destructive_button_index,
+        )
+    };
+    let count: NSUInteger = msg![env; titles count];
+    let row_height = 48.0;
+    let title_height = if title == nil { 0.0 } else { 40.0 };
+    let top = (bounds.size.height - count as f32 * row_height - title_height - 12.0).max(0.0);
+    if title != nil {
+        let label: id = msg_class![env; UILabel alloc];
+        let frame = CGRect {
+            origin: CGPoint { x: 8.0, y: top },
+            size: CGSize {
+                width: bounds.size.width - 16.0,
+                height: title_height,
+            },
+        };
+        let label: id = msg![env; label initWithFrame:frame];
+        let white: id = msg_class![env; UIColor whiteColor];
+        let _: () = msg![env; label setText:title];
+        let _: () = msg![env; label setTextColor:white];
+        let clear: id = msg_class![env; UIColor clearColor];
+        let _: () = msg![env; label setBackgroundColor:clear];
+        let _: () = msg![env; label setTextAlignment:1i32];
+        let _: () = msg![env; label setNumberOfLines:2i32];
+        let _: () = msg![env; sheet addSubview:label];
+        release(env, label);
+    }
+    let action = env
+        .objc
+        .register_host_selector("_touchHLE_buttonTapped:".into(), &mut env.mem);
+    for i in 0..count {
+        let button: id = msg_class![env; UIButton buttonWithType:1i32];
+        let frame = CGRect {
+            origin: CGPoint {
+                x: 8.0,
+                y: top + title_height + i as f32 * row_height,
+            },
+            size: CGSize {
+                width: bounds.size.width - 16.0,
+                height: row_height - 4.0,
+            },
+        };
+        let text: id = msg![env; titles objectAtIndex:i];
+        let _: () = msg![env; button setFrame:frame];
+        let _: () = msg![env; button setTitle:text forState:0u32];
+        let _: () = msg![env; button setTag:(i as i32)];
+        if i as i32 == destructive {
+            let red: id = msg_class![env; UIColor redColor];
+            let _: () = msg![env; button setTitleColor:red forState:0u32];
+        } else if i as i32 == cancel {
+            let black: id = msg_class![env; UIColor blackColor];
+            let _: () = msg![env; button setTitleColor:black forState:0u32];
+        }
+        let _: () = msg![env; button addTarget:sheet action:action forControlEvents:64u32];
+        let _: () = msg![env; sheet addSubview:button];
+    }
+    env.objc
+        .borrow_mut::<UIActionSheetHostObject>(sheet)
+        .visible = true;
+    retain(env, sheet);
+    notify(env, sheet, "willPresentActionSheet:", None);
+    let _: () = msg![env; parent addSubview:sheet];
+    notify(env, sheet, "didPresentActionSheet:", None);
+    release(env, sheet);
+}
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -33,6 +135,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 + (id)allocWithZone:(NSZonePtr)_zone {
     let host_object = Box::new(UIActionSheetHostObject {
+        superclass: Default::default(),
         delegate: nil,
         title: nil,
         button_titles: nil,
@@ -45,23 +148,28 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
 
+- (id)init {
+    let this: id = msg_super![env; this init];
+    let buttons: id = msg_class![env; NSMutableArray new];
+    env.objc.borrow_mut::<UIActionSheetHostObject>(this).button_titles = buttons;
+    this
+}
+
 // MARK: - Designated initializer
 
 - (id)initWithTitle:(id)title               // NSString*
            delegate:(id)delegate
   cancelButtonTitle:(id)cancel_title        // NSString*
 destructiveButtonTitle:(id)destructive_title // NSString*
-  otherButtonTitles:(id)other_titles {      // NSString*, ..., nil  (varargs stub)
-    // Initialise button array.
-    let buttons: id = msg_class![env; NSMutableArray new];
-    env.objc.borrow_mut::<UIActionSheetHostObject>(this).button_titles = buttons;
+  otherButtonTitles:(id)other_titles, ...args {
+    let this: id = msg![env; this init];
+    let buttons = env.objc.borrow::<UIActionSheetHostObject>(this).button_titles;
 
     // Set title.
     retain(env, title);
     env.objc.borrow_mut::<UIActionSheetHostObject>(this).title = title;
 
     // Set delegate.
-    retain(env, delegate);
     env.objc.borrow_mut::<UIActionSheetHostObject>(this).delegate = delegate;
 
     // Add destructive button first (index 0 when present), matching UIKit.
@@ -72,10 +180,14 @@ destructiveButtonTitle:(id)destructive_title // NSString*
             idx as i32;
     }
 
-    // Add the first "other" button if provided (varargs not supported here;
-    // callers wanting more buttons should use addButtonWithTitle: afterwards).
     if other_titles != nil {
         let _: () = msg![env; buttons addObject:other_titles];
+        let mut args = args.start();
+        loop {
+            let title: id = args.next(env);
+            if title == nil { break; }
+            let _: () = msg![env; buttons addObject:title];
+        }
     }
 
     // Add cancel button last, matching UIKit behaviour.
@@ -91,12 +203,10 @@ destructiveButtonTitle:(id)destructive_title // NSString*
 
 - (())dealloc {
     let host = env.objc.borrow::<UIActionSheetHostObject>(this);
-    let (delegate, title, button_titles) =
-        (host.delegate, host.title, host.button_titles);
-    release(env, delegate);
+    let (title, button_titles) = (host.title, host.button_titles);
     release(env, title);
     release(env, button_titles);
-    env.objc.dealloc_object(this, &mut env.mem)
+    msg_super![env; this dealloc]
 }
 
 // MARK: - Delegate
@@ -106,9 +216,6 @@ destructiveButtonTitle:(id)destructive_title // NSString*
 }
 
 - (())setDelegate:(id)delegate {
-    let old = env.objc.borrow::<UIActionSheetHostObject>(this).delegate;
-    release(env, old);
-    retain(env, delegate);
     env.objc.borrow_mut::<UIActionSheetHostObject>(this).delegate = delegate;
 }
 
@@ -206,97 +313,34 @@ destructiveButtonTitle:(id)destructive_title // NSString*
     env.objc.borrow::<UIActionSheetHostObject>(this).visible
 }
 
-// MARK: - Presentation
-// touchHLE has no sheet UI. We immediately fire the cancel callback so the
-// app's delegate can clean up, matching the MPMediaPickerController pattern.
+// Presentation is asynchronous. UIKit calls the delegate only on selection.
+// https://developer.apple.com/documentation/uikit/uiactionsheetdelegate
+- (())showInView:(id)view { present(env, this, view); }
+- (())showFromToolbar:(id)view { present(env, this, view); }
+- (())showFromTabBar:(id)view { present(env, this, view); }
+- (())showFromBarButtonItem:(id)_item animated:(bool)_animated { present(env, this, nil); }
+- (())showFromRect:(CGRect)_rect inView:(id)view animated:(bool)_animated { present(env, this, view); }
 
-- (())showInView:(id)_view {
-    let _: () = msg![env; this _touchHLE_dismiss];
+- (())_touchHLE_buttonTapped:(id)sender {
+    let index: i32 = msg![env; sender tag];
+    let _: () = msg![env; this dismissWithClickedButtonIndex:index animated:true];
 }
 
-- (())showFromToolbar:(id)_toolbar {
-    let _: () = msg![env; this _touchHLE_dismiss];
-}
-
-- (())showFromTabBar:(id)_tab_bar {
-    let _: () = msg![env; this _touchHLE_dismiss];
-}
-
-- (())showFromBarButtonItem:(id)_item animated:(bool)_animated {
-    let _: () = msg![env; this _touchHLE_dismiss];
-}
-
-- (())showFromRect:(id)_rect inView:(id)_view animated:(bool)_animated {
-    let _: () = msg![env; this _touchHLE_dismiss];
-}
-
-// MARK: - Dismissal
-
-- (())dismissWithClickedButtonIndex:(NSUInteger)index animated:(bool)_animated {
+- (())dismissWithClickedButtonIndex:(i32)index animated:(bool)_animated {
+    if !env.objc.borrow::<UIActionSheetHostObject>(this).visible { return; }
+    retain(env, this);
     env.objc.borrow_mut::<UIActionSheetHostObject>(this).visible = false;
-
-    let delegate = env.objc.borrow::<UIActionSheetHostObject>(this).delegate;
-    if delegate == nil {
-        return;
+    notify(env, this, "actionSheet:clickedButtonAtIndex:", Some(index));
+    notify(env, this, "actionSheet:willDismissWithButtonIndex:", Some(index));
+    let _: () = msg![env; this removeFromSuperview];
+    let subviews: id = msg![env; this subviews];
+    let count: NSUInteger = msg![env; subviews count];
+    for i in 0..count {
+        let view: id = msg![env; subviews objectAtIndex:i];
+        let _: () = msg![env; view removeFromSuperview];
     }
-
-    let sel_clicked        = env.objc.register_host_selector("actionSheet:clickedButtonAtIndex:".to_string(), &mut env.mem);
-    let sel_will_dismiss   = env.objc.register_host_selector("actionSheet:willDismissWithButtonIndex:".to_string(), &mut env.mem);
-    let sel_did_dismiss    = env.objc.register_host_selector("actionSheet:didDismissWithButtonIndex:".to_string(), &mut env.mem);
-
-    let responds_clicked: bool      = msg![env; delegate respondsToSelector:sel_clicked];
-    let responds_will:    bool      = msg![env; delegate respondsToSelector:sel_will_dismiss];
-    let responds_did:     bool      = msg![env; delegate respondsToSelector:sel_did_dismiss];
-
-    if responds_clicked {
-        let _: () = msg![env; delegate actionSheet:this clickedButtonAtIndex:index];
-    }
-    if responds_will {
-        let _: () = msg![env; delegate actionSheet:this willDismissWithButtonIndex:index];
-    }
-    if responds_did {
-        let _: () = msg![env; delegate actionSheet:this didDismissWithButtonIndex:index];
-    }
-}
-
-- (())dismissDidClickedButtonIndex:(NSUInteger)index {
-    env.objc.borrow_mut::<UIActionSheetHostObject>(this).visible = false;
-
-    let delegate = env.objc.borrow::<UIActionSheetHostObject>(this).delegate;
-    if delegate == nil {
-        return;
-    }
-
-    let sel_clicked = env.objc.register_host_selector("actionSheet:clickedButtonAtIndex:".to_string(), &mut env.mem);
-    let responds: bool = msg![env; delegate respondsToSelector:sel_clicked];
-    if responds {
-        let _: () = msg![env; delegate actionSheet:this clickedButtonAtIndex:index];
-    }
-
-    // Then fire the full dismiss sequence.
-    let _: () = msg![env; this dismissWithClickedButtonIndex:index animated:false];
-}
-
-// Private helper — dismiss via cancel button (or index 0 as fallback).
-- (())_touchHLE_dismiss {
-    env.objc.borrow_mut::<UIActionSheetHostObject>(this).visible = false;
-
-    let delegate = env.objc.borrow::<UIActionSheetHostObject>(this).delegate;
-    if delegate != nil {
-        let sel_cancel = env.objc.register_host_selector("actionSheetCancel:".to_string(), &mut env.mem);
-        let responds: bool = msg![env; delegate respondsToSelector:sel_cancel];
-        if responds {
-            let _: () = msg![env; delegate actionSheetCancel:this];
-        }
-    }
-
-    let cancel_index = env.objc.borrow::<UIActionSheetHostObject>(this).cancel_button_index;
-    let dismiss_index: NSUInteger = if cancel_index >= 0 {
-        cancel_index as NSUInteger
-    } else {
-        0
-    };
-    let _: () = msg![env; this dismissDidClickedButtonIndex:dismiss_index];
+    notify(env, this, "actionSheet:didDismissWithButtonIndex:", Some(index));
+    release(env, this);
 }
 
 @end

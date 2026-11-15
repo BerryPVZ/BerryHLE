@@ -5,8 +5,9 @@
  */
 //! `UINavigationBar`.
 
-use crate::frameworks::core_graphics::{CGRect, CGSize};
+use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::NSInteger;
+use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::frameworks::uikit::ui_view::UIViewHostObject;
 use crate::objc::{
     id, impl_HostObject_with_superclass, msg, msg_class, msg_super, nil, objc_classes, release,
@@ -39,6 +40,9 @@ struct UINavigationBarHostObject {
     shadow_image: id,
     /// UIImage* background — retained
     background_image: id,
+    title_label: id,
+    prompt_label: id,
+    back_view: id,
 }
 impl_HostObject_with_superclass!(UINavigationBarHostObject);
 
@@ -59,6 +63,20 @@ struct UINavigationItemHostObject {
 }
 impl HostObject for UINavigationItemHostObject {}
 
+/// Item setters invalidate attached bars so late Done/title changes appear.
+fn invalidate_item_bars(env: &mut crate::Environment, item: id) {
+    let views = env.framework_state.uikit.ui_view.views.clone();
+    let class: id = msg_class![env; UINavigationBar class];
+    for view in views {
+        if msg![env; view isKindOfClass:class] {
+            let items = env.objc.borrow::<UINavigationBarHostObject>(view).items;
+            if msg![env; items containsObject:item] {
+                () = msg![env; view setNeedsLayout];
+            }
+        }
+    }
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -78,6 +96,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         items,
         shadow_image: nil,
         background_image: nil,
+        title_label: nil,
+        prompt_label: nil,
+        back_view: nil,
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -92,7 +113,24 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)initWithCoder:(id)coder {
-    msg_super![env; this initWithCoder:coder]
+    let this: id = msg_super![env; this initWithCoder:coder];
+    let key = get_static_str(env, "UIBarStyle");
+    let style: NSInteger = msg![env; coder decodeIntForKey:key];
+    () = msg![env; this setBarStyle:style];
+    let key = get_static_str(env, "UITranslucent");
+    let has: bool = msg![env; coder containsValueForKey:key];
+    if has {
+        let value: bool = msg![env; coder decodeBoolForKey:key];
+        () = msg![env; this setTranslucent:value];
+    }
+    let key = get_static_str(env, "UITintColor");
+    let tint: id = msg![env; coder decodeObjectForKey:key];
+    if tint != nil { () = msg![env; this setTintColor:tint]; }
+    let key = get_static_str(env, "UIItems");
+    let items: id = msg![env; coder decodeObjectForKey:key];
+    if items != nil { () = msg![env; this setItems:items]; }
+    () = msg![env; this layoutSubviews];
+    this
 }
 
 - (())dealloc {
@@ -111,8 +149,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, items);
     release(env, shadow);
     release(env, bg);
-    // delegate is weak — no release
-    env.objc.dealloc_object(this, &mut env.mem)
+    let host = env.objc.borrow::<UINavigationBarHostObject>(this);
+    let extra = [host.title_label, host.prompt_label, host.back_view];
+    for object in extra { release(env, object); }
+    // delegate is weak — no release; UIView tears down retained subviews/layer.
+    msg_super![env; this dealloc]
 }
 
 // MARK: - Delegate
@@ -219,10 +260,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())setItems:(id)items { // NSArray*
     let old_items = env.objc.borrow::<UINavigationBarHostObject>(this).items;
-    release(env, old_items);
     let new_items: id = msg_class![env; NSMutableArray alloc];
     let new_items: id = msg![env; new_items initWithArray:items];
+    release(env, old_items);
     env.objc.borrow_mut::<UINavigationBarHostObject>(this).items = new_items;
+    () = msg![env; this setNeedsLayout];
 }
 
 - (())setItems:(id)items animated:(bool)_animated {
@@ -289,7 +331,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
     }
 
+    retain(env, top);
     () = msg![env; items removeLastObject];
+    () = msg![env; this setNeedsLayout];
 
     if delegate != nil {
         let sel = env.objc.register_host_selector(
@@ -300,7 +344,94 @@ pub const CLASSES: ClassExports = objc_classes! {
             () = msg![env; delegate navigationBar:this didPopItem:top];
         }
     }
-    top
+    crate::objc::autorelease(env, top)
+}
+
+// Navigation items supply the bar's visible title and controls, rather than
+// being metadata-only. Use the existing UIBarButtonItem control renderer.
+// https://developer.apple.com/library/archive/documentation/WindowsViews/Conceptual/ViewControllerCatalog/Chapters/NavigationControllers.html
+- (())layoutSubviews {
+    () = msg_super![env; this layoutSubviews];
+    let item: id = msg![env; this topItem];
+    let bounds: CGRect = msg![env; this bounds];
+    if item == nil || bounds.size.width <= 0.0 { return; }
+    let (mut title, mut prompt_label, mut back) = {
+        let h = env.objc.borrow::<UINavigationBarHostObject>(this);
+        (h.title_label, h.prompt_label, h.back_view)
+    };
+    if title == nil {
+        title = msg_class![env; UILabel new];
+        prompt_label = msg_class![env; UILabel new];
+        back = msg_class![env; UIButton buttonWithType:(1i32)];
+        retain(env, back);
+        let selector = env.objc.register_host_selector("_touchHLE_navigationBack:".into(), &mut env.mem);
+        () = msg![env; back addTarget:this action:selector forControlEvents:(64u32)];
+        let h = env.objc.borrow_mut::<UINavigationBarHostObject>(this);
+        h.title_label = title; h.prompt_label = prompt_label; h.back_view = back;
+        let white: id = msg_class![env; UIColor whiteColor];
+        let clear: id = msg_class![env; UIColor clearColor];
+        let font: id = msg_class![env; UIFont boldSystemFontOfSize:(17.0f32)];
+        for label in [title, prompt_label] {
+            () = msg![env; label setBackgroundColor:clear];
+            () = msg![env; label setTextColor:white];
+            () = msg![env; label setTextAlignment:(1i32)];
+            () = msg![env; label setFont:font];
+        }
+    }
+    let color: id = if let Some(color) = {
+        let h = env.objc.borrow::<UINavigationBarHostObject>(this);
+        (h.bar_tint_color != nil).then_some(h.bar_tint_color)
+    } { color } else {
+        let style = env.objc.borrow::<UINavigationBarHostObject>(this).bar_style;
+        if style == 0 { msg_class![env; UIColor colorWithRed:(0.35f32) green:(0.45f32) blue:(0.58f32) alpha:(1.0f32)] }
+        else { msg_class![env; UIColor colorWithWhite:(0.12f32) alpha:(1.0f32)] }
+    };
+    () = msg![env; this setBackgroundColor:color];
+    let prompt: id = msg![env; item prompt];
+    let prompt_height = if prompt == nil { 0.0 } else { 30.0 };
+    let row_height = (bounds.size.height - prompt_height).max(0.0);
+    let custom_title: id = msg![env; item titleView];
+    let left: id = msg![env; item leftBarButtonItem];
+    let right: id = msg![env; item rightBarButtonItem];
+    let back_item: id = msg![env; this backItem];
+    let hide_back: bool = msg![env; item hidesBackButton];
+    let left = if left != nil { left } else if back_item != nil && !hide_back {
+        let back_title: id = msg![env; back_item title];
+        let back_title = if back_title == nil { crate::frameworks::foundation::ns_string::get_static_str(env, "Back") } else { back_title };
+        () = msg![env; back setTitle:back_title forState:(0u32)]; back
+    } else { nil };
+    let mut visible = vec![if custom_title == nil { title } else { custom_title }];
+    if left != nil { visible.push(left); }
+    if right != nil { visible.push(right); }
+    if prompt != nil { visible.push(prompt_label); }
+    let old: id = msg![env; this subviews];
+    let count: u32 = msg![env; old count];
+    for i in 0..count {
+        let child: id = msg![env; old objectAtIndex:i];
+        if !visible.contains(&child) { () = msg![env; child removeFromSuperview]; }
+    }
+    let left_width = if left == nil { 0.0 } else { 76.0 };
+    let right_width = if right == nil { 0.0 } else { 76.0 };
+    for (view, x, width) in [(left, 5.0, left_width), (right, bounds.size.width - right_width - 5.0, right_width)] {
+        if view != nil {
+            () = msg![env; view setFrame:(CGRect { origin: CGPoint { x, y: prompt_height }, size: CGSize { width, height: row_height } })];
+            () = msg![env; view layoutSubviews];
+        }
+    }
+    let title_text: id = msg![env; item title];
+    () = msg![env; title setText:title_text];
+    let center = if custom_title == nil { title } else { custom_title };
+    let margin = left_width.max(right_width) + 5.0;
+    () = msg![env; center setFrame:(CGRect { origin: CGPoint { x: margin, y: prompt_height }, size: CGSize { width: (bounds.size.width - margin * 2.0).max(0.0), height: row_height } })];
+    () = msg![env; prompt_label setText:prompt];
+    () = msg![env; prompt_label setFrame:(CGRect { origin: CGPoint::default(), size: CGSize { width: bounds.size.width, height: prompt_height } })];
+    for view in visible {
+        let parent: id = msg![env; view superview];
+        if parent != this { () = msg![env; this addSubview:view]; }
+    }
+}
+- (())_touchHLE_navigationBack:(id)_sender {
+    let _: id = msg![env; this popNavigationItemAnimated:true];
 }
 
 // MARK: - Size
@@ -333,6 +464,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)initWithTitle:(id)title {
     retain(env, title);
     env.objc.borrow_mut::<UINavigationItemHostObject>(this).title = title;
+    invalidate_item_bars(env, this);
     this
 }
 
@@ -341,8 +473,29 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 // --- ДОБАВЛЕНО: Поддержка загрузки из NIB-файла ---
-- (id)initWithCoder:(id)_coder {
-    msg_super![env; this init]
+- (id)initWithCoder:(id)coder {
+    let this: id = msg_super![env; this init];
+    // Archived navigation metadata must supply the same title and controls
+    // as programmatic items. The bar's back-reference is weak, not owned.
+    // https://developer.apple.com/documentation/uikit/uinavigationitem
+    for (key, setter) in [
+        ("UITitle", "setTitle:"), ("UIPrompt", "setPrompt:"),
+        ("UITitleView", "setTitleView:"),
+        ("UIBackBarButtonItem", "setBackBarButtonItem:"),
+        ("UILeftBarButtonItem", "setLeftBarButtonItem:"),
+        ("UIRightBarButtonItem", "setRightBarButtonItem:"),
+    ] {
+        let key = get_static_str(env, key);
+        let value: id = msg![env; coder decodeObjectForKey:key];
+        if value != nil {
+            let selector = env.objc.lookup_selector(setter).unwrap();
+            let _: () = crate::objc::msg_send_no_type_checking(env, (this, selector, value));
+        }
+    }
+    let key = get_static_str(env, "UIHidesBackButton");
+    let hidden: bool = msg![env; coder decodeBoolForKey:key];
+    () = msg![env; this setHidesBackButton:hidden];
+    this
 }
 // --------------------------------------------------
 
@@ -373,6 +526,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, old);
     retain(env, title);
     env.objc.borrow_mut::<UINavigationItemHostObject>(this).title = title;
+    invalidate_item_bars(env, this);
 }
 
 - (id)titleView {
@@ -384,6 +538,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, old);
     retain(env, view);
     env.objc.borrow_mut::<UINavigationItemHostObject>(this).title_view = view;
+    invalidate_item_bars(env, this);
 }
 
 - (id)prompt {
@@ -395,6 +550,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, old);
     retain(env, prompt);
     env.objc.borrow_mut::<UINavigationItemHostObject>(this).prompt = prompt;
+    invalidate_item_bars(env, this);
 }
 
 - (id)backBarButtonItem {
@@ -406,6 +562,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, old);
     retain(env, item);
     env.objc.borrow_mut::<UINavigationItemHostObject>(this).back_button = item;
+    invalidate_item_bars(env, this);
 }
 
 - (id)leftBarButtonItem {
@@ -417,6 +574,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, old);
     retain(env, item);
     env.objc.borrow_mut::<UINavigationItemHostObject>(this).left_button = item;
+    invalidate_item_bars(env, this);
 }
 
 - (())setLeftBarButtonItem:(id)item animated:(bool)_animated {
@@ -432,6 +590,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, old);
     retain(env, item);
     env.objc.borrow_mut::<UINavigationItemHostObject>(this).right_button = item;
+    invalidate_item_bars(env, this);
 }
 
 - (())setRightBarButtonItem:(id)item animated:(bool)_animated {
@@ -477,6 +636,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())setHidesBackButton:(bool)value {
     env.objc.borrow_mut::<UINavigationItemHostObject>(this).hides_back_button = value;
+    invalidate_item_bars(env, this);
 }
 
 - (())setHidesBackButton:(bool)value animated:(bool)_animated {
