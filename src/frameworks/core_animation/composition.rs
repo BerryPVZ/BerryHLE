@@ -1328,6 +1328,13 @@ unsafe fn composite_masked_layer(
     let bounds = host.bounds;
     let radius = host.corner_radius;
     let group_opacity = opacity * host.opacity;
+    // `mask_target` binds the target it hands back, so remember the
+    // caller's framebuffer before asking for one.
+    let mut previous = 0;
+    {
+        let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
+        gl.GetIntegerv(gles11::FRAMEBUFFER_BINDING_OES, &mut previous);
+    }
     // Offscreen targets are best-effort: if the driver refuses them, draw
     // the layer unmasked rather than dropping it from the frame.
     let (content, alpha) = match (mask_target(env), mask_target(env)) {
@@ -1346,11 +1353,6 @@ unsafe fn composite_masked_layer(
         }
     };
     host.opacity = 1.0;
-    let mut previous = 0;
-    {
-        let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
-        gl.GetIntegerv(gles11::FRAMEBUFFER_BINDING_OES, &mut previous);
-    }
     clear_mask_target(env, content.1);
     composite_layer_contents(env, state, layer, parent, 1.0, local, host);
     if mask != nil {
