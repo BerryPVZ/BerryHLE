@@ -1308,11 +1308,10 @@ unsafe fn composite_masked_layer(
     // its own quad. Those two cases skip the detour.
     //
     // Taking the detour anyway cost two full-composition-size RGBA targets
-    // for every `clipsToBounds` view, every frame. On drivers that will not
-    // allocate targets that large the whole subtree was dropped, which is
-    // how the lock screen lost its slider and the home screen lost its
-    // grid. A rounded clip with children still pays, because dropping the
-    // clip there would let them paint over the corners.
+    // for every `clipsToBounds` view, every frame, so it is worth skipping
+    // when the clip cannot change the result. A rounded clip with children
+    // still pays, because dropping the clip there would let them paint
+    // over the corners.
     let rounded = host.corner_radius > 0.0;
     let clip_can_bite = host.masks_to_bounds && rounded && !host.sublayers.is_empty();
     if host.mask == nil && !clip_can_bite {
