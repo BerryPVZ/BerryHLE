@@ -9,7 +9,7 @@ use crate::frameworks::core_graphics::{CGRect, CGSize};
 use crate::frameworks::foundation::NSUInteger;
 use crate::frameworks::uikit::ui_view::UIViewHostObject;
 use crate::objc::{
-    id, impl_HostObject_with_superclass, msg, nil, objc_classes, ClassExports, NSZonePtr,
+    id, impl_HostObject_with_superclass, msg, msg_super, nil, objc_classes, ClassExports, NSZonePtr,
 };
 
 // TODO: rendering
@@ -49,7 +49,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     // delegate/dataSource are assign (non-retained); nothing to release.
-    env.objc.dealloc_object(this, &mut env.mem)
+    // Chain to UIView so its subviews, layer and view-list entry are released.
+    msg_super![env; this dealloc]
 }
 
 // MARK: - Delegate

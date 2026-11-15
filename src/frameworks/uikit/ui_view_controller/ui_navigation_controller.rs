@@ -138,18 +138,31 @@ pub const CLASSES: ClassExports = objc_classes! {
     let hidden = env.objc.borrow::<UINavigationControllerHostObject>(this).navigation_bar_hidden;
     let item: id = msg![env; top navigationItem];
     let prompt: id = msg![env; item prompt];
+    // Trust a declared landscape orientation, otherwise follow the shape of the
+    // view: fullscreen games rarely call `setStatusBarOrientation:` even though
+    // their root view is already landscape.
+    let orientation: i32 = msg![env; this interfaceOrientation];
+    let landscape = orientation == 3 || orientation == 4 || bounds.size.width > bounds.size.height;
     let height = if hidden { 0.0 } else {
-        (if bounds.size.width > bounds.size.height { 32.0 } else { 44.0 }) + if prompt == nil { 0.0 } else { 30.0 }
+        (if landscape { 32.0 } else { 44.0 }) + if prompt == nil { 0.0 } else { 30.0 }
     };
+    // Frame first: `setItems:` lays the bar out itself, and it must lay out at
+    // the size it is about to have rather than the size it had last pass.
+    let frame = CGRect { origin: CGPoint { x: bounds.origin.x, y: bounds.origin.y }, size: CGSize { width: bounds.size.width, height } };
+    () = msg![env; bar setFrame:frame];
+    () = msg![env; bar setHidden:hidden];
+    // Claiming the delegate on every pass would discard a delegate the app
+    // installed. Only take the position when it is free; an app that replaces
+    // it then owns back-button handling, as on real iOS.
+    let bar_delegate: id = msg![env; bar delegate];
+    if bar_delegate == nil {
+        () = msg![env; bar setDelegate:this];
+    }
     let mut items = Vec::new();
     for &controller in &stack { let item: id = msg![env; controller navigationItem]; items.push(retain(env, item)); }
     let items = ns_array::from_vec(env, items);
     () = msg![env; bar setItems:items];
     release(env, items);
-    let frame = CGRect { origin: CGPoint { x: bounds.origin.x, y: bounds.origin.y }, size: CGSize { width: bounds.size.width, height } };
-    () = msg![env; bar setFrame:frame];
-    () = msg![env; bar setHidden:hidden];
-    () = msg![env; bar setDelegate:this];
     let content = CGRect { origin: CGPoint { x: bounds.origin.x, y: bounds.origin.y + height }, size: CGSize { width: bounds.size.width, height: (bounds.size.height - height).max(0.0) } };
     for controller in stack {
         let view: id = msg![env; controller view];
@@ -164,7 +177,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     let parent: id = msg![env; bar superview];
     if parent != root { () = msg![env; root addSubview:bar]; }
     else { () = msg![env; root bringSubviewToFront:bar]; }
-    () = msg![env; bar layoutSubviews];
     env.objc.borrow_mut::<UINavigationControllerHostObject>(this).layout_running = false;
 }
 - (bool)navigationBar:(id)_bar shouldPopItem:(id)_item {

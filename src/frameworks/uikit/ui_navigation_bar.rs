@@ -355,7 +355,21 @@ pub const CLASSES: ClassExports = objc_classes! {
     () = msg_super![env; this layoutSubviews];
     let item: id = msg![env; this topItem];
     let bounds: CGRect = msg![env; this bounds];
-    if item == nil || bounds.size.width <= 0.0 { return; }
+    if bounds.size.width <= 0.0 {
+        return;
+    }
+    if item == nil {
+        // `setItems:@[]` leaves no top item. Clear the bar rather than keep the
+        // previous screen's title, buttons or custom title view sitting on an
+        // empty one; the next layout adds back whatever the new item wants.
+        let subviews: id = msg![env; this subviews];
+        let count: u32 = msg![env; subviews count];
+        for i in 0..count {
+            let view: id = msg![env; subviews objectAtIndex:i];
+            () = msg![env; view removeFromSuperview];
+        }
+        return;
+    }
     let (mut title, mut prompt_label, mut back) = {
         let h = env.objc.borrow::<UINavigationBarHostObject>(this);
         (h.title_label, h.prompt_label, h.back_view)
@@ -421,6 +435,32 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     let title_text: id = msg![env; item title];
     () = msg![env; title setText:title_text];
+    // `titleTextAttributes` is how an app restyles its title, usually to white
+    // or black to suit a custom tint. Reset to the defaults first so clearing
+    // the attributes restores them.
+    let attrs = env.objc.borrow::<UINavigationBarHostObject>(this).title_text_attributes;
+    let default_color: id = msg_class![env; UIColor whiteColor];
+    let default_font: id = msg_class![env; UIFont boldSystemFontOfSize:(17.0f32)];
+    () = msg![env; title setTextColor:default_color];
+    () = msg![env; title setFont:default_font];
+    if attrs != nil {
+        for key in ["UITextAttributeTextColor", "NSForegroundColorAttributeName"] {
+            let name = crate::frameworks::foundation::ns_string::get_static_str(env, key);
+            let value: id = msg![env; attrs objectForKey:name];
+            if value != nil {
+                () = msg![env; title setTextColor:value];
+                break;
+            }
+        }
+        for key in ["UITextAttributeFont", "NSFontAttributeName"] {
+            let name = crate::frameworks::foundation::ns_string::get_static_str(env, key);
+            let value: id = msg![env; attrs objectForKey:name];
+            if value != nil {
+                () = msg![env; title setFont:value];
+                break;
+            }
+        }
+    }
     let center = if custom_title == nil { title } else { custom_title };
     let margin = left_width.max(right_width) + 5.0;
     () = msg![env; center setFrame:(CGRect { origin: CGPoint { x: margin, y: prompt_height }, size: CGSize { width: (bounds.size.width - margin * 2.0).max(0.0), height: row_height } })];
@@ -438,8 +478,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - Size
 
 - (CGSize)sizeThatFits:(CGSize)_size {
-    // Standard navigation bar height.
-    CGSize { width: 320.0, height: 44.0 }
+    // Standard bar height, plus the extra row a prompt occupies.
+    let item: id = msg![env; this topItem];
+    let prompt: id = if item == nil { nil } else { msg![env; item prompt] };
+    let height = 44.0 + if prompt == nil { 0.0 } else { 30.0 };
+    CGSize { width: _size.width, height }
 }
 
 @end

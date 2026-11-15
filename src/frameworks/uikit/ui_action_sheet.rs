@@ -65,6 +65,11 @@ fn present(env: &mut Environment, sheet: id, view: id) {
         )
     };
     let count: NSUInteger = msg![env; titles count];
+    if count == 0 {
+        // Nothing to tap: the sheet would cover the whole app with a dimmed
+        // overlay and there would be no way back out of it.
+        return;
+    }
     let row_height = 48.0;
     let title_height = if title == nil { 0.0 } else { 40.0 };
     let top = (bounds.size.height - count as f32 * row_height - title_height - 12.0).max(0.0);
@@ -117,13 +122,23 @@ fn present(env: &mut Environment, sheet: id, view: id) {
         let _: () = msg![env; button addTarget:sheet action:action forControlEvents:64u32];
         let _: () = msg![env; sheet addSubview:button];
     }
+    // Install the sheet before announcing it. `willPresentActionSheet:` is
+    // where a delegate is allowed to dismiss, and a dismissal has to find the
+    // sheet already on screen: marking it visible or adding it afterwards
+    // would resurrect a sheet the delegate just closed.
+    retain(env, sheet);
+    let _: () = msg![env; parent addSubview:sheet];
     env.objc
         .borrow_mut::<UIActionSheetHostObject>(sheet)
         .visible = true;
-    retain(env, sheet);
     notify(env, sheet, "willPresentActionSheet:", None);
-    let _: () = msg![env; parent addSubview:sheet];
-    notify(env, sheet, "didPresentActionSheet:", None);
+    if env
+        .objc
+        .borrow::<UIActionSheetHostObject>(sheet)
+        .visible
+    {
+        notify(env, sheet, "didPresentActionSheet:", None);
+    }
     release(env, sheet);
 }
 
