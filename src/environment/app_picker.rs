@@ -2464,7 +2464,6 @@ fn app_picker_inner(
         show_fullscreen_row,
     );
     let mut quick_options_show_fps = initial_quick_options_show_fps;
-    let mut quick_options_memory_limit_mb = picker_settings.memory_limit_mb;
     let mut device_state = DropdownState {
         selected: picker_settings.device_model_tag,
         ..Default::default()
@@ -2578,7 +2577,7 @@ fn app_picker_inner(
     refresh_dropdown(
         env,
         &settings.memory_limit_dropdown,
-        &memory_limit_label(quick_options_memory_limit_mb),
+        &memory_limit_label(picker_settings.memory_limit_mb),
         &memory_limit_state,
     );
 
@@ -3011,7 +3010,7 @@ log!("Warning: Couldn't inspect the last app's bundle; some app-specific options
                 refresh_dropdown(
                     env,
                     &settings.memory_limit_dropdown,
-                    &memory_limit_label(quick_options_memory_limit_mb),
+                    &memory_limit_label(picker_settings.memory_limit_mb),
                     &memory_limit_state,
                 );
             }
@@ -3118,16 +3117,16 @@ log!("Warning: Couldn't inspect the last app's bundle; some app-specific options
                 // The "Custom…" row opens a keypad instead of setting a size.
                 // It starts from the current cap, so an existing custom value
                 // is easy to adjust.
-                custom_limit_input = quick_options_memory_limit_mb
+                custom_limit_input = picker_settings.memory_limit_mb
                     .map(|mb| mb.to_string())
                     .unwrap_or_default();
                 show_custom_limit_dialog(env, &custom_limit_dialog, &custom_limit_input);
             } else {
-                quick_options_memory_limit_mb = memory_limit_choice(Some(tag));
+                picker_settings.memory_limit_mb = memory_limit_choice(Some(tag));
                 refresh_dropdown(
                     env,
                     &settings.memory_limit_dropdown,
-                    &memory_limit_label(quick_options_memory_limit_mb),
+                    &memory_limit_label(picker_settings.memory_limit_mb),
                     &memory_limit_state,
                 );
             }
@@ -3144,13 +3143,13 @@ log!("Warning: Couldn't inspect the last app's bundle; some app-specific options
             set_custom_limit_dialog_text(env, &custom_limit_dialog, &custom_limit_input);
         } else if std::mem::take(&mut host_obj.memory_limit_custom_confirm) {
             if let Some(mb) = custom_memory_limit_mb(&custom_limit_input) {
-                quick_options_memory_limit_mb = Some(mb);
+                picker_settings.memory_limit_mb = Some(mb);
                 memory_limit_state.selected = Some(MEMORY_LIMIT_CUSTOM_TAG);
                 hide_custom_limit_dialog(env, &custom_limit_dialog);
                 refresh_dropdown(
                     env,
                     &settings.memory_limit_dropdown,
-                    &memory_limit_label(quick_options_memory_limit_mb),
+                    &memory_limit_label(picker_settings.memory_limit_mb),
                     &memory_limit_state,
                 );
             }
@@ -3158,11 +3157,11 @@ log!("Warning: Couldn't inspect the last app's bundle; some app-specific options
             // to apply, and closing it would look like it had been applied.
         } else if std::mem::take(&mut host_obj.memory_limit_custom_cancel) {
             hide_custom_limit_dialog(env, &custom_limit_dialog);
-            memory_limit_state.selected = Some(memory_limit_tag(quick_options_memory_limit_mb));
+            memory_limit_state.selected = Some(memory_limit_tag(picker_settings.memory_limit_mb));
             refresh_dropdown(
                 env,
                 &settings.memory_limit_dropdown,
-                &memory_limit_label(quick_options_memory_limit_mb),
+                &memory_limit_label(picker_settings.memory_limit_mb),
                 &memory_limit_state,
             );
         } else if std::mem::take(&mut host_obj.memory_limit_toggle) {
@@ -3170,7 +3169,7 @@ log!("Warning: Couldn't inspect the last app's bundle; some app-specific options
             refresh_dropdown(
                 env,
                 &settings.memory_limit_dropdown,
-                &memory_limit_label(quick_options_memory_limit_mb),
+                &memory_limit_label(picker_settings.memory_limit_mb),
                 &memory_limit_state,
             );
         } else if let Some(position) = std::mem::take(&mut host_obj.memory_limit_scroll_to) {
@@ -3179,7 +3178,7 @@ log!("Warning: Couldn't inspect the last app's bundle; some app-specific options
             refresh_dropdown(
                 env,
                 &settings.memory_limit_dropdown,
-                &memory_limit_label(quick_options_memory_limit_mb),
+                &memory_limit_label(picker_settings.memory_limit_mb),
                 &memory_limit_state,
             );
         } else if let Some(tag) = std::mem::take(&mut host_obj.device_model_tag) {
@@ -3514,6 +3513,7 @@ log!("Warning: Couldn't inspect the last app's bundle; some app-specific options
             device_state: device_state.clone(),
             language_state: language_state.clone(),
             renderer_state: renderer_state.clone(),
+            memory_limit_state: memory_limit_state.clone(),
         };
         handle_reset_settings_request(
             env,
@@ -3527,6 +3527,7 @@ log!("Warning: Couldn't inspect the last app's bundle; some app-specific options
         device_state = drafts.device_state;
         language_state = drafts.language_state;
         renderer_state = drafts.renderer_state;
+        memory_limit_state = drafts.memory_limit_state;
 
         if is_dialog_visible(env, &reset_dialog) || is_dialog_visible(env, &save_error_dialog) {
             // While a confirmation or error dialog is up, only the dialog's
@@ -3658,7 +3659,7 @@ log!("Warning: Couldn't inspect the last app's bundle; some app-specific options
     option_args
         .push(quick_options_renderer_mode_argument(picker_settings.renderer_mode).to_string());
 option_args.extend(quick_options_ram_limiter_arguments(
-        quick_options_memory_limit_mb,
+        picker_settings.memory_limit_mb,
     ));
 
     // The two compatibility fixes are only emitted when the Settings screen
@@ -7923,6 +7924,7 @@ struct SettingsDrafts {
     device_state: DropdownState,
     language_state: DropdownState,
     renderer_state: DropdownState,
+    memory_limit_state: DropdownState,
 }
 /// Applies the reset settings screen request now that `env` and the
 /// delegate's host object are no longer borrowed at the same time.
@@ -7944,6 +7946,7 @@ fn handle_reset_settings_request(
     let device_state = &mut drafts.device_state;
     let language_state = &mut drafts.language_state;
     let renderer_state = &mut drafts.renderer_state;
+    let memory_limit_state = &mut drafts.memory_limit_state;
     match request {
         ResetSettingsRequest::None => {}
         ResetSettingsRequest::Ask => {
@@ -7987,6 +7990,14 @@ fn handle_reset_settings_request(
                         &settings.language_dropdown,
                         &language_label_for_tag(language_state.selected),
                         language_state,
+                    );
+                    memory_limit_state.selected =
+                        Some(memory_limit_tag(picker_settings.memory_limit_mb));
+                    refresh_dropdown(
+                        env,
+                        &settings.memory_limit_dropdown,
+                        &memory_limit_label(picker_settings.memory_limit_mb),
+                        memory_limit_state,
                     );
                 }
                 Err(error) => {
@@ -9101,6 +9112,7 @@ fn ram_limiter_arguments_are_only_emitted_for_explicit_choices() {
         vec!["--memory-limit=256"]
     );
 }
+#[test]
     fn custom_ram_limiter_sizes_are_typed_in_megabytes() {
         assert_eq!(custom_memory_limit_mb("10"), Some(10));
         assert_eq!(custom_memory_limit_mb("3000"), Some(3000));
