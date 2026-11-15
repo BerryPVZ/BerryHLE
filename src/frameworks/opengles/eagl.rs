@@ -3279,11 +3279,13 @@ unsafe fn ensure_present_objects(gles: &mut dyn GLES) -> PresentObjects {
 /// the layer tree; `window_rotation` is the same turn derived independently
 /// from the device orientation.
 ///
-/// They are two measurements of one rotation, not two rotations. Adding them
-/// turned an autorotated root view by two quarter turns, which presented a
-/// landscape game 180 degrees out inside the portrait drawable the window
-/// still had. Whichever one is available is used alone, and the layer tree
-/// wins because it is what Core Animation itself would have used.
+/// The renderbuffer is drawn in the layer's own space, and the layer is
+/// already turned by `layer_rotation` in screen space, so the presenter needs
+/// the screen rotation with that turn removed. An autorotated landscape view
+/// has `layer_rotation == window_rotation` and its renderbuffer is already
+/// upright, so the answer is the identity. Using `layer_rotation` alone
+/// presented that case a quarter turn out; adding the two presented it 180
+/// degrees out.
 fn present_rotation_matrix(
     window_rotation: crate::matrix::Matrix<2>,
     skip_rotation: bool,
@@ -3295,7 +3297,7 @@ fn present_rotation_matrix(
     if skip_rotation && !override_given {
         crate::matrix::Matrix::<2>::identity()
     } else if layer_rotation != 0.0 {
-        crate::matrix::Matrix::z_rotation(layer_rotation)
+        window_rotation.multiply(&crate::matrix::Matrix::z_rotation(-layer_rotation))
     } else {
         window_rotation
     }
@@ -3329,19 +3331,15 @@ unsafe fn present_renderbuffer(
     // their drawing themselves, so we must NOT apply the extra rotation
     // for them.
     // By default, retain the legacy iPad/non-portrait heuristic. The opt-in
-    // `--rotation-fix` path instead checks whether UIKit actually applied the
-    // autorotation transform, avoiding an extra 180-degree turn for apps that
-    // do not rotate their root view.
+    // `--rotation-fix` path trusts the measured `layer_rotation` instead and
+    // never adds a blind half turn: the layer tree already says which way the
+    // app turned its view, so a second guess can only be wrong.
     //
     // This is only a fallback: `layer_rotation` is the rotation Core Animation
     // itself would apply, measured from the layer tree. An extra 180 degrees
     // cannot stand in for it, because the tree can be rotated by a quarter turn
     // (and the two answers differ by 90 degrees, not 0 or 180).
-    let rotation_compensation_trigger = if env.options.rotation_fix {
-        env.framework_state.uikit.autorotation_transform_applied
-    } else {
-        device_family.is_ipad()
-    };
+    let rotation_compensation_trigger = !env.options.rotation_fix && device_family.is_ipad();
     let needs_autorotation_compensation = rotation_compensation_trigger
         && !matches!(
             device_orientation,

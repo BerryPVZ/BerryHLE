@@ -337,9 +337,9 @@ pub struct Options {
     /// rotation turns the picture sideways; `--present-rotate=0` presents it
     /// as-is. `None` keeps the automatic behaviour.
     pub present_rotate: Option<u32>,
-    /// Use UIKit's actual autorotation transform when deciding whether to add
-    /// EAGL's 180-degree presentation compensation. Off by default to retain
-    /// the legacy iPad/non-portrait heuristic; opt in with `--rotation-fix`.
+    /// Trust the layer tree's measured autorotation instead of adding EAGL's
+    /// legacy 180-degree presentation compensation. Off by default to retain
+    /// the iPad/non-portrait heuristic; opt in with `--rotation-fix`.
     pub rotation_fix: bool,
     /// Force EAGL `initWithAPI:` to create an OpenGL ES 1.1 (fixed-function)
     /// context even when the app requested an OpenGL ES 2.0/3.x context.
