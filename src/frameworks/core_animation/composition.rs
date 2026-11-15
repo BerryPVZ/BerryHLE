@@ -1298,6 +1298,28 @@ unsafe fn composite_masked_layer(
     local: Matrix<4>,
     mut host: CALayerHostObject,
 ) {
+    // The offscreen route exists so that `masksToBounds` can clip the
+    // LAYER'S CHILDREN, and so that a `mask` layer can carve the subtree.
+    // Neither is needed when there is no mask and nothing that can
+    // overflow: without children the rounded background is the whole
+    // story, and `composite_layer_contents` already rounds it from
+    // `corner_radius`. An unrounded clip is an ordinary rectangle, which
+    // the compositor gets for free because it never draws a layer outside
+    // its own quad. Those two cases skip the detour.
+    //
+    // Taking the detour anyway cost two full-composition-size RGBA targets
+    // for every `clipsToBounds` view, every frame. On drivers that will not
+    // allocate targets that large the whole subtree was dropped, which is
+    // how the lock screen lost its slider and the home screen lost its
+    // grid. A rounded clip with children still pays, because dropping the
+    // clip there would let them paint over the corners.
+    let rounded = host.corner_radius > 0.0;
+    let clip_can_bite = host.masks_to_bounds && rounded && !host.sublayers.is_empty();
+    if host.mask == nil && !clip_can_bite {
+        composite_layer_contents(env, state, layer, parent, opacity, local, host);
+        return;
+    }
+
     let transform = local
         .multiply(&<Matrix<4> as From<_>>::from(host.superlayer_to_layer_transform()))
         .multiply(&parent);
@@ -1342,16 +1364,20 @@ unsafe fn composite_masked_layer(
     }
     if clip {
         clear_mask_target(env, alpha.1);
+        // Draw the clip quad in the layer's own co-ordinate space.
+        //
+        // `transform` is already this layer's full local-to-screen matrix.
+        // `composite_layer_contents` multiplies its `cumulative_transform`
+        // argument by the layer's own `superlayer_to_layer_transform`, so
+        // passing `transform` here applied the layer's position twice and
+        // moved the rounded clip off the layer: everything inside a
+        // `clipsToBounds` view with a `cornerRadius` was multiplied by a
+        // mask that no longer covered it, and vanished. Passing the parent
+        // transform and the local transform lets the layer's own matrix be
+        // built exactly once, by the same code path that positions its
+        // background and contents.
         let clipping = CALayerHostObject::bounds_mask(bounds, radius);
-        composite_layer_contents(
-            env,
-            state,
-            nil,
-            transform,
-            1.0,
-            Matrix::identity(),
-            clipping,
-        );
+        composite_layer_contents(env, state, nil, parent, 1.0, local, clipping);
         {
             let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
             gl.BindFramebufferOES(gles11::FRAMEBUFFER_OES, content.1);
@@ -1369,7 +1395,6 @@ unsafe fn composite_masked_layer(
         .mask_targets
         .extend([content, alpha]);
 }
-
 
 fn make_9patch_coords(x_edges: [f32; 4], y_edges: [f32; 4]) -> [f32; FLOATS_PER_9PATCH] {
     let mut out_points = [0.0; FLOATS_PER_9PATCH];

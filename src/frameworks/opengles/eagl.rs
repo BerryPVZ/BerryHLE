@@ -3269,6 +3269,37 @@ unsafe fn ensure_present_objects(gles: &mut dyn GLES) -> PresentObjects {
 /// (which should be provided by the app) to a texture and presents it with
 /// [present_frame], trying to avoid noticeably modifying OpenGL ES state while
 /// doing so. The front and back buffers are then swapped.
+/// The rotation the GPU presenter applies to a frame just before the swap.
+///
+/// A fullscreen `CAEAGLLayer` is normally presented straight into the window,
+/// bypassing Core Animation. Core Animation is also where UIKit's
+/// autorotation of the root view would have been applied, so the presenter
+/// has to reproduce it. `layer_rotation` is that autorotation measured from
+/// the layer tree; `window_rotation` is the same turn derived independently
+/// from the device orientation.
+///
+/// They are two measurements of one rotation, not two rotations. Adding them
+/// turned an autorotated root view by two quarter turns, which presented a
+/// landscape game 180 degrees out inside the portrait drawable the window
+/// still had. Whichever one is available is used alone, and the layer tree
+/// wins because it is what Core Animation itself would have used.
+fn present_rotation_matrix(
+    window_rotation: crate::matrix::Matrix<2>,
+    skip_rotation: bool,
+    layer_rotation: f32,
+    override_given: bool,
+) -> crate::matrix::Matrix<2> {
+    // The iOS ES 2.0 direct presenter already draws in display orientation,
+    // so rotating again would turn the frame sideways.
+    if skip_rotation && !override_given {
+        crate::matrix::Matrix::<2>::identity()
+    } else if layer_rotation != 0.0 {
+        crate::matrix::Matrix::z_rotation(layer_rotation)
+    } else {
+        window_rotation
+    }
+}
+
 unsafe fn present_renderbuffer(
     env: &mut Environment,
     renderbuffer: GLuint,
@@ -3316,8 +3347,9 @@ unsafe fn present_renderbuffer(
             crate::window::DeviceOrientation::Portrait
         )
         && options.layer_rotation == 0.0;
-    // PERF: cached read-once flag; present_renderbuffer runs every frame.
-    let rotation_matrix = if crate::env_flag_cached!("TOUCHHLE_DISABLE_PRESENT_ROTATION") {
+    // `TOUCHHLE_DISABLE_PRESENT_ROTATION` wins over everything so a
+    // broken driver can be worked around without a rebuild.
+    let mut window_rotation = if crate::env_flag_cached!("TOUCHHLE_DISABLE_PRESENT_ROTATION") {
         log_once!(
             "TOUCHHLE_DISABLE_PRESENT_ROTATION=1: presenting EAGL renderbuffer without texture rotation"
         );
@@ -3331,33 +3363,36 @@ unsafe fn present_renderbuffer(
     } else {
         env.window.as_mut().unwrap().rotation_matrix()
     };
-    // Fixed present-rotation override: the `--present-rotate=N` option (per-app
-    // via the default options file) takes precedence, then the live
-    // TOUCHHLE_PRESENT_ROTATE env var, else the orientation-derived matrix.
+    // Fixed present-rotation override: `--present-rotate=N` (per-app via the
+    // default options file) or the live TOUCHHLE_PRESENT_ROTATE env var wins
+    // over the orientation-derived matrix.
     let rotate_override = env
         .options
         .present_rotate
         .map(|d| d.to_string())
-        .or_else(|| crate::env_var_cached!("TOUCHHLE_PRESENT_ROTATE").map(|s| s.to_string()));
-    let rotation_matrix = match rotate_override.as_deref() {
-        Some("0") => crate::matrix::Matrix::<2>::identity(),
-        Some("90") => crate::matrix::Matrix::z_rotation(std::f32::consts::FRAC_PI_2),
-        Some("180") => crate::matrix::Matrix::z_rotation(std::f32::consts::PI),
-        Some("270") => crate::matrix::Matrix::z_rotation(-std::f32::consts::FRAC_PI_2),
-        _ => rotation_matrix,
-    };
+        .or_else(|| {
+            crate::env_var_cached!("TOUCHHLE_PRESENT_ROTATE").map(|s| s.to_string())
+        });
+    match rotate_override.as_deref() {
+        Some("0") => window_rotation = crate::matrix::Matrix::<2>::identity(),
+        Some("90") => {
+            window_rotation = crate::matrix::Matrix::z_rotation(std::f32::consts::FRAC_PI_2)
+        }
+        Some("180") => window_rotation = crate::matrix::Matrix::z_rotation(std::f32::consts::PI),
+        Some("270") => {
+            window_rotation = crate::matrix::Matrix::z_rotation(-std::f32::consts::FRAC_PI_2)
+        }
+        _ => {}
+    }
     // The iOS ES 2.0 direct presenter bypasses Core Animation, which is where
     // the rotation would otherwise have been applied, and the guest has already
     // drawn in display orientation, so rotating again would turn it sideways.
-    let rotation_matrix = if options.skip_rotation && rotate_override.is_none() {
-        crate::matrix::Matrix::<2>::identity()
-    } else if options.layer_rotation != 0.0 {
-        // The layer transform is what Core Animation would have applied, so
-        // compose it with the window's rotation instead of guessing.
-        rotation_matrix.multiply(&crate::matrix::Matrix::z_rotation(options.layer_rotation))
-    } else {
-        rotation_matrix
-    };
+    let rotation_matrix = present_rotation_matrix(
+        window_rotation,
+        options.skip_rotation,
+        options.layer_rotation,
+        rotate_override.is_some(),
+    );
     let virtual_cursor_visible_at = env.window.as_mut().unwrap().virtual_cursor_visible_at();
 
     if crate::env_flag_cached!("TOUCHHLE_TRACE_PRESENT") {
@@ -4696,5 +4731,68 @@ mod present_route_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod present_rotation_tests {
+    use super::present_rotation_matrix;
+    use crate::matrix::Matrix;
+
+    fn turn(angle: f32) -> Matrix<2> {
+        Matrix::<2>::z_rotation(angle)
+    }
+
+    fn quarter_turns(m: Matrix<2>) -> i32 {
+        // Compare the forward image of +x against the four quarter turns.
+        let [x, y] = m.transform([1.0, 0.0]);
+        for (turns, (ex, ey)) in [(0, (1.0, 0.0)), (1, (0.0, 1.0)), (2, (-1.0, 0.0)), (3, (0.0, -1.0))]
+    {
+            if (x - ex).abs() < 1e-4 && (y - ey).abs() < 1e-4 {
+                return turns;
+            }
+        }
+        -1
+    }
+
+    #[test]
+    fn an_autorotated_root_is_not_turned_twice() {
+        // A landscape game on a phone held in landscape: UIKit autorotated the
+        // root view by a quarter turn, and the device orientation would add the
+        // same quarter turn again. The frame must come out with one quarter
+        // turn, not two. Two is the 180-degree-upside-down presentation.
+        let device = turn(std::f32::consts::FRAC_PI_2);
+        let layer = std::f32::consts::FRAC_PI_2;
+        let result = present_rotation_matrix(device, false, layer, false);
+        assert_eq!(quarter_turns(result), 1);
+    }
+
+    #[test]
+    fn a_layer_without_a_transform_falls_back_to_the_device_orientation() {
+        // A game that draws its own landscape frame leaves the root view
+        // unrotated. Nothing in the layer tree can be used, so the device
+        // orientation is the only source and it must still be applied.
+        let device = turn(-std::f32::consts::FRAC_PI_2);
+        let result = present_rotation_matrix(device, false, 0.0, false);
+        assert_eq!(quarter_turns(result), 3);
+    }
+
+    #[test]
+    fn the_ios_direct_presenter_never_rotates() {
+        // That path draws in display orientation already.
+        let device = turn(std::f32::consts::PI);
+        let result = present_rotation_matrix(device, true, 0.0, false);
+        assert_eq!(quarter_turns(result), 0);
+    }
+
+    #[test]
+    fn an_explicit_override_only_replaces_the_device_orientation() {
+        // `--present-rotate` is folded into `window_rotation` by the caller, so
+        // it stands in for the device orientation and nothing more. An
+        // autorotated layer still wins, which is what keeps the option from
+        // fighting UIKit on an app whose root view UIKit already turned.
+        let override_matrix = turn(std::f32::consts::PI);
+        let result = present_rotation_matrix(override_matrix, false, 0.0, true);
+        assert_eq!(quarter_turns(result), 2);
     }
 }

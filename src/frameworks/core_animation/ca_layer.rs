@@ -1179,10 +1179,20 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
     // <https://developer.apple.com/documentation/quartzcore/calayer/maskstobounds>
-    - (bool)masksToBounds { env.objc.borrow::<CALayerHostObject>(this).masks_to_bounds }
-    - (())setMasksToBounds:(bool)clip {
-        env.objc.borrow_mut::<CALayerHostObject>(this).masks_to_bounds = clip;
+ - (bool)masksToBounds { env.objc.borrow::<CALayerHostObject>(this).masks_to_bounds }
+ - (())setMasksToBounds:(bool)clip {
+    let was_clipping = env.objc.borrow_mut::<CALayerHostObject>(this).masks_to_bounds;
+    if was_clipping == clip { return; }
+    env.objc.borrow_mut::<CALayerHostObject>(this).masks_to_bounds = clip;
+    if clip {
+        // The contents were rasterised without a clip, so turn the layer
+        // back into a tile of its own and let it redraw under the new
+        // geometry. A scrolling ancestor treats a clipsToBounds layer
+        // differently from a plain one, so a layer that gains a clip late
+        // must not keep the tile it drew before.
+        () = msg![env; this setNeedsDisplay];
     }
+}
 
 - (id)mask { env.objc.borrow::<CALayerHostObject>(this).mask }
 
