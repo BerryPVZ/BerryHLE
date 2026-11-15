@@ -156,10 +156,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())dealloc {
-    let UITextViewHostObject { font, text, text_color, .. } = std::mem::take(env.objc.borrow_mut(this));
+    let UITextViewHostObject { superclass, font, text, text_color, .. } = std::mem::take(env.objc.borrow_mut(this));
     release(env, font);
     release(env, text_color);
     release(env, text);
+    // Preserve superclass ownership until its own deallocator runs.
+    env.objc.borrow_mut::<UITextViewHostObject>(this).superclass = superclass;
     msg_super![env; this dealloc]
 }
 

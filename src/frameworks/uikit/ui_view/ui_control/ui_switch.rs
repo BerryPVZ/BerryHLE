@@ -287,7 +287,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     let UISwitchHostObject {
-        superclass: _,
+        superclass,
         is_on: _,
         back,
         thumb,
@@ -299,6 +299,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, thumb);
     release(env, label_on);
     release(env, label_off);
+    // Preserve superclass ownership until its own deallocator runs.
+    env.objc.borrow_mut::<UISwitchHostObject>(this).superclass = superclass;
     msg_super![env; this dealloc]
 }
 

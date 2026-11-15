@@ -223,7 +223,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     let UIToolbarHostObject {
-        superclass: _,
+        superclass,
         items,
         button_views,
         bar_style: _,
@@ -240,6 +240,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         release(env, item);
     }
 
+    // Preserve superclass ownership until its own deallocator runs.
+    env.objc.borrow_mut::<UIToolbarHostObject>(this).superclass = superclass;
     msg_super![env; this dealloc]
 }
 

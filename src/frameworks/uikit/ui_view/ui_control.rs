@@ -117,7 +117,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     let UIControlHostObject {
-        superclass: _,
+        superclass,
         enabled: _,
         selected: _,
         highlighted: _,
@@ -129,6 +129,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     release(env, tracked_touch);
 
+    // Preserve superclass ownership until its own deallocator runs.
+    env.objc.borrow_mut::<UIControlHostObject>(this).superclass = superclass;
     msg_super![env; this dealloc]
 }
 

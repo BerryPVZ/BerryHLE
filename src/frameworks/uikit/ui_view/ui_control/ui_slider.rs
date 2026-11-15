@@ -245,12 +245,15 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     let UISliderHostObject {
-        superclass: _, value: _, minimum_value: _, maximum_value: _, continuous: _,
+        superclass,
+        value: _, minimum_value: _, maximum_value: _, continuous: _,
         track_left, track_right, thumb,
     } = std::mem::take(env.objc.borrow_mut(this));
     release(env, track_left);
     release(env, track_right);
     release(env, thumb);
+    // Preserve superclass ownership until its own deallocator runs.
+    env.objc.borrow_mut::<UISliderHostObject>(this).superclass = superclass;
     msg_super![env; this dealloc]
 }
 

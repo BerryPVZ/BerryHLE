@@ -391,6 +391,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     let host = std::mem::take(env.objc.borrow_mut::<UIButtonHostObject>(this));
+    // Preserve superclass ownership until its own deallocator runs.
+    env.objc.borrow_mut::<UIButtonHostObject>(this).superclass = host.superclass;
     release(env, host.title_label);
     release(env, host.image_view);
     release(env, host.background_image_view);

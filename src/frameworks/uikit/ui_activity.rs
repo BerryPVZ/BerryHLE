@@ -23,7 +23,8 @@
 
 use crate::frameworks::foundation::NSInteger;
 use crate::objc::{
-    id, impl_HostObject_with_superclass, msg, nil, objc_classes, release, retain, ClassExports,
+    id, impl_HostObject_with_superclass, msg, msg_super, nil, objc_classes, release, retain,
+    ClassExports,
     HostObject, NSZonePtr,
 };
 
@@ -192,12 +193,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     let host = std::mem::take(env.objc.borrow_mut::<UIActivityViewControllerHostObject>(this));
+    // Preserve superclass ownership until its own deallocator runs.
+    env.objc.borrow_mut::<UIActivityViewControllerHostObject>(this).superclass = host.superclass;
     release(env, host.activity_items);
     release(env, host.application_activities);
     release(env, host.completion_handler);
     release(env, host.completion_with_items_handler);
     release(env, host.excluded_activity_types);
-    env.objc.dealloc_object(this, &mut env.mem);
+    msg_super![env; this dealloc]
 }
 
 @end

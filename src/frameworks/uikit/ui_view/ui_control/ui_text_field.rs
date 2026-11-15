@@ -312,6 +312,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     let UITextFieldHostObject {
+        superclass,
         text_label, placeholder_label, background_view, placeholder, attributed_placeholder, font, text_color,
         background, disabled_background, left_view, right_view, input_view, input_accessory_view, ..
     } = std::mem::take(env.objc.borrow_mut(this));
@@ -329,6 +330,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, right_view);
     release(env, input_view);
     release(env, input_accessory_view);
+    // Preserve superclass ownership until its own deallocator runs.
+    env.objc.borrow_mut::<UITextFieldHostObject>(this).superclass = superclass;
     msg_super![env; this dealloc]
 }
 

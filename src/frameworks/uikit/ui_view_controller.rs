@@ -483,7 +483,19 @@ pub const CLASSES: ClassExports = objc_classes! {
     if title != nil {
         retain(env, title);
     }
-    env.objc.borrow_mut::<UIViewControllerHostObject>(this).title = title;
+    let (item, tab_item) = {
+        let host = env.objc.borrow_mut::<UIViewControllerHostObject>(this);
+        host.title = title;
+        (host.navigation_item, host.tab_bar_item)
+    };
+    // The navigation bar and the tab bar both display this title, so the
+    // items follow it once they exist.
+    if item != nil {
+        () = msg![env; item setTitle:title];
+    }
+    if tab_item != nil {
+        () = msg![env; tab_item setTitle:title];
+    }
 }
 
 - (())setEditing:(bool)editing {
@@ -496,7 +508,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow::<UIViewControllerHostObject>(this).is_being_presented
 }
 - (bool)isBeingDismissed {
- env.objc.borrow::<UIViewControllerHostObject>(this).is_being_dismissed
+    env.objc.borrow::<UIViewControllerHostObject>(this).is_being_dismissed
 }
 
 - (())setWantsFullScreenLayout:(bool)_wants {
@@ -576,16 +588,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)title {
-    let stored_title = env.objc.borrow::<UIViewControllerHostObject>(this).title;
-    if stored_title != nil {
-        stored_title
-    } else {
-        let class: Class = msg![env; this class];
-        // The class-name string is newly created (+1); autorelease it so
-        // the getter respects the +0 return convention.
-        let class_name = NSStringFromClass(env, class);
-        autorelease(env, class_name)
+    // UIKit keeps the controller title and its navigation item in sync,
+    // so a screen that sets either one reads the same value back.
+    let item = env.objc.borrow::<UIViewControllerHostObject>(this).navigation_item;
+    if item != nil {
+        let item_title: id = msg![env; item title];
+        if item_title != nil {
+            return item_title;
+        }
     }
+    env.objc.borrow::<UIViewControllerHostObject>(this).title
 }
 
 - (bool)isViewLoaded {
@@ -797,7 +809,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // view has an associated UIViewController and posts the appropriate
     // appearance hooks for the new view, so we route through the window
     // directly instead of adding the view to the presenter's view.
-   () = msg![env; window addSubview:modal_view];
+    () = msg![env; window addSubview:modal_view];
     let style = env
         .objc
         .borrow::<UIViewControllerHostObject>(modal_vc)
@@ -870,17 +882,17 @@ pub const CLASSES: ClassExports = objc_classes! {
         return;
     }
 
-   if env
-   .objc
-   .borrow::<UIViewControllerHostObject>(presented)
-   .is_being_dismissed
-   {
-   return;
-   }
-   env.objc
-   .borrow_mut::<UIViewControllerHostObject>(presented)
-   .is_being_dismissed = true;
-   () = msg![env; presented viewWillDisappear:animated];
+    if env
+    .objc
+    .borrow::<UIViewControllerHostObject>(presented)
+    .is_being_dismissed
+    {
+    return;
+    }
+    env.objc
+    .borrow_mut::<UIViewControllerHostObject>(presented)
+    .is_being_dismissed = true;
+    () = msg![env; presented viewWillDisappear:animated];
     let style = env
         .objc
         .borrow::<UIViewControllerHostObject>(presented)
@@ -894,7 +906,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     } else {
         modal_transition::complete(env, this, presented, true, animated);
     }
-   invoke_void_block(env, completion);
+    invoke_void_block(env, completion);
 }
 
 // Apple docs: The style used to transition the receiver's modal view controller
@@ -997,19 +1009,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     if existing != nil {
         return existing;
     }
-    // Match Apple: lazily create an item whose title is the controller's
-    // current `title` (falling back to the class name when unset). Retain it
-    // on the host object so subsequent property writes (e.g.
-    // `self.navigationItem.rightBarButtonItem = ...`) are not lost.
+    // Match Apple: the item starts with the controller's current title, which
+    // is nil until the app sets one. Retain it on the host object so later
+    // property writes (e.g. `self.navigationItem.rightBarButtonItem = ...`)
+    // are not lost.
     let title: id = msg![env; this title];
-    let init_title = if title != nil {
-        title
-    } else {
-        let class: Class = msg![env; this class];
-        NSStringFromClass(env, class)
-    };
     let item: id = msg_class![env; UINavigationItem alloc];
-    let item: id = msg![env; item initWithTitle:init_title];
+    let item: id = msg![env; item initWithTitle:title];
     env.objc.borrow_mut::<UIViewControllerHostObject>(this).navigation_item = item;
     item
 }
