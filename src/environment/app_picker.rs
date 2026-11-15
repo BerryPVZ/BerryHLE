@@ -295,7 +295,7 @@ mod delete_app_tests {
     #[test]
     fn only_plain_names_are_accepted() {
         assert!(is_plain_name("com.example.game"));
-        assert!(!is_plain_name(""));
+    assert!(!is_plain_name(""));
         assert!(!is_plain_name("."));
         assert!(!is_plain_name(".."));
         assert!(!is_plain_name("a/b"));
@@ -418,6 +418,9 @@ struct AppPickerDelegateHostObject {
     corruption_mode_changed: bool,
     corruption_startup_delay: Option<StartupDelayPreset>,
     corruption_cooldown: Option<CooldownPreset>,
+    memory_limit_tag: Option<i32>,
+    memory_limit_toggle: bool,
+    memory_limit_scroll_to: Option<CGFloat>,
     preserve_aspect_ratio: Option<bool>,
     show_lock_screen: Option<bool>,
     force_composition: Option<bool>,
@@ -455,6 +458,40 @@ struct AppPickerDelegateHostObject {
     lock_slider_progress: f32,
 }
 impl HostObject for AppPickerDelegateHostObject {}
+
+
+/// The choices offered by the "RAM Limiter" dropdown, in display order:
+/// `None` is "Default" (the Device model decides), otherwise the cap in MiB.
+const MEMORY_LIMIT_CHOICES: &[Option<u32>] = &[
+    None,
+    Some(128),
+    Some(256),
+    Some(512),
+    Some(1024),
+    Some(2048),
+];
+
+/// The button title of the "RAM Limiter" dropdown for a choice.
+fn memory_limit_label(choice: Option<u32>) -> String {
+    match choice {
+        None => "Default".to_string(),
+        Some(mb) if mb >= 1024 => format!("{} GB", mb / 1024),
+        Some(mb) => format!("{mb} MB"),
+    }
+}
+
+/// The dropdown tag of a RAM limiter choice (`0` is "Default").
+fn memory_limit_tag(choice: Option<u32>) -> i32 {
+    MEMORY_LIMIT_CHOICES
+        .iter()
+        .position(|candidate| *candidate == choice)
+        .unwrap_or(0) as i32
+}
+
+/// The RAM limiter choice of a dropdown tag.
+fn memory_limit_choice(tag: Option<i32>) -> Option<u32> {
+    tag.and_then(|tag| MEMORY_LIMIT_CHOICES.get(tag as usize).copied().flatten())
+}
 
 #[derive(Clone, PartialEq)]
 struct PickerSettings {
@@ -502,6 +539,10 @@ struct PickerSettings {
     corruption_max_offset: Option<u32>,
     corruption_seed: u64,
     gles2_mode: Gles2Mode,
+    /// `None` is "Default" (the Device model decides, unless an options file
+    /// sets the cap).
+    /// `Some(..)` is an explicit "RAM Limiter" choice, in MiB.
+    memory_limit_mb: Option<u32>,
     cheat_engine: bool,
     network: bool,
     game_center_authenticated: bool,
@@ -859,7 +900,16 @@ impl PickerSettings {
                 "gles2_mode" => {
                     if let Some(mode) = Gles2Mode::from_short_name(value) {
                         settings.gles2_mode = mode;
+                    } else if value == "native" {
+                        // Older builds wrote `native` for the driver path; keep reading it.
+                        settings.gles2_mode = Gles2Mode::Off;
                     }
+                    }
+                "memory_limit_mb" => {
+                    settings.memory_limit_mb = match value {
+                        "default" => None,
+                        _ => value.parse().ok().filter(|mb| *mb > 0),
+                    };
                 }
                 "cheat_engine" => set_bool(value, &mut settings.cheat_engine),
                 "network" => set_bool(value, &mut settings.network),
@@ -924,6 +974,7 @@ impl PickerSettings {
             dpad_to_touch: options.dpad_to_touch,
             stick_to_touch: options.stick_to_touch,
             fps_limit: options.fps_limit,
+            memory_limit_mb: options.memory_limit_mb,
             overlay_mode: options.performance_overlay_mode.for_current_platform(),
             overlay_corner: options.performance_overlay_corner,
             // An explicit CLI choice is preserved; otherwise app profiles can
@@ -959,7 +1010,7 @@ impl PickerSettings {
             Some(DeviceOrientation::Portrait) => "default",
         };
         let contents = format!(
-            "# Saved by the graphical settings screen.\n\
+        "# Saved by the graphical settings screen.\n\
              scale_hack={}\n\
              orientation={orientation}\n\
              fullscreen={}\n\
@@ -998,6 +1049,8 @@ impl PickerSettings {
              corruption_max_offset={}\n\
              corruption_seed={}\n\
              gles2_mode={}\n\
+             fps_limit={}\n\
+             memory_limit_mb={}\n\
              cheat_engine={}\n\
              network={}\n\
              game_center_authenticated={}\n\
@@ -1049,6 +1102,10 @@ impl PickerSettings {
                 .map_or_else(|| "unbounded".to_string(), |value| value.to_string()),
             self.corruption_seed,
             self.gles2_mode.short_name(),
+            self.fps_limit
+                .map_or_else(|| "off".to_string(), |value| value.to_string()),
+            self.memory_limit_mb
+                .map_or_else(|| "default".to_string(), |mb| mb.to_string()),
             self.cheat_engine,
             self.network,
             self.game_center_authenticated,
@@ -1723,13 +1780,14 @@ const CLASSES: ClassExports = objc_classes! {
 }
 - (())textFieldShouldReturn:(id)sender {
     let tag: NSInteger = msg![env; sender tag];
-    let host = env.objc.borrow_mut::<AppPickerDelegateHostObject>(this);
-    if tag == access_prompt::FIELD_TAG {
-        host.access_prompt_submit = true;
-    } else if !is_manual_value_tag(tag) {
-        host.archive_store_search = true;
-    }
-    drop(host);
+        {
+            let host = env.objc.borrow_mut::<AppPickerDelegateHostObject>(this);
+            if tag == access_prompt::FIELD_TAG {
+                host.access_prompt_submit = true;
+            } else if !is_manual_value_tag(tag) {
+                host.archive_store_search = true;
+            }
+        }
     let _: bool = msg![env; sender resignFirstResponder];
 }
 - (())textFieldDidEndEditing:(id)sender {
@@ -1930,6 +1988,18 @@ const CLASSES: ClassExports = objc_classes! {
 }
 - (())overlayCornerBottomLeft {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).overlay_corner = Some(PerformanceOverlayCorner::BottomLeft);
+}
+- (())memoryLimit:(id)sender { // UIButton*
+    let tag: NSInteger = msg![env; sender tag];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).memory_limit_tag = Some(tag as i32);
+}
+- (())memoryLimitToggle {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).memory_limit_toggle = true;
+}
+- (())memoryLimitScroll:(id)sender forEvent:(id)event {
+    if let Some(position) = dropdown_scroll_position(env, sender, event) {
+        env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).memory_limit_scroll_to = Some(position);
+    }
 }
 - (())showFPS:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
@@ -2308,6 +2378,7 @@ fn app_picker_inner(
         show_fullscreen_row,
     );
     let mut quick_options_show_fps = initial_quick_options_show_fps;
+    let mut quick_options_memory_limit_mb = picker_settings.memory_limit_mb;
     let mut device_state = DropdownState {
         selected: picker_settings.device_model_tag,
         ..Default::default()
@@ -2320,7 +2391,13 @@ fn app_picker_inner(
         selected: picker_settings.language_tag,
         ..Default::default()
     };
+    let mut memory_limit_state = DropdownState {
+        selected: Some(memory_limit_tag(picker_settings.memory_limit_mb)),
+        ..Default::default()
+    };
     let mut last_saved_picker_settings = picker_settings.clone();
+
+
     let mut next_settings_save = Instant::now();
 
     update_scale_hack_buttons(
@@ -2411,6 +2488,12 @@ fn app_picker_inner(
         &settings.renderer_dropdown,
         &renderer_mode_label_for_tag(renderer_state.selected),
         &renderer_state,
+    );
+    refresh_dropdown(
+        env,
+        &settings.memory_limit_dropdown,
+        &memory_limit_label(quick_options_memory_limit_mb),
+        &memory_limit_state,
     );
 
     // Built after the settings screen, so that it is drawn on top of it.
@@ -2503,7 +2586,7 @@ fn app_picker_inner(
     }
     // If an app is picked, this loop returns. If the user quits touchHLE, the
     // process exits.
-    let (app_path, app_id) = loop {
+    let app_path = loop {
         run_run_loop_single_iteration(env, main_run_loop);
         update_settings_scrollbar(env, &settings);
         sync_dropdown_scroll(env, &settings.device_dropdown, &mut device_state);
@@ -2672,7 +2755,6 @@ fn app_picker_inner(
                 Some(app_idx) => {
                     let app = &apps.as_ref().unwrap()[app_idx];
                     let app_path = app.path.clone();
-                    let app_id = app.bundle_id.clone();
                     remember_last_app_path(&app_path);
                     echo!("Picked: {}", app_path.display());
                     // iOS-style launch: the icon travels to the middle of the
@@ -2688,7 +2770,7 @@ fn app_picker_inner(
                         icon_frame,
                         icon_image,
                     );
-                    break (app_path, app_id);
+                        break app_path;
                 }
                 None => (), // Tapped on a black space
             }
@@ -2699,8 +2781,6 @@ fn app_picker_inner(
             std::mem::take(&mut host.status_accessory_tapped)
         };
         if status_accessory_tapped {
-            press = None;
-            long_pressed_icon = None;
             let downloaded = access_prompt::run_access_prompt(
                 env,
                 main_run_loop,
@@ -2762,17 +2842,13 @@ fn app_picker_inner(
         if recent_app_tapped {
             if let Some((path, _, _)) = recent_app.as_ref() {
                 echo!("Picked last launched app: {}", path.display());
-                let app_id = BundleData::open_any(path)
-                    .and_then(|data| Bundle::new_bundle_and_fs_from_host_path(data, true))
-                    .map(|(bundle, _)| bundle.bundle_identifier().to_owned());
-                let app_id = match app_id {
-                    Ok(app_id) if !app_id.is_empty() => app_id,
-                    Ok(_) | Err(_) => {
-                        log!("Warning: Couldn't inspect the last app's bundle identifier; some app-specific options may not be applied");
-                        String::new()
-                    }
-                };
-                break (path.clone(), app_id);
+if BundleData::open_any(path)
+.and_then(|data| Bundle::new_bundle_and_fs_from_host_path(data, true))
+.is_err()
+{
+log!("Warning: Couldn't inspect the last app's bundle; some app-specific options may not be applied");
+}
+                break path.clone();
             }
         }
         if add_ipa {
@@ -2838,6 +2914,15 @@ fn app_picker_inner(
                     &settings.language_dropdown,
                     &language_label_for_tag(language_state.selected),
                     &language_state,
+                );
+            }
+            if memory_limit_state.open {
+                memory_limit_state.open = false;
+                refresh_dropdown(
+                    env,
+                    &settings.memory_limit_dropdown,
+                    &memory_limit_label(quick_options_memory_limit_mb),
+                    &memory_limit_state,
                 );
             }
             hide_settings_screen(env, main_run_loop, delegate, &settings);
@@ -2935,6 +3020,33 @@ fn app_picker_inner(
                 width,
                 height,
                 &mut picker_settings,
+            );
+        } else if let Some(tag) = std::mem::take(&mut host_obj.memory_limit_tag) {
+            memory_limit_state.selected = Some(tag);
+            memory_limit_state.open = false;
+            quick_options_memory_limit_mb = memory_limit_choice(Some(tag));
+            refresh_dropdown(
+                env,
+                &settings.memory_limit_dropdown,
+                &memory_limit_label(quick_options_memory_limit_mb),
+                &memory_limit_state,
+            );
+        } else if std::mem::take(&mut host_obj.memory_limit_toggle) {
+            memory_limit_state.open = !memory_limit_state.open;
+            refresh_dropdown(
+                env,
+                &settings.memory_limit_dropdown,
+                &memory_limit_label(quick_options_memory_limit_mb),
+                &memory_limit_state,
+            );
+        } else if let Some(position) = std::mem::take(&mut host_obj.memory_limit_scroll_to) {
+            memory_limit_state.scroll =
+                dropdown_scroll_at(position, settings.memory_limit_dropdown.items.len());
+            refresh_dropdown(
+                env,
+                &settings.memory_limit_dropdown,
+                &memory_limit_label(quick_options_memory_limit_mb),
+                &memory_limit_state,
             );
         } else if let Some(tag) = std::mem::take(&mut host_obj.device_model_tag) {
             device_state.selected = Some(tag);
@@ -3223,10 +3335,13 @@ fn app_picker_inner(
         let wheel = PENDING_MOUSE_WHEEL.swap(0, Ordering::Relaxed);
         if wheel != 0 {
             let language_open = language_state.open;
+            let memory_limit_open = memory_limit_state.open;
             let dropdown = if language_open {
                 Some((&mut language_state, &settings.language_dropdown))
             } else if device_state.open {
                 Some((&mut device_state, &settings.device_dropdown))
+            } else if memory_limit_open {
+                Some((&mut memory_limit_state, &settings.memory_limit_dropdown))
             } else {
                 None
             };
@@ -3235,6 +3350,8 @@ fn app_picker_inner(
                     .clamp(0, dropdown_max_scroll(dropdown.items.len()));
                 let label = if language_open {
                     language_label_for_tag(state.selected)
+                } else if memory_limit_open {
+                    memory_limit_label(memory_limit_choice(state.selected))
                 } else {
                     device_model_label_for_tag(state.selected)
                 };
@@ -3396,6 +3513,10 @@ fn app_picker_inner(
     // options-file settings, including legacy --gles-native switches.
     option_args
         .push(quick_options_renderer_mode_argument(picker_settings.renderer_mode).to_string());
+option_args.extend(quick_options_ram_limiter_arguments(
+        quick_options_memory_limit_mb,
+    ));
+
     // The two compatibility fixes are only emitted when the Settings screen
     // actually set them (see `quick_options_fix_arguments`).
     option_args.extend(quick_options_fix_arguments(
@@ -5413,6 +5534,8 @@ enum SettingsRow {
     Toggle(&'static str, &'static str, &'static str, bool, bool),
     /// Renderer mode dropdown.
     RendererDropdown(&'static str, &'static str),
+    /// The "RAM Limiter" row (its dropdown is a root-level overlay).
+    MemoryLimitDropdown,
     /// A full-width action row with centered red text, like the old-iOS
     /// "Delete Account" cell.
     Button {
@@ -5539,6 +5662,7 @@ fn settings_row_height(env: &mut Environment, row: &SettingsRow, inner_width: CG
         SettingsRow::Button { title, .. } => {
             settings_text_height(env, title, 16.0, inner_width - 2.0 * side) + 24.0
         }
+            SettingsRow::MemoryLimitDropdown => 58.0,
         SettingsRow::ManualValue {
             title, description, ..
         } => {
@@ -5603,6 +5727,8 @@ struct SettingsStuff {
     language_dropdown: SettingsDropdown,
     /// The "Renderer Mode" dropdown.
     renderer_dropdown: SettingsDropdown,
+    /// The "RAM Limiter" dropdown.
+    memory_limit_dropdown: SettingsDropdown,
 }
 
 /// The views of one settings dropdown: a button in a settings row, and a list
@@ -5618,8 +5744,11 @@ struct SettingsDropdown {
     dimmer: id,
     /// One button per choice, in the order of the spec's entries.
     items: Vec<id>,
-    /// The scrollbar thumb shown alongside the list.
+    /// The scrollbar thumb shown alongside the list, or `nil` when all the
+    /// entries fit and the list needs no scrollbar.
     thumb: id,
+    /// Width of the list itself, excluding the scrollbar (if there is one).
+    list_width: CGFloat,
 }
 
 /// What a settings dropdown offers, and which delegate selectors its buttons
@@ -5663,10 +5792,11 @@ fn refresh_dropdown(
     () = msg![env; (dropdown.scroll_view) setContentOffset:content_offset];
     update_dropdown_menu(
         env,
-        dropdown.scroll_view,
         &dropdown.items,
         dropdown.thumb,
         state.selected,
+        state.scroll,
+        dropdown.list_width,
     );
     let arrow = if state.open { "▲" } else { "▼" };
     let title = ns_string::from_rust_string(env, format!("{label} {arrow}"));
@@ -5706,7 +5836,14 @@ fn sync_dropdown_scroll(
     let offset: CGPoint = msg![env; (dropdown.scroll_view) contentOffset];
     state.scroll = ((offset.y / DEVICE_MENU_ITEM_HEIGHT).round() as isize)
         .clamp(0, dropdown_max_scroll(dropdown.items.len()));
-    update_dropdown_scroll_position(env, dropdown.scroll_view, &dropdown.items, dropdown.thumb);
+    update_dropdown_menu(
+        env,
+        &dropdown.items,
+        dropdown.thumb,
+        state.selected,
+        state.scroll,
+        dropdown.list_width,
+    );
 }
 
 /// Builds the Settings screen: a navigation bar with a "Done" button, and a
@@ -5924,6 +6061,16 @@ fn setup_settings(
             true,
         ));
     }
+    // Both compatibility fixes are opt-in and may be enabled per-app in the
+    // options files. Leaving a switch alone keeps those defaults; flipping it
+    // (either way) is an explicit override for every later launch.
+    display_rows.push(SettingsRow::Toggle(
+        "Rotation fix",
+        "Moves the game image if it starts out turned the wrong way. iPad games need it most; other games can come out turned if it is on, so leave it off unless you need it.",
+        "rotationFix:",
+        picker_settings.rotation_fix.unwrap_or(false),
+        true,
+    ));
     sections.push(("DISPLAY", display_rows));
     let overlay_mode_options: &'static [(&'static str, &'static str)] =
         if cfg!(any(target_os = "android", target_os = "ios")) {
@@ -6046,16 +6193,6 @@ fn setup_settings(
                 ("Bottom\nRight", "overlayCornerBottomRight"),
                 ("Bottom\nLeft", "overlayCornerBottomLeft"),
             ],
-        ),
-        // Both fixes are opt-in and may be enabled per-app in the options
-        // files. Leaving a switch alone keeps those defaults; flipping it
-        // (either way) is an explicit override for every later launch.
-        SettingsRow::Toggle(
-            "Rotation fix",
-            "Uses UIKit’s actual screen rotation to orient the game image. This may help some iPad games; it can change how other games turn.",
-            "rotationFix:",
-            picker_settings.rotation_fix.unwrap_or(false),
-            true,
         ),
         SettingsRow::Toggle(
             "Movie player fix",
@@ -6237,32 +6374,19 @@ fn setup_settings(
     sections.push((
         "EMULATION",
         vec![
+            SettingsRow::MemoryLimitDropdown,
             SettingsRow::Toggle(
                 "Cheat Engine",
-                "Enables the built-in cheat interface for supported games. It does not add cheats to every game.",
+                "Allows the in-game trainer to be used where a game expects one. Leave off unless a game needs it.",
                 "cheatEngine:",
                 picker_settings.cheat_engine,
                 true,
             ),
             SettingsRow::Toggle(
                 "Network access",
-                "Lets the game connect to the Internet and local network. Online services may still be unavailable.",
+                "Lets a game reach the network. Most single-player games do not need it, and it can make a game wait on servers that no longer exist.",
                 "network:",
                 picker_settings.network,
-                true,
-            ),
-            SettingsRow::Toggle(
-                "Local Game Center sign-in",
-                "Tells the game that a local player is signed in. Online Game Center services are not provided.",
-                "gameCenterAuthenticated:",
-                picker_settings.game_center_authenticated,
-                true,
-            ),
-            SettingsRow::Toggle(
-                "Use analog sticks for tilt controls",
-                "Uses a controller’s analog stick to imitate tilting the device. When enabled, the real accelerometer is ignored.",
-                "analogStickTiltControls:",
-                picker_settings.analog_stick_tilt_controls,
                 true,
             ),
         ],
@@ -6283,6 +6407,7 @@ fn setup_settings(
     let mut device_dropdown: Option<SettingsDropdown> = None;
     let mut language_dropdown: Option<SettingsDropdown> = None;
     let mut renderer_dropdown: Option<SettingsDropdown> = None;
+    let mut memory_limit_dropdown: Option<SettingsDropdown> = None;
     let mut overlay_mode_buttons = Vec::new();
     let mut overlay_corner_buttons = Vec::new();
     let mut corruption_mode_buttons = Vec::new();
@@ -6453,36 +6578,29 @@ fn setup_settings(
                         device_model_dropdown_spec(),
                     ));
                 }
-                SettingsRow::LanguageDropdown(title, description) => {
-                    let dropdown_width: CGFloat = 170.0;
-                    let label_width = inner_width - 2.0 * side - dropdown_width - 8.0;
-                    let title_height = settings_text_height(env, title, 16.0, label_width);
-                    let description_height = settings_text_height(
-                        env,
-                        description,
-                        SETTINGS_DESCRIPTION_FONT_SIZE,
-                        label_width,
-                    );
-                    let title_view = new_setting_title_label(
-                        env,
-                        rect(side, row_y + 8.0, label_width, title_height),
-                        title,
-                        16.0,
-                        black,
-                    );
-                    () = msg![env; group addSubview:title_view];
-                    let description_view = new_setting_description_label(
-                        env,
-                        rect(
-                            side,
-                            row_y + 8.0 + title_height + 4.0,
-                            label_width,
-                            description_height,
-                        ),
-                        description,
-                        gray_text,
-                    );
-                    () = msg![env; group addSubview:description_view];
+        SettingsRow::LanguageDropdown(title, description) => {
+            let dropdown_width: CGFloat = 170.0;
+            let label_width = inner_width - 2.0 * side - dropdown_width;
+            let title_height =
+                settings_text_height(env, title, 16.0, label_width);
+            let description_height = settings_text_height(
+                env,
+                description,
+                SETTINGS_DESCRIPTION_FONT_SIZE,
+                label_width,
+            );
+            let label_frame = rect(side, row_y + 8.0 + title_height + 4.0, label_width, description_height);
+            let description_label: id =
+                new_label(env, label_frame, description, SETTINGS_DESCRIPTION_FONT_SIZE, false, gray_text);
+            () = msg![env; group addSubview:description_label];
+            let title_view = new_setting_title_label(
+                env,
+                rect(side, row_y + 8.0, label_width, title_height),
+                title,
+                16.0,
+                black,
+            );
+            () = msg![env; group addSubview:title_view];
                     language_dropdown = Some(make_settings_dropdown(
                         env,
                         delegate,
@@ -6496,6 +6614,26 @@ fn setup_settings(
                         ),
                         menu_origin,
                         language_dropdown_spec(),
+                    ));
+                }
+                SettingsRow::MemoryLimitDropdown => {
+                    let label_view = new_label(
+                        env,
+                        rect(side, row_y + 11.0, 150.0, 22.0),
+                        "RAM Limiter",
+                        16.0,
+                        false,
+                        black,
+                    );
+                    () = msg![env; group addSubview:label_view];
+                    memory_limit_dropdown = Some(make_settings_dropdown(
+                        env,
+                        delegate,
+                        group,
+                        settings_view,
+                        rect(inner_width - side - 170.0, row_y + 7.0, 170.0, 30.0),
+                        menu_origin,
+                        memory_limit_dropdown_spec(),
                     ));
                 }
                 SettingsRow::RendererDropdown(title, description) => {
@@ -6757,6 +6895,8 @@ fn setup_settings(
             .expect("the settings screen always has a language row"),
         renderer_dropdown: renderer_dropdown
             .expect("the settings screen always has a renderer mode row"),
+        memory_limit_dropdown: memory_limit_dropdown
+            .expect("the settings screen always has a RAM limiter row"),
     }
 }
 
@@ -6893,6 +7033,21 @@ fn language_dropdown_spec() -> DropdownSpec {
     }
 }
 
+/// The spec of the "RAM Limiter" dropdown.
+fn memory_limit_dropdown_spec() -> DropdownSpec {
+    DropdownSpec {
+        entries: MEMORY_LIMIT_CHOICES
+            .iter()
+            .enumerate()
+            .map(|(idx, choice)| (memory_limit_label(*choice), idx as NSInteger))
+            .collect(),
+        toggle_selector: "memoryLimitToggle",
+        item_selector: "memoryLimit:",
+        scroll_selector: "memoryLimitScroll:forEvent:",
+        button_font_size: 16.0,
+    }
+}
+
 /// The button title of the language dropdown for the chosen tag.
 fn language_label_for_tag(tag: Option<i32>) -> String {
     let idx = tag.unwrap_or(0) as usize;
@@ -6929,13 +7084,29 @@ fn device_model_label_for_tag(tag: Option<i32>) -> String {
 /// the rest in dark gray. The scrollbar thumb is moved to reflect `scroll`.
 fn update_dropdown_menu(
     env: &mut Environment,
-    scroll_view: id,
     items: &[id],
     thumb: id,
     selected: Option<i32>,
+    scroll: isize,
+    list_width: CGFloat,
 ) {
-    update_dropdown_scroll_position(env, scroll_view, items, thumb);
-    for &item in items {
+    let visible_menu_height = (DEVICE_MENU_VISIBLE_ITEMS as CGFloat) * DEVICE_MENU_ITEM_HEIGHT;
+    let max_scroll = (items.len() as isize).saturating_sub(DEVICE_MENU_VISIBLE_ITEMS as isize);
+
+    for (j, &item) in items.iter().enumerate() {
+        let y_pos = ((j as isize - scroll) as CGFloat) * DEVICE_MENU_ITEM_HEIGHT;
+        let is_visible = y_pos >= 0.0 && y_pos < visible_menu_height;
+        () = msg![env; item setHidden:(!is_visible)];
+        if is_visible {
+            let item_frame = CGRect {
+                origin: CGPoint { x: 0.0, y: y_pos },
+                size: CGSize {
+                    width: list_width,
+                    height: DEVICE_MENU_ITEM_HEIGHT,
+                },
+            };
+            () = msg![env; item setFrame:item_frame];
+        }
         let tag: NSInteger = msg![env; item tag];
         let is_selected = selected.is_some_and(|v| v as NSInteger == tag);
         let color = if is_selected {
@@ -6951,48 +7122,30 @@ fn update_dropdown_menu(
         () = msg![env; item setBackgroundColor:color];
         () = msg![env; item setTitleColor:text_color forState:UIControlStateNormal];
     }
-}
 
-fn update_dropdown_scroll_position(
-    env: &mut Environment,
-    scroll_view: id,
-    items: &[id],
-    thumb: id,
-) {
-    let visible_menu_height = (DEVICE_MENU_VISIBLE_ITEMS as CGFloat) * DEVICE_MENU_ITEM_HEIGHT;
-    let offset: CGPoint = msg![env; scroll_view contentOffset];
-    for (j, &item) in items.iter().enumerate() {
-        let item_top = j as CGFloat * DEVICE_MENU_ITEM_HEIGHT - offset.y;
-        let visible = item_top + DEVICE_MENU_ITEM_HEIGHT > 0.0 && item_top < visible_menu_height;
-        let hidden: bool = msg![env; item isHidden];
-        let should_hide = !visible;
-        if hidden != should_hide {
-            () = msg![env; item setHidden:should_hide];
-        }
+    // Position the scrollbar thumb proportionally to the scroll offset. A list
+    // that fits has no thumb (and no track).
+    if thumb == nil {
+        return;
     }
-    let max_offset =
-        ((items.len() as CGFloat) * DEVICE_MENU_ITEM_HEIGHT - visible_menu_height).max(0.0);
     let thumb_height: CGFloat = 54.0;
     let travel = (visible_menu_height - thumb_height).max(0.0);
-    let thumb_y = if max_offset > 0.0 {
-        (offset.y / max_offset).clamp(0.0, 1.0) * travel
+    let thumb_y = if max_scroll > 0 {
+        (scroll as CGFloat / max_scroll as CGFloat) * travel
     } else {
         0.0
     };
-    let frame: CGRect = msg![env; thumb frame];
-    if (frame.origin.y - thumb_y).abs() > 0.01 {
-        let thumb_frame = CGRect {
-            origin: CGPoint {
-                x: 256.0,
-                y: thumb_y,
-            },
-            size: CGSize {
-                width: 24.0,
-                height: thumb_height,
-            },
-        };
-        () = msg![env; thumb setFrame:thumb_frame];
-    }
+    let thumb_frame = CGRect {
+        origin: CGPoint {
+            x: list_width,
+            y: thumb_y,
+        },
+        size: CGSize {
+            width: 24.0,
+            height: thumb_height,
+        },
+    };
+    () = msg![env; thumb setFrame:thumb_frame];
 }
 
 /// Builds a settings dropdown: a button in a settings row, whose title shows
@@ -7017,8 +7170,15 @@ fn make_settings_dropdown(
         scroll_selector,
         button_font_size,
     } = spec;
-    let list_width: CGFloat = 256.0;
+    // Lists whose entries all fit need no scrollbar, so they use the whole
+    // menu width instead of leaving a bare track next to the rows.
+    let scrollable = entries.len() > DEVICE_MENU_VISIBLE_ITEMS;
     let scrollbar_width: CGFloat = 24.0;
+    let list_width: CGFloat = if scrollable {
+        SETTINGS_DROPDOWN_MENU_WIDTH - scrollbar_width
+    } else {
+        SETTINGS_DROPDOWN_MENU_WIDTH
+    };
     let dark_gray: id = msg_class![env; UIColor darkGrayColor];
     let root_size: CGSize = {
         let bounds: CGRect = msg![env; root_view bounds];
@@ -7113,48 +7273,55 @@ fn make_settings_dropdown(
         items.push(item_btn);
     }
 
-    // Scrollbar track (full height) and thumb.
-    let track_view: id = msg_class![env; UIView alloc];
-    let track_frame = CGRect {
-        origin: CGPoint {
-            x: list_width,
-            y: 0.0,
-        },
-        size: CGSize {
-            width: scrollbar_width,
-            height: visible_menu_height,
-        },
-    };
-    let track_view: id = msg![env; track_view initWithFrame:track_frame];
-    let track_color = ui_color(env, 0.87, 0.87, 0.89, 1.0);
-    () = msg![env; track_view setBackgroundColor:track_color];
-    () = msg![env; menu_view addSubview:track_view];
+    // Scrollbar track (full height), thumb, and the control that supports
+    // clicking the track and dragging the thumb. A list that fits gets none of
+    // them: there is nothing to scroll.
+    let thumb_view: id = if scrollable {
+        let track_view: id = msg_class![env; UIView alloc];
+        let track_frame = CGRect {
+            origin: CGPoint {
+                x: list_width,
+                y: 0.0,
+            },
+            size: CGSize {
+                width: scrollbar_width,
+                height: visible_menu_height,
+            },
+        };
+        let track_view: id = msg![env; track_view initWithFrame:track_frame];
+        let track_color = ui_color(env, 0.87, 0.87, 0.89, 1.0);
+        () = msg![env; track_view setBackgroundColor:track_color];
+        () = msg![env; menu_view addSubview:track_view];
 
-    let thumb_view: id = msg_class![env; UIView alloc];
-    let thumb_frame = CGRect {
-        origin: CGPoint {
-            x: list_width,
-            y: 0.0,
-        },
-        size: CGSize {
-            width: scrollbar_width,
-            height: 54.0,
-        },
-    };
-    let thumb_view: id = msg![env; thumb_view initWithFrame:thumb_frame];
-    let thumb_color = ui_color(env, 0.55, 0.55, 0.58, 1.0);
-    () = msg![env; thumb_view setBackgroundColor:thumb_color];
-    () = msg![env; menu_view addSubview:thumb_view];
+        let thumb_view: id = msg_class![env; UIView alloc];
+        let thumb_frame = CGRect {
+            origin: CGPoint {
+                x: list_width,
+                y: 0.0,
+            },
+            size: CGSize {
+                width: scrollbar_width,
+                height: 54.0,
+            },
+        };
+        let thumb_view: id = msg![env; thumb_view initWithFrame:thumb_frame];
+        let thumb_color = ui_color(env, 0.55, 0.55, 0.58, 1.0);
+        () = msg![env; thumb_view setBackgroundColor:thumb_color];
+        () = msg![env; menu_view addSubview:thumb_view];
 
-    // A single control supports clicking the track and dragging the thumb.
-    let clear: id = msg_class![env; UIColor clearColor];
-    let scroll_btn: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
-    () = msg![env; scroll_btn setFrame:track_frame];
-    () = msg![env; scroll_btn setBackgroundColor:clear];
-    () = msg![env; scroll_btn addTarget:delegate
-                               action:(env.objc.lookup_selector(scroll_selector).unwrap())
-                     forControlEvents:(UIControlEventTouchDown | UIControlEventTouchDragInside | UIControlEventTouchDragExit | UIControlEventTouchDragOutside)];
-    () = msg![env; menu_view addSubview:scroll_btn];
+        let clear: id = msg_class![env; UIColor clearColor];
+        let scroll_btn: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+        () = msg![env; scroll_btn setFrame:track_frame];
+        () = msg![env; scroll_btn setBackgroundColor:clear];
+        () = msg![env; scroll_btn addTarget:delegate
+                                   action:(env.objc.lookup_selector(scroll_selector).unwrap())
+                         forControlEvents:(UIControlEventTouchDown | UIControlEventTouchDragInside | UIControlEventTouchDragExit | UIControlEventTouchDragOutside)];
+        () = msg![env; menu_view addSubview:scroll_btn];
+
+        thumb_view
+    } else {
+        nil
+    };
 
     SettingsDropdown {
         button,
@@ -7163,6 +7330,7 @@ fn make_settings_dropdown(
         dimmer,
         items,
         thumb: thumb_view,
+        list_width,
     }
 }
 
@@ -7859,6 +8027,18 @@ fn quick_options_picker_settings_arguments(settings: &PickerSettings) -> Vec<Str
     args
 }
 
+/// Launch argument for the Emulation section's RAM limiter. `None` means
+/// "Default": nothing is emitted, so the command line and the app-specific
+/// options files stay in charge.
+fn quick_options_ram_limiter_arguments(memory_limit_mb: Option<u32>) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(mb) = memory_limit_mb {
+        args.push(format!("--memory-limit={mb}"));
+    }
+    args
+}
+
+
 fn quick_options_corruption_arguments(
     mode: CorruptionMode,
     startup_delay: StartupDelayPreset,
@@ -8488,6 +8668,41 @@ mod manual_settings_tests {
             .manual_value_overrides
             .contains(&MANUAL_X_TILT_OFFSET));
     }
+}
+
+#[cfg(test)]
+mod limiter_option_tests {
+    use super::*;
+
+    #[test]
+    fn ram_limiter_choices_map_to_labels_and_tags() {
+        assert_eq!(memory_limit_label(None), "Default");
+        assert_eq!(memory_limit_label(Some(128)), "128 MB");
+        assert_eq!(memory_limit_label(Some(512)), "512 MB");
+        assert_eq!(memory_limit_label(Some(1024)), "1 GB");
+        assert_eq!(memory_limit_label(Some(2048)), "2 GB");
+
+        for (idx, choice) in MEMORY_LIMIT_CHOICES.iter().enumerate() {
+            assert_eq!(memory_limit_tag(*choice), idx as i32);
+            assert_eq!(memory_limit_choice(Some(idx as i32)), *choice);
+        }
+        // "Default" is the fallback for a tag that isn't offered.
+        assert_eq!(memory_limit_tag(Some(64)), 0);
+        assert_eq!(memory_limit_choice(Some(i32::MAX)), None);
+    }
+
+    #[test]
+fn ram_limiter_arguments_are_only_emitted_for_explicit_choices() {
+    assert!(quick_options_ram_limiter_arguments(None).is_empty());
+    assert_eq!(
+        quick_options_ram_limiter_arguments(Some(1024)),
+        vec!["--memory-limit=1024"]
+    );
+    assert_eq!(
+        quick_options_ram_limiter_arguments(Some(256)),
+        vec!["--memory-limit=256"]
+    );
+}
 }
 
 #[cfg(test)]
