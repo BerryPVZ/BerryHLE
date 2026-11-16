@@ -438,12 +438,6 @@ mod tests {
             "stale duplicate of cf_http_message.rs; its constants are already \
              registered by cf_network and cf_stream",
         ),
-        // Not compiled: no `mod` declaration anywhere, so these never reach the guest.
-        ("extended_audio_file.rs", "not compiled"),
-        ("localytics.rs", "not compiled"),
-        ("ns_method_signature.rs", "not compiled"),
-        ("raknet.rs", "not compiled"),
-        ("ui_undo_manager.rs", "not compiled"),
     ];
 
     fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
