@@ -406,23 +406,6 @@ impl std::fmt::Display for ThreadBlock {
         }
     }
 }
-impl ThreadBlock {
-    /// The scheduler's host deadline for a timed wait. Read wall time lazily:
-    /// most scheduling passes have no timed condition-variable waiters.
-    fn host_wakeup_deadline(
-        &self,
-        clock: &crate::guest_clock::GuestClock,
-        host_now: Instant,
-        wall_now: impl FnOnce() -> Duration,
-    ) -> Option<Instant> {
-        match *self {
-            Self::Sleeping(due) => Some(due),
-            Self::GuestSleeping(due) => Some(clock.host_deadline_at(due, host_now)),
-            Self::Condition(_, Some(due)) => Some(host_now + due.saturating_sub(wall_now())),
-            _ => None,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ThreadState {
@@ -436,7 +419,6 @@ pub enum ThreadState {
     /// The thread has died.
     Dead,
 }
-
 struct BinaryDependencyNode {
     name: String,
     dependencies: Vec<String>,
@@ -575,11 +557,10 @@ static ENVIRONMENT_INSTANCE_EXISTS: std::sync::atomic::AtomicBool =
 /// biggest process last).
 ///
 /// So "Default" means half of the Device model's RAM, which makes the Device
-/// choice matter for real, with two practical clamps: at least 256 MiB, because
-/// the earliest device profiles only report 128-256 MiB and games that run
-/// today already use 150-200 MiB, and at most 2 GiB, because the app's own
-/// segments, thread stacks and the null segment share the same 4 GiB address
-/// space.
+/// choice matter for real, with two practical clamps: at least 256 MiB, since
+/// half the RAM of the earliest profiles is only 64-128 MiB and can be too
+/// restrictive for some apps, and at most 2 GiB, because the app's segments,
+/// thread stacks and the null segment share the same 4 GiB address space.
 fn default_guest_heap_cap(device_family: DeviceFamily) -> GuestUSize {
     const FLOOR: u64 = 256 * 1024 * 1024;
     const CEILING: u64 = 2 * 1024 * 1024 * 1024;
@@ -786,21 +767,25 @@ impl Environment {
             // doing an exact-match check on the plist's spelling instead was
             // what made the picker log "Using launch image" for a file that
             // then silently wasn't shown.
-            let launch_image = bundle
-                .launch_image_path(&fs, device_family)
-                .and_then(|path| {
-                    let res = fs
-                        .read(path)
-                        .map_err(|_| "Could not read launch image file".to_string())
-                        .and_then(|bytes| {
-                            image::Image::from_bytes(&bytes)
-                                .map_err(|e| format!("Could not parse launch image: {e}"))
-                        });
-                    if let Err(ref e) = res {
-                        log!("Warning: {}", e);
-                    };
-                    res.ok()
-                });
+            let launch_image = if options.skip_launch_image {
+                None
+            } else {
+                bundle
+                    .launch_image_path(&fs, device_family)
+                    .and_then(|path| {
+                        let res = fs
+                            .read(path)
+                            .map_err(|_| "Could not read launch image file".to_string())
+                            .and_then(|bytes| {
+                                crate::image::load_image_cached(&bytes)
+                                    .map_err(|e| format!("Could not parse launch image: {e}"))
+                            });
+                        if let Err(ref e) = res {
+                            log!("Warning: {}", e);
+                        };
+                        res.ok()
+                    })
+            };
             Some(Box::new(window::Window::new(
                 &format!(
                     "{} ({} {}{}{})",
@@ -817,6 +802,7 @@ impl Environment {
                 icon.ok(),
                 launch_image,
                 &options,
+                /* is_app_picker: */ false,
             )?))
         };
 
@@ -1346,6 +1332,7 @@ impl Environment {
             window_icon,
             launch_image,
             &options,
+            /* is_app_picker: */ true,
         )?));
 
         let mut mem = mem::Mem::new();
@@ -2088,13 +2075,13 @@ impl Environment {
     /// Applies the batch of changes the quick menu collected while its panel
     /// was open.
     ///
-    /// Everything lands here at once, on purpose: the FPS limiter, the RAM
-    /// limiter, the performance display and the trainer are read all over the
-    /// emulator, so changing them one by one while the panel is still being
-    /// edited would make the game react to a half-finished edit.
+    /// Everything lands here at once, on purpose: FPS and RAM limits,
+    /// performance display and trainer should not change while the panel is
+    /// still being edited.
     fn apply_quick_menu(&mut self, applied: &crate::quick_menu::Applied) {
         self.options.performance_overlay_enabled = applied.perf_display;
         self.options.fps_limit = applied.fps_limit;
+        self.options.memory_limit_mb = applied.memory_limit_mb;
         if let Some(window) = self.window.as_mut() {
             window.set_show_fps_counter(applied.perf_display);
         }
@@ -2174,28 +2161,19 @@ impl Environment {
                 // timers, audio callbacks) precise while retaining the
                 // overhead win in long busy stretches, fall back to the
                 // smaller batch whenever any thread has an imminent wake-up.
-                let host_now = Instant::now();
-                let cutoff = host_now + Duration::from_millis(10);
-                let mut wall_now = None;
-                let imminent_wakeup =
-                    self.threads
-                        .iter()
-                        .filter(|thread| thread.is_alive())
-                        .any(|thread| {
-                            let deadline = thread.blocked_by.host_wakeup_deadline(
-                                &self.guest_clock,
-                                host_now,
-                                || {
-                                    *wall_now.get_or_insert_with(|| {
-                                        SystemTime::now()
-                                            .duration_since(SystemTime::UNIX_EPOCH)
-                                            .unwrap()
-                                    })
-                                },
-                            );
-                            deadline.is_some_and(|due| due < cutoff)
-                        });
-                self.remaining_ticks = Some(if imminent_wakeup { 100_000 } else { 1_000_000 });
+                let imminent_wakeup = self.threads.iter().any(|thread| {
+                    let deadline = match thread.blocked_by {
+                        ThreadBlock::Sleeping(due) => Some(due),
+                        ThreadBlock::GuestSleeping(due) => Some(self.guest_clock.host_deadline(due)),
+                        _ => None,
+                    };
+                    deadline.is_some_and(|due| due < Instant::now() + Duration::from_millis(10))
+                });
+                self.remaining_ticks = Some(if imminent_wakeup {
+                    100_000
+                } else {
+                    1_000_000
+                });
             }
             // Game trainer (Cheat Engine-style memory search/patch + on-screen
             // UI). Disabled by default; skip it unless `--trainer` is enabled.
@@ -4252,8 +4230,6 @@ impl Environment {
             // Try to find a new thread to execute, starting with the thread
             // following the one currently executing.
             let mut next_awakening: Option<Instant> = None;
-            let host_now = Instant::now();
-            let mut wall_now = None;
             for i in 0..self.threads.len() {
                 let thread_id = (self.current_thread + 1 + i) % self.threads.len();
                 let candidate = &mut self.threads[thread_id];
@@ -4263,7 +4239,7 @@ impl Environment {
                 }
                 match candidate.blocked_by {
                     ThreadBlock::Sleeping(sleeping_until) => {
-                        if sleeping_until <= host_now {
+                        if sleeping_until <= Instant::now() {
                             log_dbg!("Thread {} finished sleeping.", thread_id);
                             candidate.blocked_by = ThreadBlock::NotBlocked;
                             return thread_id;
@@ -4275,11 +4251,11 @@ impl Environment {
                         }
                     }
                     ThreadBlock::GuestSleeping(due) => {
-                        let host_due = self.guest_clock.host_deadline_at(due, host_now);
-                        if host_due <= host_now {
+                        if due <= self.guest_clock.now() {
                             candidate.blocked_by = ThreadBlock::NotBlocked;
                             return thread_id;
                         }
+                        let host_due = self.guest_clock.host_deadline(due);
                         next_awakening = Some(next_awakening.map_or(host_due, |d| d.min(host_due)));
                     }
                     ThreadBlock::Mutex(mutex_id) => {
@@ -4345,11 +4321,9 @@ impl Environment {
                             self.relock_unblocked_mutex_for_thread(thread_id, mutex);
                             return thread_id;
                         } else if let Some(deadline) = deadline {
-                            let time = *wall_now.get_or_insert_with(|| {
-                                SystemTime::now()
-                                    .duration_since(SystemTime::UNIX_EPOCH)
-                                    .unwrap()
-                            });
+                            let time = SystemTime::now()
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .unwrap();
                             if deadline <= time {
                                 log_dbg!(
                                     "Thread {} is timed out on cond var {:?}.",
@@ -4394,7 +4368,7 @@ impl Environment {
                                 // Теперь эмулятор не упадет, а честно уснет до
                                 // этого момента.
                                 let remaining = deadline - time;
-                                let awakening = host_now + remaining;
+                                let awakening = Instant::now() + remaining;
                                 next_awakening = match next_awakening {
                                     None => Some(awakening),
                                     Some(other) => Some(other.min(awakening)),
@@ -4734,59 +4708,6 @@ fn direct_call_is_consistent_with_fault(call_site: u32, target: u32, fault_pc: u
 }
 
 #[cfg(test)]
-mod scheduler_wakeup_tests {
-    use super::ThreadBlock;
-    use crate::guest_clock::{GuestClock, Speed};
-    use crate::mem::Ptr;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn timed_condition_waits_have_monotonic_scheduler_deadlines() {
-        let host_now = Instant::now();
-        let clock = GuestClock::new();
-        let wall_now = Duration::from_secs(1_000);
-        let wait = ThreadBlock::Condition(Ptr::null(), Some(wall_now + Duration::from_millis(2)));
-        assert_eq!(
-            wait.host_wakeup_deadline(&clock, host_now, || wall_now),
-            Some(host_now + Duration::from_millis(2))
-        );
-        let expired = ThreadBlock::Condition(Ptr::null(), Some(wall_now - Duration::from_secs(1)));
-        assert_eq!(
-            expired.host_wakeup_deadline(&clock, host_now, || wall_now),
-            Some(host_now)
-        );
-        let untimed = ThreadBlock::Condition(Ptr::null(), None);
-        assert_eq!(
-            untimed.host_wakeup_deadline(&clock, host_now, || panic!("untimed wait")),
-            None
-        );
-    }
-
-    #[test]
-    fn sleep_deadlines_do_not_read_wall_time_and_follow_guest_speed() {
-        let mut clock = GuestClock::new();
-        clock.set_speed(Speed::Double);
-        let host_now = Instant::now();
-        let sleeping = ThreadBlock::Sleeping(host_now + Duration::from_millis(4));
-        assert_eq!(
-            sleeping.host_wakeup_deadline(&clock, host_now, || panic!("host sleep")),
-            Some(host_now + Duration::from_millis(4))
-        );
-        let due = clock.now_at(host_now) + Duration::from_millis(4);
-        let guest_sleeping = ThreadBlock::GuestSleeping(due);
-        assert_eq!(
-            guest_sleeping.host_wakeup_deadline(&clock, host_now, || panic!("guest sleep")),
-            Some(host_now + Duration::from_millis(2))
-        );
-        let suspended = ThreadBlock::Suspended(1, Box::new(sleeping));
-        assert_eq!(
-            suspended.host_wakeup_deadline(&clock, host_now, || panic!("suspended")),
-            None
-        );
-    }
-}
-
-#[cfg(test)]
 mod guest_trap_call_site_tests {
     use super::*;
 
@@ -4950,6 +4871,36 @@ mod guest_cpu_error_tests {
         assert!(!Environment::is_recoverable_guest_cpu_error(
             &cpu::CpuError::MemoryError
         ));
+    }
+}
+
+#[cfg(test)]
+mod heap_cap_tests {
+    use super::*;
+
+    /// The Default ceiling is derived from the RAM the Device model reports, so
+    /// two models that shipped with the same RAM must get the same ceiling.
+    /// The iPhone 5 and the iPhone 6 both have 1 GiB, and the iPhone 5 used to
+    /// report 512 MiB, which halved its ceiling alone.
+    #[test]
+    fn models_with_the_same_ram_get_the_same_default_ceiling() {
+        const MIB: GuestUSize = 1024 * 1024;
+        assert_eq!(default_guest_heap_cap(DeviceFamily::iPhone5), 512 * MIB);
+        assert_eq!(default_guest_heap_cap(DeviceFamily::iPhone6), 512 * MIB);
+        assert_eq!(default_guest_heap_cap(DeviceFamily::iPhone5c), 512 * MIB);
+        assert_eq!(default_guest_heap_cap(DeviceFamily::iPhone4), 256 * MIB);
+        assert_eq!(default_guest_heap_cap(DeviceFamily::iPhone4s), 256 * MIB);
+        // Tiny models hit the floor rather than being asked to run in 64 MiB.
+        assert_eq!(default_guest_heap_cap(DeviceFamily::iPhone3GS), 256 * MIB);
+        assert_eq!(default_guest_heap_cap(DeviceFamily::iPad3), 512 * MIB);
+        // The iPad 5 is an iPad6,11, not an iPad Air: 2 GiB of RAM.
+        assert_eq!(default_guest_heap_cap(DeviceFamily::iPad5), 1024 * MIB);
+        // The iPods are all below 1 GiB, so the floor, not half their RAM,
+        // decides their ceiling; none of them ends up with an unusable heap.
+        assert_eq!(default_guest_heap_cap(DeviceFamily::iPodTouch), 256 * MIB);
+        assert_eq!(default_guest_heap_cap(DeviceFamily::iPodTouch3), 256 * MIB);
+        assert_eq!(default_guest_heap_cap(DeviceFamily::iPodTouch4), 256 * MIB);
+        assert_eq!(default_guest_heap_cap(DeviceFamily::iPodTouch5), 256 * MIB);
     }
 }
 

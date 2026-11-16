@@ -274,6 +274,10 @@ pub struct Options {
     /// missing symbols; useful for tests and for finding out what an app
     /// needs before it can run.
     pub strict_symbols: bool,
+    /// Skip decoding and showing the game's launch image (splash screen) on
+    /// startup. Makes game launch noticeably faster, at the cost of not
+    /// seeing the app's launch artwork.
+    pub skip_launch_image: bool,
     pub print_fps: bool,
     pub performance_overlay_enabled: bool,
     pub performance_overlay_mode: PerformanceOverlayMode,
@@ -464,6 +468,7 @@ impl Default for Options {
             preferred_languages: None,
             headless: false,
             strict_symbols: false,
+            skip_launch_image: false,
             print_fps: false,
             performance_overlay_enabled: false,
             performance_overlay_mode: if cfg!(any(target_os = "android", target_os = "ios")) {
@@ -787,6 +792,10 @@ impl Options {
             self.popup_errors = false;
         } else if arg == "--strict-symbols" {
             self.strict_symbols = true;
+        } else if arg == "--skip-launch-image" {
+            self.skip_launch_image = true;
+        } else if arg == "--no-skip-launch-image" {
+            self.skip_launch_image = false;
         } else if arg == "--print-fps" {
             self.print_fps = true;
         } else if arg == "--no-print-fps" {
