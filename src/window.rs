@@ -984,8 +984,6 @@ pub struct Window {
     gl_driver_description: String,
     host_framebuffer: u32,
     splash_image: Option<Image>,
-    /// Whether the selected image already targets the startup orientation.
-    splash_image_is_orientation_specific: bool,
     device_family: DeviceFamily,
     device_orientation: DeviceOrientation,
     controller_ctx: sdl2::GameControllerSubsystem,
@@ -1068,7 +1066,7 @@ impl Window {
     pub fn new(
         title: &str,
         icon: Option<Image>,
-        launch_image: Option<(Image, bool)>,
+        launch_image: Option<Image>,
         options: &Options,
     ) -> Result<Window, String> {
         crate::gles::perf_overlay::configure_from_options(options);
@@ -1156,7 +1154,7 @@ impl Window {
     fn new_with_configured_driver(
         title: &str,
         icon: Option<Image>,
-        launch_image: Option<(Image, bool)>,
+        launch_image: Option<Image>,
         options: &Options,
     ) -> Result<Window, String> {
         let sdl_ctx = sdl2::init().map_err(|err| format!("SDL initialization failed: {}", err))?;
@@ -1354,9 +1352,7 @@ impl Window {
             size_for_orientation_from_size(portrait_screen_size, device_orientation, scale_hack),
         );
 
-        let (splash_image, splash_image_is_orientation_specific) = launch_image
-            .map(|(image, orientation_specific)| (Some(image), orientation_specific))
-            .unwrap_or((None, false));
+        let splash_image = launch_image;
 
         let mut window = Window {
             _sdl_ctx: sdl_ctx,
@@ -1400,7 +1396,6 @@ impl Window {
             gl_driver_description: String::new(),
             host_framebuffer: 0,
             splash_image,
-            splash_image_is_orientation_specific,
             device_family,
             device_orientation,
             controller_ctx,
@@ -2792,21 +2787,17 @@ impl Window {
         let image = self.splash_image.as_ref().unwrap();
         let (image_width, image_height) = image.dimensions();
 
-        // Legacy iPhone landscape launch images are stored in a portrait-sized
-        // Default.png with their content already rotated. Applying the normal
-        // framebuffer rotation to such an image turns it upside down, so use
-        // the inverse rotation for that case. Native landscape-sized launch
-        // images and portrait launch images use the regular transform.
+        // Launch images are stored portrait-sized, so one shown in a landscape
+        // orientation has to be turned a quarter turn. A landscape image is
+        // shown as-is.
         let is_landscape = matches!(
             self.device_orientation,
             DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight
         );
-        let rotation = if self.splash_image_is_orientation_specific {
-            Matrix::identity()
-        } else if is_landscape && image_height > image_width {
-            self.rotation_matrix().inverse().unwrap()
+        let rotation = if is_landscape && image_height > image_width {
+            Matrix::z_rotation(std::f32::consts::FRAC_PI_2)
         } else {
-            self.rotation_matrix()
+            Matrix::identity()
         };
 
         // OpenGL ES expects bottom-to-top row order for image data, but our
@@ -2814,6 +2805,20 @@ impl Window {
         let matrix = rotation.multiply(&Matrix::y_flip());
         let (vx, vy, vw, vh) = self.viewport();
         let viewport = (vx, vy + self.viewport_y_offset(), vw, vh);
+        // Fill the app's rectangle (already positioned for any macOS offset)
+        // so a full-screen launch image lands where the app will draw. One that
+        // does not share the screen's aspect ratio keeps its own.
+        let fitted_viewport = geometry::fit_viewport((image_width, image_height), (vw, vh));
+        let splash_viewport = if fitted_viewport.2 * vh == fitted_viewport.3 * vw {
+            viewport
+        } else {
+            (
+                vx + fitted_viewport.0,
+                vy + fitted_viewport.1,
+                fitted_viewport.2,
+                fitted_viewport.3,
+            )
+        };
 
         unsafe {
             let mut gl_ctx = self
@@ -2854,7 +2859,7 @@ impl Window {
 
             present_frame(
                 gl_ctx.as_mut(),
-                viewport,
+                splash_viewport,
                 matrix,
                 /* virtual_cursor_visible_at: */ None,
                 self.perf_context_token,
