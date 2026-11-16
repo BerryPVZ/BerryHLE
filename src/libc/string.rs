@@ -715,8 +715,6 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(strlcat(_, _, _)),
     export_c_func!(__strlcpy_chk(_, _, _, _)),
     export_c_func!(__strlcat_chk(_, _, _, _)),
-    export_c_func!(strspn(_, _)),
-    export_c_func!(strpbrk(_, _)),
     export_c_func!(strndup(_, _)),
     export_c_func!(memrchr(_, _, _)),
     export_c_func!(memmem(_, _, _, _)),
