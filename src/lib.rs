@@ -57,6 +57,7 @@ mod paths;
 mod perf_hints;
 mod quick_menu;
 mod stack;
+mod stall_watchdog;
 mod trainer;
 mod trainer_ui;
 mod window;

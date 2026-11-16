@@ -337,6 +337,14 @@ Other options:
   this turns it into an immediate, named failure. The same list is
   printed as a summary at normal verbosity either way.
 
+ --trace-cxx-exceptions
+ Log every C++ exception the app throws, with its type name and what(),
+ before the app's own C++ runtime unwinds it. Apps that bundle their own
+ C++ runtime normally bind the throw symbols straight to it, which makes
+ a throw invisible in the log; this routes them through the emulator
+ first, so a throw shows up even when the app catches it. Off by default
+ because it changes which definition of those symbols wins.
+
   --skip-launch-image
         Skip decoding and showing the game's launch image (splash screen) on
         startup. Makes game launch noticeably faster, at the cost of not

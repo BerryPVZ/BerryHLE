@@ -274,6 +274,11 @@ pub struct Options {
     /// missing symbols; useful for tests and for finding out what an app
     /// needs before it can run.
     pub strict_symbols: bool,
+    /// `--trace-cxx-exceptions`: log every guest C++ throw (type and `what()`)
+    /// by routing the throw symbols through the host stub instead of straight
+    /// to the app's bundled C++ runtime. Off by default, because changing which
+    /// definition wins affects every C++ app.
+    pub trace_cxx_exceptions: bool,
     /// Skip decoding and showing the game's launch image (splash screen) on
     /// startup. Makes game launch noticeably faster, at the cost of not
     /// seeing the app's launch artwork.
@@ -468,6 +473,7 @@ impl Default for Options {
             preferred_languages: None,
             headless: false,
             strict_symbols: false,
+            trace_cxx_exceptions: false,
             skip_launch_image: false,
             print_fps: false,
             performance_overlay_enabled: false,
@@ -792,6 +798,8 @@ impl Options {
             self.popup_errors = false;
         } else if arg == "--strict-symbols" {
             self.strict_symbols = true;
+        } else if arg == "--trace-cxx-exceptions" {
+            self.trace_cxx_exceptions = true;
         } else if arg == "--skip-launch-image" {
             self.skip_launch_image = true;
         } else if arg == "--no-skip-launch-image" {

@@ -298,7 +298,7 @@ const THROW_LOOP_LIMIT: u32 = 512;
 /// host stub, so forward the call to the guest implementation as a tail call.
 /// The guest function returns to our caller's LR, exactly as a real
 /// implementation of the intercepted function would.
-fn forward_to_guest_cxxabi(env: &mut Environment, name: &str, args: &[u32]) -> bool {
+pub(crate) fn forward_to_guest_cxxabi(env: &mut Environment, name: &str, args: &[u32]) -> bool {
     use std::sync::atomic::{AtomicU32, Ordering};
     static FORWARD_LOGS: AtomicU32 = AtomicU32::new(0);
 

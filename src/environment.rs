@@ -579,6 +579,7 @@ impl Environment {
         let startup_time = Instant::now();
         let launched_bundle_id = bundle.bundle_identifier().to_owned();
         let corruption_options = options.corruption;
+        crate::dyld::set_trace_cxx_exceptions(options.trace_cxx_exceptions);
 
         if launched_bundle_id == "at.source.potato.full" {
             log!(
@@ -2107,6 +2108,7 @@ impl Environment {
     }
 
     pub(crate) fn run(mut self) -> Option<GuestTermination> {
+        crate::stall_watchdog::start();
         let mut curr_host_context = self.threads[0].host_context.take().unwrap();
         let panic_cell = self.panic_cell.clone();
         loop {

@@ -942,7 +942,7 @@ impl Mem {
     }
 
     /// Format the recent host-function dispatches, oldest first.
-    fn host_call_ring_dump() -> String {
+    pub(crate) fn host_call_ring_dump() -> String {
         use std::sync::atomic::Ordering;
         let idx = crate::environment::HOST_CALL_RING_IDX.load(Ordering::Relaxed);
         let ring = &crate::environment::HOST_CALL_RING;

@@ -94,6 +94,7 @@ impl_HostObject_with_superclass!(UIWebViewHostObject);
 
 const DEFERRED_RETRY_INTERVAL: Duration = Duration::from_millis(600);
 const MAX_DEFERRED_RETRIES: u32 = 100;
+const NSURLErrorBadURL: i32 = -1000;
 const NSURLErrorCancelled: i32 = -999;
 const NSURLErrorTimedOut: i32 = -1001;
 const NSURLErrorNotConnectedToInternet: i32 = -1009;
@@ -1021,7 +1022,36 @@ fn network_access_allows_url(url: &str, network_access: bool) -> bool {
     android_web_view::network_access_allows_url(url, network_access)
 }
 
+/// True when `url` cannot load because it names no host: `""`, `"http://"`
+/// or a scheme-only `"file://"`. A page can still pass a path with no scheme,
+/// so only a scheme with an empty authority is rejected.
+fn url_has_no_host(url: &str) -> bool {
+    match url.split_once("://") {
+        Some((_scheme, rest)) => rest.split('/').next().unwrap_or_default().is_empty(),
+        None => url.trim().is_empty(),
+    }
+}
+
 fn defer_url_load(env: &mut Environment, this: id, url: String) {
+    // Retrying a URL with no host can never succeed, and each attempt costs
+    // one of the 100 retries, so fail at once instead of polling for a
+    // viewport that would not help.
+    if url_has_no_host(&url) {
+        log!(
+            "UIWebView: load failed immediately, the URL has no host: {:?} ({})",
+            url,
+            deferred_load_context(env, this)
+        );
+        let error = make_webview_error(
+            env,
+            NSURLErrorDomain,
+            NSURLErrorBadURL,
+            "The URL is empty.",
+            &url,
+        );
+        fail_load(env, this, error);
+        return;
+    }
     log!(
         "UIWebView: deferring URL load of {} ({})",
         url,
@@ -1033,17 +1063,20 @@ fn defer_url_load(env: &mut Environment, this: id, url: String) {
     host.last_deferred_retry = Some(Instant::now());
 }
 
-fn retry_pending_load(env: &mut Environment, this: id) {
+/// Try one deferred load. Returns `false` when nothing could be attempted
+/// (no pending load, no overlay backend, or no usable geometry yet) so the
+/// caller does not spend a retry on a poll that could not have worked.
+fn retry_pending_load(env: &mut Environment, this: id) -> bool {
     if env
         .objc
         .borrow::<UIWebViewHostObject>(this)
         .pending_load
         .is_none()
     {
-        return;
+        return false;
     }
     if !android_web_view::native_webview_available() {
-        return;
+        return false;
     }
     let frame: CGRect = msg![env; this frame];
     if !has_webview_extent((frame.size.width, frame.size.height), None) {
@@ -1052,11 +1085,11 @@ fn retry_pending_load(env: &mut Environment, this: id) {
         // only keep waiting when there is no usable superview either.
         let superview: id = msg![env; this superview];
         if superview == nil {
-            return;
+            return false;
         }
         let super_frame: CGRect = msg![env; superview frame];
         if super_frame.size.width <= 0.0 || super_frame.size.height <= 0.0 {
-            return;
+            return false;
         }
     }
     let pending = env
@@ -1083,6 +1116,7 @@ fn retry_pending_load(env: &mut Environment, this: id) {
             .borrow_mut::<UIWebViewHostObject>(this)
             .pending_load = Some(pending);
     }
+    true
 }
 
 /// One-line description of a deferred webview's geometry: its own frame
@@ -1117,7 +1151,11 @@ pub(crate) fn handle_native_load_events(env: &mut Environment) -> (Option<Instan
         env.objc
             .borrow_mut::<UIWebViewHostObject>(web_view)
             .last_deferred_retry = Some(now);
-        retry_pending_load(env, web_view);
+        if !retry_pending_load(env, web_view) {
+            // No usable geometry or no overlay backend yet: waiting costs
+            // nothing, so do not spend one of the retries on this poll.
+            continue;
+        }
         let (polls, current_url) = {
             let host = env.objc.borrow::<UIWebViewHostObject>(web_view);
             if host.pending_load.is_none() {
@@ -1474,9 +1512,20 @@ fn unwrap_js_result(result: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        has_webview_extent, network_access_allows_url, webview_event_action, WebViewEventAction,
+        has_webview_extent, network_access_allows_url, url_has_no_host, webview_event_action,
+        WebViewEventAction,
     };
     use crate::android_web_view::WebViewEventType;
+
+    #[test]
+    fn urls_without_a_host_are_rejected_immediately() {
+        assert!(url_has_no_host(""));
+        assert!(url_has_no_host("   "));
+        assert!(url_has_no_host("http://"));
+        assert!(url_has_no_host("https:///path"));
+        assert!(!url_has_no_host("http://example.com/"));
+        assert!(!url_has_no_host("about:blank"));
+    }
 
     #[test]
     fn native_webview_callbacks_require_current_load_and_page() {

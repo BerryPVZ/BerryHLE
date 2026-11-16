@@ -972,7 +972,10 @@ impl Dyld {
             // It is often 0, but not always.
             let offset: u32 = mem.read(ptr_ptr).to_bits();
             let guest_cxxabi_export =
-                if self.guest_sjlj_runtime_available && is_guest_cxxabi_symbol(name) {
+                if self.guest_sjlj_runtime_available
+                    && is_guest_cxxabi_symbol(name)
+                    && !(trace_cxx_exceptions() && is_cxx_throw_symbol(name))
+                {
                     self.guest_cxxabi_export(name)
                 } else {
                     None
@@ -1923,7 +1926,10 @@ impl Dyld {
             );
         };
 
-        if self.guest_sjlj_runtime_available && is_guest_cxxabi_symbol(symbol) {
+        if self.guest_sjlj_runtime_available
+            && is_guest_cxxabi_symbol(symbol)
+            && !(trace_cxx_exceptions() && is_cxx_throw_symbol(symbol))
+        {
             if let Some(addr) = self.guest_cxxabi_export(symbol) {
                 register_cxxabi_typeinfo_vtable(
                     symbol,
@@ -2192,7 +2198,7 @@ fn cxxabi_throw_intercept(
     env: &mut Environment,
     exception: MutVoidPtr,
     tinfo: MutVoidPtr,
-    _dest: MutVoidPtr,
+    dest: MutVoidPtr,
 ) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static LOGGED: AtomicU32 = AtomicU32::new(0);
@@ -2219,6 +2225,33 @@ fn cxxabi_throw_intercept(
     } else {
         String::new()
     };
+
+    if trace_cxx_exceptions() {
+        static TRACED: AtomicU32 = AtomicU32::new(0);
+        let n = TRACED.fetch_add(1, Ordering::Relaxed);
+        if n < 32 {
+            log!(
+                "Guest C++ exception: type={} what={} at exception={:?}.",
+                if type_name.is_empty() { "?" } else { &type_name[..] },
+                if what.is_empty() { "?" } else { &what[..] },
+                exception
+            );
+        } else if n == 32 {
+            log!("Guest C++ exception: further throws are not logged.");
+        }
+        // The app brought its own C++ runtime, so hand the throw back to it
+        // instead of unwinding on the host.
+        let forwarded = ["___cxa_throw", "__cxa_throw"].into_iter().any(|name| {
+            crate::libc::cxxabi::forward_to_guest_cxxabi(
+                env,
+                name,
+                &[exception.to_bits(), tinfo.to_bits(), dest.to_bits()],
+            )
+        });
+        if forwarded {
+            return;
+        }
+    }
 
     let continuation = crate::libc::cxxabi::unwind_to_app_frame(env);
     let n = LOGGED.fetch_add(1, Ordering::Relaxed);
@@ -2343,11 +2376,34 @@ fn is_guest_cxxabi_symbol(name: &str) -> bool {
         || name.starts_with("__ZTS")
 }
 
+/// Set from `--trace-cxx-exceptions`. Off by default: preferring our stub over
+/// the app's bundled C++ runtime changes link precedence for every C++ app, so
+/// it stays opt-in.
+static TRACE_CXX_EXCEPTIONS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_trace_cxx_exceptions(enabled: bool) {
+    TRACE_CXX_EXCEPTIONS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn trace_cxx_exceptions() -> bool {
+    TRACE_CXX_EXCEPTIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn is_cxx_throw_symbol(name: &str) -> bool {
+    matches!(name, "__cxa_throw" | "___cxa_throw")
+}
+
+/// Names the stub that should intercept `name`, or `None` to leave the symbol
+/// to the app's own dylibs. The throw symbols are taken over only when the app
+/// has no C++ runtime of its own, or when `--trace-cxx-exceptions` asks for
+/// them to be logged.
 fn cxxabi_intercept_symbol(name: &str, guest_sjlj_runtime_available: bool) -> Option<&'static str> {
+    let intercept_throws = trace_cxx_exceptions() || !guest_sjlj_runtime_available;
     match name {
         "___dynamic_cast" | "__dynamic_cast" => Some("___dynamic_cast"),
-        "__cxa_throw" if !guest_sjlj_runtime_available => Some("__cxa_throw"),
-        "___cxa_throw" if !guest_sjlj_runtime_available => Some("___cxa_throw"),
+        "__cxa_throw" if intercept_throws => Some("__cxa_throw"),
+        "___cxa_throw" if intercept_throws => Some("___cxa_throw"),
         _ => None,
     }
 }
