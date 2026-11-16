@@ -305,20 +305,11 @@ pub const CLASSES: ClassExports = objc_classes! {
         if overlay_load(env, this, Some(&url_string), None, load_id) {
             return;
         }
-        // The bridge is up, but the view has no on-screen extent yet.
-        // Remember the load and retry it from -setFrame: once the view
-        // is laid out.
-        log!(
-            "UIWebView: deferring load of {} until the view is laid out ({})",
-            url_string,
-            deferred_load_context(env, this)
-        );
-        {
-            let host_obj = env.objc.borrow_mut::<UIWebViewHostObject>(this);
-            host_obj.pending_load = Some(PendingLoad::Url(url_string));
-            host_obj.deferred_polls = 0;
-            host_obj.last_deferred_retry = Some(Instant::now());
-        }
+        // The bridge is up, but the view has no on-screen extent yet, so
+        // remember the load and retry it from -setFrame: once the view is
+        // laid out. This is the one place a URL load is deferred, so the
+        // no-host rejection in `defer_url_load` covers this path too.
+        defer_url_load(env, this, url_string);
         return;
     }
     log!("UIWebView: native WebView bridge not available; using fallback rendering");
