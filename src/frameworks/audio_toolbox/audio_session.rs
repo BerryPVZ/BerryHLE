@@ -158,9 +158,8 @@ pub fn AudioSessionInitialize(
     _in_interruption_listener: AudioSessionInterruptionListener,
     _in_client_data: ConstVoidPtr,
 ) -> OSStatus {
-    // Normal level, not debug: this is the first audio call most apps make,
-    // so its presence or absence in a log tells us whether the app reached
-    // the audio path at all.
+    // Normal level, not debug: most apps' first audio call, so its presence
+    // or absence in a log says whether the app reached the audio path.
     log!("AudioSessionInitialize");
     kAudioSessionNoErr
 }

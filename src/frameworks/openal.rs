@@ -384,14 +384,16 @@ fn alcCreateContext(
         )
     };
     let Ok(ctx) = res else {
-        log_dbg!("alcCreateContext({:?}, (...)) вернул NULL", device);
+        log!("alcCreateContext({:?}, (...)) returned NULL", device);
         return Ptr::null();
     };
 
     let guest_res = env.mem.alloc_and_write(GuestALCcontext { _filler: 0 });
 
-    log_dbg!(
-        "alcCreateContext({:?}, ...) => {:?} (хост: {:?})",
+    // Normal level: games that use OpenAL directly never touch
+    // AudioSessionInitialize, so this is their "audio was reached" line.
+    log!(
+        "alcCreateContext({:?}, ...) => {:?} (host: {:?})",
         device,
         guest_res,
         ctx,

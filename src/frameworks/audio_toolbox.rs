@@ -96,9 +96,8 @@ impl LazyALContext {
             // will then get error codes rather than a host crash.
             match OpenALContext::new(manager) {
                 Ok(context) => {
-                    // Logged at normal level, once: a log with no line like
-                    // this means the app never reached the audio path at all,
-                    // which is otherwise indistinguishable from silent audio.
+                    // Normal level: a log with no audio lines at all means the
+                    // app never reached the audio path, not that it was silent.
                     log!("First AudioToolbox OpenAL context created ({:?})", context);
                     self.0 = Some(context);
                 }
