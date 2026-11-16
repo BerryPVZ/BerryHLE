@@ -1,133 +1,117 @@
 # AGENTS.md
 
-This repo contains two products:
-1. **touchHLE emulator** (Rust) — an HLE iPhone OS app emulator
-2. **AppDB** (Python/FastAPI) — a compatibility report web app at `appdb/`
+Two products in this tree:
 
-The emulator is the main one: a Rust host reimplements iOS frameworks and runs
-the guest ARM code (Dynarmic JIT, with an interpreter fallback).
+1. **touchHLE** (Rust) — an HLE iPhone OS app emulator. The main one: a Rust host
+   reimplements iOS frameworks and runs guest ARM code (Dynarmic JIT, with an
+   interpreter fallback).
+2. **AppDB** (Python/FastAPI) — a compatibility report web app at `appdb/`.
 
-## Overview
-
-Beyond the two main products, the tree also carries `telegram_bot/` (an app-fix
-request bot), `android/` (the Gradle app) and `platform/ios/` (the Applesauce
-host app).
+Also present: `telegram_bot/` (app-fix request bot), `android/` (Gradle app),
+`platform/ios/` (Applesauce host app).
 
 ## Rules for emulator changes
 
 These come from bugs that reached trunk. They apply to every agent and environment.
 
-1. **Run the test suite.** `cargo test` runs the unit tests and the TestApp
-   integration tests. If you cannot run TestApp, write "TestApp not run" and why.
-   Never delete, skip or weaken a failing test or CI step to get a green run: fix
-   the cause, or leave it failing and report it.
-2. **Do not change shared behavior for one game.** A change that affects every app
-   must match real iOS. If one game needs different behavior, add a general option
-   in `src/options.rs` and enable it for that bundle ID in
-   `touchHLE_default_options.txt`. Do not add new `bundle_identifier()` checks in
-   code.
-3. **When a game crashes, find and fix the root cause first.** Check the last
-   emulated API calls, loader, CPU, memory, audio and graphics state against
-   Apple's documentation before considering a fallback. If the emulator is wrong,
-   fix the subsystem and add a regression test (TestApp where possible, otherwise
-   a Rust unit test). Keep `--headless` and TestApp strict: they must never mask
-   guest `exit`, `abort`, uncaught exceptions or fatal signals. GUI compatibility
-   fallbacks (legacy DRM/anti-tamper `exit()`/`abort()`, unhandled `SIGPIPE` from
-   old ad SDKs) stay scoped to non-headless sessions and never replace a real fix.
+1. **Run the test suite.** `cargo test` covers the unit tests and TestApp. If you
+   cannot run TestApp, write "TestApp not run" and why. Never delete, skip or
+   weaken a failing test or CI step: fix the cause, or leave it failing and report
+   it.
+2. **Do not change shared behavior for one game.** Anything affecting every app
+   must match real iOS. Per-game differences go in a general option in
+   `src/options.rs`, enabled for that bundle ID in `touchHLE_default_options.txt`;
+   no new `bundle_identifier()` checks in code.
+3. **Find the root cause before any fallback.** Check the last emulated API calls,
+   loader, CPU, memory, audio and graphics state against Apple's documentation
+   first. Fix the subsystem and add a regression test (TestApp, else a Rust unit
+   test). `--headless` and TestApp stay strict: never mask guest `exit`, `abort`,
+   uncaught exceptions or fatal signals. GUI fallbacks (legacy DRM/anti-tamper
+   `exit()`/`abort()`, unhandled `SIGPIPE` from old ad SDKs) stay scoped to
+   non-headless sessions and never replace a real fix.
 4. **Match iOS and cite the source.** Check Apple's documentation (old references
-   are on web.archive.org) and touchHLE before implementing or changing an API.
-   Link the source in the commit message or the test.
-5. **Search before adding.** Before adding a class, method, function or constant,
-   search for an existing one. The `no_duplicate_*` tests fail on duplicates.
+   are on web.archive.org) and touchHLE before implementing or changing an API;
+   link the source in the commit message or test.
+5. **Search before adding.** Check for an existing class, method, function or
+   constant first; the `no_duplicate_*` tests fail on duplicates.
 
 ## Where things live
 
-- `src/lib.rs` — `main()` and the module list. `src/environment.rs` —
-  `Environment`, threads, the run loop.
-- `src/environment/app_picker.rs` (~8.8k lines) — the native app picker and the
-  whole Settings screen. Most settings/UI work lands here, not in `frameworks/`.
+- `src/lib.rs` — `main()` and the module list; `src/environment.rs` —
+  `Environment`, threads, run loop.
+- `src/environment/app_picker.rs` (~8.8k lines) — native app picker and the whole
+  Settings screen; most settings/UI work lands here, not in `frameworks/`.
 - `src/frameworks/<framework>/` — HLE implementations (`uikit/`, `foundation/`,
-  `core_animation/`, `opengles/`, ...). `src/libc/` and `src/dyld/` — C runtime
-  and loader. `src/objc/` — Objective-C runtime and the `msg!`, `msg_super!`,
-  `msg_class!` and `objc_classes!` macros. `src/window.rs` — SDL window, input,
-  device profiles. `src/quick_menu.rs` and `src/trainer_ui.rs` — the two
-  in-game overlays, drawn last in `src/gles/present.rs` and fed touches before
-  the guest in `src/window.rs`.
-- Guest pointers are 32-bit and host pointers 64-bit; use `Ptr`/`MutPtr` from
+  `core_animation/`, `opengles/`, ...); `src/libc/` and `src/dyld/` — C runtime
+  and loader; `src/objc/` — Objective-C runtime and the `msg!`, `msg_super!`,
+  `msg_class!`, `objc_classes!` macros; `src/window.rs` — SDL window, input,
+  device profiles; `src/quick_menu.rs`, `src/trainer_ui.rs` — in-game overlays,
+  drawn last in `src/gles/present.rs`, fed touches before the guest in
+  `src/window.rs`.
+- Guest pointers are 32-bit, host pointers 64-bit: use `Ptr`/`MutPtr` from
   `src/mem.rs`, never raw host pointers, for anything the guest can see.
-- Other products in the tree: `appdb/` (FastAPI compatibility database,
-  `cd appdb && pip install -e . && uvicorn app.main:app`), `telegram_bot/`,
-  `android/` (Gradle app), `platform/ios/` (Applesauce host app).
+- `appdb/`: `cd appdb && pip install -e . && uvicorn app.main:app`.
 
 ## Adding an iOS API
 
-- Implement it in the framework module. Classes go in an `objc_classes!` block as
-  `@implementation Class: Superclass`; C functions use `export_c_func!`; constants
-  use `HostConstant`.
-- Export it through the module's `FUNCTIONS`/`CLASSES`/`CONSTANTS`, wired via that
-  module's `DYLIB` const and listed in `DYLIB_LIST` in `src/dyld/dylib_list.rs`.
-  Nothing resolves until it is in that list.
-- `no_duplicate_classes`, `no_duplicate_functions` and `no_duplicate_constants`
-  (`src/dyld/dylib_list.rs`) fail on duplicates.
-- `objc_classes!` requires all `+` class methods before the first `-` instance
+- Implement in the framework module: classes in `objc_classes!` as
+  `@implementation Class: Superclass`, C functions with `export_c_func!`,
+  constants with `HostConstant`.
+- Export via the module's `FUNCTIONS`/`CLASSES`/`CONSTANTS`, wired through its
+  `DYLIB` const and listed in `DYLIB_LIST` (`src/dyld/dylib_list.rs`); nothing
+  resolves until then. `no_duplicate_classes`/`_functions`/`_constants` fail on
+  duplicates.
+- `objc_classes!` needs all `+` class methods before the first `-` instance
   method.
-- `msg!` arguments must each be a single token tree, so bind complex expressions
-  first: `let hidden = !selected;` then `msg![env; this setHidden:hidden]`.
+- `msg!` arguments must each be a single token tree: bind complex expressions
+  first (`let hidden = !selected;` then `msg![env; this setHidden:hidden]`).
   `msg_super!` only works inside `objc_classes!`.
 - In `-dealloc`, `std::mem::take` on a host object resets the embedded superclass
-  host object. Copy `superclass` back before `msg_super![env; this dealloc]`
-  (pattern at `src/frameworks/uikit/ui_view/ui_scroll_view/ui_text_view.rs:158`),
+  host object; copy `superclass` back before `msg_super![env; this dealloc]`
+  (pattern at `src/frameworks/uikit/ui_view/ui_scroll_view/ui_text_view.rs:158`)
   or the superclass's retained fields leak.
 
 ## Options and the Settings screen
 
-- Options live in `src/options.rs` (fields, parsing, and a large `#[cfg(test)]`
-  suite). Help text is `OPTIONS_HELP.txt`, `include_str!`'d, so `--help` and the
-  on-disk copy change together.
+- Options live in `src/options.rs` (fields, parsing, a large `#[cfg(test)]` suite).
+  Help text is `OPTIONS_HELP.txt`, `include_str!`'d, so `--help` and the on-disk
+  copy change together.
 - A new setting touches three places: `src/options.rs`, `OPTIONS_HELP.txt`, and a
   row in the Settings screen in `src/environment/app_picker.rs`.
-- Per-app defaults go in `touchHLE_default_options.txt`, one line per bundle ID.
-  Read its header before editing.
+- Per-app defaults go in `touchHLE_default_options.txt`, one line per bundle ID;
+  read its header before editing.
 
 ## Build, test, lint
 
-`cargo` and `rustc` are not on `PATH` in this environment:
-
-```sh
-export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
-```
-
+- `cargo`/`rustc` may be off `PATH`:
+  `export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"`.
 - Submodules first: `git submodule update --init` (`vendor/SDL`, `dynarmic`,
   `openal-soft`, `libxml2`, `stb`).
-- Fresh builds need `export CMAKE_POLICY_VERSION_MINIMUM=3.5`: the installed
-  CMake 4.4 rejects `sdl2-sys`'s old `cmake_minimum_required`.
+- Fresh builds need `export CMAKE_POLICY_VERSION_MINIMUM=3.5`: CMake 4.4 rejects
+  `sdl2-sys`'s old `cmake_minimum_required`.
 - `cargo test` — 652 tests in 5 suites (649 unit, 2 in `tests/integration.rs`,
   1 trainer atlas), 12 ignored doc-tests, ~25 s warm. TestApp needs `tests/llvm`
   (LLVM 12; its `clang` is x86_64, so Rosetta on Apple Silicon) and
-  `tests/common-3.0.sdk`; both are present here.
+  `tests/common-3.0.sdk`.
 - One test: `cargo test --lib <name>`. TestApp only:
   `cargo test --test integration test_app`.
 - Run an app: `cargo run --release -- path/to/app.app`, with the bundle in
   `touchHLE_apps/`. That directory, `touchHLE_sandbox/` and the `touchHLE_*.txt`
   runtime files are gitignored.
-- Android: the `android/` Gradle project builds the core with
-  `--no-default-features` and `sdl2/bundled` plus the two static wrappers, not
-  the default feature set (see the `extraCargoBuildArguments` in
-  `android/app/build.gradle`).
+- Android: `android/` builds the core with `--no-default-features` and
+  `sdl2/bundled` plus two static wrappers, not the default feature set (see
+  `extraCargoBuildArguments` in `android/app/build.gradle`).
 
-## Never run `cargo fmt`
+## Formatting and lint
 
-`cargo fmt --check` reports 986 files: the tree is hand-formatted (4-space indent,
-wrapped by hand). Running it buries a real change in an unreviewable diff. Follow
-the surrounding style instead.
+Never run `cargo fmt`: `cargo fmt --check` reports 986 files because the tree is
+hand-formatted (4-space indent, wrapped by hand), so it buries a real change in an
+unreviewable diff. Follow the surrounding style.
 
-## Lint baseline
-
-`dev-scripts/lint.sh` cannot pass on this tree: 351 pre-existing comment lines
-over 80 columns, and ~1000 pre-existing clippy warnings that `--deny warnings`
-turns into a failure. Use it as a delta check only: keep new comments within 80
-columns and add no new warnings. `cargo clippy` needs the `PATH` above, or it
-reports "no such command: clippy".
+`dev-scripts/lint.sh` cannot pass: 351 pre-existing comment lines over 80 columns
+and ~1000 pre-existing clippy warnings that `--deny warnings` turns into a failure.
+Use it as a delta check only: keep new comments within 80 columns, add no new
+warnings. `cargo clippy` needs the `PATH` above.
 
 ## Commits and docs
 
@@ -136,3 +120,30 @@ reports "no such command: clippy".
 - A user-visible change updates `README.md`, `CHANGELOG.md` and
   `OPTIONS_HELP.txt` where relevant.
 - Commit messages and tests cite the iOS behaviour they match (rule 4 above).
+
+## Optional agent tooling
+
+Use a line only if that tool is installed; otherwise ignore it. Nothing here is
+required to work on the repo.
+
+- **Code graph (graphify)** — if `graphify-out/graph.json` exists, run
+  `graphify query "<question>"` before grep or file reads, and pass that rule to
+  subagents; `graphify path A B` for relationships, `graphify explain X` for one
+  concept. After code changes run `graphify update .` (AST-only, no API cost);
+  never hand-edit `graphify-out/`.
+- **Symbol navigation (serena)** — prefer `find_symbol`,
+  `find_referencing_symbols` and `replace_symbol_body` over text search for named
+  symbols, especially in large files; call `initial_instructions` first.
+- **Memory (mnemon, claudemem, hindsight, openviking)** — recall before answering
+  anything that may depend on past sessions, decisions or preferences; store
+  durable decisions and non-obvious findings after substantive work. Never store
+  secrets or transient state.
+- **Context compression (caveman)** — compress a large tool output or file before
+  it enters context, keep the `ccr_` handle, and retrieve when details are needed.
+  Compress by need, not routinely.
+- **Ponytail (lite/full/ultra)** — smallest complete change: reuse what exists, no
+  speculative abstraction, finish the callers, tests and fixtures it needs. The
+  level changes verbosity, not correctness.
+- **Skills (grilling, grill-me, ...)** — when a request is ambiguous or a plan is
+  expensive to get wrong, load the skill and question the user before
+  implementing; skip for small, well-specified fixes.
