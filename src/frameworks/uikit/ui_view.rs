@@ -58,6 +58,9 @@ pub(super) struct AnimationBlockState {
     pub(super) delegate: id,
     pub(super) did_stop_selector: Option<SEL>,
     pub(super) will_start_selector: Option<SEL>,
+    /// `+setAnimationRepeatCount:`; 0 means "run once".
+    pub(super) repeat_count: f32,
+    pub(super) repeat_autoreverses: bool,
     transition: Option<crate::frameworks::core_animation::view_transition::Pending>,
     curve: i32,
 }
@@ -72,10 +75,25 @@ impl Default for AnimationBlockState {
             delegate: nil,
             did_stop_selector: None,
             will_start_selector: None,
+            repeat_count: 0.0,
+            repeat_autoreverses: false,
             transition: None,
             curve: 0,
         }
     }
+}
+
+/// Total time an animation block occupies: the delay plus every repeat.
+/// `repeat_count` 0 means a single run; an autoreversing animation plays
+/// forwards and backwards, so each repeat takes twice the duration.
+fn block_total_duration(block: &AnimationBlockState) -> f64 {
+    let runs = if block.repeat_count > 0.0 {
+        block.repeat_count as f64
+    } else {
+        1.0
+    };
+    let cycle = block.duration * if block.repeat_autoreverses { 2.0 } else { 1.0 };
+    block.delay + cycle * runs
 }
 
 #[derive(Default)]
@@ -564,7 +582,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // Schedule the `setAnimationDidStopSelector:` callback. Even when the
     // delegate is nil we still need to release the retained animation_id, so
     // the early-return paths below take care of that.
-    let total_delay = (block.delay + block.duration).max(0.0);
+    let total_delay = block_total_duration(&block).max(0.0);
 
     if block.delegate == nil || block.did_stop_selector.is_none() {
         if block.delegate != nil { release(env, block.delegate); }
@@ -668,8 +686,15 @@ crate::frameworks::core_animation::view_transition::expire(env);
  env.framework_state.uikit.ui_view.animation_block.curve = curve;
 }
 + (())setAnimationBeginsFromCurrentState:(bool)_from { }
-+ (())setAnimationRepeatAutoreverses:(bool)_autoreverses { }
-+ (())setAnimationRepeatCount:(f32)_count { }
++ (())setAnimationRepeatAutoreverses:(bool)autoreverses {
+ if !env.framework_state.uikit.ui_view.animation_block.in_block { return; }
+ env.framework_state.uikit.ui_view.animation_block.repeat_autoreverses = autoreverses;
+}
++ (())setAnimationRepeatCount:(f32)count {
+ if !env.framework_state.uikit.ui_view.animation_block.in_block { return; }
+ if !(count >= 0.0) { return; }
+ env.framework_state.uikit.ui_view.animation_block.repeat_count = count;
+}
 + (())setAnimationsEnabled:(f32)_enabled { }
 + (())setAnimationTransition:(NSInteger)transition forView:(id)view cache:(bool)cache {
  if !env.framework_state.uikit.ui_view.animation_block.in_block { return; }

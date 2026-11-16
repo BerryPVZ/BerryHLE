@@ -761,7 +761,7 @@ fn strptime(
     }
 }
 
-fn strftime(
+pub fn strftime(
     env: &mut Environment,
     s: MutPtr<u8>,
     max_size: GuestUSize,

@@ -12,7 +12,7 @@
 use crate::environment::MutexType::PTHREAD_MUTEX_RECURSIVE;
 use crate::environment::{MutexId, PTHREAD_MUTEX_DEFAULT};
 use crate::msg;
-use crate::objc::{id, nil, objc_classes, ClassExports, HostObject};
+use crate::objc::{id, nil, objc_classes, release, ClassExports, HostObject};
 use std::sync::{Arc, Condvar, Mutex};
 
 // NSInteger is i32 on 32-bit ARM.
@@ -91,7 +91,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())setName:(id)name { // NSString *
     // @property(copy), name has to be copied
+    let old_name = env.objc.borrow::<NSLockHostObject>(this).name;
     env.objc.borrow_mut::<NSLockHostObject>(this).name = msg![env; name copy];
+    release(env, old_name);
 }
 - (id)name {
     env.objc.borrow::<NSLockHostObject>(this).name
@@ -99,6 +101,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     log_dbg!("[(NSLock *){:?} dealloc]", this);
+    release(env, env.objc.borrow::<NSLockHostObject>(this).name);
     let host_object = env.objc.borrow::<NSLockHostObject>(this);
     let _ = env.mutex_state.destroy_mutex(host_object.mutex_id);
     env.objc.dealloc_object(this, &mut env.mem)
@@ -146,7 +149,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())setName:(id)name { // NSString *
     // @property(copy), name has to be copied
+    let old_name = env.objc.borrow::<NSLockHostObject>(this).name;
     env.objc.borrow_mut::<NSLockHostObject>(this).name = msg![env; name copy];
+    release(env, old_name);
 }
 - (id)name {
     env.objc.borrow::<NSLockHostObject>(this).name
@@ -154,12 +159,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     log_dbg!("[(NSRecursiveLock *){:?} dealloc]", this);
+    release(env, env.objc.borrow::<NSLockHostObject>(this).name);
     let host_object = env.objc.borrow::<NSLockHostObject>(this);
     let _ = env.mutex_state.destroy_mutex(host_object.mutex_id);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 
 @end
-
 
 };

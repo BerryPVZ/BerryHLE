@@ -284,6 +284,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     nil
 }
 
+- (NSUInteger)hash {
+    // TODO: define better hash
+    msg![env; this count]
+}
+
 - (bool)isEqual:(id)other {
     if this == other {
         return true;
