@@ -1237,6 +1237,13 @@ const CLASSES: ClassExports = objc_classes! {
 - (bool)isMagnetometerActive {
     false
 }
+- (bool)isAccelerometerAvailable {
+    // According to https://developer.apple.com/documentation/coremotion/getting-raw-accelerometer-events?language=objc,
+    // every iOS device has an accelerometer, but on real hardware this method
+    // can still return false if the device isn't ready to produce data yet.
+    // Here we always return true since we don't model that readiness state.
+    true
+}
 
 // Companion symmetric APIs for the magnetometer-pull-mode API. Apple
 // documents `startMagnetometerUpdates` / `stopMagnetometerUpdates` and

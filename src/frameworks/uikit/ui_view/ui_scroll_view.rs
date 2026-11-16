@@ -122,6 +122,26 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // MARK: - Content offset
 
+- (())setDirectionalLockEnabled:(bool)enabled {
+    todo_objc_setter!(this, enabled);
+}
+
+- (())setPagingEnabled:(bool)enabled {
+    todo_objc_setter!(this, enabled);
+}
+
+- (())setShowsHorizontalScrollIndicator:(bool)value {
+    todo_objc_setter!(this, value);
+}
+
+- (())setShowsVerticalScrollIndicator:(bool)value {
+    todo_objc_setter!(this, value);
+}
+
+- (())setScrollsToTop:(bool)value {
+    todo_objc_setter!(this, value);
+}
+
 - (CGPoint)contentOffset {
     env.objc.borrow::<UIScrollViewHostObject>(this).content_offset
 }
