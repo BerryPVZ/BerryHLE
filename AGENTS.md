@@ -134,6 +134,10 @@ required to work on the repo.
 - **Symbol navigation (serena)** — prefer `find_symbol`,
   `find_referencing_symbols` and `replace_symbol_body` over text search for named
   symbols, especially in large files; call `initial_instructions` first.
+- **Library docs (context7)** — for a question about a library, framework, SDK,
+  API or CLI (SDL2, Dynarmic, a Rust crate, Gradle, FastAPI), fetch current docs
+  with `resolve-library-id` then `query-docs` instead of trusting training data.
+  Skip it for refactoring or debugging that does not depend on a library API.
 - **Memory (mnemon, claudemem, hindsight, openviking)** — recall before answering
   anything that may depend on past sessions, decisions or preferences. On a large
   plan or exploration, record findings, decisions and the plan itself as you go,
