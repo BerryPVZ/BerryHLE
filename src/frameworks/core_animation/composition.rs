@@ -1365,20 +1365,12 @@ unsafe fn composite_masked_layer(
     }
     if clip {
         clear_mask_target(env, alpha.1);
-        // Draw the clip quad in the layer's own co-ordinate space.
-        //
-        // `transform` is already this layer's full local-to-screen matrix.
-        // `composite_layer_contents` multiplies its `cumulative_transform`
-        // argument by the layer's own `superlayer_to_layer_transform`, so
-        // passing `transform` here applied the layer's position twice and
-        // moved the rounded clip off the layer: everything inside a
-        // `clipsToBounds` view with a `cornerRadius` was multiplied by a
-        // mask that no longer covered it, and vanished. Passing the parent
-        // transform and the local transform lets the layer's own matrix be
-        // built exactly once, by the same code path that positions its
-        // background and contents.
+        // `bounds_mask`'s own transform is the identity, so the clip needs the
+        // layer's full matrix and nothing else. `parent` plus `local` drops the
+        // layer's position and puts the clip at the parent's origin, where it
+        // multiplies the subtree by zero.
         let clipping = CALayerHostObject::bounds_mask(bounds, radius);
-        composite_layer_contents(env, state, nil, parent, 1.0, local, clipping);
+        composite_layer_contents(env, state, nil, transform, 1.0, Matrix::identity(), clipping);
         {
             let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
             gl.BindFramebufferOES(gles11::FRAMEBUFFER_OES, content.1);
