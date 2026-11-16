@@ -21,7 +21,7 @@ use crate::frameworks::foundation::ns_run_loop::run_run_loop_single_iteration;
 use crate::frameworks::foundation::ns_string;
 use crate::frameworks::foundation::NSInteger;
 use crate::frameworks::uikit::ui_font::{
-    UILineBreakModeWordWrap, UITextAlignmentCenter, UITextAlignmentLeft, UITextAlignmentRight,
+    UILineBreakModeWordWrap, UITextAlignmentCenter, UITextAlignmentLeft,
 };
 use crate::frameworks::uikit::ui_gesture_recognizer::{
     UISwipeGestureRecognizerDirectionLeft, UISwipeGestureRecognizerDirectionRight,

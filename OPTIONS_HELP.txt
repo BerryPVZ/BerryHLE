@@ -330,7 +330,14 @@ Other options:
         be no graphical output and no input. Only useful for command-line apps.
         Implies --no-error-popup.
 
-    --skip-launch-image
+    --strict-symbols
+  Fail at startup if the app or one of its libraries references a symbol
+  that touchHLE could not resolve, instead of leaving it NULL. A missing
+  symbol usually shows up much later as a crash or a wrong result, so
+  this turns it into an immediate, named failure. The same list is
+  printed as a summary at normal verbosity either way.
+
+  --skip-launch-image
         Skip decoding and showing the game's launch image (splash screen) on
         startup. Makes game launch noticeably faster, at the cost of not
         seeing the app's launch artwork. Decoded images are cached in the

@@ -1370,44 +1370,9 @@ fn system(env: &mut Environment, cmd: ConstPtr<u8>) -> i32 {
     }
 }
 
-/// `int dladdr(const void *addr, Dl_info *info);` — see
-/// <https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/dladdr.3.html>.
-///
-/// Fills in the image containing `addr` and the nearest symbol at or below
-/// it. The guest `Dl_info` is four 32-bit fields: `dli_fname`, `dli_fbase`,
-/// `dli_sname`, `dli_saddr`. Returns non-zero on success, 0 if no loaded
-/// image contains `addr`.
-fn dladdr(env: &mut Environment, addr: ConstVoidPtr, info: MutVoidPtr) -> i32 {
-    let addr = addr.to_bits();
-    let Some(bin) = env
-        .bins
-        .iter()
-        .find(|bin| addr >= bin.text_base && addr < bin.last_segment_end)
-    else {
-        return 0;
-    };
-    // Nearest defined symbol at or below the address. The Thumb bit is
-    // masked off for the comparison but kept in the reported address, as
-    // dlsym() does.
-    let symbol = bin
-        .exported_symbols
-        .iter()
-        .filter(|(_, &value)| (value & !1) <= addr)
-        .max_by_key(|(_, &value)| value & !1);
-    // The strings are allocated per call rather than cached: dladdr is a
-    // diagnostic API that apps call a handful of times at startup, and a
-    // cache would have to be invalidated when the app is relaunched.
-    let fname = env.mem.alloc_and_write_cstr(bin.name.as_bytes());
-    let sname = match symbol {
-        Some((name, _)) => env.mem.alloc_and_write_cstr(name.as_bytes()),
-        None => MutPtr::null(),
-    };
-    let info = info.cast::<u32>();
-    env.mem.write(info, fname.to_bits());
-    env.mem.write(info + 1, bin.text_base);
-    env.mem.write(info + 2, sname.to_bits());
-    env.mem.write(info + 3, symbol.map_or(0, |(_, &value)| value));
-    1
+fn dladdr(_env: &mut Environment, _addr: ConstVoidPtr, _info: MutVoidPtr) -> i32 {
+    // FakeDladdr
+    0
 }
 
 fn kqueue(_env: &mut Environment) -> i32 {
