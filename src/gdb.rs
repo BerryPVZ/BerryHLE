@@ -136,33 +136,38 @@ impl GdbServer {
     pub fn wait_for_debugger(&mut self, stop_reason: Option<CpuError>, env: &mut Environment) {
         echo!("Waiting for debugger to continue.");
 
+        /// Maps a gdb thread ID to an index into `env.threads`. TID zero
+        /// should mean any thread, but gdb expects it to mean the current
+        /// thread. Returns `None` for an ID that names no live thread, so a
+        /// malformed packet gets `E00` instead of panicking the emulator.
+        fn thread_index(env: &Environment, gdb_tid: isize) -> Option<usize> {
+            if gdb_tid == 0 {
+                return Some(env.current_thread);
+            }
+            usize::try_from(gdb_tid)
+                .ok()
+                .and_then(|tid| tid.checked_sub(1))
+                .filter(|&tid| tid < env.threads.len())
+        }
+
         fn regs_for_command<'b>(
             server: &mut GdbServer,
             env: &'b mut Environment,
-        ) -> &'b mut [u32; 16] {
-            let tid = server.thread_for_other;
-            // TID zero should mean any thread, but gdb expects it to
-            // mean the current thread.
-            let tid: usize = if tid == 0 {
-                env.current_thread
-            } else {
-                (tid - 1).try_into().unwrap()
-            };
+        ) -> Option<&'b mut [u32; 16]> {
+            let tid = thread_index(env, server.thread_for_other)?;
             if tid == env.current_thread {
-                env.cpu.regs_mut()
+                Some(env.cpu.regs_mut())
             } else {
-                &mut env.threads[tid].guest_context.as_mut().unwrap().regs
+                env.threads[tid]
+                    .guest_context
+                    .as_mut()
+                    .map(|context| &mut context.regs)
             }
         }
 
         /// The thread the `g`/`p`/`P` register packets refer to.
-        fn tid_for_other(server: &GdbServer, env: &Environment) -> usize {
-            let tid = server.thread_for_other;
-            if tid == 0 {
-                env.current_thread
-            } else {
-                (tid - 1).try_into().unwrap()
-            }
+        fn tid_for_other(server: &GdbServer, env: &Environment) -> Option<usize> {
+            thread_index(env, server.thread_for_other)
         }
 
         // Send reply to continue/step packet that gdb sent earlier, so it knows
@@ -213,7 +218,10 @@ impl GdbServer {
                 }
                 // Read general registers
                 b'g' => {
-                    let regs = regs_for_command(self, env);
+                    let Some(regs) = regs_for_command(self, env) else {
+                        self.send_packet("E00");
+                        continue;
+                    };
                     let mut packet = String::with_capacity(16 * 4 * 2);
                     for reg in regs {
                         // Rust always prints in big-endian, but GDB expects
@@ -226,7 +234,10 @@ impl GdbServer {
                 // Write general registers
                 b'G' => {
                     let data = &p[1..];
-                    let regs = regs_for_command(self, env);
+                    let Some(regs) = regs_for_command(self, env) else {
+                        self.send_packet("E00");
+                        continue;
+                    };
                     assert!(data.len() == regs.len() * 4 * 2);
                     for (i, reg) in regs.iter_mut().enumerate() {
                         let word = &data[i * 4 * 2..][..4 * 2];
@@ -252,14 +263,15 @@ impl GdbServer {
                     // state through GDB in practice). This prevents GDB
                     // from disconnecting on "E00" for every FP register.
                     let reg = if num < 16 {
-                        let regs = regs_for_command(self, env);
-                        Some(regs[num])
+                        regs_for_command(self, env).map(|regs| regs[num])
                     } else if num == 25 {
-                        let tid = tid_for_other(self, env);
-                        if tid == env.current_thread {
-                            Some(env.cpu.cpsr())
-                        } else {
-                            Some(env.threads[tid].guest_context.as_mut().unwrap().cpsr)
+                        match tid_for_other(self, env) {
+                            Some(tid) if tid == env.current_thread => Some(env.cpu.cpsr()),
+                            Some(tid) => env.threads[tid]
+                                .guest_context
+                                .as_ref()
+                                .map(|context| context.cpsr),
+                            None => None,
                         }
                     } else if (26..=57).contains(&num) {
                         // VFP d0-d15: report as 64-bit zero
@@ -297,19 +309,30 @@ impl GdbServer {
                         // Rust decodes in big-endian, but GDB supplies
                         // little-endian.
                         let word = u32::from_le_bytes(word.to_be_bytes());
-                        let regs = regs_for_command(self, env);
-                        regs[num] = word;
-                        self.send_packet("OK");
+                        match regs_for_command(self, env) {
+                            Some(regs) => {
+                                regs[num] = word;
+                                self.send_packet("OK");
+                            }
+                            None => self.send_packet("E00"),
+                        }
                     } else if num == 25 {
                         let word = u32::from_str_radix(word, 16).unwrap();
                         let word = u32::from_le_bytes(word.to_be_bytes());
-                        let tid = tid_for_other(self, env);
-                        if tid == env.current_thread {
-                            env.cpu.set_cpsr(word);
-                        } else {
-                            env.threads[tid].guest_context.as_mut().unwrap().cpsr = word;
+                        match tid_for_other(self, env) {
+                            Some(tid) if tid == env.current_thread => {
+                                env.cpu.set_cpsr(word);
+                                self.send_packet("OK");
+                            }
+                            Some(tid) => match env.threads[tid].guest_context.as_mut() {
+                                Some(context) => {
+                                    context.cpsr = word;
+                                    self.send_packet("OK");
+                                }
+                                None => self.send_packet("E00"),
+                            },
+                            None => self.send_packet("E00"),
                         }
-                        self.send_packet("OK");
                     } else if (26..=57).contains(&num) || num == 58 || (16..=24).contains(&num) {
                         // VFP / FPA registers: accept the write silently
                         // (we can't actually set them without dynarmic exposure)
@@ -485,12 +508,14 @@ impl GdbServer {
                             };
                             match subcommand.split_once(':') {
                                 Some((_, tid_str)) => {
-                                    let tid: isize = tid_str.parse().unwrap();
+                                    let tid: isize = tid_str.parse().unwrap_or(0);
                                     if tid == -1 {
                                         default_state = state;
                                     } else {
-                                        let tid: usize = tid.try_into().unwrap();
-                                        let tid = tid.saturating_sub(1);
+                                        let Some(tid) = thread_index(env, tid) else {
+                                            self.send_packet("E00");
+                                            continue 'packet_loop;
+                                        };
                                         states[tid] = Some(state);
                                     }
                                 }
@@ -514,17 +539,19 @@ impl GdbServer {
                 }
                 // Checks if thread is still alive
                 b'T' => {
-                    let tid: usize = p.split_at(1).1.parse().unwrap();
-                    if env.threads[tid - 1].is_alive() {
-                        self.send_packet("OK");
-                    } else {
-                        self.send_packet("");
+                    let tid: isize = p.split_at(1).1.parse().unwrap_or(0);
+                    match thread_index(env, tid) {
+                        Some(tid) if env.threads[tid].is_alive() => self.send_packet("OK"),
+                        _ => self.send_packet(""),
                     }
                 }
                 // Specifies thread commands should run on.
                 b'H' => {
-                    let command = p.as_bytes()[1];
-                    let tid: isize = p.split_at(2).1.parse().unwrap();
+                    let Some(command) = p.as_bytes().get(1).copied() else {
+                        self.send_packet("E00");
+                        continue;
+                    };
+                    let tid: isize = p.split_at(2).1.parse().unwrap_or(0);
                     if command == b'c' {
                         self.thread_for_run = tid;
                     } else if command == b'g' {
@@ -532,6 +559,7 @@ impl GdbServer {
                     } else {
                         // Unsupported command type
                         self.send_packet("E00");
+                        continue;
                     }
                     self.send_packet("OK");
                 }
@@ -554,18 +582,26 @@ impl GdbServer {
                         }
 
                         let mut packet = "m".to_string();
-                        for tid in live_threads[..live_threads.len() - 1].iter() {
-                            write!(packet, "{tid:x},").unwrap();
+                        for (i, tid) in live_threads.iter().enumerate() {
+                            if i > 0 {
+                                packet.push(',');
+                            }
+                            write!(packet, "{tid:x}").unwrap();
                         }
-                        write!(packet, "{:x}", live_threads[live_threads.len() - 1]).unwrap();
                         self.send_packet(packet.as_str());
                     } else if p == "qsThreadInfo" {
                         // Second command to get threads, end the list.
                         self.send_packet("l");
                     } else if p.starts_with("qThreadExtraInfo") {
-                        let (_, tid_str) = p.split_once(',').unwrap();
-                        let tid: usize = tid_str.parse().unwrap();
-                        let tid = tid.saturating_sub(1);
+                        let Some((_, tid_str)) = p.split_once(',') else {
+                            self.send_packet("E00");
+                            continue;
+                        };
+                        let tid: isize = tid_str.parse().unwrap_or(0);
+                        let Some(tid) = thread_index(env, tid) else {
+                            self.send_packet("E00");
+                            continue;
+                        };
                         let thread_block = format!("{}", env.threads[tid].blocked_by);
                         let mut thread_block_hex = String::new();
                         thread_block

@@ -84,14 +84,11 @@ impl Default for AnimationBlockState {
 }
 
 /// Total time an animation block occupies: the delay plus every repeat.
-/// `repeat_count` 0 means a single run; an autoreversing animation plays
+/// `repeatCount` counts repeats, so the animation plays one more time than
+/// that; 0 (the default) means a single run. An autoreversing animation plays
 /// forwards and backwards, so each repeat takes twice the duration.
 fn block_total_duration(block: &AnimationBlockState) -> f64 {
-    let runs = if block.repeat_count > 0.0 {
-        block.repeat_count as f64
-    } else {
-        1.0
-    };
+    let runs = block.repeat_count as f64 + 1.0;
     let cycle = block.duration * if block.repeat_autoreverses { 2.0 } else { 1.0 };
     block.delay + cycle * runs
 }

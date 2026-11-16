@@ -6,7 +6,7 @@
 //! `wchar.h`
 
 use crate::dyld::{export_c_func, FunctionExports};
-use crate::mem::{ConstPtr, GuestUSize, MutPtr, Ptr};
+use crate::mem::{ConstPtr, GuestUSize, MutPtr};
 use crate::Environment;
 
 use super::generic_char::GenericChar;
@@ -245,11 +245,7 @@ fn wcsftime(
     time_ptr: ConstPtr<crate::libc::time::tm>,
 ) -> GuestUSize {
     // TODO: support other locales
-    let ctype_locale = crate::libc::clocale::setlocale(env, crate::libc::clocale::LC_CTYPE, Ptr::null());
-    assert_eq!(env.mem.read(ctype_locale), b'C');
-
     let format_string = env.mem.wcstr_at(format);
-    assert!(format_string.is_ascii()); // TODO
 
     let c_string: MutPtr<u8> = env.mem.alloc(max_size).cast();
     let c_format_string: ConstPtr<u8> = env
@@ -258,9 +254,11 @@ fn wcsftime(
         .cast_const();
     let res = crate::libc::time::strftime(env, c_string, max_size, c_format_string, time_ptr);
     env.mem.free(c_format_string.cast().cast_mut());
-    crate::libc::stdlib::mbstowcs(env, wcs, c_string.cast_const(), max_size);
+    let written = crate::libc::stdlib::mbstowcs(env, wcs, c_string.cast_const(), max_size);
     env.mem.free(c_string.cast());
-    res
+    // strftime returns 0 when the buffer was too small; wcsftime reports the
+    // same failure, otherwise the number of wide characters written.
+    if res == 0 { 0 } else { written }
 }
 
 /// wcstok — tokenise a wide string (stateful via saveptr).

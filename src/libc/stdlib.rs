@@ -1279,7 +1279,15 @@ pub fn mbstowcs(
 ) -> GuestUSize {
     set_errno(env, 0);
     let ctype_locale = setlocale(env, LC_CTYPE, Ptr::null());
-    assert_eq!(env.mem.read(ctype_locale), b'C');
+    let ctype_locale_byte = env.mem.read(ctype_locale);
+    if ctype_locale_byte != b'C' {
+        // We only model the C locale; treat anything else as C rather than
+        // aborting the emulator.
+        log!(
+            "Warning: mbstowcs(): unexpected LC_CTYPE locale {:?}; treating as C locale.",
+            ctype_locale_byte
+        );
+    }
     let size = strlen(env, s);
     let to_write = size.min(n);
     for i in 0..to_write {
