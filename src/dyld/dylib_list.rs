@@ -421,4 +421,91 @@ mod tests {
         assert!(has_protected_open, "open_dprotected_np is missing");
         assert!(has_screen_recorder, "ReplayKit screen recorder is missing");
     }
+
+    /// Files whose exports are deliberately not registered, with the reason.
+    const INTENTIONALLY_UNREGISTERED: &[(&str, &str)] = &[
+        (
+            "chipmunk_space.rs",
+            "Drive Ahead bundles its own Objective-Chipmunk classes; registering the \
+             host placeholders would shadow the app's implementations",
+        ),
+        (
+            "tw_tweet_compose_view_controller.rs",
+            "Twitter.framework is a stub superseded by Social",
+        ),
+        (
+            "cf_network/cf_http_message.rs",
+            "stale duplicate of cf_http_message.rs; its constants are already \
+             registered by cf_network and cf_stream",
+        ),
+        // Not compiled: no `mod` declaration anywhere, so these never reach the guest.
+        ("extended_audio_file.rs", "not compiled"),
+        ("localytics.rs", "not compiled"),
+        ("ns_method_signature.rs", "not compiled"),
+        ("raknet.rs", "not compiled"),
+        ("ui_undo_manager.rs", "not compiled"),
+    ];
+
+    fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// A module can define `CLASSES`/`CONSTANTS`/`FUNCTIONS` and still never reach the
+    /// guest, because only the `Library`/`HostDylib` literals are consulted when
+    /// linking. That is invisible until an app links the symbol and gets a nil value
+    /// or a panic, so check the source instead.
+    #[test]
+    fn every_export_is_registered() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut paths = Vec::new();
+        rust_sources(&src, &mut paths);
+        // (path, module name, contents)
+        let sources: Vec<(String, String, String)> = paths
+            .iter()
+            .map(|path| {
+                (
+                    path.to_string_lossy().into_owned(),
+                    path.file_stem().unwrap().to_string_lossy().into_owned(),
+                    std::fs::read_to_string(path).unwrap(),
+                )
+            })
+            .collect();
+
+        let mut unregistered = Vec::new();
+        for (path, module, text) in &sources {
+            if INTENTIONALLY_UNREGISTERED
+                .iter()
+                .any(|(allowed, _)| path.ends_with(allowed))
+            {
+                continue;
+            }
+            for kind in ["CLASSES", "CONSTANTS", "FUNCTIONS"] {
+                if !text.contains(&format!("pub const {kind}:")) {
+                    continue;
+                }
+                // Registered either in this file (`class_exports: &[CLASSES]`) or from
+                // another one (`module::CLASSES`).
+                let used_here = text.matches(kind).count() > 1;
+                let used_elsewhere = sources
+                    .iter()
+                    .any(|(_, _, other)| other.contains(&format!("{module}::{kind}")));
+                if !used_here && !used_elsewhere {
+                    unregistered.push(format!("{module}::{kind}"));
+                }
+            }
+        }
+
+        assert!(
+            unregistered.is_empty(),
+            "these exports are defined but never registered in a library, so the guest \
+             cannot link them: {unregistered:?}"
+        );
+    }
 }

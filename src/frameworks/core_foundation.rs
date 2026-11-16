@@ -51,6 +51,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         cf_net_service::CLASSES,
         cf_stream::CLASSES,
         cf_uuid::CLASSES,
+        cf_socket::CLASSES,
     ],
     constant_exports: &[
         cf_allocator::CONSTANTS,
