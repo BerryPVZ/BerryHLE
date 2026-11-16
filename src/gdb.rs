@@ -458,8 +458,10 @@ impl GdbServer {
                             }
                         }
                     }
-                    assert!(self.thread_for_run > 0);
-                    let target_tid: usize = self.thread_for_run.try_into().unwrap();
+                    // thread_for_run is a GDB thread number (1-based, or
+                    // non-positive for "any thread"), not an index.
+                    let target_tid =
+                        thread_index(env, self.thread_for_run).unwrap_or(env.current_thread);
                     for (tid, thread) in env.threads.iter_mut().enumerate() {
                         if !thread.is_alive() {
                             continue;
@@ -489,7 +491,12 @@ impl GdbServer {
                         let mut default_state = ThreadState::Paused;
                         let mut has_stepped = false;
                         for subcommand in commands.split(';') {
-                            let state = match subcommand.as_bytes()[0] {
+                            let Some(&command) = subcommand.as_bytes().first() else {
+                                // Bad vcont packet
+                                self.send_packet("E00");
+                                continue 'packet_loop;
+                            };
+                            let state = match command {
                                 // Signal is just ignored for now (TODO?)
                                 b'c' | b'C' => ThreadState::Running,
                                 b's' | b'S' => {
