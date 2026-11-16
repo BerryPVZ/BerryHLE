@@ -2202,6 +2202,7 @@ fn cxxabi_throw_intercept(
 ) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static LOGGED: AtomicU32 = AtomicU32::new(0);
+    static TRACED: AtomicU32 = AtomicU32::new(0);
 
     // type_info layout (Itanium, 32-bit): +0 vptr, +4 `char const* name`.
     let type_name = if !tinfo.is_null() {
@@ -2227,7 +2228,6 @@ fn cxxabi_throw_intercept(
     };
 
     if trace_cxx_exceptions() {
-        static TRACED: AtomicU32 = AtomicU32::new(0);
         let n = TRACED.fetch_add(1, Ordering::Relaxed);
         if n < 32 {
             log!(

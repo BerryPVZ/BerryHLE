@@ -1022,14 +1022,17 @@ fn network_access_allows_url(url: &str, network_access: bool) -> bool {
     android_web_view::network_access_allows_url(url, network_access)
 }
 
-/// True when `url` cannot load because it names no host: `""`, `"http://"`
-/// or a scheme-only `"file://"`. A page can still pass a path with no scheme,
-/// so only a scheme with an empty authority is rejected.
+/// True when `url` cannot load because it names no host: `""`, `"http://"` or
+/// a scheme-only `"https:///path"`. A `file:` URL names a path rather than a
+/// host, and a page can still pass a path with no scheme, so both are allowed.
 fn url_has_no_host(url: &str) -> bool {
-    match url.split_once("://") {
-        Some((_scheme, rest)) => rest.split('/').next().unwrap_or_default().is_empty(),
-        None => url.trim().is_empty(),
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.trim().is_empty();
+    };
+    if scheme.eq_ignore_ascii_case("file") {
+        return false;
     }
+    rest.split(['/', '?', '#']).next().unwrap_or_default().is_empty()
 }
 
 fn defer_url_load(env: &mut Environment, this: id, url: String) {
@@ -1046,7 +1049,7 @@ fn defer_url_load(env: &mut Environment, this: id, url: String) {
             env,
             NSURLErrorDomain,
             NSURLErrorBadURL,
-            "The URL is empty.",
+            "The URL has no host.",
             &url,
         );
         fail_load(env, this, error);
@@ -1525,6 +1528,10 @@ mod tests {
         assert!(url_has_no_host("https:///path"));
         assert!(!url_has_no_host("http://example.com/"));
         assert!(!url_has_no_host("about:blank"));
+        // A `file:` URL names a path, so an empty authority is normal.
+        assert!(!url_has_no_host("file:///var/mobile/Documents/index.html"));
+        assert!(!url_has_no_host("FILE:///index.html"));
+        assert!(!url_has_no_host("index.html"));
     }
 
     #[test]
