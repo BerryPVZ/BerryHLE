@@ -2787,37 +2787,23 @@ impl Window {
         let image = self.splash_image.as_ref().unwrap();
         let (image_width, image_height) = image.dimensions();
 
-        // Launch images are stored portrait-sized, so one shown in a landscape
-        // orientation has to be turned a quarter turn. A landscape image is
-        // shown as-is.
-        let is_landscape = matches!(
-            self.device_orientation,
-            DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight
-        );
-        let rotation = if is_landscape && image_height > image_width {
-            Matrix::z_rotation(std::f32::consts::FRAC_PI_2)
-        } else {
-            Matrix::identity()
-        };
-
+        // Shown the way it is stored, so the launch screen is the same way up as
+        // the app that follows. A portrait launch image in a landscape app keeps
+        // its own proportions instead of being turned to fill the screen.
+        //
         // OpenGL ES expects bottom-to-top row order for image data, but our
         // image data will be top-to-bottom. A reflection transform compensates.
-        let matrix = rotation.multiply(&Matrix::y_flip());
+        let matrix = Matrix::y_flip();
         let (vx, vy, vw, vh) = self.viewport();
-        let viewport = (vx, vy + self.viewport_y_offset(), vw, vh);
+        let vy = vy + self.viewport_y_offset();
         // Fill the app's rectangle (already positioned for any macOS offset)
         // so a full-screen launch image lands where the app will draw. One that
         // does not share the screen's aspect ratio keeps its own.
-        let fitted_viewport = geometry::fit_viewport((image_width, image_height), (vw, vh));
-        let splash_viewport = if fitted_viewport.2 * vh == fitted_viewport.3 * vw {
-            viewport
+        let fitted = geometry::fit_viewport((image_width, image_height), (vw, vh));
+        let splash_viewport = if fitted.2 * vh == fitted.3 * vw {
+            (vx, vy, vw, vh)
         } else {
-            (
-                vx + fitted_viewport.0,
-                vy + fitted_viewport.1,
-                fitted_viewport.2,
-                fitted_viewport.3,
-            )
+            (vx + fitted.0, vy + fitted.1, fitted.2, fitted.3)
         };
 
         unsafe {

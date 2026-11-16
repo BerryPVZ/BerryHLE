@@ -245,6 +245,15 @@ impl Bundle {
         None
     }
 
+    /// Whether the launch image is wider than it is tall. A landscape-shaped
+    /// launch image is an explicit ask for a landscape launch.
+    pub fn launch_image_is_landscape(&self, fs: &Fs, path: GuestPathBuf) -> bool {
+        fs.read(path)
+            .ok()
+            .and_then(|bytes| Image::from_bytes(&bytes).ok())
+            .is_some_and(|image| image.dimensions().0 > image.dimensions().1)
+    }
+
     /// The first of `names` that exists in the bundle root, with the spelling
     /// that is actually stored there.
     fn first_existing_file<'a>(

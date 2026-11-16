@@ -537,57 +537,6 @@ impl Environment {
         // window rotation after-the-fact is somewhat glitchy.
         // This also ensures the splash screen is correctly oriented.
         //
-        // Only force a non-portrait orientation when the app explicitly
-        // does NOT advertise portrait support. Storyboard apps (and any
-        // other modern UIKit binary) routinely declare every orientation
-        // they can run in via `UISupportedInterfaceOrientations`, and
-        // picking the first non-portrait entry would force them into
-        // landscape even when portrait is perfectly fine. Apple's own
-        // launch logic uses portrait by default whenever it's listed, so
-        // mirror that.
-        let portrait_supported = bundle
-            .supported_interface_orientations()
-            .contains(&"UIInterfaceOrientationPortrait");
-        if options.initial_orientation == window::DeviceOrientation::Portrait && !portrait_supported
-        {
-            if let Some(&non_portrait_orientation) = bundle
-                .supported_interface_orientations()
-                .iter()
-                .find(|&&o| o != "UIInterfaceOrientationPortrait")
-            {
-                // TODO: Overwriting the options might not be ideal; do we need
-                //       to distinguish this kind of orientation change from
-                //       others?
-                options.initial_orientation = match non_portrait_orientation {
-                    // UIInterfaceOrientation values are flipped relative to
-                    // (UI)DeviceOrientation values (content has to rotate in
-                    // the opposite direction to how the device rotates).
-                    "UIInterfaceOrientationLandscapeLeft" => {
-                        window::DeviceOrientation::LandscapeRight
-                    }
-                    "UIInterfaceOrientationLandscapeRight" => {
-                        window::DeviceOrientation::LandscapeLeft
-                    }
-                    // This appears to be an older way set the orientation.
-                    // From testing, it seems to correspond to left.
-                    "UIInterfaceOrientationLandscape" => window::DeviceOrientation::LandscapeLeft,
-
-                    // ДОБАВЛЯЕМ СЮДА ПРИВЯЗКУ К ОБЫЧНОМУ ПОРТРЕТУ:
-                    "UIInterfaceOrientationPortraitUpsideDown" => {
-                        window::DeviceOrientation::Portrait
-                    }
-
-                    other => {
-                        log!(
-                            "Warning: Unsupported startup orientation: {:?}; defaulting to Portrait.",
-                            other
-                        );
-                        window::DeviceOrientation::Portrait
-                    }
-                };
-                log!("App needs non-portrait user interface orientation {:?}, applying device orientation {:?}.", non_portrait_orientation, options.initial_orientation);
-            }
-        }
 
         let device_family_override = options.device_family;
         // `--device-family=auto`: when the user hasn't pinned a specific family,
@@ -669,6 +618,66 @@ impl Environment {
         };
         log!("{:?} device family is chosen.", device_family);
         options.device_family = Some(device_family);
+
+        // Only force a non-portrait orientation when the app explicitly
+        // does NOT advertise portrait support. Storyboard apps (and any
+        // other modern UIKit binary) routinely declare every orientation
+        // they can run in via `UISupportedInterfaceOrientations`, and
+        // picking the first non-portrait entry would force them into
+        // landscape even when portrait is perfectly fine. Apple's own
+        // launch logic uses portrait by default whenever it's listed, so
+        // mirror that. A landscape launch image counts as an explicit ask
+        // for landscape.
+        let portrait_supported = bundle
+            .supported_interface_orientations()
+            .contains(&"UIInterfaceOrientationPortrait");
+        let landscape_launch_image = bundle
+            .launch_image_path(&fs, device_family)
+            .is_some_and(|path| bundle.launch_image_is_landscape(&fs, path));
+
+        // The launch screen has to be upright in whatever orientation it opens
+        // in, so a landscape launch image starts the app in landscape even
+        // when the app would run happily in portrait.
+        let launch_orientation = if options.initial_orientation != window::DeviceOrientation::Portrait {
+            // --landscape-left, --landscape-right, --upside-down, or the
+            // per-app setting from the app picker.
+            options.initial_orientation
+        } else if portrait_supported && !landscape_launch_image {
+            window::DeviceOrientation::Portrait
+        } else if landscape_launch_image {
+            window::DeviceOrientation::LandscapeLeft
+        } else if let Some(&non_portrait_orientation) = bundle
+            .supported_interface_orientations()
+            .iter()
+            .find(|&&o| o != "UIInterfaceOrientationPortrait")
+        {
+            let orientation = match non_portrait_orientation {
+                // UIInterfaceOrientation values are flipped relative to
+                // (UI)DeviceOrientation values (content has to rotate in
+                // the opposite direction to how the device rotates).
+                "UIInterfaceOrientationLandscapeLeft" => window::DeviceOrientation::LandscapeRight,
+                "UIInterfaceOrientationLandscapeRight" => window::DeviceOrientation::LandscapeLeft,
+                // This appears to be an older way set the orientation.
+                // From testing, it seems to correspond to left.
+                "UIInterfaceOrientationLandscape" => window::DeviceOrientation::LandscapeLeft,
+
+                // ДОБАВЛЯЕМ СЮДА ПРИВЯЗКУ К ОБЫЧНОМУ ПОРТРЕТУ:
+                "UIInterfaceOrientationPortraitUpsideDown" => window::DeviceOrientation::Portrait,
+
+                other => {
+                    log!(
+                        "Warning: Unsupported startup orientation: {:?}; defaulting to Portrait.",
+                        other
+                    );
+                    window::DeviceOrientation::Portrait
+                }
+            };
+            log!("App needs non-portrait user interface orientation {:?}, applying device orientation {:?}.", non_portrait_orientation, orientation);
+            orientation
+        } else {
+            window::DeviceOrientation::Portrait
+        };
+        options.initial_orientation = launch_orientation;
 
         // Read the executable before constructing the Mach-O image below;
         // this lets us reuse the bytes instead of reading the file twice.
