@@ -984,8 +984,6 @@ pub struct Window {
     gl_driver_description: String,
     host_framebuffer: u32,
     splash_image: Option<Image>,
-    /// Whether the selected image already targets the startup orientation.
-    splash_image_is_orientation_specific: bool,
     device_family: DeviceFamily,
     device_orientation: DeviceOrientation,
     controller_ctx: sdl2::GameControllerSubsystem,
@@ -1068,7 +1066,7 @@ impl Window {
     pub fn new(
         title: &str,
         icon: Option<Image>,
-        launch_image: Option<(Image, bool)>,
+        launch_image: Option<Image>,
         options: &Options,
     ) -> Result<Window, String> {
         crate::gles::perf_overlay::configure_from_options(options);
@@ -1156,7 +1154,7 @@ impl Window {
     fn new_with_configured_driver(
         title: &str,
         icon: Option<Image>,
-        launch_image: Option<(Image, bool)>,
+        launch_image: Option<Image>,
         options: &Options,
     ) -> Result<Window, String> {
         let sdl_ctx = sdl2::init().map_err(|err| format!("SDL initialization failed: {}", err))?;
@@ -1354,9 +1352,7 @@ impl Window {
             size_for_orientation_from_size(portrait_screen_size, device_orientation, scale_hack),
         );
 
-        let (splash_image, splash_image_is_orientation_specific) = launch_image
-            .map(|(image, orientation_specific)| (Some(image), orientation_specific))
-            .unwrap_or((None, false));
+        let splash_image = launch_image;
 
         let mut window = Window {
             _sdl_ctx: sdl_ctx,
@@ -1400,7 +1396,6 @@ impl Window {
             gl_driver_description: String::new(),
             host_framebuffer: 0,
             splash_image,
-            splash_image_is_orientation_specific,
             device_family,
             device_orientation,
             controller_ctx,
@@ -2792,26 +2787,14 @@ impl Window {
         let image = self.splash_image.as_ref().unwrap();
         let (image_width, image_height) = image.dimensions();
 
-        // Legacy iPhone landscape launch images are stored in a portrait-sized
-        // Default.png with their content already rotated. Applying the normal
-        // framebuffer rotation to such an image turns it upside down, so use
-        // the inverse rotation for that case. Native landscape-sized launch
-        // images and portrait launch images use the regular transform.
-        let is_landscape = matches!(
-            self.device_orientation,
-            DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight
-        );
-        let rotation = if self.splash_image_is_orientation_specific {
-            Matrix::identity()
-        } else if is_landscape && image_height > image_width {
-            self.rotation_matrix().inverse().unwrap()
-        } else {
-            self.rotation_matrix()
-        };
-
+        // A landscape app's launch image is stored in a portrait-sized canvas
+        // with its artwork already turned, so it takes the same rotation as the
+        // app's frames. Undoing that rotation turns the splash a quarter turn
+        // away from the app.
+        //
         // OpenGL ES expects bottom-to-top row order for image data, but our
         // image data will be top-to-bottom. A reflection transform compensates.
-        let matrix = rotation.multiply(&Matrix::y_flip());
+        let matrix = self.rotation_matrix().multiply(&Matrix::y_flip());
         let (vx, vy, vw, vh) = self.viewport();
         let viewport = (vx, vy + self.viewport_y_offset(), vw, vh);
 

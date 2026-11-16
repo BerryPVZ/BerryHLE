@@ -720,7 +720,7 @@ impl Environment {
                     super::VERSION
                 ),
                 icon.ok(),
-                launch_image.map(|image| (image, false)),
+                launch_image,
                 &options,
             )?))
         };
