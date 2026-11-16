@@ -269,6 +269,11 @@ pub struct Options {
     pub gdb_listen_addrs: Option<Vec<SocketAddr>>,
     pub preferred_languages: Option<Vec<String>>,
     pub headless: bool,
+    /// `--strict-symbols`: abort when the app links a symbol the emulator
+    /// does not implement. Off by default, because most apps tolerate a few
+    /// missing symbols; useful for tests and for finding out what an app
+    /// needs before it can run.
+    pub strict_symbols: bool,
     pub print_fps: bool,
     pub performance_overlay_enabled: bool,
     pub performance_overlay_mode: PerformanceOverlayMode,
@@ -458,6 +463,7 @@ impl Default for Options {
             gdb_listen_addrs: None,
             preferred_languages: None,
             headless: false,
+            strict_symbols: false,
             print_fps: false,
             performance_overlay_enabled: false,
             performance_overlay_mode: if cfg!(any(target_os = "android", target_os = "ios")) {
@@ -779,6 +785,8 @@ impl Options {
             self.headless = true;
             // Can't show the dialog box when headless!
             self.popup_errors = false;
+        } else if arg == "--strict-symbols" {
+            self.strict_symbols = true;
         } else if arg == "--print-fps" {
             self.print_fps = true;
         } else if arg == "--no-print-fps" {

@@ -945,6 +945,9 @@ impl Environment {
 
         let mut dyld = dyld::Dyld::new();
         dyld.do_initial_linking(&bundle, &bins, &mut mem, &mut objc);
+        if options.strict_symbols {
+            dyld.assert_no_unresolved_symbols();
+        }
 
         let cpu = cpu::Cpu::new(match options.direct_memory_access {
             true => Some(&mut mem),

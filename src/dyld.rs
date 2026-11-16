@@ -30,7 +30,7 @@ use crate::mach_o::{MachO, SectionType};
 use crate::mem::{ConstPtr, ConstVoidPtr, GuestUSize, Mem, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::{nil, ClassExports, ObjC};
 use crate::Environment;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub use dylib_list::DYLIB_LIST;
 
@@ -465,6 +465,11 @@ pub struct Dyld {
     /// keyed by `(svc_pc, svc)`, with the number of times each was reported.
     /// A stray trap can be hit on every frame, so logging is capped.
     stray_svc_reports: HashMap<(u32, u32), u32>,
+    /// Symbols the guest referenced but no host library implements, with the
+    /// number of reference sites. These are linked to NULL, so the app only
+    /// fails once it uses one. Filled by `do_non_lazy_linking` and reported
+    /// once at the end of linking.
+    unresolved_symbols: BTreeMap<String, usize>,
 }
 
 impl Dyld {
@@ -502,6 +507,7 @@ impl Dyld {
             guest_sjlj_runtime_available: false,
             guest_cxxabi_exports: HashMap::new(),
             stray_svc_reports: HashMap::new(),
+            unresolved_symbols: BTreeMap::new(),
         }
     }
 
@@ -584,6 +590,7 @@ impl Dyld {
             // pointers will be wrong.
             self.do_non_lazy_linking(bin, bins, mem, objc);
         }
+        self.report_unresolved_symbols();
 
         objc.register_bin_classes(bundle, &bins[0], mem);
         objc.register_bin_categories(&bins[0], mem);
@@ -1291,6 +1298,10 @@ impl Dyld {
                     .entry(name)
                     .or_default()
                     .push(ptr_ptr.to_bits());
+                *self
+                    .unresolved_symbols
+                    .entry(name.to_string())
+                    .or_default() += 1;
                 continue;
             };
             // wrapping_add() is used in case the offset is negative. I haven't
@@ -1648,6 +1659,10 @@ impl Dyld {
                 continue;
             }
 
+            *self
+                .unresolved_symbols
+                .entry(symbol.to_string())
+                .or_default() += 1;
             log!(
                 "Warning: unhandled non-lazy symbol {:?} at {:?} in \"{}\"",
                 symbol,
@@ -1657,6 +1672,41 @@ impl Dyld {
         }
 
         // FIXME: check for internal relocations?
+    }
+
+    /// Print one summary of the symbols the guest linked to NULL, so a
+    /// missing export is visible at the end of the log instead of being
+    /// buried among the per-relocation warnings.
+    fn report_unresolved_symbols(&self) {
+        if self.unresolved_symbols.is_empty() {
+            return;
+        }
+        let references: usize = self.unresolved_symbols.values().sum();
+        log!(
+            "Warning: {} symbol(s) the emulator does not implement were linked to NULL ({} reference(s)); the app may misbehave where they are used:",
+            self.unresolved_symbols.len(),
+            references
+        );
+        for (symbol, count) in &self.unresolved_symbols {
+            log!("  {} ({} reference(s))", symbol, count);
+        }
+    }
+
+    /// Fail if the guest linked a symbol the emulator does not implement.
+    /// Used by `--strict-symbols`, so a test or a compatibility run fails
+    /// loudly instead of running on with NULL pointers.
+    pub fn assert_no_unresolved_symbols(&self) {
+        if self.unresolved_symbols.is_empty() {
+            return;
+        }
+        let mut message = format!(
+            "{} symbol(s) the emulator does not implement were linked to NULL:",
+            self.unresolved_symbols.len()
+        );
+        for (symbol, count) in &self.unresolved_symbols {
+            message.push_str(&format!("\n  {} ({} reference(s))", symbol, count));
+        }
+        panic!("{message}");
     }
 
     /// Do linking that can only be done once there is a full [Environment].
@@ -2504,5 +2554,34 @@ mod lazy_link_recovery_tests {
         let external_code = mock_binary(symbol, 0x1011, "__text", true);
         assert_eq!(local_code_symbol(&external_code, symbol), None);
         assert_eq!(local_code_symbol(&private_code, "__other"), None);
+    }
+}
+
+#[cfg(test)]
+mod unresolved_symbol_tests {
+    use super::Dyld;
+
+    #[test]
+    fn strict_symbols_only_fails_when_a_symbol_is_unresolved() {
+        let mut dyld = Dyld::new();
+        // Nothing unresolved: strict mode must not complain.
+        dyld.assert_no_unresolved_symbols();
+
+        dyld.unresolved_symbols
+            .insert("_NSURLIsExcludedFromBackupKey".to_string(), 2);
+
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dyld.assert_no_unresolved_symbols()
+        }));
+        std::panic::set_hook(previous_hook);
+
+        let message = result.expect_err("strict mode must fail on an unresolved symbol");
+        let message = message
+            .downcast_ref::<String>()
+            .expect("panic message should be a String");
+        assert!(message.contains("_NSURLIsExcludedFromBackupKey"));
+        assert!(message.contains("2 reference(s)"));
     }
 }
