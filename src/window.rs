@@ -2787,14 +2787,28 @@ impl Window {
         let image = self.splash_image.as_ref().unwrap();
         let (image_width, image_height) = image.dimensions();
 
-        // A landscape app's launch image is stored in a portrait-sized canvas
-        // with its artwork already turned, so it takes the same rotation as the
-        // app's frames. Undoing that rotation turns the splash a quarter turn
-        // away from the app.
+        // Turn the launch image only when its shape disagrees with the window.
+        // A landscape image in a landscape window is already the right way up,
+        // and turning it would show the splash a quarter turn away from the
+        // app; a portrait image in a landscape window needs the quarter turn.
         //
         // OpenGL ES expects bottom-to-top row order for image data, but our
         // image data will be top-to-bottom. A reflection transform compensates.
-        let matrix = self.rotation_matrix().multiply(&Matrix::y_flip());
+        let image_is_landscape = image_width > image_height;
+        let window_is_landscape = matches!(
+            self.device_orientation,
+            DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight
+        );
+        let already_upright = image_is_landscape == window_is_landscape
+            && !matches!(
+                self.device_orientation,
+                DeviceOrientation::PortraitUpsideDown
+            );
+        let matrix = if already_upright {
+            Matrix::y_flip()
+        } else {
+            self.rotation_matrix().multiply(&Matrix::y_flip())
+        };
         let (vx, vy, vw, vh) = self.viewport();
         let viewport = (vx, vy + self.viewport_y_offset(), vw, vh);
 
