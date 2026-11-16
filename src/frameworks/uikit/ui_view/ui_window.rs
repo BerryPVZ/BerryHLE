@@ -593,13 +593,20 @@ fn finish_launch_autorotation_with_rotation(
 /// The interface orientation a window should adopt for a given device
 /// orientation. Portrait is the default layout, so there is nothing to rotate
 /// to and the caller does nothing.
+///
+/// The two enums are flipped relative to each other: the interface turns the
+/// opposite way to the device so that the content ends up upright. This is the
+/// inverse of the mapping in `crate::environment` that turns the app's
+/// declared interface orientation into the device orientation.
 fn interface_orientation_for(
     rotation: crate::window::DeviceOrientation,
 ) -> Option<UIInterfaceOrientation> {
     match rotation {
-        crate::window::DeviceOrientation::LandscapeLeft => Some(UIInterfaceOrientationLandscapeLeft),
-        crate::window::DeviceOrientation::LandscapeRight => {
+        crate::window::DeviceOrientation::LandscapeLeft => {
             Some(UIInterfaceOrientationLandscapeRight)
+        }
+        crate::window::DeviceOrientation::LandscapeRight => {
+            Some(UIInterfaceOrientationLandscapeLeft)
         }
         crate::window::DeviceOrientation::PortraitUpsideDown => {
             Some(UIInterfaceOrientationPortraitUpsideDown)
@@ -850,17 +857,19 @@ mod autorotation_tests {
     use super::*;
 
     #[test]
-    fn launch_rotation_maps_to_the_interface_orientation_it_draws_in() {
+    fn launch_rotation_maps_to_the_opposite_interface_orientation() {
         // A game that launches landscape has to end up with the landscape
         // interface orientation, otherwise its renderbuffer is presented a
-        // quarter turn away from the UI.
+        // quarter turn away from the UI. The interface turns the opposite way
+        // to the device, so a phone held in LandscapeLeft shows the
+        // LandscapeRight interface.
         assert_eq!(
             interface_orientation_for(crate::window::DeviceOrientation::LandscapeLeft),
-            Some(UIInterfaceOrientationLandscapeLeft)
+            Some(UIInterfaceOrientationLandscapeRight)
         );
         assert_eq!(
             interface_orientation_for(crate::window::DeviceOrientation::LandscapeRight),
-            Some(UIInterfaceOrientationLandscapeRight)
+            Some(UIInterfaceOrientationLandscapeLeft)
         );
         assert_eq!(
             interface_orientation_for(crate::window::DeviceOrientation::PortraitUpsideDown),

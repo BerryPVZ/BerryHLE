@@ -3281,11 +3281,11 @@ unsafe fn ensure_present_objects(gles: &mut dyn GLES) -> PresentObjects {
 ///
 /// The renderbuffer is drawn in the layer's own space, and the layer is
 /// already turned by `layer_rotation` in screen space, so the presenter needs
-/// the screen rotation with that turn removed. An autorotated landscape view
-/// has `layer_rotation == window_rotation` and its renderbuffer is already
-/// upright, so the answer is the identity. Using `layer_rotation` alone
-/// presented that case a quarter turn out; adding the two presented it 180
-/// degrees out.
+/// the screen rotation with that turn added back. An autorotated landscape
+/// view has `layer_rotation == -window_rotation` and its renderbuffer is
+/// already upright, so the answer is the identity. Using `layer_rotation`
+/// alone presented that case a quarter turn out; subtracting it presented it
+/// 180 degrees out.
 fn present_rotation_matrix(
     window_rotation: crate::matrix::Matrix<2>,
     skip_rotation: bool,
@@ -3297,7 +3297,7 @@ fn present_rotation_matrix(
     if skip_rotation && !override_given {
         crate::matrix::Matrix::<2>::identity()
     } else if layer_rotation != 0.0 {
-        window_rotation.multiply(&crate::matrix::Matrix::z_rotation(-layer_rotation))
+        window_rotation.multiply(&crate::matrix::Matrix::z_rotation(layer_rotation))
     } else {
         window_rotation
     }
@@ -4758,12 +4758,12 @@ mod present_rotation_tests {
     fn an_autorotated_root_is_presented_upright() {
         // A landscape game on a phone held in landscape: UIKit autorotated the
         // root view by a quarter turn, and the device orientation reports the
-        // same quarter turn. The renderbuffer is already upright in the layer's
-        // own space, so presenting it must add nothing. Replacing the device
-        // rotation with the layer turn left it a quarter turn out; adding the
-        // two left it 180 degrees out.
+        // opposite quarter turn. The renderbuffer is already upright in the
+        // layer's own space, so presenting it must add nothing. Replacing the
+        // device rotation with the layer turn left it a quarter turn out;
+        // subtracting the two left it 180 degrees out.
         let device = turn(std::f32::consts::FRAC_PI_2);
-        let layer = std::f32::consts::FRAC_PI_2;
+        let layer = -std::f32::consts::FRAC_PI_2;
         let result = present_rotation_matrix(device, false, layer, false);
         assert_eq!(quarter_turns(result), 0);
         // The two turns are measured from the same place, so when the guest
