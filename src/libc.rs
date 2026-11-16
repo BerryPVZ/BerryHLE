@@ -38,7 +38,6 @@ pub mod mach;
 pub mod mach_o;
 pub mod malloc;
 pub mod math;
-pub mod mmap;
 pub mod net;
 pub mod netdb;
 pub mod posix_io;
@@ -125,7 +124,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         mach_o::FUNCTIONS,
         malloc::FUNCTIONS,
         math::FUNCTIONS,
-        mmap::FUNCTIONS,
+        sys::mman::FUNCTIONS,
         net::if_::FUNCTIONS,
         netdb::FUNCTIONS,
         posix_io::FUNCTIONS,
@@ -192,7 +191,7 @@ pub struct State {
     mach_vm: mach::vm_map::State,
     mach_ports: mach::mach_port::State,
     mach_error: mach::error::State,
-    mmap: mmap::State,
+    mmap: sys::mman::State,
 }
 
 impl State {

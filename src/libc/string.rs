@@ -187,9 +187,6 @@ fn __strcat_chk(
 ) -> MutPtr<u8> {
     GenericChar::<u8>::strcat(env, dest, src, size)
 }
-fn strspn(env: &mut Environment, s: ConstPtr<u8>, charset: ConstPtr<u8>) -> GuestUSize {
-    GenericChar::<u8>::strspn(env, s, charset)
-}
 fn strcspn(env: &mut Environment, s: ConstPtr<u8>, charset: ConstPtr<u8>) -> GuestUSize {
     GenericChar::<u8>::strcspn(env, s, charset)
 }
@@ -328,9 +325,6 @@ fn index(env: &mut Environment, s: ConstPtr<u8>, c: u8) -> ConstPtr<u8> {
 }
 fn strrchr(env: &mut Environment, path: ConstPtr<u8>, c: u8) -> ConstPtr<u8> {
     GenericChar::<u8>::strrchr(env, path, c)
-}
-fn strpbrk(env: &mut Environment, s: ConstPtr<u8>, charset: ConstPtr<u8>) -> ConstPtr<u8> {
-    GenericChar::<u8>::strpbrk(env, s, charset)
 }
 fn strlcpy(
     env: &mut Environment,

@@ -30,11 +30,11 @@ fn writev(
     }
     let mut res: GuestISize = 0;
     for i in 0..iov_cnt {
-        let next = env.mem.read(iov + i.try_into().unwrap());
+        let next = env.mem.read(iov + i as GuestUSize);
         let len = next.iov_len;
         let written = write(env, fd, next.iov_base.cast_const(), len);
         assert!(written >= 0); // TODO
-        assert_eq!(written, len.try_into().unwrap()); // TODO
+        assert_eq!(written as GuestUSize, len); // TODO
         res += written;
     }
     res
