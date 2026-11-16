@@ -1237,6 +1237,7 @@ const CLASSES: ClassExports = objc_classes! {
 - (bool)isMagnetometerActive {
     false
 }
+
 // Companion symmetric APIs for the magnetometer-pull-mode API. Apple
 // documents `startMagnetometerUpdates` / `stopMagnetometerUpdates` and
 // the `magnetometerData` accessor in

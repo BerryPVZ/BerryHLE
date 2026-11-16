@@ -159,7 +159,7 @@ pub const CONSTANTS: ConstantExports = &[
     ),
     (
         "_kCFStreamSSLAllowsExpiredCertificates",
-        HostConstant::NSString("_kCFStreamSSLAllowsExpiredCertificates"),
+        HostConstant::NSString("kCFStreamSSLAllowsExpiredCertificates"),
     ),
     (
         "_kCFStreamSSLAllowsAnyRoot",
