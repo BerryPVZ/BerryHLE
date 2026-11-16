@@ -135,12 +135,18 @@ required to work on the repo.
   `find_referencing_symbols` and `replace_symbol_body` over text search for named
   symbols, especially in large files; call `initial_instructions` first.
 - **Memory (mnemon, claudemem, hindsight, openviking)** — recall before answering
-  anything that may depend on past sessions, decisions or preferences; store
-  durable decisions and non-obvious findings after substantive work. Never store
-  secrets or transient state.
+  anything that may depend on past sessions, decisions or preferences. On a large
+  plan or exploration, record findings, decisions and the plan itself as you go,
+  not only at the end: that is what survives context compaction and session
+  switches. Never store secrets or transient state.
 - **Context compression (caveman)** — compress a large tool output or file before
   it enters context, keep the `ccr_` handle, and retrieve when details are needed.
   Compress by need, not routinely.
+- **Context management (billion-context / ACP)** — in long sessions, history is
+  summarized automatically. `acp_status` shows usage and compressible ranges,
+  `search_context` finds an old block by keyword, `decompress` restores it. A
+  summary is not a plan of record: anything a later session must act on belongs
+  in memory, not only in a compressed block.
 - **Ponytail (lite/full/ultra)** — smallest complete change: reuse what exists, no
   speculative abstraction, finish the callers, tests and fixtures it needs. The
   level changes verbosity, not correctness.
