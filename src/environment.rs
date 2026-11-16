@@ -135,6 +135,39 @@ pub static LAST_HOST_CALL_SYMBOL_PTR: std::sync::atomic::AtomicUsize =
 pub static LAST_HOST_CALL_SYMBOL_LEN: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// One host-function dispatch, as recorded in [`HOST_CALL_RING`].
+pub struct HostCallRecord {
+    /// Symbol name, stored the same way as [`LAST_HOST_CALL_SYMBOL_PTR`].
+    pub symbol_ptr: std::sync::atomic::AtomicUsize,
+    pub symbol_len: std::sync::atomic::AtomicUsize,
+    /// Guest PC of the call site.
+    pub guest_pc: std::sync::atomic::AtomicU32,
+    /// Guest r0-r3, the AAPCS argument registers.
+    pub args: [std::sync::atomic::AtomicU32; 4],
+}
+
+/// Ring buffer of the most recent host-function dispatches, for crash
+/// diagnostics. A null-page fault usually happens a few calls after the one
+/// that produced the bad pointer, so the single [`LAST_HOST_CALL_*`] snapshot
+/// does not show the sequence that led there.
+pub static HOST_CALL_RING: [HostCallRecord; 32] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const EMPTY: HostCallRecord = HostCallRecord {
+        symbol_ptr: std::sync::atomic::AtomicUsize::new(0),
+        symbol_len: std::sync::atomic::AtomicUsize::new(0),
+        guest_pc: std::sync::atomic::AtomicU32::new(0),
+        args: [
+            std::sync::atomic::AtomicU32::new(0),
+            std::sync::atomic::AtomicU32::new(0),
+            std::sync::atomic::AtomicU32::new(0),
+            std::sync::atomic::AtomicU32::new(0),
+        ],
+    };
+    [EMPTY; 32]
+};
+pub static HOST_CALL_RING_IDX: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// How a guest process ended, independently of the host process.
 #[derive(Clone, Copy, Debug)]
 pub enum GuestTermination {
@@ -3816,6 +3849,47 @@ impl Environment {
                                         std::sync::atomic::Ordering::Relaxed,
                                     );
                                 }
+                                // Also record the call in the ring buffer, so a
+                                // crash some calls later can show the sequence.
+                                let ring_i = std::sync::atomic::AtomicUsize::load(
+                                    &crate::environment::HOST_CALL_RING_IDX,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                let record = &crate::environment::HOST_CALL_RING
+                                    [ring_i % crate::environment::HOST_CALL_RING.len()];
+                                std::sync::atomic::AtomicUsize::store(
+                                    &record.symbol_ptr,
+                                    std::sync::atomic::AtomicUsize::load(
+                                        &crate::environment::LAST_HOST_CALL_SYMBOL_PTR,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    ),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                std::sync::atomic::AtomicUsize::store(
+                                    &record.symbol_len,
+                                    std::sync::atomic::AtomicUsize::load(
+                                        &crate::environment::LAST_HOST_CALL_SYMBOL_LEN,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    ),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                std::sync::atomic::AtomicU32::store(
+                                    &record.guest_pc,
+                                    svc_pc,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                for (slot, reg) in record.args.iter().enumerate() {
+                                    std::sync::atomic::AtomicU32::store(
+                                        reg,
+                                        regs[slot],
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                }
+                                std::sync::atomic::AtomicUsize::store(
+                                    &crate::environment::HOST_CALL_RING_IDX,
+                                    ring_i.wrapping_add(1),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
                             }
                             f.call_from_guest(self);
 

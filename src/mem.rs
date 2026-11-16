@@ -857,6 +857,21 @@ impl Mem {
             set.len(),
             MAX_UNIQUE_LOGS
         );
+        // Show the calls that led here. This matters for reads too: a nil read
+        // is the usual black-screen signature, and the call that produced the
+        // bad pointer is often a few calls back.
+        {
+            use std::sync::atomic::Ordering;
+            static LAST_RING_GUEST_PC: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(u32::MAX);
+            let guest_pc = crate::environment::LAST_GUEST_PC.load(Ordering::Relaxed);
+            if LAST_RING_GUEST_PC.swap(guest_pc, Ordering::Relaxed) != guest_pc {
+                log!(
+                    "touchHLE::mem: recent host calls (oldest first):{}",
+                    Self::host_call_ring_dump()
+                );
+            }
+        }
         if !is_write {
             return;
         }
@@ -904,8 +919,17 @@ impl Mem {
     /// concurrent dispatch can leave them mismatched.
     fn last_host_call_symbol() -> String {
         use std::sync::atomic::Ordering;
-        let ptr = crate::environment::LAST_HOST_CALL_SYMBOL_PTR.load(Ordering::Relaxed);
-        let len = crate::environment::LAST_HOST_CALL_SYMBOL_LEN.load(Ordering::Relaxed);
+        Self::host_call_symbol_at(
+            crate::environment::LAST_HOST_CALL_SYMBOL_PTR.load(Ordering::Relaxed),
+            crate::environment::LAST_HOST_CALL_SYMBOL_LEN.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Recover a symbol name recorded as a (pointer, length) pair. The length
+    /// is clamped and the bytes validated because the pointer and length are
+    /// stored by two separate relaxed stores, so a concurrent dispatch can
+    /// leave them mismatched.
+    fn host_call_symbol_at(ptr: usize, len: usize) -> String {
         const MAX_SYMBOL_LEN: usize = 512;
         if ptr == 0 || len == 0 || len > MAX_SYMBOL_LEN {
             return "<unknown>".to_string();
@@ -915,6 +939,35 @@ impl Mem {
             Ok(s) => s.to_string(),
             Err(_) => "<unparsable>".to_string(),
         }
+    }
+
+    /// Format the recent host-function dispatches, oldest first.
+    fn host_call_ring_dump() -> String {
+        use std::sync::atomic::Ordering;
+        let idx = crate::environment::HOST_CALL_RING_IDX.load(Ordering::Relaxed);
+        let ring = &crate::environment::HOST_CALL_RING;
+        let mut out = String::new();
+        for offset in 0..ring.len() {
+            let record = &ring[idx.wrapping_add(offset) % ring.len()];
+            let ptr = record.symbol_ptr.load(Ordering::Relaxed);
+            if ptr == 0 {
+                // Not filled yet: the ring starts empty.
+                continue;
+            }
+            out.push_str(&format!(
+                "\n  {} pc={:#x} r0={:#x} r1={:#x} r2={:#x} r3={:#x}",
+                Self::host_call_symbol_at(ptr, record.symbol_len.load(Ordering::Relaxed)),
+                record.guest_pc.load(Ordering::Relaxed),
+                record.args[0].load(Ordering::Relaxed),
+                record.args[1].load(Ordering::Relaxed),
+                record.args[2].load(Ordering::Relaxed),
+                record.args[3].load(Ordering::Relaxed),
+            ));
+        }
+        if out.is_empty() {
+            out.push_str("\n  (none yet)");
+        }
+        out
     }
 
     /// Dump 8 words of guest memory at `addr` as little-endian hex words, for
