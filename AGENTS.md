@@ -131,6 +131,11 @@ required to work on the repo.
   subagents; `graphify path A B` for relationships, `graphify explain X` for one
   concept. After code changes run `graphify update .` (AST-only, no API cost);
   never hand-edit `graphify-out/`.
+- **Search tools (bettergrep, betterglob, betterread)** — OpenCode plugins that
+ keep the names `grep`, `glob` and `read` but add filters, limits and
+ continuation footers. An OpenCode agent that has them should use them; other
+ agents just use their own grep/glob/read. Caveat: `betterread` does not load a
+ nested `AGENTS.md` from a subdirectory, so in `appdb/` open that file yourself.
 - **Symbol navigation (serena)** — prefer `find_symbol`,
   `find_referencing_symbols` and `replace_symbol_body` over text search for named
   symbols, especially in large files; call `initial_instructions` first.
