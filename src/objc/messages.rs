@@ -1122,25 +1122,29 @@ Type mismatch when sending message {} to {:?}!
             if let Some(result) =
                 fake_class_message_result(&class_name_for_log, is_metaclass, &sel_name)
             {
-                log!(
-                    "Call to faked class \"{}\" ({:?}) {} method \"{}\". Returning {}.",
-                    class_name_for_log,
-                    class,
-                    if is_metaclass { "class" } else { "instance" },
-                    sel_name,
-                    result,
-                );
+                if should_log_faked_class_call(&class_name_for_log, &sel_name) {
+                    log!(
+                        "Call to faked class \"{}\" ({:?}) {} method \"{}\". Returning {}.",
+                        class_name_for_log,
+                        class,
+                        if is_metaclass { "class" } else { "instance" },
+                        sel_name,
+                        result,
+                    );
+                }
                 env.cpu.regs_mut()[0] = result;
                 env.cpu.regs_mut()[1] = 0;
                 return;
             }
-            log!(
-                "Call to faked class \"{}\" ({:?}) {} method \"{}\". Behaving as if message was sent to nil.",
-                class_name_for_log,
-                class,
-                if is_metaclass { "class" } else { "instance" },
-                sel_name,
-            );
+            if should_log_faked_class_call(&class_name_for_log, &sel_name) {
+                log!(
+                    "Call to faked class \"{}\" ({:?}) {} method \"{}\". Behaving as if message was sent to nil.",
+                    class_name_for_log,
+                    class,
+                    if is_metaclass { "class" } else { "instance" },
+                    sel_name,
+                );
+            }
             env.cpu.regs_mut()[0..2].fill(0);
             return;
         } else {
@@ -1175,6 +1179,36 @@ fn objc_ret_zero(env: &mut Environment) {
 fn objc_ret_u32(env: &mut Environment, value: u32) {
     env.cpu.regs_mut()[0] = value;
     env.cpu.regs_mut()[1] = 0;
+}
+
+/// Rate-limit the "faked class" log lines. An app can call the same
+/// unimplemented SDK method on every frame (Epic Island logged 31 identical
+/// Flurry `logEvent:withParameters:` lines), which buries everything else in
+/// the log. The first few calls are logged in full, then one note, then
+/// silence.
+fn should_log_faked_class_call(class_name: &str, selector: &str) -> bool {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashMap<(String, String), u32>>> = Mutex::new(None);
+    const MAX_LOGS_PER_METHOD: u32 = 3;
+
+    let mut guard = SEEN.lock().unwrap();
+    let seen = guard.get_or_insert_with(HashMap::new);
+    let count = seen
+        .entry((class_name.to_owned(), selector.to_owned()))
+        .or_insert(0);
+    *count += 1;
+    if *count <= MAX_LOGS_PER_METHOD {
+        return true;
+    }
+    if *count == MAX_LOGS_PER_METHOD + 1 {
+        log!(
+            "Further calls to faked class \"{}\" method \"{}\" will not be logged.",
+            class_name,
+            selector
+        );
+    }
+    false
 }
 
 /// Return value for a message to a faked third-party SDK class (see
@@ -2983,6 +3017,21 @@ pub fn autorelease(env: &mut Environment, object: id) -> id {
 #[cfg(test)]
 mod fake_class_tests {
     use super::fake_class_message_result;
+    use super::should_log_faked_class_call;
+
+    #[test]
+    fn faked_class_logging_is_rate_limited_per_method() {
+        // Unique names so this does not share the global counter with a real run.
+        let class = "TestSdkRateLimit";
+        assert!(should_log_faked_class_call(class, "logEvent:"));
+        assert!(should_log_faked_class_call(class, "logEvent:"));
+        assert!(should_log_faked_class_call(class, "logEvent:"));
+        // The fourth call only emits the "will not be logged" note.
+        assert!(!should_log_faked_class_call(class, "logEvent:"));
+        assert!(!should_log_faked_class_call(class, "logEvent:"));
+        // A different method has its own budget.
+        assert!(should_log_faked_class_call(class, "startSession:"));
+    }
 
     #[test]
     fn openfeint_reports_that_the_player_declined_it() {
