@@ -153,6 +153,12 @@ pub struct ObjC {
     /// <https://developer.apple.com/documentation/objectivec/nsobject/1418639-initialize>
     pub(super) initialized_classes: FxHashSet<Class>,
 
+    /// Classes whose `+initialize` is running on some thread right now, with
+    /// the mutex/condvar other threads wait on. Apple's runtime serialises
+    /// `+initialize` per class: a second thread sending a message to the class
+    /// blocks until the first thread's `+initialize` returns.
+    pub(super) initializer_threads: FxHashMap<Class, messages::ThreadInitializer>,
+
     /// ARC weak-reference side table.
     ///
     /// `objc_storeWeak(location, value)` registers `location` (a guest
@@ -226,6 +232,7 @@ impl ObjC {
             property_locks: FxHashMap::default(),
             message_type_info: None,
             initialized_classes: FxHashSet::default(),
+            initializer_threads: FxHashMap::default(),
             weak_refs: FxHashMap::default(),
             associated_objects: FxHashMap::default(),
             method_handles: FxHashMap::default(),

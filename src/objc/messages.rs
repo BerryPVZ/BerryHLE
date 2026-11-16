@@ -19,9 +19,28 @@
 
 use super::{id, nil, Class, ObjC, IMP, SEL};
 use crate::abi::{CallFromHost, GuestRet};
-use crate::mem::{ConstPtr, MutVoidPtr, Ptr, SafeRead};
+use crate::environment::ThreadId;
+use crate::libc::pthread::cond::pthread_cond_t;
+use crate::libc::pthread::cond::{
+    pthread_cond_broadcast, pthread_cond_destroy, pthread_cond_init, pthread_cond_wait,
+};
+use crate::libc::pthread::mutex::pthread_mutex_t;
+use crate::libc::pthread::mutex::{
+    pthread_mutex_destroy, pthread_mutex_init, pthread_mutex_lock, pthread_mutex_unlock,
+};
+use crate::mem::{guest_size_of, ConstPtr, MutPtr, MutVoidPtr, Ptr, SafeRead};
 use crate::Environment;
 use std::any::TypeId;
+
+/// A `+initialize` currently running on some thread, with the guest mutex and
+/// condvar that other threads use to wait for it to finish.
+pub(super) struct ThreadInitializer {
+    mutex: MutPtr<pthread_mutex_t>,
+    cond: MutPtr<pthread_cond_t>,
+    tid: ThreadId,
+    waiters: u32,
+}
+
 fn trace_cocos_menu(env: &mut Environment, menu: id, touch: id) {
     let saved_regs = *env.cpu.regs();
     let Some(location_selector) = env.objc.lookup_selector("locationInView:") else {
@@ -132,9 +151,12 @@ use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
 /// See <https://developer.apple.com/documentation/objectivec/nsobject/1418639-initialize>.
 ///
 /// `class_to_init` must be a (regular) class, not a metaclass. The class is
-/// marked as initialized *before* `+initialize` is dispatched, so that any
+/// recorded as initializing before `+initialize` is dispatched, so that any
 /// messages sent to it from within `+initialize` itself do not cause infinite
-/// recursion.
+/// recursion, and other threads block until it finishes.
+///
+/// Apple's runtime serialises `+initialize` per class:
+/// <https://developer.apple.com/documentation/objectivec/nsobject/1418639-initialize>
 fn ensure_class_initialized(env: &mut Environment, class_to_init: Class) {
     if class_to_init == nil {
         return;
@@ -165,9 +187,35 @@ fn ensure_class_initialized(env: &mut Environment, class_to_init: Class) {
     };
     ensure_class_initialized(env, superclass);
 
-    // Re-check after recursion (the recursive call could not have
-    // initialised this class, but be defensive).
-    if !env.objc.initialized_classes.insert(class_to_init) {
+    // Another thread may be running `+initialize` for this class right now.
+    if let Some(&ThreadInitializer {
+        mutex, cond, tid, ..
+    }) = env.objc.initializer_threads.get(&class_to_init)
+    {
+        // A message from inside `+initialize` itself: let it proceed.
+        if tid == env.current_thread {
+            return;
+        }
+
+        env.objc
+            .initializer_threads
+            .get_mut(&class_to_init)
+            .unwrap()
+            .waiters += 1;
+        pthread_mutex_lock(env, mutex);
+        while !env.objc.initialized_classes.contains(&class_to_init) {
+            pthread_cond_wait(env, cond, mutex);
+        }
+        pthread_mutex_unlock(env, mutex);
+
+        let initializer = env.objc.initializer_threads.get_mut(&class_to_init).unwrap();
+        initializer.waiters -= 1;
+        let last_waiter = initializer.waiters == 0;
+        if last_waiter {
+            pthread_cond_destroy(env, cond);
+            pthread_mutex_destroy(env, mutex);
+            env.objc.initializer_threads.remove(&class_to_init);
+        }
         return;
     }
 
@@ -177,11 +225,27 @@ fn ensure_class_initialized(env: &mut Environment, class_to_init: Class) {
     // anyway) and dispatching would just emit a "does not respond" warning.
     let metaclass = ObjC::read_isa(class_to_init, &env.mem);
     let Some(sel_initialize) = env.objc.lookup_selector("initialize") else {
+        env.objc.initialized_classes.insert(class_to_init);
         return;
     };
     if !env.objc.class_has_method(metaclass, sel_initialize) {
+        env.objc.initialized_classes.insert(class_to_init);
         return;
     }
+
+    let mutex = env.mem.alloc(guest_size_of::<pthread_mutex_t>()).cast();
+    let cond = env.mem.alloc(guest_size_of::<pthread_cond_t>()).cast();
+    pthread_mutex_init(env, mutex, ConstPtr::null());
+    pthread_cond_init(env, cond, ConstPtr::null());
+    env.objc.initializer_threads.insert(
+        class_to_init,
+        ThreadInitializer {
+            mutex,
+            cond,
+            tid: env.current_thread,
+            waiters: 0,
+        },
+    );
 
     // `+initialize` only takes (self, _cmd); however, the *outer* message
     // dispatch we're nested inside has its real arguments sitting in r0..r3
@@ -197,8 +261,21 @@ fn ensure_class_initialized(env: &mut Environment, class_to_init: Class) {
     ];
     log_dbg!("Dispatching +[{:?} initialize]", class_to_init);
     let _: () = msg_send_no_type_checking(env, (class_to_init, sel_initialize));
+    env.objc.initialized_classes.insert(class_to_init);
     let regs = env.cpu.regs_mut();
     regs[0..4].copy_from_slice(&saved_r0_r3);
+
+    let initializer = env.objc.initializer_threads.get(&class_to_init).unwrap();
+    if initializer.waiters == 0 {
+        // Nobody ended up waiting, so there is nothing to wait for.
+        pthread_cond_destroy(env, cond);
+        pthread_mutex_destroy(env, mutex);
+        env.objc.initializer_threads.remove(&class_to_init);
+    } else {
+        pthread_mutex_lock(env, mutex);
+        pthread_cond_broadcast(env, cond);
+        pthread_mutex_unlock(env, mutex);
+    }
 }
 
 /// The core implementation of `objc_msgSend`, the main function of Objective-C.
