@@ -410,6 +410,71 @@ impl ClassHostObject {
     // See methods.rs for binary method parsing
 }
 
+/// Where a faked SDK namespace applies.
+enum FakeScope {
+    /// Classes the app ships in its own binary and classes it only looks up by
+    /// name.
+    Everywhere,
+    /// Only classes the app looks up by name, never ones it ships.
+    LookedUp,
+}
+
+/// Third-party SDK class namespaces that are faked, so messages sent to their
+/// classes behave as if sent to nil. Both `substitute_classes` (classes from
+/// the app's own binary) and `link_class` (classes the app only looks up)
+/// consult this table, so the two paths cannot drift apart.
+const FAKED_SDKS: &[(&str, FakeScope)] = &[
+    // Advertising and analytics SDKs.
+    ("AdMob", FakeScope::Everywhere),
+    ("AltAds", FakeScope::Everywhere),
+    ("Mobclix", FakeScope::Everywhere),
+    ("Flurry", FakeScope::Everywhere),
+    ("OpenFeint", FakeScope::Everywhere),
+    ("Tapjoy", FakeScope::Everywhere),
+    ("UA", FakeScope::Everywhere),
+    ("GAD", FakeScope::Everywhere),
+    ("RevMob", FakeScope::Everywhere),
+    ("iSimulate", FakeScope::Everywhere),
+    ("ALSdk", FakeScope::Everywhere), // AppLovin SDK
+    ("ALAd", FakeScope::Everywhere), // AppLovin ads
+    ("ALEvent", FakeScope::Everywhere), // AppLovin events
+    ("ALIncentivized", FakeScope::Everywhere), // AppLovin incentivized ads
+    ("ALTargeting", FakeScope::Everywhere), // AppLovin targeting
+    ("ALPrivacy", FakeScope::Everywhere), // AppLovin privacy settings
+    // Everyplay gameplay video-recording SDK. Its capture proxy hooks the GL
+    // context and installs a CCGLView frame-completion handler that re-renders
+    // every frame through APPLE fence sync objects. Under touchHLE that
+    // handler spins forever inside -[CCGLView presentFrame], so the game never
+    // gets past its first frame. Recording is optional, so faking the whole
+    // Everyplay class namespace disables capture and lets the game run.
+    ("Everyplay", FakeScope::Everywhere),
+    // The Facebook SDK is different: a bundled Facebook SDK (e.g. the 3.x SDK
+    // inside Subway Surfers 1.11.0) has real, working code. Faking it turns
+    // `+[FBSession activeSession]` into nil, the app's `FacebookSession`
+    // wrapper then dereferences it, Unity throws, and mono ends up in its
+    // internal `g_assert_not_reached` trap.
+    ("FB", FakeScope::LookedUp),
+    // SpringBoard private classes (e.g. "SBSceneFor%@" → "SBSceneFor(null)").
+    // Apps probing for jailbroken-device features look these up via
+    // NSClassFromString and only act if they exist; returning a fake class
+    // lets the probe fail gracefully instead of panicking. Restricted to the
+    // known prefixes to avoid accidentally swallowing real third-party
+    // SB-prefixed libs.
+    ("SBScene", FakeScope::LookedUp),
+    ("SBSystem", FakeScope::LookedUp),
+];
+
+/// Would a class with this name from this origin be faked?
+fn is_faked_sdk(name: &str, from_app_binary: bool) -> bool {
+    FAKED_SDKS.iter().any(|(prefix, scope)| {
+        let applies = match scope {
+            FakeScope::Everywhere => true,
+            FakeScope::LookedUp => !from_app_binary,
+        };
+        applies && name.starts_with(prefix)
+    })
+}
+
 /// Decide whether a certain class/metaclass pair from the guest app should use
 /// fake class host objects and return the substitutions if so.
 fn substitute_classes(
@@ -430,43 +495,7 @@ fn substitute_classes(
     };
     // Substitute classes that seem to be from various third-party advertising
     // or social network SDKs.
-    if !(
-        name.starts_with("AdMob")
-        || name.starts_with("AltAds")
-        || name.starts_with("Mobclix")
-        // Note: the Facebook SDK namespace ("FB…") is deliberately *not*
-        // substituted here. Classes handled by this function come from the
-        // app's own binary, so a bundled Facebook SDK (e.g. the 3.x SDK inside
-        // Subway Surfers 1.11.0) has real, working code. Faking it turns
-        // `+[FBSession activeSession]` into nil, the app's `FacebookSession`
-        // wrapper then dereferences it, Unity throws, and mono ends up in its
-        // internal `g_assert_not_reached` trap. Classes that are only *looked
-        // up* and never shipped with the app are still faked by `link_class`.
-        || name.starts_with("Flurry")
-        || name.starts_with("OpenFeint")
-        || name.starts_with("Tapjoy")
-        || name.starts_with("UA")
-        || name.starts_with("GAD")
-        || name.starts_with("RevMob")
-        || name.starts_with("iSimulate")
-        || name.starts_with("ALSdk") // AppLovin SDK
-        || name.starts_with("ALAd")  // AppLovin ads
-        || name.starts_with("ALEvent") // AppLovin events
-        || name.starts_with("ALIncentivized") // AppLovin incentivized ads
-        || name.starts_with("ALTargeting") // AppLovin targeting
-        || name.starts_with("ALPrivacy")
-        // AppLovin privacy settings
-        || name.starts_with("Everyplay")
-        // Everyplay gameplay video-recording SDK. Its capture proxy hooks the
-        // GL context and installs a CCGLView frame-completion handler that
-        // re-renders every frame through APPLE fence sync objects. Under
-        // touchHLE that handler spins forever inside -[CCGLView presentFrame],
-        // so the game never gets past its first frame. Recording is optional,
-        // so faking the whole Everyplay class namespace (messages behave as if
-        // sent to nil) disables capture and lets the game run.
-    )
-    // <-- ДОБАВЛЕНО ЗДЕСЬ
-    {
+    if !is_faked_sdk(name, /* from_app_binary: */ true) {
         // TODO : try to remove when sqlite3 is supported.
         if (bundle.bundle_identifier() == "com.chillingo.defenderchronicles")
             && (name == "OFHighScoreService")
@@ -696,25 +725,8 @@ impl ObjC {
                 self,
             ));
         } else {
-            // ЗДЕСЬ ДОБАВЛЕНА ЛОГИКА ДЛЯ ДИНАМИЧЕСКИХ КЛАССОВ (GAD и др.)
-            let is_fake = name.starts_with("AdMob")
-                || name.starts_with("AltAds")
-                || name.starts_with("Mobclix")
-                || name.starts_with("FB")
-                || name.starts_with("Flurry")
-                || name.starts_with("OpenFeint")
-                || name.starts_with("Tapjoy")
-                || name.starts_with("UA")
-                || name.starts_with("GAD")
-                || name.starts_with("iSimulate")
-                // SpringBoard private classes (e.g. "SBSceneFor%@" → "SBSceneFor(null)").
-                // Apps probing for jailbroken-device features look these up
-                // via NSClassFromString and only act if they exist; returning
-                // a fake class lets the probe fail gracefully instead of
-                // panicking. Restricted to the known SBScene prefix to avoid
-                // accidentally swallowing real third-party SB-prefixed libs.
-                || name.starts_with("SBScene")
-                || name.starts_with("SBSystem"); // <-- ДОБАВЛЕНО ЗДЕСЬ
+            // Classes the app only looks up by name, never ships.
+            let is_fake = is_faked_sdk(name, /* from_app_binary: */ false);
 
             // Note: empty/garbage class names are rejected earlier in this
             // function (they return nil), so by this point `name` is a
@@ -3342,6 +3354,24 @@ mod class_registration_tests {
         let mut objc = ObjC::new();
         objc.register_host_selectors(&mut mem);
         (objc, mem)
+    }
+
+    #[test]
+    fn faked_sdk_table_covers_both_lookup_paths() {
+        // Ad SDKs are faked whether the app ships them or only looks them up.
+        assert!(is_faked_sdk("GADBannerView", true));
+        assert!(is_faked_sdk("GADBannerView", false));
+        assert!(is_faked_sdk("ALSdk", true));
+        assert!(is_faked_sdk("ALSdk", false));
+        // A bundled Facebook SDK has real code, so only lookups are faked.
+        assert!(!is_faked_sdk("FBSession", true));
+        assert!(is_faked_sdk("FBSession", false));
+        // SpringBoard probes are lookups only.
+        assert!(!is_faked_sdk("SBSceneFor", true));
+        assert!(is_faked_sdk("SBSceneFor", false));
+        // Unrelated classes are never faked.
+        assert!(!is_faked_sdk("NSObject", true));
+        assert!(!is_faked_sdk("NSObject", false));
     }
 
     #[test]
