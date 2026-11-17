@@ -643,6 +643,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
             gles.as_mut(),
             present_frame_args.0,
             present_frame_args.1,
+            /* uv_scale: */ (1.0, 1.0),
             present_frame_args.2,
             present_frame_args.3,
         );

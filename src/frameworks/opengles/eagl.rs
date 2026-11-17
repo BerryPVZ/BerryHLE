@@ -2362,20 +2362,35 @@ unsafe fn present_renderbuffer_es2(
         gles.Disable(gles2::SCISSOR_TEST);
         gles.ActiveTexture(gles2::TEXTURE0);
         gles.BindTexture(gles2::TEXTURE_2D, present_objects.texture);
-        let texture_size = PRESENT_TEXTURE_SIZE.with(|cell| cell.get());
-        if texture_size != Some((width, height)) {
+        let allocated = PRESENT_TEXTURE_SIZE.with(|cell| cell.get());
+        let fits =
+            matches!(allocated, Some((w, h)) if w >= width && h >= height);
+        if !fits {
+            // Allocate storage only when the renderbuffer no longer fits. A
+            // guest that presents several renderbuffers in a frame (game
+            // view, a smaller UI overlay, the game view again) would
+            // otherwise redefine the storage on every present; on a
+            // tile-based driver a redefinition between the guest's draws and
+            // the copy can force a mid-frame resolve. The copy below fills
+            // only the top-left `width`x`height` texels, and the present quad
+            // samples that sub-rectangle (uUVScale).
+            let (alloc_width, alloc_height) = match allocated {
+                Some((w, h)) => (w.max(width), h.max(height)),
+                None => (width, height),
+            };
             gles.TexImage2D(
                 gles2::TEXTURE_2D,
                 0,
                 gles2::RGBA as GLint,
-                width,
-                height,
+                alloc_width,
+                alloc_height,
                 0,
                 gles2::RGBA,
                 gles2::UNSIGNED_BYTE,
                 std::ptr::null(),
             );
-            PRESENT_TEXTURE_SIZE.with(|cell| cell.set(Some((width, height))));
+            PRESENT_TEXTURE_SIZE
+                .with(|cell| cell.set(Some((alloc_width, alloc_height))));
         }
         gles.CopyTexSubImage2D(
             gles2::TEXTURE_2D,
@@ -2491,6 +2506,14 @@ unsafe fn present_renderbuffer_es2(
 
     gles.UseProgram(program.program);
     gles.Uniform1i(program.u_tex, 0);
+    // Sample only the sub-rectangle the copy filled, when the cached storage
+    // is larger than this renderbuffer (see the grow-only allocation above).
+    let uv_scale = present_uv_scale(
+        width,
+        height,
+        PRESENT_TEXTURE_SIZE.with(|cell| cell.get()),
+    );
+    gles.Uniform2f(program.u_uv_scale, uv_scale.0, uv_scale.1);
     // Keep rotation around the center of the texture. Applying a raw
     // 0..1-space rotation sends one or both axes negative for landscape
     // orientations; with CLAMP_TO_EDGE that samples only the border texel and
@@ -2642,6 +2665,7 @@ struct PresentProgram {
     a_uv: GLint,
     u_tex: GLint,
     u_tex_mat: GLint,
+    u_uv_scale: GLint,
 }
 
 /// Reusable GL objects for the ES 2.0 present path. Allocating and freeing a
@@ -2651,13 +2675,41 @@ struct PresentProgram {
 /// the driver's ability to pipeline frames, which shows up as severe stutter
 /// in 60 FPS games (notably Unity titles, which present through this path).
 /// Caching the objects and reusing them across frames removes that per-frame
-/// churn entirely. Texture storage is allocated only when its dimensions
-/// change; steady-state frames use `glCopyTexSubImage2D`.
+/// churn entirely. Texture storage only ever grows; steady-state frames use
+/// `glCopyTexSubImage2D`.
 #[derive(Copy, Clone)]
 struct PresentObjects {
     framebuffer: GLuint,
     texture: GLuint,
     quad_vbo: GLuint,
+}
+
+/// The sub-rectangle of a present texture that holds the current frame, as a
+/// fraction of the allocated storage: `(width, height) / allocated`.
+///
+/// The presenters allocate texture storage at the largest size they have seen
+/// and copy a smaller renderbuffer into the top-left corner of it, so that a
+/// guest alternating between renderbuffer sizes never redefines storage
+/// mid-frame. Both presenters rotate in 0..1 space and apply this scale
+/// afterwards, which keeps the rotation centred on the frame itself.
+fn present_uv_scale(
+    width: GLint,
+    height: GLint,
+    allocated: Option<(GLint, GLint)>,
+) -> (f32, f32) {
+    let Some((alloc_width, alloc_height)) = allocated else {
+        return (1.0, 1.0);
+    };
+    if width <= 0 || height <= 0 || alloc_width <= 0 || alloc_height <= 0 {
+        return (1.0, 1.0);
+    }
+    if alloc_width == width && alloc_height == height {
+        return (1.0, 1.0);
+    }
+    (
+        width as f32 / alloc_width as f32,
+        height as f32 / alloc_height as f32,
+    )
 }
 
 /// One flag per entry of [gles1_on_gl2::CAPABILITIES]: does the driver reject
@@ -2755,6 +2807,27 @@ fn route_memo_survives_a_frame_but_not_a_context_change() {
     // A recreated context is a new session, so comparisons start from scratch.
     invalidate_present_cache_for_context(second);
     assert_eq!(LAST_PRESENT_ROUTE.load(Ordering::Relaxed), PRESENT_ROUTE_UNSET);
+}
+
+#[cfg(test)]
+#[test]
+fn present_uv_scale_crops_to_the_filled_sub_rectangle() {
+    // Grow-only storage: the frame is copied into the top-left corner, so the
+    // quad samples that fraction of the texture.
+    assert_eq!(
+        present_uv_scale(320, 480, Some((1024, 768))),
+        (0.3125, 0.625)
+    );
+    assert_eq!(
+        present_uv_scale(128, 128, Some((1024, 1024))),
+        (0.125, 0.125)
+    );
+    // Steady state and unknown storage sample the whole texture.
+    assert_eq!(present_uv_scale(1024, 768, Some((1024, 768))), (1.0, 1.0));
+    assert_eq!(present_uv_scale(320, 480, None), (1.0, 1.0));
+    // Degenerate sizes must not produce NaN or a negative scale.
+    assert_eq!(present_uv_scale(0, 480, Some((1024, 768))), (1.0, 1.0));
+    assert_eq!(present_uv_scale(320, 480, Some((0, 0))), (1.0, 1.0));
 }
 
 /// Drain the GL error queue. Returns whether there was anything in it.
@@ -3094,10 +3167,11 @@ unsafe fn ensure_present_program(gles: &mut dyn GLES) -> Option<PresentProgram> 
         attribute vec2 aPos;\n\
         attribute vec2 aUV;\n\
         uniform mat4 uTexMat;\n\
+        uniform vec2 uUVScale;\n\
         varying vec2 vUV;\n\
         void main() {\n\
             gl_Position = vec4(aPos, 0.0, 1.0);\n\
-            vUV = (uTexMat * vec4(aUV, 0.0, 1.0)).xy;\n\
+            vUV = (uTexMat * vec4(aUV, 0.0, 1.0)).xy * uUVScale;\n\
         }\0";
     // Alpha is forced to 1.0: the window surface may have an alpha channel
     // that the OS compositor honours (Android SurfaceFlinger), and an app's
@@ -3181,6 +3255,8 @@ unsafe fn ensure_present_program(gles: &mut dyn GLES) -> Option<PresentProgram> 
     let a_uv = gles.GetAttribLocation(prog, b"aUV\0".as_ptr() as *const _);
     let u_tex = gles.GetUniformLocation(prog, b"uTex\0".as_ptr() as *const _);
     let u_tex_mat = gles.GetUniformLocation(prog, b"uTexMat\0".as_ptr() as *const _);
+    let u_uv_scale =
+        gles.GetUniformLocation(prog, b"uUVScale\0".as_ptr() as *const _);
 
     let result = PresentProgram {
         program: prog,
@@ -3188,6 +3264,7 @@ unsafe fn ensure_present_program(gles: &mut dyn GLES) -> Option<PresentProgram> 
         a_uv,
         u_tex,
         u_tex_mat,
+        u_uv_scale,
     };
     PRESENT_PROGRAM.with(|c| c.set(Some(result)));
     Some(result)
@@ -3687,7 +3764,7 @@ unsafe fn present_renderbuffer(
     let (texture, storage_valid) =
         if let Some((texture, cached_width, cached_height)) = PRESENT_ES1_TEXTURE.with(|c| c.get()) {
             gles.BindTexture(gles11::TEXTURE_2D, texture);
-            (texture, cached_width == width && cached_height == height)
+            (texture, cached_width >= width && cached_height >= height)
         } else {
             let mut texture = 0;
             gles.GenTextures(1, &mut texture);
@@ -3785,17 +3862,42 @@ unsafe fn present_renderbuffer(
             height,
         );
     } else {
-        gles.CopyTexImage2D(
+        // Define storage at the largest size seen so far, then copy into its
+        // top-left corner. Redefining storage on every present is what a
+        // guest alternating between renderbuffer sizes would otherwise
+        // force, and on a tile-based driver that redefinition can resolve the
+        // source mid-frame. The present quad samples the sub-rectangle
+        // (present_uv_scale).
+        let (alloc_width, alloc_height) =
+            match PRESENT_ES1_TEXTURE.with(|c| c.get()) {
+            Some((_, cached_width, cached_height)) => {
+                (cached_width.max(width), cached_height.max(height))
+            }
+            None => (width, height),
+        };
+        gles.TexImage2D(
             gles11::TEXTURE_2D,
             0,
             gles11::RGBA as _,
+            alloc_width,
+            alloc_height,
+            0,
+            gles11::RGBA,
+            gles11::UNSIGNED_BYTE,
+            std::ptr::null(),
+        );
+        gles.CopyTexSubImage2D(
+            gles11::TEXTURE_2D,
+            0,
+            0,
+            0,
             0,
             0,
             width,
             height,
-            0,
         );
-        PRESENT_ES1_TEXTURE.with(|c| c.set(Some((texture, width, height))));
+        PRESENT_ES1_TEXTURE
+            .with(|c| c.set(Some((texture, alloc_width, alloc_height))));
     }
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -4288,10 +4390,18 @@ unsafe fn present_renderbuffer(
     }
 
     // Draw the quad
+    let uv_scale = present_uv_scale(
+        width,
+        height,
+        PRESENT_ES1_TEXTURE
+            .with(|c| c.get())
+            .map(|(_, w, h)| (w, h)),
+    );
     present_frame(
         gles,
         viewport,
         rotation_matrix,
+        uv_scale,
         virtual_cursor_visible_at,
         context_token,
     );
