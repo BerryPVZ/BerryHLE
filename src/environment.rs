@@ -1613,6 +1613,37 @@ impl Environment {
         self.stack_trace_all();
     }
 
+    /// One line per live guest thread: state, block reason and PC/LR. Printed
+    /// before the register and stack dumps so a stall can be read at a glance
+    /// (which thread is spinning, which one is parked, and on what).
+    fn dump_thread_summary(&self) {
+        echo_no_panic!(
+            "STALL-DIAG app executable: {}",
+            self.bundle.executable_path().as_str()
+        );
+        for (tid, thread) in self.threads.iter().enumerate() {
+            if !thread.is_alive() {
+                continue;
+            }
+            let (pc, lr) = if tid == self.current_thread {
+                let regs = self.cpu.regs();
+                (regs[cpu::Cpu::PC], regs[cpu::Cpu::LR])
+            } else if let Some(ctx) = thread.guest_context.as_ref() {
+                (ctx.regs[cpu::Cpu::PC], ctx.regs[cpu::Cpu::LR])
+            } else {
+                (0, 0)
+            };
+            echo_no_panic!(
+                "STALL-DIAG thread #{}: state={:?} blocked_by={} PC={:#010x} LR={:#010x}",
+                tid,
+                thread.state,
+                thread.blocked_by,
+                pc,
+                lr
+            );
+        }
+    }
+
     fn dump_all_regs(&self) {
         echo_no_panic!(
             "Dumping registers for current thread (#{})",
@@ -2287,6 +2318,7 @@ impl Environment {
             if crate::stall_watchdog::take_guest_dump_request()
                 && crate::gles::present::ms_since_last_present().map_or(true, |ms| ms >= 3000)
             {
+                self.dump_thread_summary();
                 self.dump_all_regs();
                 self.stack_trace_all();
             }
