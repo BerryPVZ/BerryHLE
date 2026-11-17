@@ -2281,6 +2281,16 @@ impl Environment {
                 self.stall_diag();
             }
 
+            // The stall watchdog cannot touch guest state, so it asks for a
+            // dump here. Only dump when frames have also stopped, so a game
+            // idling on a menu with no host calls does not spam stacks.
+            if crate::stall_watchdog::take_guest_dump_request()
+                && crate::gles::present::ms_since_last_present().map_or(true, |ms| ms >= 3000)
+            {
+                self.dump_all_regs();
+                self.stack_trace_all();
+            }
+
             if kill_current_thread && self.guest_termination_requested.is_some() {
                 echo!("Guest session ended through the controlled return-to-host path.");
                 return self.guest_termination_requested;

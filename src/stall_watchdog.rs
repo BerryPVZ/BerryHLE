@@ -18,6 +18,17 @@ const REPORT_EVERY: Duration = Duration::from_secs(60);
 
 static STARTED: AtomicBool = AtomicBool::new(false);
 
+/// Set when a report wants guest register/stack dumps. The watchdog cannot
+/// read guest state itself (the host loop owns it), so the host loop picks
+/// this up and dumps on its next iteration.
+static DUMP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the host loop should dump guest thread state now. Clears the
+/// request.
+pub fn take_guest_dump_request() -> bool {
+    DUMP_REQUESTED.swap(false, Ordering::Relaxed)
+}
+
 /// What counts as progress. Both halves move while anything at all is
 /// happening, including a game that runs but never presents a frame.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -67,6 +78,7 @@ pub fn start() {
                     continue;
                 }
                 reported_at = Some(Instant::now());
+                DUMP_REQUESTED.store(true, Ordering::Relaxed);
                 log!(
                     "Stall watchdog: no guest activity for {}s (guest PC={:#010x}, LR={:#010x}, thread={}, {} host calls so far). Recent host calls:{}",
                     idle.as_secs(),
