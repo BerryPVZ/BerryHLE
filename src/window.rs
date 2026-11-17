@@ -58,6 +58,143 @@ fn swap_interval_for_mode(mode: VsyncMode, is_android: bool) -> Option<sdl2::vid
     }
 }
 
+/// A swap slower than this means the app is below 30 FPS.
+const ADAPTIVE_VSYNC_SLOW_INTERVAL: Duration = Duration::from_millis(33);
+/// A swap faster than this means the app is above 50 FPS.
+const ADAPTIVE_VSYNC_FAST_INTERVAL: Duration = Duration::from_millis(20);
+/// Consecutive slow swaps before display sync is dropped.
+const ADAPTIVE_VSYNC_SLOW_SWAPS: u32 = 30;
+/// Consecutive fast swaps before display sync is restored.
+const ADAPTIVE_VSYNC_FAST_SWAPS: u32 = 120;
+
+/// Drops display sync while the app cannot keep up with it, and restores it
+/// once the app is comfortably fast again.
+///
+/// With `VsyncMode::Auto` on Android the swap interval is 1. An app that
+/// misses the display deadline then waits for the *next* refresh, so a game
+/// that renders at 25 FPS is shown at 20, and one at 35 FPS at 30: the frame
+/// rate becomes a staircase and input latency jumps by a whole refresh. Letting
+/// such an app run unsynced trades tearing for a steady frame rate and lower
+/// latency. Explicit `--vsync=on`/`off` never uses this.
+struct AdaptiveVsync {
+    synced: bool,
+    last_swap: Option<Instant>,
+    slow_swaps: u32,
+    fast_swaps: u32,
+}
+
+impl AdaptiveVsync {
+    fn new() -> Self {
+        Self {
+            synced: true,
+            last_swap: None,
+            slow_swaps: 0,
+            fast_swaps: 0,
+        }
+    }
+
+    /// Call after every swap. Returns the new sync choice when it should
+    /// change.
+    fn observe(&mut self, now: Instant) -> Option<bool> {
+        let last = self.last_swap.replace(now)?;
+        let elapsed = now.duration_since(last);
+        if elapsed >= ADAPTIVE_VSYNC_SLOW_INTERVAL {
+            self.fast_swaps = 0;
+            self.slow_swaps += 1;
+            if self.synced && self.slow_swaps >= ADAPTIVE_VSYNC_SLOW_SWAPS {
+                self.slow_swaps = 0;
+                self.synced = false;
+                return Some(false);
+            }
+        } else if elapsed < ADAPTIVE_VSYNC_FAST_INTERVAL {
+            self.slow_swaps = 0;
+            self.fast_swaps += 1;
+            if !self.synced && self.fast_swaps >= ADAPTIVE_VSYNC_FAST_SWAPS {
+                self.fast_swaps = 0;
+                self.synced = true;
+                return Some(true);
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod adaptive_vsync_tests {
+    use super::{
+        AdaptiveVsync, ADAPTIVE_VSYNC_FAST_SWAPS, ADAPTIVE_VSYNC_SLOW_SWAPS,
+    };
+    use std::time::{Duration, Instant};
+
+    /// Swaps `count` times at a fixed interval and returns the last decision.
+    fn swap_n(
+        vsync: &mut AdaptiveVsync,
+        now: &mut Instant,
+        interval_ms: u64,
+        count: u32,
+    ) -> Option<bool> {
+        let mut change = None;
+        for _ in 0 .. count {
+            *now += Duration::from_millis(interval_ms);
+            if let Some(new) = vsync.observe(*now) {
+                change = Some(new);
+            }
+        }
+        change
+    }
+
+    #[test]
+    fn drops_sync_only_after_a_sustained_slow_run() {
+        let mut now = Instant::now();
+        let mut vsync = AdaptiveVsync::new();
+        // The first swap only starts the measurement.
+        assert_eq!(swap_n(&mut vsync, &mut now, 40, 1), None);
+        assert_eq!(
+            swap_n(&mut vsync, &mut now, 40, ADAPTIVE_VSYNC_SLOW_SWAPS - 1),
+            None
+        );
+        assert_eq!(swap_n(&mut vsync, &mut now, 40, 1), Some(false));
+    }
+
+    #[test]
+    fn a_fast_swap_resets_the_slow_run() {
+        let mut now = Instant::now();
+        let mut vsync = AdaptiveVsync::new();
+        assert_eq!(
+            swap_n(&mut vsync, &mut now, 40, ADAPTIVE_VSYNC_SLOW_SWAPS),
+            None
+        );
+        assert_eq!(swap_n(&mut vsync, &mut now, 16, 1), None);
+        assert_eq!(
+            swap_n(&mut vsync, &mut now, 40, ADAPTIVE_VSYNC_SLOW_SWAPS - 1),
+            None
+        );
+        assert_eq!(swap_n(&mut vsync, &mut now, 40, 1), Some(false));
+    }
+
+    #[test]
+    fn restores_sync_after_a_sustained_fast_run() {
+        let mut now = Instant::now();
+        let mut vsync = AdaptiveVsync::new();
+        assert_eq!(
+            swap_n(&mut vsync, &mut now, 40, ADAPTIVE_VSYNC_SLOW_SWAPS + 1),
+            Some(false)
+        );
+        assert_eq!(
+            swap_n(&mut vsync, &mut now, 16, ADAPTIVE_VSYNC_FAST_SWAPS - 1),
+            None
+        );
+        assert_eq!(swap_n(&mut vsync, &mut now, 16, 1), Some(true));
+    }
+
+    #[test]
+    fn a_steady_sixty_hertz_never_changes_anything() {
+        let mut now = Instant::now();
+        let mut vsync = AdaptiveVsync::new();
+        assert_eq!(swap_n(&mut vsync, &mut now, 16, 1000), None);
+    }
+}
+
 #[cfg(test)]
 mod swap_interval_tests {
     use super::{swap_interval_for_mode, VsyncMode};
@@ -1008,6 +1145,9 @@ pub struct Window {
     /// Host scheduling / power-management hints for the emulator thread
     /// (Android). Fed once per presented frame from [Window::swap_window].
     perf_hints: crate::perf_hints::PerfHints,
+    /// Drops and restores display sync for `VsyncMode::Auto` on Android. `None`
+    /// when the mode is explicit or the platform syncs swaps in hardware.
+    adaptive_vsync: Option<AdaptiveVsync>,
     /// Whether or not we are on the "main" environment stack (rather than
     /// a coroutine stack). Checked in various functions to make sure that
     /// certain SDL functions (that call JNI functions) are on the main
@@ -1432,6 +1572,9 @@ impl Window {
                     .unwrap_or(Duration::from_micros(16_667)),
                 options.affinity.as_deref(),
             ),
+            adaptive_vsync: (options.vsync == VsyncMode::Auto
+                && env::consts::OS == "android")
+                .then(AdaptiveVsync::new),
             on_main_stack: true,
         };
 
@@ -2875,6 +3018,7 @@ impl Window {
                 gl_ctx.as_mut(),
                 viewport,
                 matrix,
+                /* uv_scale: */ (1.0, 1.0),
                 /* virtual_cursor_visible_at: */ None,
                 self.perf_context_token,
             );
@@ -2891,6 +3035,30 @@ impl Window {
     /// Swap front-buffer and back-buffer so the result of OpenGL rendering is
     /// presented.
     pub fn swap_window(&mut self) {
+        let change = self
+            .adaptive_vsync
+            .as_mut()
+            .and_then(|adaptive| adaptive.observe(Instant::now()));
+        if let Some(synced) = change {
+            let interval = if synced {
+                sdl2::video::SwapInterval::VSync
+            } else {
+                sdl2::video::SwapInterval::Immediate
+            };
+            match self.video_ctx.gl_set_swap_interval(interval) {
+                Ok(()) => log!(
+                    "Vsync {} (swap interval {}): the app {}.",
+                    if synced { "enabled" } else { "disabled" },
+                    if synced { 1 } else { 0 },
+                    if synced {
+                        "caught up with the display"
+                    } else {
+                        "cannot sustain display refresh, running unsynced"
+                    }
+                ),
+                Err(e) => log!("Warning: could not change vsync: {}", e),
+            }
+        }
         self.window.gl_swap_window();
         self.perf_hints.frame_presented();
         crate::gles::perf_overlay::record_host_present();
