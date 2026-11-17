@@ -260,6 +260,10 @@ pub const CLASSES: ClassExports = objc_classes! {
         String::new()
     };
     log!("UIWebView loadRequest: {}", url_string);
+    if !delegate_should_start_load(env, this, request, UIWebViewNavigationTypeOther) {
+        log!("UIWebView: delegate refused to load {}", url_string);
+        return;
+    }
     cancel_current_load(env, this, "A new request replaced the current WebView load.");
 
     // Push current URL onto back stack before navigating.
@@ -334,6 +338,15 @@ pub const CLASSES: ClassExports = objc_classes! {
         String::new()
     };
     log_dbg!("UIWebView loadHTMLString: ({} chars)", html_str.len());
+    let request: id = if _base_url != nil {
+        msg_class![env; NSURLRequest requestWithURL:_base_url]
+    } else {
+        nil
+    };
+    if !delegate_should_start_load(env, this, request, UIWebViewNavigationTypeOther) {
+        log!("UIWebView: delegate refused to load an HTML string");
+        return;
+    }
     cancel_current_load(env, this, "A new request replaced the current WebView load.");
     let load_id = begin_load(env, this);
     fire_did_start_load(env, this);
@@ -379,6 +392,15 @@ pub const CLASSES: ClassExports = objc_classes! {
         String::new()
     };
     log_dbg!("UIWebView loadData:MIMEType:{}", mime_str);
+    let request: id = if _base_url != nil {
+        msg_class![env; NSURLRequest requestWithURL:_base_url]
+    } else {
+        nil
+    };
+    if !delegate_should_start_load(env, this, request, UIWebViewNavigationTypeOther) {
+        log!("UIWebView: delegate refused to load data");
+        return;
+    }
     cancel_current_load(env, this, "A new request replaced the current WebView load.");
     let load_id = begin_load(env, this);
     fire_did_start_load(env, this);
@@ -1407,6 +1429,80 @@ fn fire_did_fail_load(env: &mut Environment, this: id, error: id) {
             let _: () = msg![env; delegate webView:this didFailLoadWithError:error];
         }
     }
+}
+
+/// The `User-Agent` real UIWebView attaches to the requests it hands to its
+/// delegate. Apps read it with `-valueForHTTPHeaderField:` instead of
+/// evaluating JavaScript, so the header must be present.
+fn web_view_user_agent(env: &mut Environment) -> String {
+    let device: id = msg_class![env; UIDevice currentDevice];
+    let model: id = msg![env; device model];
+    let model = if model != nil {
+        to_rust_string(env, model).into_owned()
+    } else {
+        "iPhone".to_string()
+    };
+    let (major, minor, _patch) = env
+        .options
+        .as_ref()
+        .ios_version
+        .unwrap_or(crate::options::LATEST_IOS_VERSION);
+    let cpu = if model.starts_with("iPad") {
+        format!("CPU OS {major}_{minor}")
+    } else {
+        format!("CPU iPhone OS {major}_{minor}")
+    };
+    format!(
+        "Mozilla/5.0 ({model}; {cpu} like Mac OS X) \
+         AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/16A366"
+    )
+}
+
+/// `request` with a `User-Agent` header attached, like the one UIWebView
+/// passes to `-webView:shouldStartLoadWithRequest:navigationType:`.
+fn request_with_user_agent(env: &mut Environment, request: id) -> id {
+    if request == nil {
+        return request;
+    }
+    let field = ns_string::from_rust_string(env, "User-Agent".to_string());
+    let existing: id = msg![env; request valueForHTTPHeaderField:field];
+    if existing != nil {
+        return request;
+    }
+    let user_agent_str = web_view_user_agent(env);
+    let user_agent = ns_string::from_rust_string(env, user_agent_str);
+    let copy: id = msg![env; request mutableCopy];
+    if copy == nil {
+        return request;
+    }
+    let _: () = msg![env; copy setValue:user_agent forHTTPHeaderField:field];
+    crate::objc::autorelease(env, copy)
+}
+
+/// Ask the delegate whether a navigation may start, as UIWebView does before
+/// every load. Returns `false` when the delegate vetoes the load.
+/// https://developer.apple.com/documentation/uikit/uiwebviewdelegate/1617945-webview
+fn delegate_should_start_load(
+    env: &mut Environment,
+    this: id,
+    request: id,
+    navigation_type: UIWebViewNavigationType,
+) -> bool {
+    let delegate = env.objc.borrow::<UIWebViewHostObject>(this).delegate;
+    if delegate == nil {
+        return true;
+    }
+    let sel = env.objc.register_host_selector(
+        "webView:shouldStartLoadWithRequest:navigationType:".to_string(),
+        &mut env.mem,
+    );
+    let responds: bool = msg![env; delegate respondsToSelector:sel];
+    if !responds {
+        return true;
+    }
+    let request = request_with_user_agent(env, request);
+    let allowed: bool = msg![env; delegate webView:this shouldStartLoadWithRequest:request navigationType:navigation_type];
+    allowed
 }
 
 /// Fire `webViewDidFinishLoad:` on the delegate (if it responds).
