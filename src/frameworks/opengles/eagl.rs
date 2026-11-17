@@ -4027,24 +4027,33 @@ unsafe fn present_renderbuffer(
             // Querying only the ES 1.1 names made every log show
             // `src=0x0000 dst=0x0000`, which reads like a broken blend setup.
             let qi_fallback = |gles: &mut dyn GLES, names: &[GLenum]| -> GLint {
+                let mut v: GLint = 0;
                 for &name in names {
                     while gles.GetError() != 0 {}
-                    let mut v: GLint = 0;
                     gles.GetIntegerv(name, &mut v);
                     if gles.GetError() == 0 {
                         return v;
                     }
                 }
+                while gles.GetError() != 0 {}
                 0
+            };
+            // `get_ints` leaves a rejected query's error in the queue and its
+            // zeroed array reads like real state, so drain like `qf4` does.
+            let qi4 = |gles: &mut dyn GLES, name: GLenum| -> [GLint; 4] {
+                while gles.GetError() != 0 {}
+                let v = get_ints::<4>(gles, name);
+                while gles.GetError() != 0 {}
+                v
             };
             let blend_on = qb(gles, gles11::BLEND);
             let blend_src =
                 qi_fallback(gles, &[gles11::BLEND_SRC, 0x80C9]) as u32;
             let blend_dst =
                 qi_fallback(gles, &[gles11::BLEND_DST, 0x80C8]) as u32;
-            let color_mask = get_ints::<4>(gles, gles11::COLOR_WRITEMASK);
+            let color_mask = qi4(gles, gles11::COLOR_WRITEMASK);
             let scissor_on = qb(gles, gles11::SCISSOR_TEST);
-            let scissor_box = get_ints::<4>(gles, gles11::SCISSOR_BOX);
+            let scissor_box = qi4(gles, gles11::SCISSOR_BOX);
             let depth_func = qi(gles, 0x0B74 /* GL_DEPTH_FUNC */);
             let depth_mask = qb(gles, 0x0B72 /* GL_DEPTH_WRITEMASK */);
             let depth_on = qb(gles, gles11::DEPTH_TEST);
