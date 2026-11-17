@@ -1431,6 +1431,19 @@ fn fire_did_fail_load(env: &mut Environment, this: id, error: id) {
     }
 }
 
+/// WebKit and Mobile build tokens per iOS major version. A web view that
+/// claims iOS 6 must not claim the WebKit that shipped with iOS 12, or an app
+/// that sniffs the header enables features the emulated OS does not have.
+const WEBKIT_BY_IOS: &[(u32, &str, &str)] = &[
+    (6, "536.26", "10B500"),
+    (7, "537.51.1", "11A465"),
+    (8, "600.1.4", "12A365"),
+    (9, "601.1.46", "13A344"),
+    (10, "602.1.50", "14A403"),
+    (11, "604.1.38", "15A372"),
+    (12, "605.1.15", "16A366"),
+];
+
 /// The `User-Agent` real UIWebView attaches to the requests it hands to its
 /// delegate. Apps read it with `-valueForHTTPHeaderField:` instead of
 /// evaluating JavaScript, so the header must be present.
@@ -1452,10 +1465,20 @@ fn web_view_user_agent(env: &mut Environment) -> String {
     } else {
         format!("CPU iPhone OS {major}_{minor}")
     };
+    let (webkit, mobile) = webkit_tokens(major.max(0) as u32);
     format!(
         "Mozilla/5.0 ({model}; {cpu} like Mac OS X) \
-         AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/16A366"
+         AppleWebKit/{webkit} (KHTML, like Gecko) Mobile/{mobile}"
     )
+}
+
+fn webkit_tokens(ios_major: u32) -> (&'static str, &'static str) {
+    WEBKIT_BY_IOS
+        .iter()
+        .rev()
+        .find(|(version, _, _)| *version <= ios_major)
+        .map(|(_, webkit, mobile)| (*webkit, *mobile))
+        .unwrap_or((WEBKIT_BY_IOS[0].1, WEBKIT_BY_IOS[0].2))
 }
 
 /// `request` with a `User-Agent` header attached, like the one UIWebView
@@ -1603,7 +1626,7 @@ fn unwrap_js_result(result: &str) -> String {
 mod tests {
     use super::{
         has_webview_extent, network_access_allows_url, url_has_no_host, webview_event_action,
-        WebViewEventAction,
+        webkit_tokens, WebViewEventAction,
     };
     use crate::android_web_view::WebViewEventType;
 
@@ -1708,5 +1731,14 @@ mod tests {
         assert!(!has_webview_extent((0.0, 0.0), Some((0.0, 0.0))));
         assert!(has_webview_extent((0.0, 0.0), Some((320.0, 480.0))));
         assert!(has_webview_extent((320.0, 480.0), None));
+    }
+
+    #[test]
+    fn user_agent_webkit_matches_ios_version() {
+        assert_eq!(webkit_tokens(6), ("536.26", "10B500"));
+        assert_eq!(webkit_tokens(9), ("601.1.46", "13A344"));
+        assert_eq!(webkit_tokens(12), ("605.1.15", "16A366"));
+        // Newer than the newest table entry: keep the newest tokens.
+        assert_eq!(webkit_tokens(99), ("605.1.15", "16A366"));
     }
 }
