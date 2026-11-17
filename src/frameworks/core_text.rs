@@ -73,6 +73,12 @@ pub type CTTypesetterRef = crate::objc::id;
 /// Opaque CoreText line reference.
 pub type CTLineRef = crate::objc::id;
 
+/// `CTLineTruncationType`, from `CTLine.h`.
+pub type CTLineTruncationType = u32;
+pub const kCTLineTruncationStart: CTLineTruncationType = 0;
+pub const kCTLineTruncationMiddle: CTLineTruncationType = 1;
+pub const kCTLineTruncationEnd: CTLineTruncationType = 2;
+
 /// Opaque CoreText run reference.
 pub type CTRunRef = crate::objc::id;
 
@@ -670,6 +676,154 @@ fn CTLineCreateWithAttributedString(
     retain(env, font);
     retain(env, attributes);
     alloc_line(env, text, font, attributes)
+}
+
+/// `CFIndex CTTypesetterSuggestClusterBreak(
+///     CTTypesetterRef typesetter, CFIndex startIndex, double width)`
+///
+/// Returns how many characters, counted from `startIndex`, fit into `width`
+/// without splitting a cluster. Like real Core Text, we always let at least
+/// one cluster through so callers that loop on the result make progress.
+/// Metrics come from the same font measurement `CTLineGetTypographicBounds`
+/// uses.
+/// <https://developer.apple.com/documentation/coretext/1509556-cttypesettersuggestclusterbreak>
+fn CTTypesetterSuggestClusterBreak(
+    env: &mut Environment,
+    typesetter: CTTypesetterRef,
+    start_index: CFIndex,
+    width: f64,
+) -> CFIndex {
+    if typesetter.is_null() || start_index < 0 || !(width > 0.0) {
+        return 0;
+    }
+    let attr_string = env
+        .objc
+        .borrow::<CTTypesetterHostObject>(typesetter)
+        .attr_string;
+    let (text, font, _attributes) = string_and_font_from_attr_string(env, attr_string);
+    if text == nil || font == nil {
+        return 0;
+    }
+    let text_str = to_rust_string(env, text).into_owned();
+    let font_size: CGFloat = msg![env; font pointSize];
+    let font_obj = font_for_text(env, font, &text_str).unwrap_or_else(Font::sans_regular);
+    let measure = |s: &str| font_obj.calculate_text_size(font_size, s, None).0;
+    cluster_break_count(&text_str, start_index as usize, width as f32, &measure) as CFIndex
+}
+
+/// Characters from `start_index` that fit `width`, measured from
+/// `start_index` (the width budget covers the line that starts there, not the
+/// whole string). Always at least one, so callers that loop make progress.
+fn cluster_break_count(
+    text: &str,
+    start_index: usize,
+    width: f32,
+    measure: &impl Fn(&str) -> f32,
+) -> usize {
+    let mut count = 0;
+    let mut start_byte = None;
+    for (char_index, (byte_offset, ch)) in text.char_indices().enumerate() {
+        if char_index < start_index {
+            continue;
+        }
+        let start_byte = *start_byte.get_or_insert(byte_offset);
+        let candidate_end = byte_offset + ch.len_utf8();
+        if measure(&text[start_byte..candidate_end]) > width && count > 0 {
+            break;
+        }
+        count += 1;
+    }
+    count
+}
+
+/// Longest prefix of `text` whose measured width does not exceed `budget`.
+fn fitting_prefix<'a>(measure: &impl Fn(&str) -> f32, text: &'a str, budget: f32) -> &'a str {
+    let mut end = 0;
+    for (offset, ch) in text.char_indices() {
+        let candidate_end = offset + ch.len_utf8();
+        if measure(&text[..candidate_end]) > budget {
+            break;
+        }
+        end = candidate_end;
+    }
+    &text[..end]
+}
+
+/// Longest suffix of `text` whose measured width does not exceed `budget`.
+fn fitting_suffix<'a>(measure: &impl Fn(&str) -> f32, text: &'a str, budget: f32) -> &'a str {
+    let mut start = text.len();
+    for (offset, _ch) in text.char_indices().rev() {
+        if measure(&text[offset..]) > budget {
+            break;
+        }
+        start = offset;
+    }
+    &text[start..]
+}
+
+/// `CTLineRef CTLineCreateTruncatedLine(
+///     CTLineRef line, double width, CTLineTruncationType truncationType,
+///     CTLineRef truncationToken)`
+///
+/// The truncated line keeps the original line's font and attributes and
+/// carries the token text at the start, middle or end as requested. Per Apple,
+/// a `NULL` token means no token is displayed (the line is simply clipped).
+/// <https://developer.apple.com/documentation/coretext/1509487-ctlinecreatetruncatedline>
+fn CTLineCreateTruncatedLine(
+    env: &mut Environment,
+    line: CTLineRef,
+    width: f64,
+    truncation_type: CTLineTruncationType,
+    truncation_token: CTLineRef,
+) -> CTLineRef {
+    if line.is_null() || !(width > 0.0) {
+        return nil;
+    }
+    let text = line_text(env, line);
+    let font = line_font(env, line);
+    if text == nil || font == nil {
+        return nil;
+    }
+    let attributes = env.objc.borrow::<CTLineHostObject>(line).attributes;
+    let text_str = to_rust_string(env, text).into_owned();
+    let font_size: CGFloat = msg![env; font pointSize];
+    let font_obj = font_for_text(env, font, &text_str).unwrap_or_else(Font::sans_regular);
+    let measure = |s: &str| font_obj.calculate_text_size(font_size, s, None).0;
+    let new_text = if measure(&text_str) as f64 <= width {
+        text_str
+    } else {
+        let token_text = if truncation_token.is_null() {
+            String::new()
+        } else {
+            let token = line_text(env, truncation_token);
+            if token == nil {
+                String::new()
+            } else {
+                to_rust_string(env, token).into_owned()
+            }
+        };
+        let budget = (width as f32 - measure(&token_text)).max(0.0);
+        match truncation_type {
+            kCTLineTruncationStart => {
+                let tail = fitting_suffix(&measure, &text_str, budget);
+                format!("{token_text}{tail}")
+            }
+            kCTLineTruncationMiddle => {
+                let head = fitting_prefix(&measure, &text_str, budget / 2.0);
+                let rest = &text_str[head.len()..];
+                let tail = fitting_suffix(&measure, rest, budget / 2.0);
+                format!("{head}{token_text}{tail}")
+            }
+            _ => {
+                let head = fitting_prefix(&measure, &text_str, budget);
+                format!("{head}{token_text}")
+            }
+        }
+    };
+    let new_text = from_rust_string(env, new_text);
+    retain(env, font);
+    retain(env, attributes);
+    alloc_line(env, new_text, font, attributes)
 }
 
 fn line_text(env: &mut Environment, line: CTLineRef) -> id {
@@ -1492,7 +1646,9 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CTParagraphStyleGetValueForSpecifier(_, _, _, _)),
     export_c_func!(CTTypesetterCreateWithAttributedString(_)),
     export_c_func!(CTTypesetterCreateLine(_, _)),
+    export_c_func!(CTTypesetterSuggestClusterBreak(_, _, _)),
     export_c_func!(CTLineCreateWithAttributedString(_)),
+    export_c_func!(CTLineCreateTruncatedLine(_, _, _, _)),
     export_c_func!(CTLineGetTypographicBounds(_, _, _, _)),
     export_c_func!(CTLineGetImageBounds(_, _)),
     export_c_func!(CTLineDraw(_, _)),
@@ -1743,7 +1899,18 @@ pub const DYLIB: HostDylib = HostDylib {
 
 #[cfg(test)]
 mod tests {
-    use super::system_font_file;
+    use super::{cluster_break_count, system_font_file};
+
+    #[test]
+    fn cluster_break_measures_from_the_start_index() {
+        // One unit per character, so a width of 3 fits three characters.
+        let measure = |s: &str| s.chars().count() as f32;
+        assert_eq!(cluster_break_count("abcdef", 0, 3.0, &measure), 3);
+        // Measuring from the start of the string would return 0 here.
+        assert_eq!(cluster_break_count("abcdef", 3, 3.0, &measure), 3);
+        // Always at least one character, so a caller's loop makes progress.
+        assert_eq!(cluster_break_count("abcdef", 0, 0.5, &measure), 1);
+    }
 
     #[test]
     fn font_names_map_to_bundled_files() {
