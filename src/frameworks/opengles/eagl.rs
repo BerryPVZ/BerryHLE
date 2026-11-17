@@ -2692,6 +2692,9 @@ struct PresentObjects {
 /// guest alternating between renderbuffer sizes never redefines storage
 /// mid-frame. Both presenters rotate in 0..1 space and apply this scale
 /// afterwards, which keeps the rotation centred on the frame itself.
+///
+/// shortcut: the last half texel of the frame blends with the stale storage
+/// beside it, a sub-pixel seam at the frame edge; upgrade if one is visible.
 fn present_uv_scale(
     width: GLint,
     height: GLint,

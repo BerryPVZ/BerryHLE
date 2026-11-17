@@ -66,6 +66,8 @@ const ADAPTIVE_VSYNC_FAST_INTERVAL: Duration = Duration::from_millis(20);
 const ADAPTIVE_VSYNC_SLOW_SWAPS: u32 = 30;
 /// Consecutive fast swaps before display sync is restored.
 const ADAPTIVE_VSYNC_FAST_SWAPS: u32 = 120;
+/// A gap this long means the app was idle or paused, not that it is slow.
+const ADAPTIVE_VSYNC_PAUSE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Drops display sync while the app cannot keep up with it, and restores it
 /// once the app is comfortably fast again.
@@ -98,6 +100,13 @@ impl AdaptiveVsync {
     fn observe(&mut self, now: Instant) -> Option<bool> {
         let last = self.last_swap.replace(now)?;
         let elapsed = now.duration_since(last);
+        if elapsed >= ADAPTIVE_VSYNC_PAUSE_INTERVAL {
+            // The app was paused or idle; that says nothing about its frame
+            // rate, so start the measurement over instead of counting it.
+            self.slow_swaps = 0;
+            self.fast_swaps = 0;
+            return None;
+        }
         if elapsed >= ADAPTIVE_VSYNC_SLOW_INTERVAL {
             self.fast_swaps = 0;
             self.slow_swaps += 1;
@@ -192,6 +201,22 @@ mod adaptive_vsync_tests {
         let mut now = Instant::now();
         let mut vsync = AdaptiveVsync::new();
         assert_eq!(swap_n(&mut vsync, &mut now, 16, 1000), None);
+    }
+
+    #[test]
+    fn a_pause_does_not_count_as_a_slow_swap() {
+        let mut now = Instant::now();
+        let mut vsync = AdaptiveVsync::new();
+        assert_eq!(swap_n(&mut vsync, &mut now, 40, 1), None);
+        // A second-long gap (backgrounded app, loading screen).
+        now += Duration::from_secs(2);
+        assert_eq!(vsync.observe(now), None);
+        // The slow run restarts from zero, so it takes the full count again.
+        assert_eq!(
+            swap_n(&mut vsync, &mut now, 40, ADAPTIVE_VSYNC_SLOW_SWAPS - 1),
+            None
+        );
+        assert_eq!(swap_n(&mut vsync, &mut now, 40, 1), Some(false));
     }
 }
 
