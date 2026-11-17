@@ -14,6 +14,9 @@ use crate::Environment;
 
 pub type UIGestureRecognizerState = NSInteger;
 pub const UIGestureRecognizerStatePossible: UIGestureRecognizerState = 0;
+pub const UIGestureRecognizerStateBegan: UIGestureRecognizerState = 1;
+pub const UIGestureRecognizerStateChanged: UIGestureRecognizerState = 2;
+/// `UIGestureRecognizerStateRecognized` is `UIGestureRecognizerStateEnded`.
 pub const UIGestureRecognizerStateRecognized: UIGestureRecognizerState = 3;
 pub const UIGestureRecognizerStateFailed: UIGestureRecognizerState = 5;
 
@@ -501,7 +504,14 @@ pub(super) fn touches_ended(env: &mut Environment, view: id, touches: id) {
                 env.objc
                     .get_host_object(other)
                     .and_then(|host| host.as_any().downcast_ref::<UIGestureRecognizerHostObject>())
-                    .map(|host| matches!(host.state, 1 | 2 | 3))
+                    .map(|host| {
+                    matches!(
+                        host.state,
+                        UIGestureRecognizerStateBegan
+                            | UIGestureRecognizerStateChanged
+                            | UIGestureRecognizerStateRecognized
+                    )
+                })
                     .unwrap_or(false)
             })
         };
@@ -577,7 +587,7 @@ fn long_press_timer(env: &mut Environment, recognizer: id, timer: id) {
     // Delegate code may have detached or disabled the recognizer.
     let h = env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
     if !h.enabled || h.view == nil || !h.tracking { return; }
-    h.state = 1; // Began, while the finger is still down, not at release.
+    h.state = UIGestureRecognizerStateBegan; // While the finger is still down.
     h.completed_taps = 0;
     h.previous_tap = None;
     let cancel = h.cancels_touches_in_view;
@@ -639,11 +649,15 @@ fn long_press_touches_inner(env: &mut Environment, recognizer: id, touches: id, 
             h.previous_tap = Some((Instant::now(), h.current_location));
         }
         h.tracking = false;
-        h.state = if active { 3 } else { 5 };
+        h.state = if active {
+            UIGestureRecognizerStateRecognized
+        } else {
+            UIGestureRecognizerStateFailed
+        };
         stop_press_timer(env, recognizer);
         if active { send_action(env, recognizer); }
     } else if active && phase == 1 {
-        h.state = 2; // Changed
+        h.state = UIGestureRecognizerStateChanged;
         send_action(env, recognizer);
     } else if h.state == 0 && h.tracking && h.press_timer == nil && n == h.number_of_touches_required as usize
         && h.completed_taps == h.number_of_taps_required {
