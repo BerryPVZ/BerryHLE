@@ -58,10 +58,18 @@ fn swap_interval_for_mode(mode: VsyncMode, is_android: bool) -> Option<sdl2::vid
     }
 }
 
-/// A swap slower than this means the app is below 30 FPS.
-const ADAPTIVE_VSYNC_SLOW_INTERVAL: Duration = Duration::from_millis(33);
-/// A swap faster than this means the app is above 50 FPS.
-const ADAPTIVE_VSYNC_FAST_INTERVAL: Duration = Duration::from_millis(20);
+/// A swap slower than this means the app missed two display refreshes.
+///
+/// With display sync on, a swap returns on a refresh boundary, so the
+/// intervals are quantised to 16.7, 33.3, 50 ms and so on. A 30 FPS app
+/// (Unity's default `targetFrameRate` on mobile) already takes two refreshes
+/// (~33 ms at 60 Hz) and is perfectly smooth, so only a three-refresh cadence
+/// means the app cannot keep up.
+const ADAPTIVE_VSYNC_SLOW_INTERVAL: Duration = Duration::from_millis(45);
+/// A swap faster than this means the app can hold a two-refresh cadence, so
+/// display sync is worth restoring. A 30 FPS app swaps at ~33 ms when
+/// unsynced, so the threshold sits just above that.
+const ADAPTIVE_VSYNC_FAST_INTERVAL: Duration = Duration::from_millis(36);
 /// Consecutive slow swaps before display sync is dropped.
 const ADAPTIVE_VSYNC_SLOW_SWAPS: u32 = 30;
 /// Consecutive fast swaps before display sync is restored.
@@ -157,12 +165,12 @@ mod adaptive_vsync_tests {
         let mut now = Instant::now();
         let mut vsync = AdaptiveVsync::new();
         // The first swap only starts the measurement.
-        assert_eq!(swap_n(&mut vsync, &mut now, 40, 1), None);
+        assert_eq!(swap_n(&mut vsync, &mut now, 50, 1), None);
         assert_eq!(
-            swap_n(&mut vsync, &mut now, 40, ADAPTIVE_VSYNC_SLOW_SWAPS - 1),
+            swap_n(&mut vsync, &mut now, 50, ADAPTIVE_VSYNC_SLOW_SWAPS - 1),
             None
         );
-        assert_eq!(swap_n(&mut vsync, &mut now, 40, 1), Some(false));
+        assert_eq!(swap_n(&mut vsync, &mut now, 50, 1), Some(false));
     }
 
     #[test]
@@ -170,15 +178,15 @@ mod adaptive_vsync_tests {
         let mut now = Instant::now();
         let mut vsync = AdaptiveVsync::new();
         assert_eq!(
-            swap_n(&mut vsync, &mut now, 40, ADAPTIVE_VSYNC_SLOW_SWAPS),
+            swap_n(&mut vsync, &mut now, 50, ADAPTIVE_VSYNC_SLOW_SWAPS),
             None
         );
         assert_eq!(swap_n(&mut vsync, &mut now, 16, 1), None);
         assert_eq!(
-            swap_n(&mut vsync, &mut now, 40, ADAPTIVE_VSYNC_SLOW_SWAPS - 1),
+            swap_n(&mut vsync, &mut now, 50, ADAPTIVE_VSYNC_SLOW_SWAPS - 1),
             None
         );
-        assert_eq!(swap_n(&mut vsync, &mut now, 40, 1), Some(false));
+        assert_eq!(swap_n(&mut vsync, &mut now, 50, 1), Some(false));
     }
 
     #[test]
@@ -186,7 +194,7 @@ mod adaptive_vsync_tests {
         let mut now = Instant::now();
         let mut vsync = AdaptiveVsync::new();
         assert_eq!(
-            swap_n(&mut vsync, &mut now, 40, ADAPTIVE_VSYNC_SLOW_SWAPS + 1),
+            swap_n(&mut vsync, &mut now, 50, ADAPTIVE_VSYNC_SLOW_SWAPS + 1),
             Some(false)
         );
         assert_eq!(
@@ -204,19 +212,42 @@ mod adaptive_vsync_tests {
     }
 
     #[test]
+    fn a_thirty_hertz_cadence_keeps_sync() {
+        let mut now = Instant::now();
+        let mut vsync = AdaptiveVsync::new();
+        // Synced, a 30 FPS app swaps on every second refresh.
+        assert_eq!(swap_n(&mut vsync, &mut now, 33, 1000), None);
+    }
+
+    #[test]
+    fn a_thirty_hertz_cadence_restores_sync() {
+        let mut now = Instant::now();
+        let mut vsync = AdaptiveVsync::new();
+        assert_eq!(
+            swap_n(&mut vsync, &mut now, 50, ADAPTIVE_VSYNC_SLOW_SWAPS + 1),
+            Some(false)
+        );
+        // Unsynced, the same app runs at its own ~33 ms cadence.
+        assert_eq!(
+            swap_n(&mut vsync, &mut now, 33, ADAPTIVE_VSYNC_FAST_SWAPS),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn a_pause_does_not_count_as_a_slow_swap() {
         let mut now = Instant::now();
         let mut vsync = AdaptiveVsync::new();
-        assert_eq!(swap_n(&mut vsync, &mut now, 40, 1), None);
+        assert_eq!(swap_n(&mut vsync, &mut now, 50, 1), None);
         // A second-long gap (backgrounded app, loading screen).
         now += Duration::from_secs(2);
         assert_eq!(vsync.observe(now), None);
         // The slow run restarts from zero, so it takes the full count again.
         assert_eq!(
-            swap_n(&mut vsync, &mut now, 40, ADAPTIVE_VSYNC_SLOW_SWAPS - 1),
+            swap_n(&mut vsync, &mut now, 50, ADAPTIVE_VSYNC_SLOW_SWAPS - 1),
             None
         );
-        assert_eq!(swap_n(&mut vsync, &mut now, 40, 1), Some(false));
+        assert_eq!(swap_n(&mut vsync, &mut now, 50, 1), Some(false));
     }
 }
 
