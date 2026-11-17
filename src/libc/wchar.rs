@@ -527,9 +527,9 @@ fn wide_numeric_ascii(env: &Environment, s: ConstPtr<wchar_t>) -> Vec<u8> {
     }
 }
 
-/// The largest magnitude a conversion of `bits` bits may produce, which is
-/// also the value C returns on overflow (LLONG_MIN for a negative signed
-/// overflow, LLONG_MAX/ULLONG_MAX otherwise).
+/// The magnitude limit for a conversion of `bits` bits: the type's minimum
+/// for a negative signed value, its maximum otherwise. C returns this on
+/// overflow.
 fn integer_limit(signed: bool, negative: bool, bits: u32) -> u64 {
     if signed {
         if negative {
@@ -981,6 +981,11 @@ mod tests {
         let scanned = scan_integer(b"18446744073709551615", 10, false, 64);
         assert_eq!(scanned.magnitude, u64::MAX);
         assert!(!scanned.overflow);
+
+        // LLONG_MIN is a legal value, only one digit beyond it overflows.
+        let scanned = scan_integer(b"-9223372036854775808", 10, true, 64);
+        assert!(!scanned.overflow);
+        assert_eq!(scanned.magnitude.wrapping_neg() as i64, i64::MIN);
     }
 
     #[test]

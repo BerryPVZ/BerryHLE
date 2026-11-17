@@ -340,6 +340,20 @@ mod tests {
     }
 
     #[test]
+    fn wide_integer_conversions_are_exported() {
+        for function_name in ["_wcstol", "_wcstoul", "_wcstoll", "_wcstoull"] {
+            let is_exported = DYLIB_LIST
+                .iter()
+                .flat_map(|dylib| dylib.function_exports)
+                .copied()
+                .flatten()
+                .any(|(name, _)| *name == function_name);
+
+            assert!(is_exported, "Missing libc export {function_name}");
+        }
+    }
+
+    #[test]
     fn exp10_double_is_exported() {
         let is_exported = DYLIB_LIST
             .iter()
