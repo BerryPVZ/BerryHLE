@@ -51,6 +51,11 @@ fn is_valid_properties(env: &mut Environment, properties: id) -> bool {
     if properties == nil {
         return false;
     }
+    let dictionary_class: crate::objc::Class =
+        msg_class![env; NSDictionary class];
+    if !msg![env; properties isKindOfClass:dictionary_class] {
+        return false;
+    }
     let string_class: crate::objc::Class = msg_class![env; NSString class];
     for key in REQUIRED_KEYS {
         let value = property(env, properties, key);
@@ -96,9 +101,6 @@ pub const CLASSES: crate::objc::ClassExports = objc_classes! {
 }
 
 + (id)cookieWithProperties:(id)properties {
-    if !is_valid_properties(env, properties) {
-        return nil;
-    }
     let cookie: id = msg![env; this alloc];
     let cookie: id = msg![env; cookie initWithProperties:properties];
     autorelease(env, cookie)
