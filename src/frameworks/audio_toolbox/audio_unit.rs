@@ -6,6 +6,7 @@
  */
 //! `AudioUnit.h` (Audio Unit Services)
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use crate::audio::openal::al_types::{ALsizei, ALuint, ALvoid};
@@ -2089,6 +2090,9 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
 // before an audible underrun. The throttle below still drains and re-syncs
 // if we ever run ahead of playback.
 const AUDIO_RENDER_TARGET_DEPTH: i32 = 6;
+/// Pumped ticks that found the queue empty, so the log reports the first one
+/// and then every hundredth instead of on every frame.
+static AUDIO_UNDERRUNS: AtomicU32 = AtomicU32::new(0);
 
 /// `kAudioUnitRenderAction_PreRender` / `PostRender` flags passed to render
 /// notify callbacks (see AUComponent.h).
@@ -2341,6 +2345,21 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
     // (~140ms) rides out hitches at the cost of imperceptible extra latency;
     // the throttle below still reclaims buffers and re-syncs if we run ahead.
     let remaining_buffers = queued_buffers.saturating_sub(processed_buffers);
+    if remaining_buffers == 0 {
+        // Nothing was left to play, so the sound had already stopped: the
+        // app's frame took longer than the audio queued ahead of it. Report
+        // it so "the sound cuts out when the frame rate drops" can be told
+        // apart from a mixing bug, and so the size of the gap is known.
+        let underruns = AUDIO_UNDERRUNS.fetch_add(1, Ordering::Relaxed) + 1;
+        if underruns == 1 || underruns % 100 == 0 {
+            log!(
+                "Audio underrun #{}: the OpenAL queue was empty when the run \
+                 loop pumped it, {} ms since the previous pump.",
+                underruns,
+                now.duration_since(last_render_time).as_millis()
+            );
+        }
+    }
     if remaining_buffers > AUDIO_RENDER_TARGET_DEPTH {
         let mut drained_buffers = Vec::new();
         {
