@@ -144,6 +144,15 @@ pub(super) fn has_active_video(env: &mut Environment) -> bool {
     !State::get(env).videos.is_empty()
 }
 
+/// Stops the movie view from being the last thing composited. The fullscreen
+/// EAGL fast path never redraws the window, so the frame left by
+/// `present_video_frames` would stay on screen until the app presents new GL.
+fn request_recomposite_if_no_video(env: &mut Environment) {
+    if !has_active_video(env) {
+        crate::frameworks::core_animation::request_recomposite(env);
+    }
+}
+
 type MPMovieScalingMode = NSInteger;
 const MPMovieScalingModeNone: MPMovieScalingMode = 0;
 const MPMovieScalingModeAspectFit: MPMovieScalingMode = 1;
@@ -1487,6 +1496,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if !use_movie_player_fix {
         dismiss_unparented_movie_view(env, this);
     }
+    request_recomposite_if_no_video(env);
     if env
         .framework_state
         .media_player
@@ -2012,6 +2022,7 @@ pub(super) fn handle_players(env: &mut Environment) {
             if !use_movie_player_fix {
                 dismiss_unparented_movie_view(env, player);
             }
+            request_recomposite_if_no_video(env);
         }
 
         if matches!(notif, PendingNotification::PlaybackStateChange(_)) {

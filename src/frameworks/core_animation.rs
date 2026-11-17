@@ -24,7 +24,7 @@ mod animation;
 mod composition;
 pub mod view_transition;
 
-pub use composition::recomposite_if_necessary;
+pub use composition::{recomposite_if_necessary, request_recomposite};
 
 use crate::abi::{impl_GuestRet_for_large_struct, GuestArg};
 use crate::dyld::{export_c_func, FunctionExports};

@@ -35,6 +35,9 @@ pub(super) struct State {
     /// makes the compositor sample undefined texels (often a black screen).
     texture_framebuffer: Option<(GLuint, GLuint, u32, u32)>,
     recomposite_next: Option<Instant>,
+    /// Set by `request_recomposite`; consumed by the next
+    /// `recomposite_if_necessary` call, which then composites unconditionally.
+    recomposite_pending: bool,
     fps_counter: Option<FpsCounter>,
     misc_gl_objects: Option<MiscGlObjects>,
     /// Offscreen `(texture, framebuffer, width, height)` targets used to
@@ -65,6 +68,18 @@ unsafe fn load_matrix(gles: &mut dyn GLES, matrix: Matrix<4>) {
     gles.LoadMatrixf(matrix.columns().as_ptr() as *const _);
 }
 
+/// Ask the next `recomposite_if_necessary` call to composite even if the
+/// fullscreen EAGL layer is being presented directly. Call this after removing
+/// a UIKit overlay (e.g. a movie view): the fast path does not redraw the
+/// window, so the removed view would otherwise stay on screen until the app
+/// presents another GL frame.
+pub fn request_recomposite(env: &mut Environment) {
+    env.framework_state
+        .core_animation
+        .composition
+        .recomposite_pending = true;
+}
+
 /// For use by `NSRunLoop`: call this 60 times per second. Composites the app's
 /// visible layers (i.e. UI) and presents it to the screen. Does nothing if
 /// composition isn't in use or it's too soon (the latter check is skipped if
@@ -73,6 +88,17 @@ unsafe fn load_matrix(gles: &mut dyn GLES, matrix: Matrix<4>) {
 /// Returns the time a recomposite is due, if any.
 pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<Instant> {
     super::view_transition::expire(env);
+    // A UIKit overlay that was removed (see `request_recomposite`) must be
+    // painted out of the window even while the fullscreen EAGL layer is being
+    // presented directly, because the fast path never redraws the window.
+    let force = force
+        || std::mem::take(
+            &mut env
+                .framework_state
+                .core_animation
+                .composition
+                .recomposite_pending,
+        );
     // Compositing requires a window/render target. In headless mode there is
     // none, so there is nothing to composite; skip rather than touching the
     // absent window further down.
