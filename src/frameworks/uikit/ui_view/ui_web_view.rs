@@ -15,8 +15,8 @@ use crate::frameworks::foundation::NSUInteger;
 use crate::frameworks::uikit::ui_view::UIViewHostObject;
 use crate::image::Image;
 use crate::objc::{
-    id, impl_HostObject_with_superclass, msg, msg_class, msg_super, nil, objc_classes, release,
-    retain, Class, ClassExports, NSZonePtr,
+    autorelease, id, impl_HostObject_with_superclass, msg, msg_class, msg_super, nil,
+    objc_classes, release, retain, Class, ClassExports, NSZonePtr,
 };
 use crate::Environment;
 use std::path::PathBuf;
@@ -338,12 +338,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         String::new()
     };
     log_dbg!("UIWebView loadHTMLString: ({} chars)", html_str.len());
-    let request: id = if _base_url != nil {
-        msg_class![env; NSURLRequest requestWithURL:_base_url]
-    } else {
-        nil
-    };
-    if !delegate_should_start_load(env, this, request, UIWebViewNavigationTypeOther) {
+    if !delegate_allows_base_url(env, this, _base_url) {
         log!("UIWebView: delegate refused to load an HTML string");
         return;
     }
@@ -392,12 +387,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         String::new()
     };
     log_dbg!("UIWebView loadData:MIMEType:{}", mime_str);
-    let request: id = if _base_url != nil {
-        msg_class![env; NSURLRequest requestWithURL:_base_url]
-    } else {
-        nil
-    };
-    if !delegate_should_start_load(env, this, request, UIWebViewNavigationTypeOther) {
+    if !delegate_allows_base_url(env, this, _base_url) {
         log!("UIWebView: delegate refused to load data");
         return;
     }
@@ -1455,19 +1445,29 @@ fn web_view_user_agent(env: &mut Environment) -> String {
     } else {
         "iPhone".to_string()
     };
-    let (major, minor, _patch) = env
+    let version = env
         .options
         .as_ref()
         .ios_version
         .unwrap_or(crate::options::LATEST_IOS_VERSION);
+    user_agent_string(&model, version)
+}
+
+fn user_agent_string(model: &str, (major, minor, patch): (i32, i32, i32)) -> String {
     let cpu = if model.starts_with("iPad") {
-        format!("CPU OS {major}_{minor}")
+        "CPU OS"
     } else {
-        format!("CPU iPhone OS {major}_{minor}")
+        "CPU iPhone OS"
+    };
+    // iOS 6.1.6 reports `6_1_6`, but a .0 release drops the patch (`12_0`).
+    let version = if patch == 0 {
+        format!("{major}_{minor}")
+    } else {
+        format!("{major}_{minor}_{patch}")
     };
     let (webkit, mobile) = webkit_tokens(major.max(0) as u32);
     format!(
-        "Mozilla/5.0 ({model}; {cpu} like Mac OS X) \
+        "Mozilla/5.0 ({model}; {cpu} {version} like Mac OS X) \
          AppleWebKit/{webkit} (KHTML, like Gecko) Mobile/{mobile}"
     )
 }
@@ -1488,18 +1488,32 @@ fn request_with_user_agent(env: &mut Environment, request: id) -> id {
         return request;
     }
     let field = ns_string::from_rust_string(env, "User-Agent".to_string());
+    let field = autorelease(env, field);
     let existing: id = msg![env; request valueForHTTPHeaderField:field];
     if existing != nil {
         return request;
     }
     let user_agent_str = web_view_user_agent(env);
     let user_agent = ns_string::from_rust_string(env, user_agent_str);
+    let user_agent = autorelease(env, user_agent);
     let copy: id = msg![env; request mutableCopy];
     if copy == nil {
         return request;
     }
     let _: () = msg![env; copy setValue:user_agent forHTTPHeaderField:field];
-    crate::objc::autorelease(env, copy)
+    autorelease(env, copy)
+}
+
+/// Ask the delegate before `loadHTMLString:baseURL:` or
+/// `loadData:MIMEType:textEncodingName:baseURL:`, which hand it a request for
+/// the base URL.
+fn delegate_allows_base_url(env: &mut Environment, this: id, base_url: id) -> bool {
+    let request: id = if base_url != nil {
+        msg_class![env; NSURLRequest requestWithURL:base_url]
+    } else {
+        nil
+    };
+    delegate_should_start_load(env, this, request, UIWebViewNavigationTypeOther)
 }
 
 /// Ask the delegate whether a navigation may start, as UIWebView does before
@@ -1625,8 +1639,8 @@ fn unwrap_js_result(result: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        has_webview_extent, network_access_allows_url, url_has_no_host, webview_event_action,
-        webkit_tokens, WebViewEventAction,
+        has_webview_extent, network_access_allows_url, url_has_no_host, user_agent_string,
+        webview_event_action, webkit_tokens, WebViewEventAction,
     };
     use crate::android_web_view::WebViewEventType;
 
@@ -1740,5 +1754,20 @@ mod tests {
         assert_eq!(webkit_tokens(12), ("605.1.15", "16A366"));
         // Newer than the newest table entry: keep the newest tokens.
         assert_eq!(webkit_tokens(99), ("605.1.15", "16A366"));
+    }
+
+    #[test]
+    fn user_agent_string_uses_the_device_and_version() {
+        assert_eq!(
+            user_agent_string("iPod touch", (6, 1, 6)),
+            "Mozilla/5.0 (iPod touch; CPU iPhone OS 6_1_6 like Mac OS X) \
+             AppleWebKit/536.26 (KHTML, like Gecko) Mobile/10B500"
+        );
+        // A .0 release has no patch component.
+        assert_eq!(
+            user_agent_string("iPad", (12, 0, 0)),
+            "Mozilla/5.0 (iPad; CPU OS 12_0 like Mac OS X) \
+             AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/16A366"
+        );
     }
 }
