@@ -44,6 +44,7 @@ target/
 *.ipa
 touchHLE_pvrtc_cache/
 app_scan_cache.json
+image_cache/
 
 # iOS build (platform/ios)
 /dist
