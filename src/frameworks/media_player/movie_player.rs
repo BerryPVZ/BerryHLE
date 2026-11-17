@@ -144,9 +144,9 @@ pub(super) fn has_active_video(env: &mut Environment) -> bool {
     !State::get(env).videos.is_empty()
 }
 
-/// Stops the movie view from being the last thing composited. The fullscreen
-/// EAGL fast path never redraws the window, so the frame left by
-/// `present_video_frames` would stay on screen until the app presents new GL.
+/// Asks for one composite once no movie is playing, so the frame the movie
+/// view left on screen is painted out. The fullscreen EAGL fast path never
+/// redraws the window, so without this it stays until the app presents GL.
 fn request_recomposite_if_no_video(env: &mut Environment) {
     if !has_active_video(env) {
         crate::frameworks::core_animation::request_recomposite(env);
@@ -1108,6 +1108,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         enqueue(env, PendingNotification::PlaybackStateChange(this), Instant::now());
     }
 
+    request_recomposite_if_no_video(env);
     schedule_preload_sequence(env, this);
 }
 
@@ -1123,6 +1124,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         dismiss_unparented_movie_view(env, this);
     }
     remove_movie_background_view(env, this);
+    request_recomposite_if_no_video(env);
 
     // No need to drain pending notifications: each pending entry holds a
     // +1 retain on the player, so dealloc can only run once all queued
