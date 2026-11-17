@@ -527,26 +527,39 @@ fn wide_numeric_ascii(env: &Environment, s: ConstPtr<wchar_t>) -> Vec<u8> {
     }
 }
 
+/// The largest magnitude a conversion of `bits` bits may produce, which is
+/// also the value C returns on overflow (LLONG_MIN for a negative signed
+/// overflow, LLONG_MAX/ULLONG_MAX otherwise).
+fn integer_limit(signed: bool, negative: bool, bits: u32) -> u64 {
+    if signed {
+        if negative {
+            1 << (bits - 1)
+        } else {
+            (1 << (bits - 1)) - 1
+        }
+    } else if bits == 64 {
+        u64::MAX
+    } else {
+        (1 << bits) - 1
+    }
+}
+
+/// A C integer prefix scanned out of ASCII bytes.
+struct ScannedInteger {
+    /// Magnitude of the digits, before applying the sign.
+    magnitude: u64,
+    /// Byte offset just past the last digit.
+    consumed: usize,
+    /// Whether at least one digit was consumed.
+    any_digits: bool,
+    /// Whether the magnitude exceeded the type's range.
+    overflow: bool,
+    negative: bool,
+}
+
 /// Unlike Rust's whole-string `parse`, C conversions consume a numeric
-/// prefix and leave the next configuration field untouched. Darwin long is
-/// 32 bits even when the host's long is 64 bits.
-/// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/wcstol.3.html
-fn wide_integer_prefix(
-    env: &mut Environment,
-    s: ConstPtr<wchar_t>,
-    endptr: MutPtr<MutPtr<wchar_t>>,
-    mut base: i32,
-    signed: bool,
-) -> u32 {
-    use super::errno::{set_errno, EINVAL, ERANGE};
-    if !endptr.is_null() {
-        env.mem.write(endptr, s.cast_mut());
-    }
-    if base != 0 && !(2..=36).contains(&base) {
-        set_errno(env, EINVAL);
-        return 0;
-    }
-    let bytes = wide_numeric_ascii(env, s);
+/// prefix and leave the next configuration field untouched.
+fn scan_integer(bytes: &[u8], mut base: i32, signed: bool, bits: u32) -> ScannedInteger {
     let mut at = 0;
     while bytes.get(at).is_some_and(|b| matches!(*b, 9..=13 | 32)) {
         at += 1;
@@ -567,35 +580,65 @@ fn wide_integer_prefix(
         base = if bytes.get(at) == Some(&b'0') { 8 } else { 10 };
     }
     let first_digit = at;
-    let limit = if signed {
-        if negative { 0x8000_0000 } else { 0x7fff_ffff }
-    } else {
-        u32::MAX
-    };
-    let mut magnitude = 0u32;
+    let limit = integer_limit(signed, negative, bits);
+    let mut magnitude = 0u64;
     let mut overflow = false;
     while let Some(value) = bytes.get(at).and_then(|b| digit(*b)) {
         if value >= base as u32 {
             break;
         }
-        if magnitude > (limit - value) / base as u32 {
+        if magnitude > (limit - value as u64) / base as u64 {
             overflow = true;
         } else if !overflow {
-            magnitude = magnitude * base as u32 + value;
+            magnitude = magnitude * base as u64 + value as u64;
         }
         at += 1;
     }
-    if at == first_digit {
+    ScannedInteger {
+        magnitude,
+        consumed: at,
+        any_digits: at != first_digit,
+        overflow,
+        negative,
+    }
+}
+
+/// Darwin long is 32 bits even when the host's long is 64 bits, so the
+/// caller picks the width.
+/// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/wcstol.3.html
+fn wide_integer_prefix(
+    env: &mut Environment,
+    s: ConstPtr<wchar_t>,
+    endptr: MutPtr<MutPtr<wchar_t>>,
+    base: i32,
+    signed: bool,
+    bits: u32,
+) -> u64 {
+    use super::errno::{set_errno, EINVAL, ERANGE};
+    if !endptr.is_null() {
+        env.mem.write(endptr, s.cast_mut());
+    }
+    if base != 0 && !(2..=36).contains(&base) {
+        set_errno(env, EINVAL);
+        return 0;
+    }
+    let bytes = wide_numeric_ascii(env, s);
+    let scanned = scan_integer(&bytes, base, signed, bits);
+    if !scanned.any_digits {
         return 0;
     }
     if !endptr.is_null() {
-        env.mem.write(endptr, (s + at as GuestUSize).cast_mut());
+        env.mem.write(endptr, (s + scanned.consumed as GuestUSize).cast_mut());
     }
-    if overflow {
+    if scanned.overflow {
         set_errno(env, ERANGE);
-        return if signed && negative { 0x8000_0000 } else { limit };
+        return integer_limit(signed, scanned.negative, bits);
     }
-    if negative { magnitude.wrapping_neg() } else { magnitude }
+    if scanned.negative {
+        scanned.magnitude.wrapping_neg()
+    } else {
+        scanned.magnitude
+    }
 }
 
 /// wcstol — wide string to Darwin's 32-bit long.
@@ -605,7 +648,7 @@ fn wcstol(
     endptr: MutPtr<MutPtr<wchar_t>>,
     base: i32,
 ) -> i32 {
-    wide_integer_prefix(env, s, endptr, base, true) as i32
+    wide_integer_prefix(env, s, endptr, base, true, 32) as i32
 }
 
 /// wcstoul — wide string to unsigned long.
@@ -615,7 +658,27 @@ fn wcstoul(
     endptr: MutPtr<MutPtr<wchar_t>>,
     base: i32,
 ) -> u32 {
-    wide_integer_prefix(env, s, endptr, base, false)
+    wide_integer_prefix(env, s, endptr, base, false, 32) as u32
+}
+
+/// wcstoll — wide string to long long.
+fn wcstoll(
+    env: &mut Environment,
+    s: ConstPtr<wchar_t>,
+    endptr: MutPtr<MutPtr<wchar_t>>,
+    base: i32,
+) -> i64 {
+    wide_integer_prefix(env, s, endptr, base, true, 64) as i64
+}
+
+/// wcstoull — wide string to unsigned long long.
+fn wcstoull(
+    env: &mut Environment,
+    s: ConstPtr<wchar_t>,
+    endptr: MutPtr<MutPtr<wchar_t>>,
+    base: i32,
+) -> u64 {
+    wide_integer_prefix(env, s, endptr, base, false, 64)
 }
 
 /// Use the host C99 converter for decimal/hex floats, infinity and NaN, and
@@ -874,6 +937,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(wcstombs(_, _, _)),
     export_c_func!(wcstol(_, _, _)),
     export_c_func!(wcstoul(_, _, _)),
+    export_c_func!(wcstoll(_, _, _)),
+    export_c_func!(wcstoull(_, _, _)),
     export_c_func!(wcstod(_, _)),
     export_c_func!(wcstof(_, _)),
     // Classification
@@ -898,3 +963,41 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(mbsrtowcs(_, _, _, _)),
     export_c_func!(mbsrtowcs_l(_, _, _, _, _)),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::{integer_limit, scan_integer};
+
+    #[test]
+    fn scans_64_bit_integers_past_the_32_bit_range() {
+        let scanned = scan_integer(b"9223372036854775807", 10, true, 64);
+        assert_eq!(scanned.magnitude, i64::MAX as u64);
+        assert!(!scanned.overflow);
+        assert_eq!(scanned.consumed, 19);
+
+        let scanned = scan_integer(b"9223372036854775808", 10, true, 64);
+        assert!(scanned.overflow);
+
+        let scanned = scan_integer(b"18446744073709551615", 10, false, 64);
+        assert_eq!(scanned.magnitude, u64::MAX);
+        assert!(!scanned.overflow);
+    }
+
+    #[test]
+    fn keeps_32_bit_limits_for_long() {
+        let scanned = scan_integer(b"2147483648", 10, true, 32);
+        assert!(scanned.overflow);
+        assert_eq!(integer_limit(true, false, 32), i32::MAX as u64);
+        assert_eq!(integer_limit(true, true, 32), 0x8000_0000);
+        assert_eq!(integer_limit(false, false, 32), u32::MAX as u64);
+    }
+
+    #[test]
+    fn stops_at_the_first_non_digit() {
+        let scanned = scan_integer(b"  -0x1fzz", 0, true, 64);
+        assert_eq!(scanned.magnitude, 0x1f);
+        assert_eq!(scanned.consumed, 7);
+        assert!(scanned.negative);
+        assert!(scanned.any_digits);
+    }
+}
