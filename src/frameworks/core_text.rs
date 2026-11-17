@@ -73,11 +73,12 @@ pub type CTTypesetterRef = crate::objc::id;
 /// Opaque CoreText line reference.
 pub type CTLineRef = crate::objc::id;
 
-/// `CTLineTruncationType`, from `CTLine.h`.
+/// `CTLineTruncationType`, from `CTLine.h`: Start 0, End 1, Middle 2.
+/// <https://developer.apple.com/documentation/coretext/ctlinetruncationtype>
 pub type CTLineTruncationType = u32;
 pub const kCTLineTruncationStart: CTLineTruncationType = 0;
-pub const kCTLineTruncationMiddle: CTLineTruncationType = 1;
-pub const kCTLineTruncationEnd: CTLineTruncationType = 2;
+pub const kCTLineTruncationEnd: CTLineTruncationType = 1;
+pub const kCTLineTruncationMiddle: CTLineTruncationType = 2;
 
 /// Opaque CoreText run reference.
 pub type CTRunRef = crate::objc::id;
@@ -802,7 +803,13 @@ fn CTLineCreateTruncatedLine(
                 to_rust_string(env, token).into_owned()
             }
         };
-        let budget = (width as f32 - measure(&token_text)).max(0.0);
+        // Apple: "If the width of the line specified in truncationToken is
+        // greater, this function will return NULL if truncation is needed."
+        let token_width = measure(&token_text);
+        if token_width > width as f32 {
+            return nil;
+        }
+        let budget = width as f32 - token_width;
         match truncation_type {
             kCTLineTruncationStart => {
                 let tail = fitting_suffix(&measure, &text_str, budget);
@@ -814,10 +821,11 @@ fn CTLineCreateTruncatedLine(
                 let tail = fitting_suffix(&measure, rest, budget / 2.0);
                 format!("{head}{token_text}{tail}")
             }
-            _ => {
+            kCTLineTruncationEnd => {
                 let head = fitting_prefix(&measure, &text_str, budget);
                 format!("{head}{token_text}")
             }
+            _ => return nil,
         }
     };
     let new_text = from_rust_string(env, new_text);
@@ -1899,7 +1907,18 @@ pub const DYLIB: HostDylib = HostDylib {
 
 #[cfg(test)]
 mod tests {
+    use super::kCTLineTruncationEnd;
+    use super::kCTLineTruncationMiddle;
+    use super::kCTLineTruncationStart;
     use super::{cluster_break_count, system_font_file};
+
+    // CTLine.h: Start = 0, End = 1, Middle = 2.
+    #[test]
+    fn truncation_types_match_ctline_h() {
+        assert_eq!(kCTLineTruncationStart, 0);
+        assert_eq!(kCTLineTruncationEnd, 1);
+        assert_eq!(kCTLineTruncationMiddle, 2);
+    }
 
     #[test]
     fn cluster_break_measures_from_the_start_index() {
