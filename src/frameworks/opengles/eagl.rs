@@ -4021,9 +4021,32 @@ unsafe fn present_renderbuffer(
                 while gles.GetError() != 0 {}
                 v
             };
+            // ES 1.1 spells these `GL_BLEND_SRC`/`GL_BLEND_DST`, but ES 2.0
+            // (and ANGLE's ES 1.1 front end) only accept the per-channel
+            // `GL_BLEND_SRC_RGB`/`GL_BLEND_DST_RGB`, so try both spellings.
+            // Querying only the ES 1.1 names made every log show
+            // `src=0x0000 dst=0x0000`, which reads like a broken blend setup.
+            let qi_fallback = |gles: &mut dyn GLES, names: &[GLenum]| -> GLint {
+                for &name in names {
+                    while gles.GetError() != 0 {}
+                    let mut v: GLint = 0;
+                    gles.GetIntegerv(name, &mut v);
+                    if gles.GetError() == 0 {
+                        return v;
+                    }
+                }
+                0
+            };
             let blend_on = qb(gles, gles11::BLEND);
-            let blend_src = qi(gles, gles11::BLEND_SRC) as u32;
-            let blend_dst = qi(gles, gles11::BLEND_DST) as u32;
+            let blend_src =
+                qi_fallback(gles, &[gles11::BLEND_SRC, 0x80C9]) as u32;
+            let blend_dst =
+                qi_fallback(gles, &[gles11::BLEND_DST, 0x80C8]) as u32;
+            let color_mask = get_ints::<4>(gles, gles11::COLOR_WRITEMASK);
+            let scissor_on = qb(gles, gles11::SCISSOR_TEST);
+            let scissor_box = get_ints::<4>(gles, gles11::SCISSOR_BOX);
+            let depth_func = qi(gles, 0x0B74 /* GL_DEPTH_FUNC */);
+            let depth_mask = qb(gles, 0x0B72 /* GL_DEPTH_WRITEMASK */);
             let depth_on = qb(gles, gles11::DEPTH_TEST);
             let alpha_on = qb(gles, gles11::ALPHA_TEST);
             let cull_on = qb(gles, gles11::CULL_FACE);
@@ -4045,6 +4068,8 @@ unsafe fn present_renderbuffer(
                  BLEND={} (src=0x{:04x} dst=0x{:04x}) DEPTH_TEST={} ALPHA_TEST={} \
                  CULL_FACE={} TEXTURE_2D={} \
                  vertex_arr={} color_arr={} texcoord_arr={} \
+                 color_mask=({},{},{},{}) scissor={} box=({},{},{},{}) \
+                 depth_func=0x{:04x} depth_mask={} \
                  clear_color=({:.3},{:.3},{:.3},{:.3}) current_color=({:.3},{:.3},{:.3},{:.3})",
                 count,
                 used_app_fbo,
@@ -4085,6 +4110,17 @@ unsafe fn present_renderbuffer(
                 varr_on,
                 carr_on,
                 tarr_on,
+                color_mask[0],
+                color_mask[1],
+                color_mask[2],
+                color_mask[3],
+                scissor_on,
+                scissor_box[0],
+                scissor_box[1],
+                scissor_box[2],
+                scissor_box[3],
+                depth_func,
+                depth_mask,
                 clear_color[0],
                 clear_color[1],
                 clear_color[2],
