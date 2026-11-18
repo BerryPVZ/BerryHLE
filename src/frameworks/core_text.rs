@@ -662,10 +662,10 @@ fn CTFontGetLeading(env: &mut Environment, font: CTFontRef) -> CGFloat {
 
 /// `uint32_t CTGetCoreTextVersion(void)`
 ///
-/// Encodes the CoreText feature level using the `kCTVersionNumber*`
-/// constants from `CTBase.h`. iOS 4.3's CoreText corresponds to the
-/// 10.6-level API (0x00030000), which is what apps compare against when
-/// deciding whether e.g. framesetter APIs are present.
+/// Reports the `kCTVersionNumber*` level from `CTBase.h` of the CoreText this
+/// implementation models: 0x00030000 covers the framesetter/line APIs above,
+/// and apps compare against the constants to gate newer ones. This is a fixed
+/// value because the emulated iOS version does not change the implemented API.
 /// <https://developer.apple.com/documentation/coretext/1499498-ctgetcoretextversion>
 fn CTGetCoreTextVersion(_env: &mut Environment) -> u32 {
     0x0003_0000 // kCTVersionNumber10_6
