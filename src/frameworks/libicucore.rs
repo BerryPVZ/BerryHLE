@@ -377,6 +377,9 @@ pub fn uregex_appendTail(
     } else {
         capacity
     };
+    // shortcut: ICU reallocs a caller buffer that is too small; this truncates
+    // and reports U_BUFFER_OVERFLOW_ERROR instead. Upgrade if an app reuses a
+    // fixed-size tail buffer and expects it to grow.
     // Keep one slot for the NUL terminator when the caller's buffer is too
     // small.
     let writable = if buffer_capacity >= required + 1 {
