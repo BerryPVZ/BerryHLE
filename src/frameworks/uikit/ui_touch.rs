@@ -38,7 +38,7 @@ static TOUCH_ENDED_DIAGNOSTICS: AtomicUsize = AtomicUsize::new(0);
 /// gestures that moved at least [SWIPE_REPORT_POINTS]. Taps do not consume
 /// the budget, so a report of "the scroll does not follow my finger" gets its
 /// drags logged even on Android, where the environment cannot be set.
-static TOUCH_SWIPE_DIAGNOSTICS: AtomicUsize = AtomicUsize::new(0);
+const SWIPE_REPORTS_PER_LAUNCH: usize = 12;
 const SWIPE_REPORT_POINTS: f64 = 20.0;
 
 fn log_touch_delivery(marker: &str, counter: &AtomicUsize, count: usize) {
@@ -73,10 +73,11 @@ fn log_swipe_summary(env: &mut Environment, touch: id, view: id) {
     if dx.hypot(dy) < SWIPE_REPORT_POINTS {
         return;
     }
-    let sequence = TOUCH_SWIPE_DIAGNOSTICS.fetch_add(1, Ordering::Relaxed) + 1;
-    if sequence > 12 {
+    let sequence = env.framework_state.uikit.ui_touch.swipe_diagnostics + 1;
+    if sequence > SWIPE_REPORTS_PER_LAUNCH {
         return;
     }
+    env.framework_state.uikit.ui_touch.swipe_diagnostics = sequence;
     let view_class = if view == nil {
         "(nil)".to_owned()
     } else {
@@ -116,6 +117,9 @@ pub const UITouchTypeDirect: UITouchType = 0;
 pub struct State {
     pub current_touches: HashMap<FingerId, id>,
     cancelled_by_gesture: HashSet<id>,
+    /// Drags already reported by [log_swipe_summary]. Per app launch, so
+    /// scrolling the app picker does not use up the budget.
+    swipe_diagnostics: usize,
 }
 
 /// Cancel view delivery once a recognizer begins, while continuing to feed
