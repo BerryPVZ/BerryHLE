@@ -439,12 +439,39 @@ fn objc_msgSend_inner(
                 sel_name
             );
         }
-        log!(
-            "Warning: objc_msgSend recursion limit ({}) exceeded while dispatching \"{}\" to {:?}; bailing out with a nil return.",
-            MAX_DEPTH,
-            sel_name,
-            receiver,
-        );
+        // Rate-limit: a guest loop that retries after the nil return can hit
+        // this guard millions of times (Blockheads' worldWidthMacro filled
+        // 2 GB of log); log the first few with the class name, then stop.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static RECURSION_COUNT: AtomicUsize = AtomicUsize::new(0);
+        const RECURSION_LOG_LIMIT: usize = 8;
+        let count = RECURSION_COUNT.fetch_add(1, Ordering::Relaxed);
+        if count < RECURSION_LOG_LIMIT {
+            let class = ObjC::read_isa(receiver, &env.mem);
+            let class_name = env
+                .objc
+                .try_get_class_name(class)
+                .unwrap_or("<unknown>")
+                .to_owned();
+            log!(
+                "Warning: objc_msgSend recursion limit ({}) exceeded while \
+                 dispatching \"{}\" to {:?} (class \"{}\", depth {}); bailing \
+                 out with a nil return. [{}/{}]",
+                MAX_DEPTH,
+                sel_name,
+                receiver,
+                class_name,
+                depth,
+                count + 1,
+                RECURSION_LOG_LIMIT,
+            );
+        } else if count == RECURSION_LOG_LIMIT {
+            log!(
+                "Warning: suppressing further objc_msgSend recursion warnings \
+                 ({} already logged).",
+                RECURSION_LOG_LIMIT,
+            );
+        }
         // Special handling for allocWithZone: — if recursion is hit during
         // allocation, perform the allocation directly using NSObject's
         // fallback path rather than returning nil (which causes cascading
