@@ -42,6 +42,50 @@ fn set_range(host: &mut NSIndexSetHostObject, location: NSUInteger, length: NSUI
     }
 }
 
+/// Adds one index, keeping the list sorted and de-duplicated.
+fn insert_index(host: &mut NSIndexSetHostObject, index: NSUInteger) {
+    if let Err(pos) = host.indexes.binary_search(&index) {
+        host.indexes.insert(pos, index);
+    }
+}
+
+/// Adds every index in `location..location + length`, merging with the
+/// existing sorted list in one pass.
+fn add_range(host: &mut NSIndexSetHostObject, location: NSUInteger, length: NSUInteger) {
+    if length == 0 {
+        return;
+    }
+    let start = location as u64;
+    let end = start.saturating_add(length as u64);
+    let old = std::mem::take(&mut host.indexes);
+    let mut merged = Vec::with_capacity(old.len().saturating_add(length as usize));
+    let mut next_new = start;
+    for index in old {
+        let index64 = index as u64;
+        while next_new < end && next_new < index64 {
+            merged.push(next_new as NSUInteger);
+            next_new += 1;
+        }
+        merged.push(index);
+        if index64 >= next_new {
+            next_new = index64 + 1;
+        }
+    }
+    while next_new < end {
+        merged.push(next_new as NSUInteger);
+        next_new += 1;
+    }
+    host.indexes = merged;
+}
+
+/// Removes every index in `location..location + length`.
+fn remove_range(host: &mut NSIndexSetHostObject, location: NSUInteger, length: NSUInteger) {
+    let start = location as u64;
+    let end = start.saturating_add(length as u64);
+    host.indexes
+        .retain(|&index| (index as u64) < start || (index as u64) >= end);
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -216,7 +260,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)mutableCopyWithZone:(NSZonePtr)_zone {
-    let new: id = msg_class![env; NSIndexSet alloc];
+    let new: id = msg_class![env; NSMutableIndexSet alloc];
     let idxs = env.objc.borrow::<NSIndexSetHostObject>(this).indexes.clone();
     env.objc.borrow_mut::<NSIndexSetHostObject>(new).indexes = idxs;
     autorelease(env, new)
@@ -234,4 +278,122 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @end
 
+// =========================================================================
+// MARK: - NSMutableIndexSet
+// =========================================================================
+
+@implementation NSMutableIndexSet: NSIndexSet
+
++ (id)allocWithZone:(NSZonePtr)_zone {
+    let host_object = Box::<NSIndexSetHostObject>::default();
+    env.objc.alloc_object(this, host_object, &mut env.mem)
+}
+
+// MARK: - Mutation
+
+- (())addIndex:(NSUInteger)index {
+    let host = env.objc.borrow_mut::<NSIndexSetHostObject>(this);
+    insert_index(host, index);
+}
+
+- (())addIndexesInRange:(NSRange)range {
+    let host = env.objc.borrow_mut::<NSIndexSetHostObject>(this);
+    add_range(host, range.location, range.length);
+}
+
+- (())addIndexes:(id)other { // NSIndexSet*
+    if other == nil {
+        return;
+    }
+    let indexes = {
+        let other = env.objc.borrow::<NSIndexSetHostObject>(other);
+        other.indexes.clone()
+    };
+    let host = env.objc.borrow_mut::<NSIndexSetHostObject>(this);
+    host.indexes.extend_from_slice(&indexes);
+    host.indexes.sort_unstable();
+    host.indexes.dedup();
+}
+
+- (())removeIndex:(NSUInteger)index {
+    let host = env.objc.borrow_mut::<NSIndexSetHostObject>(this);
+    if let Ok(pos) = host.indexes.binary_search(&index) {
+        host.indexes.remove(pos);
+    }
+}
+
+- (())removeIndexesInRange:(NSRange)range {
+    let host = env.objc.borrow_mut::<NSIndexSetHostObject>(this);
+    remove_range(host, range.location, range.length);
+}
+
+- (())removeIndexes:(id)other { // NSIndexSet*
+    if other == nil {
+        return;
+    }
+    let indexes = {
+        let other = env.objc.borrow::<NSIndexSetHostObject>(other);
+        other.indexes.clone()
+    };
+    let host = env.objc.borrow_mut::<NSIndexSetHostObject>(this);
+    host.indexes
+        .retain(|index| indexes.binary_search(index).is_err());
+}
+
+- (())removeAllIndexes {
+    env.objc.borrow_mut::<NSIndexSetHostObject>(this).indexes.clear();
+}
+
+// MARK: - NSCopying
+
+- (id)copyWithZone:(NSZonePtr)_zone {
+    let indexes = env.objc.borrow::<NSIndexSetHostObject>(this).indexes.clone();
+    let new: id = msg_class![env; NSIndexSet alloc];
+    env.objc.borrow_mut::<NSIndexSetHostObject>(new).indexes = indexes;
+    autorelease(env, new)
+}
+
+- (id)mutableCopyWithZone:(NSZonePtr)_zone {
+    retain(env, this)
+}
+
+@end
+
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host(indexes: Vec<NSUInteger>) -> NSIndexSetHostObject {
+        NSIndexSetHostObject { indexes }
+    }
+
+    #[test]
+    fn insert_index_keeps_the_list_sorted_and_unique() {
+        let mut set = host(vec![1, 4]);
+        insert_index(&mut set, 3);
+        insert_index(&mut set, 4);
+        assert_eq!(set.indexes, vec![1, 3, 4]);
+    }
+
+    #[test]
+    fn add_range_merges_with_the_existing_indexes() {
+        let mut set = host(vec![1, 4]);
+        add_range(&mut set, 2, 3);
+        assert_eq!(set.indexes, vec![1, 2, 3, 4]);
+        add_range(&mut set, 4, 2);
+        assert_eq!(set.indexes, vec![1, 2, 3, 4, 5]);
+        add_range(&mut set, 0, 0);
+        assert_eq!(set.indexes, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn remove_range_removes_only_the_indexes_inside_it() {
+        let mut set = host(vec![0, 1, 2, 3, 4]);
+        remove_range(&mut set, 1, 3);
+        assert_eq!(set.indexes, vec![0, 4]);
+        remove_range(&mut set, 0, 0);
+        assert_eq!(set.indexes, vec![0, 4]);
+    }
+}
