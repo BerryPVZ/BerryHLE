@@ -20,8 +20,9 @@ pub struct pthread_mutexattr_t {
     /// Magic number (must be [MAGIC_MUTEXATTR])
     magic: u32,
     type_: i32,
-    /// This should eventually be a bitfield with the other attributes.
-    _unused: u32,
+    /// `PTHREAD_PROCESS_PRIVATE` or `PTHREAD_PROCESS_SHARED`; remembered only,
+    /// since a shared mutex behaves like a private one in one process.
+    pshared: u32,
 }
 unsafe impl SafeRead for pthread_mutexattr_t {}
 
@@ -60,7 +61,7 @@ fn pthread_mutexattr_init(env: &mut Environment, attr: MutPtr<pthread_mutexattr_
         pthread_mutexattr_t {
             magic: MAGIC_MUTEXATTR,
             type_: PTHREAD_MUTEX_DEFAULT as i32,
-            _unused: 0,
+            pshared: PTHREAD_PROCESS_PRIVATE as u32,
         },
     );
     0 // success
@@ -72,11 +73,29 @@ fn pthread_mutexattr_setpshared(
 ) -> i32 {
     check_magic!(env, attr, MAGIC_MUTEXATTR);
     // Apple accepts both values on iOS. A shared mutex is indistinguishable
-    // from a private one in a single-process emulator, so neither is stored.
+    // from a private one in a single-process emulator, so the flag is only
+    // remembered for `pthread_mutexattr_getpshared`.
     match pshared {
-        PTHREAD_PROCESS_SHARED | PTHREAD_PROCESS_PRIVATE => 0,
-        _ => EINVAL,
+        PTHREAD_PROCESS_SHARED | PTHREAD_PROCESS_PRIVATE => (),
+        _ => return EINVAL,
     }
+    let mut attr_copy = env.mem.read(attr);
+    attr_copy.pshared = pshared as u32;
+    env.mem.write(attr, attr_copy);
+    0 // success
+}
+fn pthread_mutexattr_getpshared(
+    env: &mut Environment,
+    attr: ConstPtr<pthread_mutexattr_t>,
+    pshared_out: MutPtr<i32>,
+) -> i32 {
+    check_magic!(env, attr, MAGIC_MUTEXATTR);
+    if pshared_out.is_null() {
+        return EINVAL;
+    }
+    let attr_copy = env.mem.read(attr);
+    env.mem.write(pshared_out, attr_copy.pshared as i32);
+    0 // success
 }
 fn pthread_mutexattr_settype(
     env: &mut Environment,
@@ -176,7 +195,7 @@ fn pthread_mutexattr_destroy(env: &mut Environment, attr: MutPtr<pthread_mutexat
         pthread_mutexattr_t {
             magic: 0,
             type_: PTHREAD_MUTEX_DEFAULT as i32,
-            _unused: 0,
+            pshared: PTHREAD_PROCESS_PRIVATE as u32,
         },
     );
     0 // success
@@ -440,6 +459,7 @@ pub fn pthread_mutex_destroy(env: &mut Environment, mutex: MutPtr<pthread_mutex_
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(pthread_mutexattr_init(_)),
     export_c_func!(pthread_mutexattr_setpshared(_, _)),
+    export_c_func!(pthread_mutexattr_getpshared(_, _)),
     export_c_func!(pthread_mutexattr_settype(_, _)),
     export_c_func!(pthread_mutexattr_gettype(_, _)),
     export_c_func!(pthread_mutexattr_destroy(_)),

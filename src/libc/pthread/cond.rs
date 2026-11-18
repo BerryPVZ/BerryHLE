@@ -367,7 +367,7 @@ pub fn pthread_condattr_getpshared(
     pshared: MutPtr<i32>,
 ) -> i32 {
     if !pshared.is_null() {
-        env.mem.write(pshared, 0); // PTHREAD_PROCESS_PRIVATE
+        env.mem.write(pshared, 2); // PTHREAD_PROCESS_PRIVATE
     }
     0
 }
