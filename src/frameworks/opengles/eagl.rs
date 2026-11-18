@@ -1394,12 +1394,16 @@ let mut gles_ins = match gles_ins {
         // again during composition. find_fullscreen_eagl_layer() exists to
         // avoid this.
         {
-            static SLOW_PATH_LOGGED: std::sync::Once = std::sync::Once::new();
-            SLOW_PATH_LOGGED.call_once(|| {
+            // Report the route change, not just the first frame: a fallback
+            // that starts with a movie and never ends was invisible in logs
+            // because this used to be a one-shot.
+            let readback = present_route_code(PresentRoute::Readback);
+            let previous = LAST_PRESENT_ROUTE.swap(readback, Ordering::Relaxed);
+            if previous != readback {
                 log!(
                     "EAGL presenter: no fullscreen layer found ({}); presenting \
                      renderbuffer {:#x} to layer {:?} via RAM readback + Core \
-                     Animation compositing. [this log will only be shown once]",
+                     Animation compositing.",
                     if env.options.force_composition {
                         "composition is forced by --force-composition"
                     } else {
@@ -1408,7 +1412,7 @@ let mut gles_ins = match gles_ins {
                     renderbuffer,
                     drawable
                 );
-            });
+            }
         }
         let pixels_vec = get_pixels_vec_for_presenting(env, drawable);
         // re-borrow
