@@ -436,6 +436,8 @@ fn semaphore_destroy(env: &mut Environment, task: task_t, semaphore: semaphore_t
     if task != MACH_TASK_SELF || !is_known_semaphore(env, semaphore) {
         return KERN_INVALID_ARGUMENT;
     }
+    // The `is_known_semaphore` check above guarantees a match, and
+    // `sem_destroy` only returns EINVAL when there is none.
     sem_destroy(env, semaphore);
     env.mem.free(semaphore.cast());
     let result = KERN_SUCCESS;

@@ -1368,10 +1368,8 @@ pub fn setup_audio_unit_for_render(env: &mut Environment, ci: AudioUnit) {
         }
         bus_sources.push((*bus_id, s));
     }
-    // No explicit drop: `context` must stay alive until function end. The
-    // AL source handles above are GLuint-style ids, but the context owns the
-    // device, and dropping it before `start_audio_unit_render_thread` gives
-    // the new guest thread the option to run before teardown.
+    // Release the borrow before spawning the render thread below.
+    drop(context);
 
     let now = Instant::now();
     {
