@@ -1678,21 +1678,17 @@ fn NSStringFromRange(env: &mut Environment, range: NSRange) -> id {
     ns_string::from_rust_string(env, string)
 }
 
-/// `NSRange NSRangeFromString(NSString *aString)` — parses the two integers of
-/// `"{location, length}"`. Apple's implementation reads the numbers in order
-/// and ignores everything else, so a string with fewer than two numbers yields
-/// zeros for the rest instead of failing; one with no numbers at all gives
-/// `{0, 0}`.
+/// `NSRange NSRangeFromString(NSString *aString)` — parses the first two
+/// integers of `"{location, length}"`. Everything else in the string is
+/// ignored, so `"{7}"` is `{7, 0}` and a string with no integers is `{0, 0}`,
+/// as Apple's implementation does.
 /// <https://developer.apple.com/documentation/foundation/1395176-nsrangefromstring>
 fn ns_range_from_string_of_text(text: &str) -> NSRange {
     let mut numbers = text
         .split(|c: char| !c.is_ascii_digit() && c != '-')
-        .filter_map(|part| part.parse::<i64>().ok());
-    let mut next = || {
-        numbers
-            .next()
-            .map_or(0, |value| value.clamp(0, NSNotFound as i64) as NSUInteger)
-    };
+        .filter_map(|part| part.parse::<i64>().ok())
+        .map(|value| value.clamp(0, NSNotFound as i64) as NSUInteger);
+    let mut next = || numbers.next().unwrap_or(0);
     NSRange {
         location: next(),
         length: next(),
@@ -1700,8 +1696,8 @@ fn ns_range_from_string_of_text(text: &str) -> NSRange {
 }
 
 fn NSRangeFromString(env: &mut Environment, string: id) -> NSRange {
-    let text = ns_string::to_rust_string(env, string).to_string();
-    ns_range_from_string_of_text(&text)
+    // `to_rust_string` reads nil as the empty string, which gives `{0, 0}`.
+    ns_range_from_string_of_text(&ns_string::to_rust_string(env, string))
 }
 
 pub type NSComparisonResult = NSInteger;
@@ -1798,6 +1794,12 @@ mod ns_range_from_string_tests {
     #[test]
     fn a_negative_or_huge_number_stays_inside_the_type() {
         assert_eq!(pair("{-1, 0}"), (0, 0));
+        assert_eq!(pair("{-99999999999, 0}"), (0, 0));
         assert_eq!(pair("{99999999999, 0}"), (NSNotFound as u32, 0));
+    }
+
+    #[test]
+    fn a_number_too_big_for_any_integer_reads_as_zero() {
+        assert_eq!(pair("{123456789012345678901234, 0}"), (0, 0));
     }
 }
