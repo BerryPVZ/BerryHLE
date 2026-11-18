@@ -1678,6 +1678,32 @@ fn NSStringFromRange(env: &mut Environment, range: NSRange) -> id {
     ns_string::from_rust_string(env, string)
 }
 
+/// `NSRange NSRangeFromString(NSString *aString)` — parses the two integers of
+/// `"{location, length}"`. Apple's implementation reads the numbers in order
+/// and ignores everything else, so a string with fewer than two numbers yields
+/// zeros for the rest instead of failing; one with no numbers at all gives
+/// `{0, 0}`.
+/// <https://developer.apple.com/documentation/foundation/1395176-nsrangefromstring>
+fn ns_range_from_string_of_text(text: &str) -> NSRange {
+    let mut numbers = text
+        .split(|c: char| !c.is_ascii_digit() && c != '-')
+        .filter_map(|part| part.parse::<i64>().ok());
+    let mut next = || {
+        numbers
+            .next()
+            .map_or(0, |value| value.clamp(0, NSNotFound as i64) as NSUInteger)
+    };
+    NSRange {
+        location: next(),
+        length: next(),
+    }
+}
+
+fn NSRangeFromString(env: &mut Environment, string: id) -> NSRange {
+    let text = ns_string::to_rust_string(env, string).to_string();
+    ns_range_from_string_of_text(&text)
+}
+
 pub type NSComparisonResult = NSInteger;
 
 pub const NSOrderedAscending: NSComparisonResult = -1;
@@ -1739,6 +1765,39 @@ fn hash_helper<T: std::hash::Hash>(hashable: &T) -> NSUInteger {
 
 const FUNCTIONS: FunctionExports = &[
     export_c_func!(NSStringFromRange(_)),
+    export_c_func!(NSRangeFromString(_)),
     export_c_func!(NSGetSizeAndAlignment(_, _, _)),
     export_c_func!(CFStringGetCharactersPtr(_)),
 ];
+
+#[cfg(test)]
+mod ns_range_from_string_tests {
+    use super::*;
+
+    fn pair(text: &str) -> (u32, u32) {
+        let range = ns_range_from_string_of_text(text);
+        (range.location, range.length)
+    }
+
+    #[test]
+    fn parses_the_pairs_that_appear_in_plists_and_logs() {
+        assert_eq!(pair("{5, 3}"), (5, 3));
+        assert_eq!(pair("{5,3}"), (5, 3));
+        assert_eq!(pair("5, 3"), (5, 3));
+        assert_eq!(pair("{0,0}"), (0, 0));
+    }
+
+    #[test]
+    fn missing_numbers_read_as_zero() {
+        assert_eq!(pair(""), (0, 0));
+        assert_eq!(pair("{}, {}"), (0, 0));
+        assert_eq!(pair("{7, 2, 9}"), (7, 2));
+        assert_eq!(pair("{7}"), (7, 0));
+    }
+
+    #[test]
+    fn a_negative_or_huge_number_stays_inside_the_type() {
+        assert_eq!(pair("{-1, 0}"), (0, 0));
+        assert_eq!(pair("{99999999999, 0}"), (NSNotFound as u32, 0));
+    }
+}
