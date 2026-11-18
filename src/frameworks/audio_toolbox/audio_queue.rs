@@ -2972,6 +2972,10 @@ fn finish_stopping_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
             mic::stop();
         }
         host_object.is_running = AudioQueueIsRunning::Stopped;
+        // A caller can reach here from inside handle_audio_queue, whose early
+        // return then skips its own guard reset. Stopped means no handler is
+        // active, so clear it here to keep a later Start from staying silent.
+        host_object.is_running_handler = false;
     }
 
     notify_aq_is_running(env, in_aq);
