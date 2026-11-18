@@ -151,6 +151,13 @@ required to work on the repo.
 - **Context compression (caveman)** — compress a large tool output or file before
   it enters context, keep the `ccr_` handle, and retrieve when details are needed.
   Compress by need, not routinely.
+- **Context mode (context-mode plugin)** — if the `ctx_execute`, `ctx_batch`,
+  `ctx_index` and `ctx_search` tools exist, run shell commands through
+  `ctx_execute` and print only the answer; read a file by passing `file:` and
+  using `$CTX_FILE` instead of dumping it. Use `ctx_batch` for several commands
+  and `ctx_index` + `ctx_search` for long output you will query again. Keep
+  `edit`/`write` direct: a mutation needs exact text. Each call is a fresh
+  subprocess in the project directory, so `cd` and env changes do not persist.
 - **Context management (billion-context / ACP)** — in long sessions, history is
   summarized automatically. `acp_status` shows usage and compressible ranges,
   `search_context` finds an old block by keyword, `decompress` restores it. A
