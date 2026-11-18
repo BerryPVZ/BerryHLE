@@ -328,6 +328,9 @@ pub struct Options {
     /// `None` keeps the `TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS` environment
     /// setting; `Some(false)` lets a later profile or CLI argument undo it.
     pub landscape_uiscreen_bounds: Option<bool>,
+    /// Drive Audio Unit rendering on a guest worker thread, independently of
+    /// the main run loop. Opt in for apps that block that loop during startup.
+    pub audio_unit_render_thread: bool,
     /// Break an otherwise-infinite `semaphore_wait()` by returning
     /// KERN_SUCCESS spuriously after this many milliseconds.
     ///
@@ -341,7 +344,8 @@ pub struct Options {
     /// It exists for FMOD's worker threads in Minecraft: Story Mode
     /// (com.telltalegames.MC100), which deadlock under our cooperative
     /// scheduler and are written to tolerate a spurious wake. Enable it only
-    /// per-app, via the default options file.
+    /// per-app, via the default options file. That app now uses
+    /// `--audio-unit-render-thread` instead, so no default profile needs it.
     pub mach_semaphore_spurious_wake_ms: Option<u64>,
     /// Override the EAGL present rotation with a fixed clockwise angle in
     /// degrees (0, 90, 180 or 270), replacing the orientation-derived rotation
@@ -502,6 +506,7 @@ impl Default for Options {
                 .unwrap_or(true),
             prefer_gles2_context: false,
             landscape_uiscreen_bounds: None,
+            audio_unit_render_thread: false,
             mach_semaphore_spurious_wake_ms: None,
             present_rotate: None,
             rotation_fix: false,
@@ -887,6 +892,10 @@ impl Options {
             self.prefer_gles2_context = true;
         } else if arg == "--no-prefer-gles2-context" {
             self.prefer_gles2_context = false;
+        } else if arg == "--audio-unit-render-thread" {
+            self.audio_unit_render_thread = true;
+        } else if arg == "--no-audio-unit-render-thread" {
+            self.audio_unit_render_thread = false;
         } else if arg == "--force-gles1-context" {
             self.force_gles1_context = true;
             // GLES-native backend selection and EAGL both read this env var
