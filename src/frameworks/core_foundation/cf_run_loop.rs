@@ -575,11 +575,43 @@ fn CFRunLoopObserverCreate(
     observer
 }
 
+/// Drops observers that are no longer valid — invalidated explicitly, or
+/// one-shot observers that already fired — releasing the reference
+/// `CFRunLoopAddObserver` took. Apple's `CFRunLoopObserverInvalidate` removes
+/// the observer from every run loop it was added to; this is where that
+/// removal happens.
+fn prune_invalid_observers(env: &mut Environment, run_loop: id) {
+    let stale: Vec<id> = env
+        .objc
+        .borrow::<crate::frameworks::foundation::ns_run_loop::NSRunLoopHostObject>(run_loop)
+        .observers
+        .clone()
+        .into_iter()
+        .filter(|&observer| {
+            !env
+                .objc
+                .borrow::<CFRunLoopObserverHostObject>(observer)
+                .valid
+        })
+        .collect();
+    if stale.is_empty() {
+        return;
+    }
+    env.objc
+        .borrow_mut::<crate::frameworks::foundation::ns_run_loop::NSRunLoopHostObject>(run_loop)
+        .observers
+        .retain(|observer| !stale.contains(observer));
+    for observer in stale {
+        CFRelease(env, observer);
+    }
+}
+
 /// Invokes the observers attached to `run_loop` for one run-loop activity, in
 /// the order Apple describes (registration order is a close enough stand-in
 /// for `order`). Non-repeating observers are invalidated after their first
 /// call.
 pub(crate) fn fire_observers(env: &mut Environment, run_loop: id, activity: CFRunLoopActivity) {
+    prune_invalid_observers(env, run_loop);
     let observers = env
         .objc
         .borrow::<crate::frameworks::foundation::ns_run_loop::NSRunLoopHostObject>(run_loop)
