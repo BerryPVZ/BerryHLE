@@ -125,11 +125,15 @@ impl AdaptiveVsync {
             }
         } else if elapsed < ADAPTIVE_VSYNC_FAST_INTERVAL {
             self.slow_swaps = 0;
-            self.fast_swaps += 1;
-            if !self.synced && self.fast_swaps >= ADAPTIVE_VSYNC_FAST_SWAPS {
-                self.fast_swaps = 0;
-                self.synced = true;
-                return Some(true);
+            // Only a run of fast swaps while unsynced can restore sync, so
+            // the counter does not need to grow while it is already on.
+            if !self.synced {
+                self.fast_swaps += 1;
+                if self.fast_swaps >= ADAPTIVE_VSYNC_FAST_SWAPS {
+                    self.fast_swaps = 0;
+                    self.synced = true;
+                    return Some(true);
+                }
             }
         }
         None
@@ -215,8 +219,8 @@ mod adaptive_vsync_tests {
     fn a_thirty_hertz_cadence_keeps_sync() {
         let mut now = Instant::now();
         let mut vsync = AdaptiveVsync::new();
-        // Synced, a 30 FPS app swaps on every second refresh.
-        assert_eq!(swap_n(&mut vsync, &mut now, 33, 1000), None);
+        // Synced, a 30 FPS app swaps on every second refresh (~33.3 ms).
+        assert_eq!(swap_n(&mut vsync, &mut now, 34, 1000), None);
     }
 
     #[test]
@@ -227,9 +231,9 @@ mod adaptive_vsync_tests {
             swap_n(&mut vsync, &mut now, 50, ADAPTIVE_VSYNC_SLOW_SWAPS + 1),
             Some(false)
         );
-        // Unsynced, the same app runs at its own ~33 ms cadence.
+        // Unsynced, the same app runs at its own ~33.3 ms cadence.
         assert_eq!(
-            swap_n(&mut vsync, &mut now, 33, ADAPTIVE_VSYNC_FAST_SWAPS),
+            swap_n(&mut vsync, &mut now, 34, ADAPTIVE_VSYNC_FAST_SWAPS),
             Some(true)
         );
     }
