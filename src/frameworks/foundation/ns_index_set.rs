@@ -86,6 +86,26 @@ fn remove_range(host: &mut NSIndexSetHostObject, location: NSUInteger, length: N
         .retain(|&index| (index as u64) < start || (index as u64) >= end);
 }
 
+/// Moves every index at or above `index` by `delta`. A negative shift can
+/// push an index below zero (Apple drops those) or past an index that stayed
+/// put, so the result is sorted again.
+fn shift_indexes(host: &mut NSIndexSetHostObject, index: NSUInteger, delta: NSInteger) {
+    let mut shifted = Vec::with_capacity(host.indexes.len());
+    for &i in &host.indexes {
+        if i < index {
+            shifted.push(i);
+            continue;
+        }
+        let moved = i as i64 + delta as i64;
+        if moved >= 0 {
+            shifted.push(moved as NSUInteger);
+        }
+    }
+    shifted.sort_unstable();
+    shifted.dedup();
+    host.indexes = shifted;
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -344,6 +364,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<NSIndexSetHostObject>(this).indexes.clear();
 }
 
+- (())shiftIndexesStartingAtIndex:(NSUInteger)index by:(NSInteger)delta {
+    let host = env.objc.borrow_mut::<NSIndexSetHostObject>(this);
+    shift_indexes(host, index, delta);
+}
+
 // MARK: - NSCopying
 
 - (id)copyWithZone:(NSZonePtr)_zone {
@@ -386,6 +411,17 @@ mod tests {
         assert_eq!(set.indexes, vec![1, 2, 3, 4, 5]);
         add_range(&mut set, 0, 0);
         assert_eq!(set.indexes, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn shift_moves_indexes_at_or_above_the_boundary() {
+        let mut set = host(vec![1, 2, 5]);
+        shift_indexes(&mut set, 2, 3);
+        assert_eq!(set.indexes, vec![1, 5, 8]);
+        shift_indexes(&mut set, 5, -4);
+        assert_eq!(set.indexes, vec![1, 4]);
+        shift_indexes(&mut set, 0, -5);
+        assert!(set.indexes.is_empty());
     }
 
     #[test]
