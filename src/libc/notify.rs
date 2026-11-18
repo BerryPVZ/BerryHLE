@@ -110,6 +110,11 @@ pub fn notify_suspend(_env: &mut Environment, _token: i32) -> u32 {
     NOTIFY_STATUS_OK
 }
 
+#[allow(non_snake_case)]
+pub fn notify_resume(_env: &mut Environment, _token: i32) -> u32 {
+    NOTIFY_STATUS_OK
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(notify_register_file_descriptor(_, _, _, _)),
     export_c_func!(notify_register_check(_, _)),
@@ -118,4 +123,5 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(notify_get_state(_, _)),
     export_c_func!(notify_set_state(_, _)),
     export_c_func!(notify_suspend(_)),
+    export_c_func!(notify_resume(_)),
 ];
