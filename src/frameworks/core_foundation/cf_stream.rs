@@ -13,7 +13,7 @@ use crate::frameworks::core_foundation::{CFRelease, CFRetain, CFTypeRef};
 use crate::frameworks::foundation::ns_string;
 use crate::fs::GuestPath;
 use crate::mem::{ConstPtr, MutPtr, MutVoidPtr, Ptr};
-use crate::objc::{msg, nil, objc_classes, ClassExports, HostObject};
+use crate::objc::{id, msg, nil, objc_classes, ClassExports, HostObject};
 use crate::Environment;
 
 pub type CFReadStreamRef = CFTypeRef;
@@ -305,6 +305,24 @@ pub const CLASSES: ClassExports = objc_classes! {
 (env, this, _cmd);
 
 @implementation _touchHLE_CFReadStream: NSObject
+// `CFReadStream` is toll-free bridged to `NSInputStream`, and apps that get
+// one from `CFStreamCreatePairWithSocketToCFHost` talk to it with the
+// `NSStream` selectors below. The C entry points are the same no-ops.
+- (CFStreamStatus)streamStatus {
+    env.objc.borrow::<CFReadStreamHostObject>(this).status
+}
+- (())open {
+    let host = env.objc.borrow_mut::<CFReadStreamHostObject>(this);
+    host.status = kCFStreamStatusOpen;
+    host.offset = 0;
+}
+- (())close {
+    env.objc.borrow_mut::<CFReadStreamHostObject>(this).status = kCFStreamStatusClosed;
+}
+- (())scheduleInRunLoop:(id)_run_loop forMode:(id)_mode {
+    // No real networking, so there are no events to deliver.
+}
+- (())removeFromRunLoop:(id)_run_loop forMode:(id)_mode {}
 - (())dealloc {
     let buffer = env.objc.borrow_mut::<CFReadStreamHostObject>(this).buffer.take();
     if let Some(buffer) = buffer {
@@ -315,6 +333,17 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 @implementation _touchHLE_CFWriteStream: NSObject
+- (CFStreamStatus)streamStatus {
+    env.objc.borrow::<CFWriteStreamHostObject>(this).status
+}
+- (())open {
+    env.objc.borrow_mut::<CFWriteStreamHostObject>(this).status = kCFStreamStatusOpen;
+}
+- (())close {
+    env.objc.borrow_mut::<CFWriteStreamHostObject>(this).status = kCFStreamStatusClosed;
+}
+- (())scheduleInRunLoop:(id)_run_loop forMode:(id)_mode {}
+- (())removeFromRunLoop:(id)_run_loop forMode:(id)_mode {}
 - (())dealloc {
     env.objc.dealloc_object(this, &mut env.mem)
 }
