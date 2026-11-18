@@ -34,6 +34,13 @@ static UNTRACKED_TOUCH_WARNS: AtomicUsize = AtomicUsize::new(8);
 static TOUCH_BEGAN_DIAGNOSTICS: AtomicUsize = AtomicUsize::new(0);
 static TOUCH_ENDED_DIAGNOSTICS: AtomicUsize = AtomicUsize::new(0);
 
+/// Drags reported without needing [crate::env_flags]: the first twelve
+/// gestures that moved at least [SWIPE_REPORT_POINTS]. Taps do not consume
+/// the budget, so a report of "the scroll does not follow my finger" gets its
+/// drags logged even on Android, where the environment cannot be set.
+static TOUCH_SWIPE_DIAGNOSTICS: AtomicUsize = AtomicUsize::new(0);
+const SWIPE_REPORT_POINTS: f64 = 20.0;
+
 fn log_touch_delivery(marker: &str, counter: &AtomicUsize, count: usize) {
     if !crate::env_flag_cached!("TOUCHHLE_TRACE_TOUCHES") {
         return;
@@ -47,6 +54,49 @@ fn log_touch_delivery(marker: &str, counter: &AtomicUsize, count: usize) {
             count
         );
     }
+}
+
+/// One line per drag, so a log can tell "the host lost the moves" (few moves
+/// for a long drag) from "the game ignored a complete gesture" (many moves,
+/// full displacement) and from "the drag went to the wrong view" (a view class
+/// other than the game's).
+fn log_swipe_summary(env: &mut Environment, touch: id, view: id) {
+    let end = touch_ivars(env, touch, |v| v.location);
+    let (start, moves) = {
+        let host = env.objc.borrow::<UITouchHostObject>(touch);
+        (host.start_location, host.move_count)
+    };
+    let (start_x, start_y) = (start.x, start.y);
+    let (end_x, end_y) = (end.x, end.y);
+    let dx = f64::from(end_x - start_x);
+    let dy = f64::from(end_y - start_y);
+    if dx.hypot(dy) < SWIPE_REPORT_POINTS {
+        return;
+    }
+    let sequence = TOUCH_SWIPE_DIAGNOSTICS.fetch_add(1, Ordering::Relaxed) + 1;
+    if sequence > 12 {
+        return;
+    }
+    let view_class = if view == nil {
+        "(nil)".to_owned()
+    } else {
+        let class: crate::objc::Class = msg![env; view class];
+        env.objc.get_class_name(class).to_owned()
+    };
+    let scroll_class: id = msg_class![env; UIScrollView class];
+    let scroll = view != nil && msg![env; view isKindOfClass:scroll_class];
+    log!(
+        "TOUCH-SWIPE #{}: {} {:?} scroll={} moves={} ({:.0}, {:.0}) -> ({:.0}, {:.0})",
+        sequence,
+        view_class,
+        view,
+        scroll,
+        moves,
+        start_x,
+        start_y,
+        end_x,
+        end_y,
+    );
 }
 
 /// A touch with no event for this long is no longer part of a live gesture;
@@ -1486,6 +1536,8 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             v.timestamp = timestamp;
             v.phase = UITouchPhaseEnded;
         });
+
+        log_swipe_summary(env, touch, view);
 
         let _: () = msg![env;
             touches addObject:touch];
