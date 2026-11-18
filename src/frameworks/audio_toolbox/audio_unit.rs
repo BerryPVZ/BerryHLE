@@ -7,7 +7,7 @@
 //! `AudioUnit.h` (Audio Unit Services)
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::audio::openal::al_types::{ALsizei, ALuint, ALvoid};
 use crate::audio::openal::{
@@ -2345,18 +2345,28 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
     // (~140ms) rides out hitches at the cost of imperceptible extra latency;
     // the throttle below still reclaims buffers and re-syncs if we run ahead.
     let remaining_buffers = queued_buffers.saturating_sub(processed_buffers);
-    if remaining_buffers == 0 {
+    let io_buffer_seconds = f64::from(
+        env.framework_state
+            .audio_toolbox
+            .audio_session
+            .current_hardware_io_buffer_duration,
+    );
+    let io_buffer_duration = Duration::from_secs_f64(io_buffer_seconds);
+    let gap = now.duration_since(last_render_time);
+    if remaining_buffers == 0 && gap >= io_buffer_duration {
         // Nothing was left to play, so the sound had already stopped: the
         // app's frame took longer than the audio queued ahead of it. Report
         // it so "the sound cuts out when the frame rate drops" can be told
-        // apart from a mixing bug, and so the size of the gap is known.
+        // apart from a mixing bug, and so the size of the gap is known. The
+        // elapsed check skips the first pump after start, which finds the
+        // queue empty only because nothing has been queued yet.
         let underruns = AUDIO_UNDERRUNS.fetch_add(1, Ordering::Relaxed) + 1;
         if underruns == 1 || underruns % 100 == 0 {
             log!(
                 "Audio underrun #{}: the OpenAL queue was empty when the run \
                  loop pumped it, {} ms since the previous pump.",
                 underruns,
-                now.duration_since(last_render_time).as_millis()
+                gap.as_millis()
             );
         }
     }
@@ -2411,13 +2421,7 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
         }
     }
 
-    let target_frames = (sample_rate
-        * env
-            .framework_state
-            .audio_toolbox
-            .audio_session
-            .current_hardware_io_buffer_duration as f64)
-        .round() as u32;
+    let target_frames = (sample_rate * io_buffer_seconds).round() as u32;
     let frames = target_frames.clamp(64, 2048);
     let planar_stereo_buffers = uses_planar_stereo_buffers(&stream_format, has_input_format);
     let bytes_per_sample = stream_format.bits_per_channel / 8;
