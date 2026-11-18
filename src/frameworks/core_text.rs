@@ -370,7 +370,7 @@ fn CTFontDescriptorCreateWithAttributes(
 ///     CFStringRef name, CGFloat size)`
 ///
 /// Convenience constructor for a descriptor carrying the two most common
-/// attributes: the PostScript/family name and the point size.
+/// attributes, keyed by `kCTFontNameAttribute` and `kCTFontSizeAttribute`.
 /// <https://developer.apple.com/documentation/coretext/1511145-ctfontdescriptorcreatewithnamea>
 fn CTFontDescriptorCreateWithNameAndSize(
     env: &mut Environment,
@@ -387,7 +387,9 @@ fn CTFontDescriptorCreateWithNameAndSize(
     let size_number: id = msg_class![env; NSNumber numberWithDouble:size_f];
     () = msg![env; attributes setObject:name forKey:name_key];
     () = msg![env; attributes setObject:size_number forKey:size_key];
-    CTFontDescriptorCreateWithAttributes(env, attributes)
+    let descriptor = CTFontDescriptorCreateWithAttributes(env, attributes);
+    release(env, attributes);
+    descriptor
 }
 
 /// `CTFontDescriptorCreateMatchingFontDescriptors` — returns descriptors
