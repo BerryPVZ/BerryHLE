@@ -1815,7 +1815,8 @@ mod ns_range_from_string_tests {
 
     #[test]
     fn a_number_too_big_for_i64_is_clamped_not_dropped() {
-        assert_eq!(pair("{123456789012345678901234, 0}"), (NSNotFound as u32, 0));
+        let too_long = "{123456789012345678901234, 0}";
+        assert_eq!(pair(too_long), (NSNotFound as u32, 0));
         assert_eq!(pair("{-123456789012345678901234, 0}"), (0, 0));
     }
 }
