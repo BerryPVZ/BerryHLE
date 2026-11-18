@@ -7,7 +7,7 @@
 //! `AudioUnit.h` (Audio Unit Services)
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::audio::openal::al_types::{ALsizei, ALuint, ALvoid};
 use crate::audio::openal::{
@@ -811,6 +811,7 @@ fn set_units_running(env: &mut Environment, units: Vec<AudioUnit>, running: bool
             // unit is connected again.
             obj.started = false;
             obj.last_render_time = None;
+            obj.last_queued_buffers = -1;
             for bus in obj.mixer_buses.values_mut() {
                 bus.last_render_time = None;
             }
@@ -1265,6 +1266,7 @@ fn AudioUnitReset(
         .get_mut(&in_unit)
     {
         obj.last_render_time = None;
+        obj.last_queued_buffers = -1;
     }
     0
 }
@@ -2224,6 +2226,7 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
         has_input_format,
         al_source,
         last_render_time,
+        last_queued_buffers,
         callback,
         start_sample_time,
     ) = {
@@ -2250,6 +2253,7 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
             obj.input_stream_format.is_some(),
             obj.al_source,
             obj.last_render_time,
+            obj.last_queued_buffers,
             obj.render_callback,
             obj.sample_time,
         )
@@ -2351,15 +2355,14 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
             .audio_session
             .current_hardware_io_buffer_duration,
     );
-    let io_buffer_duration = Duration::from_secs_f64(io_buffer_seconds);
     let gap = now.duration_since(last_render_time);
-    if remaining_buffers == 0 && gap >= io_buffer_duration {
-        // Nothing was left to play, so the sound had already stopped: the
-        // app's frame took longer than the audio queued ahead of it. Report
-        // it so "the sound cuts out when the frame rate drops" can be told
-        // apart from a mixing bug, and so the size of the gap is known. The
-        // elapsed check skips the first pump after start, which finds the
-        // queue empty only because nothing has been queued yet.
+    if last_queued_buffers > 0 && remaining_buffers == 0 {
+        // The queue held buffers at the previous pump and is empty now, so
+        // the app's frame outlasted the audio queued ahead of it and the
+        // sound had already stopped. Report it so "the sound cuts out when
+        // the frame rate drops" can be told apart from a mixing bug, and so
+        // the size of the gap is known. A queue that was empty before this
+        // pump too (audio not started yet) is not an underrun.
         let underruns = AUDIO_UNDERRUNS.fetch_add(1, Ordering::Relaxed) + 1;
         if underruns == 1 || underruns % 100 == 0 {
             log!(
@@ -2369,6 +2372,15 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
                 gap.as_millis()
             );
         }
+    }
+    if let Some(obj) = env
+        .framework_state
+        .audio_toolbox
+        .audio_components
+        .audio_component_instances
+        .get_mut(&audio_unit)
+    {
+        obj.last_queued_buffers = remaining_buffers;
     }
     if remaining_buffers > AUDIO_RENDER_TARGET_DEPTH {
         let mut drained_buffers = Vec::new();

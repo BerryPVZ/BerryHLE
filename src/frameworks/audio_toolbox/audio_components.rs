@@ -125,6 +125,12 @@ pub struct AudioComponentInstanceHostObject {
     pub output_stream_format: Option<AudioStreamBasicDescription>,
     pub render_callback: Option<AURenderCallbackStruct>,
     pub last_render_time: Option<Instant>,
+
+    /// Buffers left in this unit's OpenAL queue at the previous pump, or -1
+    /// before the first one. An underrun is the transition from a non-empty
+    /// queue to an empty one; a queue that has never held anything (audio
+    /// not started yet) is not an underrun.
+    pub last_queued_buffers: i32,
     pub al_source: Option<ALuint>,
     pub is_running_handler: bool,
 
@@ -193,6 +199,7 @@ impl Default for AudioComponentInstanceHostObject {
             output_stream_format: None,
             render_callback: None,
             last_render_time: None,
+            last_queued_buffers: -1,
             al_source: None,
             is_running_handler: false,
             sample_time: 0.0,
