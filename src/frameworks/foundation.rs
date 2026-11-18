@@ -1678,15 +1678,30 @@ fn NSStringFromRange(env: &mut Environment, range: NSRange) -> id {
     ns_string::from_rust_string(env, string)
 }
 
+/// One integer of `NSRangeFromString`'s text: a run of digits, optionally
+/// signed. A run with no digits is not a number; one too long for `i64` is
+/// clamped, so the caller still gets a value instead of a zero in its place.
+fn ns_range_number(part: &str) -> Option<i64> {
+    let digits = part.strip_prefix('-').unwrap_or(part);
+    if digits.is_empty() {
+        return None;
+    }
+    Some(match part.parse::<i64>() {
+        Ok(value) => value,
+        Err(_) if part.starts_with('-') => i64::MIN,
+        Err(_) => i64::MAX,
+    })
+}
+
 /// `NSRange NSRangeFromString(NSString *aString)` — parses the first two
 /// integers of `"{location, length}"`. Everything else in the string is
-/// ignored, so `"{7}"` is `{7, 0}` and a string with no integers is `{0, 0}`,
-/// as Apple's implementation does.
+/// ignored, so `"{7}"` is `{7, 0}` and a string with no digits is `{0, 0}`, as
+/// Apple's implementation does. A number is clamped to `0..=NSNotFound`.
 /// <https://developer.apple.com/documentation/foundation/1395176-nsrangefromstring>
 fn ns_range_from_string_of_text(text: &str) -> NSRange {
     let mut numbers = text
         .split(|c: char| !c.is_ascii_digit() && c != '-')
-        .filter_map(|part| part.parse::<i64>().ok())
+        .filter_map(ns_range_number)
         .map(|value| value.clamp(0, NSNotFound as i64) as NSUInteger);
     let mut next = || numbers.next().unwrap_or(0);
     NSRange {
@@ -1799,7 +1814,8 @@ mod ns_range_from_string_tests {
     }
 
     #[test]
-    fn a_number_too_big_for_any_integer_reads_as_zero() {
-        assert_eq!(pair("{123456789012345678901234, 0}"), (0, 0));
+    fn a_number_too_big_for_i64_is_clamped_not_dropped() {
+        assert_eq!(pair("{123456789012345678901234, 0}"), (NSNotFound as u32, 0));
+        assert_eq!(pair("{-123456789012345678901234, 0}"), (0, 0));
     }
 }
