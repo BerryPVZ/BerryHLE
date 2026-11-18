@@ -409,6 +409,14 @@ pub fn run_run_loop(
             run_loop,
             crate::frameworks::core_foundation::cf_run_loop::kCFRunLoopBeforeTimers,
         );
+        // Apple's documented order is BeforeTimers, BeforeSources, then the
+        // block that services sources and timers; touchHLE services both in
+        // that same block below.
+        crate::frameworks::core_foundation::cf_run_loop::fire_observers(
+            env,
+            run_loop,
+            crate::frameworks::core_foundation::cf_run_loop::kCFRunLoopBeforeSources,
+        );
 
         // Commit implicit CATransactions
         // From the CATransaction docs:
@@ -492,6 +500,14 @@ pub fn run_run_loop(
         // The compromise used here is that we will wait for a 60th of a second,
         // or until the next scheduled event, whichever is sooner. iPhone OS
         // apps can't do more than 60fps so this should be fine.
+        // BeforeWaiting fires once the sources above have been serviced and
+        // marks the run loop is about to block, which is the activity apps use
+        // most (deferring work to "after this iteration's sources").
+        crate::frameworks::core_foundation::cf_run_loop::fire_observers(
+            env,
+            run_loop,
+            crate::frameworks::core_foundation::cf_run_loop::kCFRunLoopBeforeWaiting,
+        );
         let limit = Duration::from_millis(1000 / 60);
         env.sleep(sleep_until.map_or(limit, |i| i.duration_since(Instant::now()).min(limit)));
         crate::frameworks::core_foundation::cf_run_loop::fire_observers(
