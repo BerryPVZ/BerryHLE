@@ -51,7 +51,6 @@ const MAGIC_MUTEX_STATIC_ERRORCHECK: u32 = 0x32AAABA1; // PTHREAD_ERRORCHECK_MUT
 const MAGIC_MUTEX_STATIC_RECURSIVE: u32 = 0x32AAABA2; // PTHREAD_RECURSIVE_MUTEX_INITIALIZER
 const MAGIC_MUTEX_STATIC_FIRSTFIT: u32 = 0x32AAABA3; // first-fit; behaves as normal for us
 
-#[allow(dead_code)]
 const PTHREAD_PROCESS_SHARED: i32 = 1;
 const PTHREAD_PROCESS_PRIVATE: i32 = 2;
 
@@ -72,10 +71,12 @@ fn pthread_mutexattr_setpshared(
     pshared: i32,
 ) -> i32 {
     check_magic!(env, attr, MAGIC_MUTEXATTR);
-    // PTHREAD_PROCESS_PRIVATE is a default one
-    // TODO: set this attribute in `attr` instead
-    assert_eq!(pshared, PTHREAD_PROCESS_PRIVATE);
-    0 // success
+    // Apple accepts both values on iOS. A shared mutex is indistinguishable
+    // from a private one in a single-process emulator, so neither is stored.
+    match pshared {
+        PTHREAD_PROCESS_SHARED | PTHREAD_PROCESS_PRIVATE => 0,
+        _ => EINVAL,
+    }
 }
 fn pthread_mutexattr_settype(
     env: &mut Environment,
