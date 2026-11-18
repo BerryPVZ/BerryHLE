@@ -491,9 +491,20 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow::<UIColorHostObject>(this).cg_color
 }
 
-- (())encodeWithCoder:(id)_coder {
-    // UIColor conforms to NSCoding; its state is the CGColor, which is
-    // rebuilt from the same component values by -initWithCoder:.
+- (())encodeWithCoder:(id)coder {
+    // Writes the four-component form that -initWithCoder: reads, so a color
+    // archived and unarchived by this stack keeps its value.
+    let (r, g, b, a) = get_rgba(&env.objc, this);
+    let key = get_static_str(env, "UIColorComponentCount");
+    () = msg![env; coder encodeInteger:4 forKey:key];
+    let key = get_static_str(env, "UIRed");
+    () = msg![env; coder encodeFloat:r forKey:key];
+    let key = get_static_str(env, "UIGreen");
+    () = msg![env; coder encodeFloat:g forKey:key];
+    let key = get_static_str(env, "UIBlue");
+    () = msg![env; coder encodeFloat:b forKey:key];
+    let key = get_static_str(env, "UIAlpha");
+    () = msg![env; coder encodeFloat:a forKey:key];
 }
 
 - (())dealloc {
