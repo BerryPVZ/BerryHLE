@@ -130,6 +130,103 @@ fn _dyld_get_image_header(env: &mut Environment, image_index: u32) -> u32 {
     env.bins[idx].text_base
 }
 
+/// `const struct section *getsectbynamefromheader(const struct mach_header *mhp, const char *segname, const char *sectname)`
+///
+/// Apple's implementation returns a pointer to the matching `struct section`
+/// inside the image's own load commands, so callers can read its `addr` and
+/// `size`. We walk the guest's copy of those load commands the same way
+/// (see `getsectbynamefromheader` in Apple's `dyld`), which is also why the
+/// result must point into guest memory rather than be a fresh structure.
+/// Crashlytics 3.8.6 (Blockheads 2019) calls this for every loaded image to
+/// find `__DATA,__objc_imageinfo`.
+fn getsectbynamefromheader(
+    env: &mut Environment,
+    mhp: ConstPtr<u8>,
+    segname: ConstPtr<u8>,
+    sectname: ConstPtr<u8>,
+) -> ConstPtr<u8> {
+    if mhp.is_null() || segname.is_null() || sectname.is_null() {
+        return Ptr::null();
+    }
+    // `sizeofcmds` bounds the load commands that follow the header; the bytes
+    // are in the image's guest memory, at the address the caller passed.
+    let sizeofcmds = env.mem.read((mhp + MACH_HEADER_SIZEOFCMDS_OFFSET).cast::<u32>());
+    let cmds_len = sizeofcmds.min(MAX_LOAD_COMMANDS_BYTES);
+    let header = env
+        .mem
+        .bytes_at(mhp, SIZEOF_MACH_HEADER + cmds_len);
+    let segname_bytes = env.mem.bytes_at(segname, NAME_FIELD_LEN);
+    let sectname_bytes = env.mem.bytes_at(sectname, NAME_FIELD_LEN);
+    match find_section_offset(header, segname_bytes, sectname_bytes) {
+        Some(offset) => mhp + offset,
+        None => Ptr::null(),
+    }
+}
+
+// `struct mach_header` (32-bit) and `struct section`, `<mach-o/loader.h>`.
+const SIZEOF_MACH_HEADER: u32 = 28;
+const MACH_HEADER_NCMDS_OFFSET: u32 = 16;
+const MACH_HEADER_SIZEOFCMDS_OFFSET: u32 = 20;
+const SIZEOF_SEGMENT_COMMAND: u32 = 56;
+const SEGMENT_COMMAND_NSECTS_OFFSET: u32 = 48;
+const SIZEOF_SECTION: u32 = 68;
+const SECTION_SEGNAME_OFFSET: u32 = 16;
+const NAME_FIELD_LEN: u32 = 16;
+const LC_SEGMENT: u32 = 0x1;
+/// A corrupt header must not make us read the whole guest address space.
+const MAX_LOAD_COMMANDS_BYTES: u32 = 4 * 1024 * 1024;
+
+/// Offset of the `struct section` matching `segname`/`sectname` within a
+/// mach_header and its load commands, if there is one.
+fn find_section_offset(header: &[u8], segname: &[u8], sectname: &[u8]) -> Option<u32> {
+    // `strncmp` semantics on the fixed-size name fields: at most 16 bytes,
+    // stopping at the NUL terminator.
+    fn name_matches(field: &[u8], wanted: &[u8]) -> bool {
+        for i in 0..NAME_FIELD_LEN as usize {
+            let a = field[i];
+            if a != wanted[i] {
+                return false;
+            }
+            if a == 0 {
+                return true;
+            }
+        }
+        true
+    }
+    fn u32_at(bytes: &[u8], offset: u32) -> Option<u32> {
+        let end = offset as usize + 4;
+        let field = bytes.get(offset as usize..end)?;
+        Some(u32::from_le_bytes([field[0], field[1], field[2], field[3]]))
+    }
+
+    let ncmds = u32_at(header, MACH_HEADER_NCMDS_OFFSET)?;
+    let mut cmd = SIZEOF_MACH_HEADER;
+    for _ in 0..ncmds {
+        let cmd_id = u32_at(header, cmd)?;
+        let cmdsize = u32_at(header, cmd + 4)?;
+        if cmdsize < 8 {
+            return None;
+        }
+        if cmd_id == LC_SEGMENT {
+            let nsects = u32_at(header, cmd + SEGMENT_COMMAND_NSECTS_OFFSET)?;
+            for i in 0..nsects {
+                let section = cmd + SIZEOF_SEGMENT_COMMAND + i * SIZEOF_SECTION;
+                let section_bytes = header.get(section as usize..)?;
+                let end = SIZEOF_SECTION as usize;
+                if section_bytes.len() < end {
+                    return None;
+                }
+                let segname_field = &section_bytes[SECTION_SEGNAME_OFFSET as usize..];
+                if name_matches(segname_field, segname) && name_matches(section_bytes, sectname) {
+                    return Some(section);
+                }
+            }
+        }
+        cmd += cmdsize;
+    }
+    None
+}
+
 /// `const char* _dyld_get_image_name(uint32_t image_index)`
 /// Returns a C-string pointer with the path of the image at `image_index`.
 /// We allocate the string in guest memory the first time it's requested.
@@ -855,6 +952,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(host_info(_, _, _, _)),
     export_c_func!(_dyld_image_count()),
     export_c_func!(_dyld_get_image_header(_)),
+export_c_func!(getsectbynamefromheader(_, _, _)),
     export_c_func!(_dyld_get_image_name(_)),
     export_c_func!(_dyld_get_image_vmaddr_slide(_)),
     export_c_func!(_dyld_register_func_for_add_image(_)),
@@ -864,3 +962,66 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(NXGetLocalArchInfo()),
     export_c_func!(NXGetAllArchInfos()),
 ];
+
+#[cfg(test)]
+mod getsectbynamefromheader_tests {
+    use super::*;
+
+    fn name(text: &str) -> [u8; 16] {
+        let mut field = [0u8; 16];
+        field[..text.len()].copy_from_slice(text.as_bytes());
+        field
+    }
+
+    /// A 32-bit mach_header with one LC_SEGMENT holding two sections.
+    fn header_with_sections() -> Vec<u8> {
+        let mut header = vec![0u8; SIZEOF_MACH_HEADER as usize];
+        header[0..4].copy_from_slice(&0xfeed_faceu32.to_le_bytes());
+        header[16..20].copy_from_slice(&1u32.to_le_bytes()); // ncmds
+        let segment_len = SIZEOF_SEGMENT_COMMAND + 2 * SIZEOF_SECTION;
+        header[20..24].copy_from_slice(&segment_len.to_le_bytes());
+
+        let mut segment = vec![0u8; SIZEOF_SEGMENT_COMMAND as usize];
+        segment[0..4].copy_from_slice(&LC_SEGMENT.to_le_bytes());
+        segment[4..8].copy_from_slice(&segment_len.to_le_bytes());
+        segment[8..24].copy_from_slice(&name("__DATA"));
+        segment[48..52].copy_from_slice(&2u32.to_le_bytes()); // nsects
+        header.extend_from_slice(&segment);
+
+        for section_name in ["__data", "__objc_imageinfo"] {
+            let mut section = vec![0u8; SIZEOF_SECTION as usize];
+            section[..16].copy_from_slice(&name(section_name));
+            section[16..32].copy_from_slice(&name("__DATA"));
+            header.extend_from_slice(&section);
+        }
+        header
+    }
+
+    #[test]
+    fn finds_a_section_by_segment_and_name() {
+        let header = header_with_sections();
+        let expected =
+            SIZEOF_MACH_HEADER + SIZEOF_SEGMENT_COMMAND + SIZEOF_SECTION;
+        let objc = name("__objc_imageinfo");
+        let found = find_section_offset(&header, &name("__DATA"), &objc);
+        assert_eq!(found, Some(expected));
+
+        let first = SIZEOF_MACH_HEADER + SIZEOF_SEGMENT_COMMAND;
+        let data_section = name("__data");
+        let found = find_section_offset(&header, &name("__DATA"), &data_section);
+        assert_eq!(found, Some(first));
+    }
+
+    #[test]
+    fn rejects_a_short_named_field_and_a_missing_section() {
+        let header = header_with_sections();
+        // strncmp semantics: "__dat" does not match "__data".
+        let data = name("__DATA");
+        let text = name("__TEXT");
+        let dat = name("__dat");
+        let data_section = name("__data");
+        assert_eq!(find_section_offset(&header, &data, &dat), None);
+        assert_eq!(find_section_offset(&header, &text, &data_section), None);
+        assert_eq!(find_section_offset(&[], &data, &data_section), None);
+    }
+}
