@@ -3801,10 +3801,8 @@ impl Environment {
             }
 
             // A memory abort raised by the one-shot null-write probe (see
-            // `touchHLE_cpu_write_impl`). This is the only way to learn which
-            // guest instruction stores through NULL, so report it and carry
-            // on: the store already reached the null page, and later nil
-            // writes are absorbed without probing again.
+            // `touchHLE_cpu_write_impl`). Interactive runs report it and carry
+            // on for compatibility; headless runs must preserve the failure.
             if matches!(error, cpu::CpuError::MemoryError) && crate::mem::null_write_probe_pending()
             {
                 crate::mem::null_write_probe_clear();
@@ -3819,7 +3817,9 @@ impl Environment {
                 );
                 self.dump_all_regs();
                 self.stack_trace_current();
-                return;
+                if null_write_probe_should_resume(self.window.is_some()) {
+                    return;
+                }
             }
 
             panic!("Error during CPU execution: {error:?}");
@@ -4950,6 +4950,10 @@ mod guest_trap_call_site_tests {
     }
 }
 
+fn null_write_probe_should_resume(has_window: bool) -> bool {
+    has_window
+}
+
 #[cfg(test)]
 mod guest_cpu_error_tests {
     use super::*;
@@ -4972,6 +4976,12 @@ mod guest_cpu_error_tests {
         assert!(!Environment::is_recoverable_guest_cpu_error(
             &cpu::CpuError::MemoryError
         ));
+    }
+
+    #[test]
+    fn null_write_probe_is_not_recovered_in_headless_mode() {
+        assert!(!null_write_probe_should_resume(false));
+        assert!(null_write_probe_should_resume(true));
     }
 }
 
