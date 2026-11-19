@@ -19,7 +19,9 @@ use crate::frameworks::core_foundation::cf_run_loop::{
     kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoopRef,
 };
 use crate::frameworks::{core_animation, media_player, uikit};
-use crate::objc::{id, msg, nil, objc_classes, release, retain, Class, ClassExports, HostObject, SEL};
+use crate::objc::{
+    id, msg, nil, objc_classes, release, retain, Class, ClassExports, HostObject, SEL,
+};
 use crate::Environment;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -427,11 +429,16 @@ pub fn run_run_loop(
 
         // We want to process those only on the main run loop
         if is_main_run_loop {
+            crate::libc::dispatch::drain_main_queue(env);
+
             let next_due = uikit::handle_events(env);
             limit_sleep_time(&mut sleep_until, next_due);
 
-            let force_video_composition = media_player::has_active_video(env);
-            let next_due = core_animation::recomposite_if_necessary(env, force_video_composition);
+            // Apply decoded movie frames before drawing the layer tree. An
+            // active video already disables the fullscreen EAGL fast path;
+            // it must still respect the compositor's 60 Hz deadline.
+            media_player::handle_players(env);
+            let next_due = core_animation::recomposite_if_necessary(env, false);
             limit_sleep_time(&mut sleep_until, next_due);
         }
 
@@ -483,10 +490,6 @@ pub fn run_run_loop(
         // single run loop, so we poll OpenAL source state once per tick
         // and dispatch finished completions here.
         tick_system_sound_completions(env);
-
-        if is_main_run_loop {
-            media_player::handle_players(env);
-        }
 
         // Unfortunately, touchHLE has to poll for certain things repeatedly;
         // it can't just wait until the next event appears.
@@ -545,7 +548,9 @@ pub fn run_run_loop(
             // and not worthy to convert back and forth)
             // The host clock could be set before the Unix epoch (or skew
             // backwards); never panic on that, just treat it as "not yet".
-            let now_secs = env.guest_clock.system_time()
+            let now_secs = env
+                .guest_clock
+                .system_time()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs_f64();

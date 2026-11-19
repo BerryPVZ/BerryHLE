@@ -651,7 +651,7 @@ fn wcstol(
     wide_integer_prefix(env, s, endptr, base, true, 32) as i32
 }
 
-/// wcstoul — wide string to unsigned long.
+/// wcstoul — wide string to unsigned 32-bit long.
 fn wcstoul(
     env: &mut Environment,
     s: ConstPtr<wchar_t>,
@@ -730,7 +730,7 @@ fn wide_float_prefix(
     value
 }
 
-/// wcstod — wide string to double.
+/// wcstod — use the same numeric-prefix scanner as narrow strtod.
 fn wcstod(env: &mut Environment, s: ConstPtr<wchar_t>, endptr: MutPtr<MutPtr<wchar_t>>) -> f64 {
     wide_float_prefix(env, s, endptr, false)
 }

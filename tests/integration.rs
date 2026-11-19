@@ -6,20 +6,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// adapted from `assert_cmd` crate
-fn target_dir() -> PathBuf {
-    env::current_exe()
-        .ok()
-        .map(|mut path| {
-            path.pop();
-            if path.ends_with("deps") {
-                path.pop();
-            }
-            path
-        })
-        .unwrap()
-}
-
 // https://stackoverflow.com/a/35907071/2241008
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
@@ -185,8 +171,7 @@ fn run_test_app(
         sources.iter().chain(cpp_objects.iter()),
         extra_compile_args,
     )?;
-    let binary_name = "touchHLE";
-    let binary_path = target_dir().join(format!("{}{}", binary_name, env::consts::EXE_SUFFIX));
+    let binary_path = env!("CARGO_BIN_EXE_touchHLE");
     let mut cmd = Command::new(binary_path);
     let output = cmd
         .arg(test_app_path)
@@ -315,6 +300,9 @@ fn test_app() -> Result<(), Box<dyn Error>> {
         // itself (see ns_string::register_constant_strings), so no stub
         // exports it.
         "-Wl,-U,___CFConstantStringClassReference",
+        // The SDK predates Blocks. Like constant strings, their class
+        // descriptor is resolved by touchHLE's loader, not a guest library.
+        "-Wl,-U,__NSConcreteStackBlock",
     ];
 
     // Generate symbol stubs.
@@ -322,8 +310,7 @@ fn test_app() -> Result<(), Box<dyn Error>> {
     let symbols_path = stubs_dir.join("SYMBOLS.txt");
     let dump_file_option = format!("--dump-file={}", symbols_path.to_str().unwrap());
     let dump_run_args = ["--dump=symbols", dump_file_option.as_str(), "--headless"];
-    let binary_name = "touchHLE";
-    let binary_path = target_dir().join(format!("{}{}", binary_name, env::consts::EXE_SUFFIX));
+    let binary_path = env!("CARGO_BIN_EXE_touchHLE");
     let mut cmd = Command::new(binary_path);
     let output = cmd
         .args(dump_run_args)
@@ -445,10 +432,61 @@ fn test_app() -> Result<(), Box<dyn Error>> {
         &extra_compile_args,
         &["--game-center-authenticated"],
     )?;
+    // ARM UDF and BKPT deliberately stop execution. Headless compatibility
+    // recovery must never let these programs return success to the test runner.
+    for (argument, error) in [
+        ("--trap-probe", "UndefinedInstruction"),
+        ("--breakpoint-probe", "Breakpoint"),
+    ] {
+        let output = Command::new(binary_path)
+            .arg(tests_dir.join("TestApp.app"))
+            .args(["--headless", "--args", argument])
+            .output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "{argument} was recovered: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("Error during CPU execution: {error}")),
+            "{argument} failed for an unrelated reason: {stderr}"
+        );
+    }
     run_test_app(
         &tests_dir,
         "AudioUnitThread",
         &extra_compile_args,
         &["--audio-unit-render-thread"],
-    )
+    )?;
+
+    let frameworks_dir = tests_dir.join("BundledDylib.app/Frameworks");
+    let library_path = frameworks_dir.join("BundledLibrary.framework/BundledLibrary");
+    std::fs::create_dir_all(library_path.parent().unwrap())?;
+    // -ObjC overrides the .mm extension and forces Objective-C, so replace it
+    // with -ObjC++ for the compiler-generated C++ lifecycle regression.
+    let mut library_compile_args: Vec<_> = extra_compile_args
+        .iter()
+        .copied()
+        .filter(|arg| *arg != "-ObjC")
+        .collect();
+    library_compile_args.extend([
+        "-dynamiclib",
+        "-ObjC++",
+        "-Wl,-install_name,@rpath/BundledLibrary.framework/BundledLibrary",
+    ]);
+    build_object(
+        &tests_dir,
+        &library_path,
+        [tests_dir.join("BundledLibrary_source/BundledLibrary.mm")].iter(),
+        &library_compile_args,
+    )?;
+    let framework_search_arg = format!("-F{}", frameworks_dir.display());
+    let mut bundled_compile_args = extra_compile_args.clone();
+    bundled_compile_args.extend([
+        framework_search_arg.as_str(),
+        "-framework",
+        "BundledLibrary",
+        "-Wl,-rpath,@executable_path/Frameworks",
+    ]);
+    run_test_app(&tests_dir, "BundledDylib", &bundled_compile_args, &[])
 }
