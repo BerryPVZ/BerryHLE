@@ -288,14 +288,25 @@ fn mmap(
             set_errno(env, EIO);
             return MAP_FAILED;
         }
-
         let read = posix_io::read(env, fd, ptr, len);
-        if (read as u32) < len {
+        if read < 0 {
             log!(
-                "Warning: mmap: read only {} of {} bytes from fd {}; padding remainder with zeros",
+                "Warning: mmap: read from fd {} at {:?}, offset {} failed ({}); \
+                 padding remainder with zeros",
+                fd,
+                ptr,
+                offset,
+                read,
+            );
+        } else if (read as u32) < len {
+            log!(
+                "Warning: mmap: read only {} of {} bytes from fd {} at {:?}, \
+                 offset {}; padding remainder with zeros",
                 read,
                 len,
-                fd
+                fd,
+                ptr,
+                offset
             );
             // Remainder is already zeroed (calloc)
         }
