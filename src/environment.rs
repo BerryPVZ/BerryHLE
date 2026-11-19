@@ -73,6 +73,11 @@ pub struct Thread {
     /// the host thread. The counter itself is a host thread-local shared by
     /// every guest thread, so `switch_thread` swaps it per thread.
     dispatch_depth: usize,
+    /// Address of a local near the top of this thread's coroutine stack, used
+    /// by the objc_msgSend guard to measure consumed host stack. Zero means
+    /// there is no known coroutine stack and the guard falls back to a depth
+    /// cap.
+    pub host_stack_base: usize,
 }
 
 impl Thread {
@@ -987,8 +992,10 @@ impl Environment {
         let main_thread_init_routine = Coroutine::with_stack(
             main_thread_init_stack,
             move |yielder, mut env: Environment| {
+                let stack_base = std::ptr::addr_of!(yielder) as usize;
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     env.with_yielder(yielder, move |env| {
+                        env.threads[0].host_stack_base = stack_base;
                         echo!("CPU emulation begins now.");
                         // Some apps use the stack inside the static initializer.
                         // While properly behaving apps should be fine, some app
@@ -1164,6 +1171,7 @@ impl Environment {
             host_context: Some(main_thread_init_routine),
             stack: Some(mem::Mem::MAIN_THREAD_STACK_LOW_END..=mem::Mem::MAIN_THREAD_STACK_HIGH_END),
             dispatch_depth: 0,
+            host_stack_base: 0,
             thread_local_framework_state: Default::default(),
         };
 
@@ -1373,6 +1381,7 @@ impl Environment {
             host_context: None,
             stack: Some(mem::Mem::MAIN_THREAD_STACK_LOW_END..=mem::Mem::MAIN_THREAD_STACK_HIGH_END),
             dispatch_depth: 0,
+            host_stack_base: 0,
             thread_local_framework_state: Default::default(),
         };
 
@@ -1818,12 +1827,15 @@ impl Environment {
             DefaultStack::new(16 * 1024 * 1024).expect("failed to allocate guest coroutine stack");
         let thread_routine =
             Coroutine::with_stack(thread_stack, move |yielder, mut env: Environment| {
+                let stack_base = std::ptr::addr_of!(yielder) as usize;
                 log_dbg!(
                     "touchHLE: guest worker thread now running (start_routine={:#x})",
                     start_routine.addr_with_thumb_bit()
                 );
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     env.with_yielder(yielder, move |env| {
+                        let tid = env.current_thread;
+                        env.threads[tid].host_stack_base = stack_base;
                         let regs = env.cpu.regs_mut();
                         regs[cpu::Cpu::LR] = env.dyld.thread_exit_routine().addr_with_thumb_bit();
                         regs[cpu::Cpu::SP] = stack_high_addr;
@@ -1857,6 +1869,7 @@ impl Environment {
             host_context: Some(thread_routine),
             stack: Some(stack_alloc.to_bits()..=(stack_high_addr - 1)),
             dispatch_depth: 0,
+            host_stack_base: 0,
             thread_local_framework_state: Default::default(),
         });
 
@@ -4648,6 +4661,7 @@ pub(crate) fn touch_test_environment() -> Environment {
         host_context: None,
         stack: None,
         dispatch_depth: 0,
+        host_stack_base: 0,
         thread_local_framework_state: Default::default(),
     });
     env.dyld.do_initial_linking_with_no_bins(&mut env.mem, &mut env.objc);

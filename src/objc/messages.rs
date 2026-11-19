@@ -407,6 +407,41 @@ fn dispatch_caller(env: &Environment) -> u32 {
     env.cpu.regs()[crate::cpu::Cpu::LR]
 }
 
+/// Bounds the *host* stack growth caused by guest-to-host dispatch round
+/// trips. Guest recursion lives on the guest stack (`Thread::stack`), so a
+/// legitimate deep guest recursion such as Blockheads' water flood-fill in
+/// `WorldTileLoader` is not a reason to bail out. What must be bounded is the
+/// host coroutine stack, which grows by one `objc_msgSend_inner` frame per
+/// dispatch. A 16 MiB coroutine stack keeps 4 MiB of margin. `None` means the
+/// headroom cannot be measured, so the caller must fall back to a depth cap.
+fn host_stack_exhausted(env: &Environment) -> Option<bool> {
+    let base = env.threads[env.current_thread].host_stack_base;
+    if base == 0 {
+        return None;
+    }
+    let here = 0u8;
+    let sp = std::ptr::addr_of!(here) as usize;
+    // `on_parent_stack_in_coroutine` temporarily runs host code on the parent
+    // stack; those addresses are unrelated to this coroutine, so ignore them.
+    if sp >= base {
+        return None;
+    }
+    host_stack_use_verdict(base - sp)
+}
+
+/// Keeps 4 MiB of the 16 MiB coroutine stack as margin. An implausible `used`
+/// means a stale base from a different coroutine, so return `None` to let the
+/// caller fall back to the depth cap instead of silently disabling the guard.
+fn host_stack_use_verdict(used: usize) -> Option<bool> {
+    const HOST_STACK_LIMIT: usize = 12 * 1024 * 1024;
+    const HOST_STACK_SIZE: usize = 16 * 1024 * 1024;
+    if used > HOST_STACK_SIZE {
+        None
+    } else {
+        Some(used > HOST_STACK_LIMIT)
+    }
+}
+
 /// Extra note for warnings whose receiver looks like a guest stack address.
 /// Guest code that passes a struct address where an object pointer belongs
 /// produces messages to a "receiver" that can never be an object.
@@ -526,14 +561,29 @@ fn objc_msgSend_inner(
     // `Environment`, since `objc_msgSend_inner` is the single chokepoint
     // through which every dispatch (host or guest) must pass.
     //
-    // 128 is a deliberate compromise: real iOS view hierarchies rarely go
-    // deeper than ~50 nested `nextResponder`/`hitTest:` levels. Guest
-    // threads run on a 16 MiB host coroutine stack, so this is a
-    // conservative cut-off rather than a stack-exhaustion bound.
+    // Prefer measuring the host stack: a legitimate deep guest recursion
+    // (Blockheads' `WorldTileLoader` water flood-fill) must not be cut off
+    // just because it nests deeply on the *guest* stack. The host coroutine
+    // stack is what a dispatch round trip consumes; cap its growth instead.
+    // For coroutines with no recorded base (the app picker's 1 MiB default),
+    // fall back to the old depth cap.
     const MAX_DEPTH: usize = 128;
     let depth_guard = DispatchDepth::enter(receiver, selector);
     let depth = depth_guard.depth;
-    if depth > MAX_DEPTH {
+    // With a known stack base, headroom is the sole criterion: a deep but
+    // shallow-on-host guest recursion must complete. Only unknown-base
+    // coroutines use the depth cap.
+    let headroom = host_stack_exhausted(env);
+    let exhausted = match headroom {
+        Some(exhausted) => exhausted,
+        None => depth > MAX_DEPTH,
+    };
+    if exhausted {
+        let guard_reason = if headroom == Some(true) {
+            "host stack headroom exhausted".to_string()
+        } else {
+            format!("recursion depth limit ({})", MAX_DEPTH)
+        };
         let sel_name = selector.as_str(&env.mem).to_string();
 
         if env.bundle.bundle_identifier() == "com.tayasui.mrpoofree"
@@ -572,10 +622,10 @@ fn objc_msgSend_inner(
         match rate_limit_verdict(hits, RECURSION_LOG_LIMIT) {
             RateLimitVerdict::Log => {
                 log!(
-                    "Warning: objc_msgSend recursion limit ({}) exceeded while \
-                     dispatching \"{}\" to {:?} (class \"{}\", depth {}); bailing \
-                     out with a nil return. [{}/{}] caller={:#010x}{}",
-                    MAX_DEPTH,
+                    "Warning: objc_msgSend bail-out ({}): dispatching \"{}\" \
+                     to {:?} (class \"{}\", depth {}); bailing out with a nil \
+                     return. [{}/{}] caller={:#010x}{}",
+                    guard_reason,
                     sel_name,
                     receiver,
                     class_name,
@@ -594,11 +644,11 @@ fn objc_msgSend_inner(
             }
             RateLimitVerdict::Total => {
                 log!(
-                    "Warning: {} objc_msgSend recursion-limit \
-                     bail-outs so far; the log stays quiet until the \
-                     next total. Latest: {:?} -> {} (class \"{}\", \
-                     depth {}), caller={:#010x}",
+                    "Warning: {} objc_msgSend bail-outs so far ({}); the log \
+                     stays quiet until the next total. Latest: {:?} -> {} \
+                     (class \"{}\", depth {}), caller={:#010x}",
                     hits,
+                    guard_reason,
                     receiver,
                     sel_name,
                     class_name,
@@ -3327,6 +3377,21 @@ mod rate_limit_tests {
             rate_limit_verdict(2 * RATE_LIMIT_TOTAL_EVERY, 8),
             RateLimitVerdict::Total
         );
+    }
+}
+
+#[cfg(test)]
+mod host_stack_tests {
+    use super::host_stack_use_verdict;
+
+    #[test]
+    fn deep_guest_recursion_does_not_trip_the_host_guard() {
+        // A 128-level guest recursion uses almost no host coroutine stack.
+        assert_eq!(host_stack_use_verdict(128 * 1024), Some(false));
+        assert_eq!(host_stack_use_verdict(11 * 1024 * 1024), Some(false));
+        assert_eq!(host_stack_use_verdict(12 * 1024 * 1024 + 1), Some(true));
+        // A stale base from another coroutine is ignored; the depth cap wins.
+        assert_eq!(host_stack_use_verdict(64 * 1024 * 1024), None);
     }
 }
 
