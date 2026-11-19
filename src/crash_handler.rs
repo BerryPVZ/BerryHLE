@@ -145,7 +145,7 @@ pub(crate) fn last_host_call_summary() -> Option<String> {
 /// Whether an `(PC, SP)` pair from the interrupted signal frame can be a real
 /// AArch64 user-mode register state.
 ///
-/// `interrupted_frame` decodes the signal handler's `ucontext_t` by field name,
+/// `interrupted_frame` decodes the signal handler's `ucontext_t`,
 /// and the layout of that structure differs between C libraries and versions;
 /// when the read is wrong it produces values that cannot be registers at all
 /// (a stack pointer of zero, or one that is not 16-byte aligned, which the
@@ -154,6 +154,42 @@ pub(crate) fn last_host_call_summary() -> Option<String> {
 #[cfg(unix)]
 fn frame_is_plausible(pc: usize, sp: usize) -> bool {
     pc != 0 && sp != 0 && sp.is_multiple_of(16)
+}
+
+// Android bionic reserves 128 bytes for the signal mask before mcontext.
+// https://android.googlesource.com/platform/bionic/+/main/libc/include/sys/ucontext.h
+#[cfg(all(unix, target_pointer_width = "64", any(test, target_arch = "aarch64")))]
+#[repr(C, align(16))]
+struct AndroidAarch64Sigcontext {
+    fault_address: u64,
+    regs: [u64; 31],
+    sp: u64,
+    pc: u64,
+    pstate: u64,
+}
+
+#[cfg(all(unix, target_pointer_width = "64", any(test, target_arch = "aarch64")))]
+#[repr(C)]
+struct AndroidAarch64Ucontext {
+    flags: u64,
+    link: *mut libc::c_void,
+    stack: libc::stack_t,
+    sigmask: [u8; 128],
+    mcontext: AndroidAarch64Sigcontext,
+}
+
+#[cfg(unix)]
+fn executable_mapping_offset(line: &str, addr: usize) -> Option<usize> {
+    let mut fields = line.split_whitespace();
+    let (start, end) = fields.next()?.split_once('-')?;
+    let start = usize::from_str_radix(start, 16).ok()?;
+    let end = usize::from_str_radix(end, 16).ok()?;
+    let perms = fields.next()?;
+    let offset = usize::from_str_radix(fields.next()?, 16).ok()?;
+    if !perms.contains('x') || !line.contains("libtouchHLE.so") || addr < start || addr >= end {
+        return None;
+    }
+    (addr - start).checked_add(offset)
 }
 
 #[cfg(unix)]
@@ -239,8 +275,7 @@ mod imp {
     }
 
     /// The interrupted PC/LR as addresses, so `maps_for` attributes them to a
-    /// loaded library (and reports the libtouchHLE.so load base needed to
-    /// symbolize them).
+    /// loaded library.
     fn fault_addrs(fault: InterruptedFrame) -> Vec<*mut libc::c_void> {
         match fault {
             Some((pc, lr, _)) => vec![pc as *mut libc::c_void, lr as *mut libc::c_void],
@@ -280,11 +315,6 @@ mod imp {
         unsafe { libc::close(fd) };
         let text = String::from_utf8_lossy(&buf[..off]).into_owned();
         let mut out = String::from("relevant /proc/self/maps entries:\n");
-        // Track the lowest mapping of libtouchHLE.so together with its file
-        // offset, so native backtrace frames can be converted to ELF file
-        // addresses for offline symbolization:
-        //   file_vaddr = frame_addr - load_base, load_base = map_start - map_offset
-        let mut touchhle_load_base: Option<(usize, usize)> = None;
         for line in text.lines() {
             // "start-end perms offset dev inode path"
             let mut it = line.splitn(2, ' ');
@@ -299,29 +329,24 @@ mod imp {
                 ) else {
                     continue;
                 };
-                if line.contains("libtouchHLE.so") && touchhle_load_base.is_none() {
-                    // Offset is the third field.
-                    let offset = line
-                        .split_whitespace()
-                        .nth(2)
-                        .and_then(|o| usize::from_str_radix(o, 16).ok())
-                        .unwrap_or(0);
-                    touchhle_load_base = Some((start.saturating_sub(offset), offset));
-                }
                 if addrs.iter().any(|a| {
                     let a = *a as usize;
                     a >= start && a < end
                 }) {
                     out.push_str(line);
                     out.push('\n');
+                    for addr in addrs {
+                        if let Some(offset) =
+                            super::executable_mapping_offset(line, *addr as usize)
+                        {
+                            out.push_str(&format!(
+                                "  address {:#x}: file offset {:#x}\n",
+                                *addr as usize, offset
+                            ));
+                        }
+                    }
                 }
             }
-        }
-        if let Some((base, _)) = touchhle_load_base {
-            out.push_str(&format!(
-                "libtouchHLE.so load base: {:#x} (symbolize native frames with: llvm-symbolizer --obj=libtouchHLE.so <frame - base>)\n",
-                base
-            ));
         }
         out
     }
@@ -351,28 +376,17 @@ mod imp {
         if uc.is_null() {
             return None;
         }
-        // The kernel/bionic arm64 `struct sigcontext`, which is what
-        // `mcontext_t` is a typedef of. Read through this mirror rather than
-        // through `libc::mcontext_t`'s own field names, which are not stable
-        // across libc versions. The field order is the ABI and must be kept
-        // even for the fields this handler does not report.
-        #[repr(C)]
-        #[allow(dead_code)]
-        struct Aarch64Sigcontext {
-            fault_address: u64,
-            regs: [u64; 31],
-            sp: u64,
-            pc: u64,
-            pstate: u64,
+        // libc's Android ucontext_t omits bionic's signal-mask padding.
+        // SAFETY: the kernel supplies a valid bionic ucontext to SA_SIGINFO.
+        let ctx = uc as *const super::AndroidAarch64Ucontext;
+        // Read only initialized register fields, not signal-mask padding.
+        unsafe {
+            let sc = std::ptr::addr_of!((*ctx).mcontext);
+            let pc = std::ptr::addr_of!((*sc).pc).read();
+            let lr = std::ptr::addr_of!((*sc).regs[30]).read();
+            let sp = std::ptr::addr_of!((*sc).sp).read();
+            Some((pc as usize, lr as usize, sp as usize))
         }
-        // SAFETY: the kernel passes a valid `ucontext_t` as the third
-        // argument of a SA_SIGINFO handler, and `uc_mcontext` is this
-        // architecture's `sigcontext`. Only reads are performed, and the
-        // mirror covers a prefix of that (larger) kernel structure.
-        let ctx = unsafe { &*(uc as *const libc::ucontext_t) };
-        let sc = unsafe { &*(&ctx.uc_mcontext as *const _ as *const Aarch64Sigcontext) };
-        // x30 is the link register on arm64.
-        Some((sc.pc as usize, sc.regs[30] as usize, sc.sp as usize))
     }
 
     /// Platforms whose `ucontext_t` layout this handler does not know: no
@@ -684,6 +698,26 @@ mod tests {
         assert!(!frame_is_plausible(0x74b3_0000, 0));
         assert!(!frame_is_plausible(0x74b3_0000, 0x7fff_1238));
         assert!(!frame_is_plausible(0, 0x7fff_1230));
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn android_aarch64_signal_context_has_bionic_offsets() {
+        assert_eq!(std::mem::offset_of!(AndroidAarch64Ucontext, mcontext), 176);
+        assert_eq!(std::mem::offset_of!(AndroidAarch64Sigcontext, regs), 8);
+        assert_eq!(std::mem::offset_of!(AndroidAarch64Sigcontext, sp), 256);
+        assert_eq!(std::mem::offset_of!(AndroidAarch64Sigcontext, pc), 264);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn file_offset_uses_the_executable_mapping_containing_a_frame() {
+        let addr = 0x6f75b145bcusize;
+        let data = "6df6259000-6df6260000 r--p 00000000 00:00 1 /libtouchHLE.so";
+        let code = "6f75798000-6f767ca000 r-xp 00785000 00:00 1 /libtouchHLE.so";
+        assert_eq!(executable_mapping_offset(data, addr), None);
+        assert_eq!(executable_mapping_offset(code, addr), Some(0xb015bc));
+        assert_eq!(executable_mapping_offset(code, 0), None);
     }
 
     // Both cases share the global LAST_HOST_CALL_* state, so they run in one
