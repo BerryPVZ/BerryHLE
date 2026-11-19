@@ -35,6 +35,11 @@ mod synchronization;
 pub(crate) mod type_encoding;
 mod weak;
 
+// The objc_msgSend recursion depth is a host thread-local that the thread
+// scheduler has to swap per guest thread: guest threads are coroutines sharing
+// one host thread. See `messages::DispatchDepth`.
+pub(crate) use messages::{set_dispatch_depth, take_dispatch_depth};
+
 pub use classes::{
     __objc_deallocOnMainThreadHelper, class_addMethod, class_conformsToProtocol,
     class_copyIvarList, class_copyMethodList, class_copyPropertyList, class_copyProtocolList,

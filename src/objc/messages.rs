@@ -28,7 +28,9 @@ use crate::libc::pthread::mutex::pthread_mutex_t;
 use crate::libc::pthread::mutex::{
     pthread_mutex_destroy, pthread_mutex_init, pthread_mutex_lock, pthread_mutex_unlock,
 };
-use crate::mem::{guest_size_of, ConstPtr, MutPtr, MutVoidPtr, Ptr, SafeRead};
+use crate::mem::{
+    guest_size_of, ConstPtr, GuestUSize, MutPtr, MutVoidPtr, Ptr, SafeRead,
+};
 use crate::Environment;
 use std::any::TypeId;
 
@@ -292,6 +294,133 @@ fn ensure_class_initialized(env: &mut Environment, class_to_init: Class) {
 /// by the method implementation.
 /// We are relying on CallFromGuest not
 /// overwriting it.
+/// Nesting state of the dispatches in progress on this host thread.
+///
+/// Every dispatch, host or guest, passes through [`objc_msgSend_inner`], so a
+/// host -> guest -> host recursion (typically `hitTest:withEvent:`) grows the
+/// host stack until it overflows. This counts the nesting so the guard there
+/// can bail out first, and records the deepest dispatches so a bail-out can
+/// report what recursed instead of only the leaf.
+///
+/// Guest threads are coroutines sharing one host thread, so
+/// `Environment::switch_thread` swaps the count per guest thread instead of
+/// letting the next thread inherit a depth it never reached.
+struct DispatchDepth {
+    depth: usize,
+    /// Set when this dispatch was written to the chain ring, so its `Drop`
+    /// removes that entry again.
+    recorded: Option<(GuestUSize, GuestUSize)>,
+}
+
+/// Depth at which dispatches start being recorded, so an ordinary message pays
+/// one compare and never touches the ring.
+const CHAIN_RECORD_DEPTH: usize = 64;
+/// Entries kept for the chain report.
+const CHAIN_LEN: usize = 24;
+
+thread_local! {
+    static DISPATCH_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// `(receiver, selector)` of the deepest dispatches, innermost last.
+    static DISPATCH_CHAIN: std::cell::RefCell<
+        std::collections::VecDeque<(GuestUSize, GuestUSize)>,
+    > = std::cell::RefCell::new(std::collections::VecDeque::new());
+}
+
+impl DispatchDepth {
+    fn enter(receiver: id, selector: SEL) -> Self {
+        let depth = DISPATCH_DEPTH.with(|cell| {
+            let depth = cell.get() + 1;
+            cell.set(depth);
+            depth
+        });
+        let entry = (receiver.to_bits(), selector.to_bits());
+        let recorded = (depth >= CHAIN_RECORD_DEPTH).then_some(entry);
+        if let Some(entry) = recorded {
+            DISPATCH_CHAIN.with(|chain| {
+                let mut chain = chain.borrow_mut();
+                if chain.len() == CHAIN_LEN {
+                    let _ = chain.pop_front();
+                }
+                chain.push_back(entry);
+            });
+        }
+        Self { depth, recorded }
+    }
+}
+
+impl Drop for DispatchDepth {
+    fn drop(&mut self) {
+        DISPATCH_DEPTH.with(|cell| cell.set(cell.get().saturating_sub(1)));
+        let Some(entry) = self.recorded else {
+            return;
+        };
+        // Another guest thread can push its own entries between this one's
+        // push and this drop (they share the host thread), so only pop when
+        // this dispatch is still the tail.
+        DISPATCH_CHAIN.with(|chain| {
+            let mut chain = chain.borrow_mut();
+            if chain.back() == Some(&entry) {
+                let _ = chain.pop_back();
+            }
+        });
+    }
+}
+
+/// The dispatch depth this host thread currently reports, for
+/// `Environment::switch_thread`. Leaves the counter at zero.
+pub(crate) fn take_dispatch_depth() -> usize {
+    DISPATCH_DEPTH.with(|cell| cell.replace(0))
+}
+
+/// Restore a depth saved by [`take_dispatch_depth`].
+pub(crate) fn set_dispatch_depth(depth: usize) {
+    DISPATCH_DEPTH.with(|cell| cell.set(depth));
+}
+
+/// One line naming the recorded deep dispatches, innermost last. The leaf of a
+/// recursion cannot tell a legitimate deep chain from a runaway one; the chain
+/// usually can.
+fn dispatch_chain_summary(env: &Environment) -> String {
+    let chain: Vec<_> = DISPATCH_CHAIN.with(|chain| {
+        chain.borrow().iter().copied().collect()
+    });
+    if chain.is_empty() {
+        return "(none recorded)".to_owned();
+    }
+    chain
+        .iter()
+        .map(|&(receiver, selector)| {
+            let class = ObjC::read_isa(id::from_bits(receiver), &env.mem);
+            format!(
+                "{}.{}",
+                env.objc.try_get_class_name(class).unwrap_or("<unknown>"),
+                SEL::from_bits(selector).as_str(&env.mem),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" <- ")
+}
+
+/// The guest return address of the dispatch in progress. A warning that names
+/// only the receiver and selector cannot be traced back to the caller.
+fn dispatch_caller(env: &Environment) -> u32 {
+    env.cpu.regs()[crate::cpu::Cpu::LR]
+}
+
+/// Extra note for warnings whose receiver looks like a guest stack address.
+/// Guest code that passes a struct address where an object pointer belongs
+/// produces messages to a "receiver" that can never be an object.
+fn stack_receiver_note(env: &Environment, receiver: id) -> String {
+    match env.thread_stack_containing(receiver.to_bits()) {
+        Some(thread) => format!(
+            " The receiver lies inside the stack of thread {}: the guest \
+             passed a stack address where an object pointer belongs.",
+            thread
+        ),
+        None => String::new(),
+    }
+}
+
 #[allow(non_snake_case)]
 fn objc_msgSend_inner(
     env: &mut Environment,
@@ -398,26 +527,12 @@ fn objc_msgSend_inner(
     // through which every dispatch (host or guest) must pass.
     //
     // 128 is a deliberate compromise: real iOS view hierarchies rarely go
-    // deeper than ~50 nested `nextResponder`/`hitTest:` levels, and a small
-    // limit keeps us well clear of Android's 1 MB default thread stack
-    // (each `objc_msgSend_inner` host frame is several KB once Rust adds
-    // local variables, log!() temporaries, and the dispatch trampoline).
+    // deeper than ~50 nested `nextResponder`/`hitTest:` levels. Guest
+    // threads run on a 16 MiB host coroutine stack, so this is a
+    // conservative cut-off rather than a stack-exhaustion bound.
     const MAX_DEPTH: usize = 128;
-    thread_local! {
-        static DISPATCH_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    }
-    let depth = DISPATCH_DEPTH.with(|d| {
-        let new = d.get() + 1;
-        d.set(new);
-        new
-    });
-    struct DepthGuard;
-    impl Drop for DepthGuard {
-        fn drop(&mut self) {
-            DISPATCH_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-        }
-    }
-    let _guard = DepthGuard;
+    let depth_guard = DispatchDepth::enter(receiver, selector);
+    let depth = depth_guard.depth;
     if depth > MAX_DEPTH {
         let sel_name = selector.as_str(&env.mem).to_string();
 
@@ -441,36 +556,57 @@ fn objc_msgSend_inner(
         }
         // Rate-limit: a guest loop that retries after the nil return can hit
         // this guard millions of times (Blockheads' worldWidthMacro filled
-        // 2 GB of log); log the first few with the class name, then stop.
+        // 2 GB of log); log the first few with the class name and the chain
+        // that led here, then keep counting and report the total occasionally.
         use std::sync::atomic::{AtomicUsize, Ordering};
-        static RECURSION_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static RECURSION_HITS: AtomicUsize = AtomicUsize::new(0);
         const RECURSION_LOG_LIMIT: usize = 8;
-        let count = RECURSION_COUNT.fetch_add(1, Ordering::Relaxed);
-        if count < RECURSION_LOG_LIMIT {
-            let class = ObjC::read_isa(receiver, &env.mem);
-            let class_name = env
-                .objc
-                .try_get_class_name(class)
-                .unwrap_or("<unknown>")
-                .to_owned();
-            log!(
-                "Warning: objc_msgSend recursion limit ({}) exceeded while \
-                 dispatching \"{}\" to {:?} (class \"{}\", depth {}); bailing \
-                 out with a nil return. [{}/{}]",
-                MAX_DEPTH,
-                sel_name,
-                receiver,
-                class_name,
-                depth,
-                count + 1,
-                RECURSION_LOG_LIMIT,
-            );
-        } else if count == RECURSION_LOG_LIMIT {
-            log!(
-                "Warning: suppressing further objc_msgSend recursion warnings \
-                 ({} already logged).",
-                RECURSION_LOG_LIMIT,
-            );
+        let hits = RECURSION_HITS.fetch_add(1, Ordering::Relaxed) + 1;
+        let class = ObjC::read_isa(receiver, &env.mem);
+        let class_name = env
+            .objc
+            .try_get_class_name(class)
+            .unwrap_or("<unknown>")
+            .to_owned();
+        let caller = dispatch_caller(env);
+        match rate_limit_verdict(hits, RECURSION_LOG_LIMIT) {
+            RateLimitVerdict::Log => {
+                log!(
+                    "Warning: objc_msgSend recursion limit ({}) exceeded while \
+                     dispatching \"{}\" to {:?} (class \"{}\", depth {}); bailing \
+                     out with a nil return. [{}/{}] caller={:#010x}{}",
+                    MAX_DEPTH,
+                    sel_name,
+                    receiver,
+                    class_name,
+                    depth,
+                    hits,
+                    RECURSION_LOG_LIMIT,
+                    caller,
+                    stack_receiver_note(env, receiver),
+                );
+                if hits == 1 {
+                    log!(
+                        "Warning: dispatch chain, innermost last: {}",
+                        dispatch_chain_summary(env),
+                    );
+                }
+            }
+            RateLimitVerdict::Total => {
+                log!(
+                    "Warning: {} objc_msgSend recursion-limit \
+                     bail-outs so far; the log stays quiet until the \
+                     next total. Latest: {:?} -> {} (class \"{}\", \
+                     depth {}), caller={:#010x}",
+                    hits,
+                    receiver,
+                    sel_name,
+                    class_name,
+                    depth,
+                    caller,
+                );
+            }
+            RateLimitVerdict::Quiet => {}
         }
         // Special handling for allocWithZone: — if recursion is hit during
         // allocation, perform the allocation directly using NSObject's
@@ -504,27 +640,36 @@ fn objc_msgSend_inner(
     // it gracefully by returning nil/0 instead of crashing.
     if orig_class == nil {
         // Rate-limit these warnings to avoid flooding the log when the
-        // guest app has a use-after-free bug that triggers repeatedly.
+        // guest app has a use-after-free bug that triggers repeatedly, but
+        // keep counting so a suppressed warning still reports its total.
         use std::sync::atomic::{AtomicUsize, Ordering};
-        static NIL_ISA_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static NIL_ISA_HITS: AtomicUsize = AtomicUsize::new(0);
         const NIL_ISA_LOG_LIMIT: usize = 8;
-        let count = NIL_ISA_COUNT.fetch_add(1, Ordering::Relaxed);
-        if count < NIL_ISA_LOG_LIMIT {
-            log!(
-                "Warning: receiver {:?} has nil isa! Ignoring message \"{}\". \
-                 (This usually means the object was already freed — use-after-free \
-                 in guest code.) [{}/{}]",
-                receiver,
-                selector.as_str(&env.mem),
-                count + 1,
-                NIL_ISA_LOG_LIMIT,
-            );
-        } else if count == NIL_ISA_LOG_LIMIT {
-            log!(
-                "Warning: suppressing further nil-isa warnings ({} already logged). \
-                 The guest app has use-after-free bugs.",
-                NIL_ISA_LOG_LIMIT,
-            );
+        let hits = NIL_ISA_HITS.fetch_add(1, Ordering::Relaxed) + 1;
+        let caller = dispatch_caller(env);
+        match rate_limit_verdict(hits, NIL_ISA_LOG_LIMIT) {
+            RateLimitVerdict::Log => {
+                log!(
+                    "Warning: receiver {:?} has nil isa! Ignoring message \"{}\". \
+                     (This usually means the object was already freed — use-after-free \
+                     in guest code.) [{}/{}] caller={:#010x}{}",
+                    receiver,
+                    selector.as_str(&env.mem),
+                    hits,
+                    NIL_ISA_LOG_LIMIT,
+                    caller,
+                    stack_receiver_note(env, receiver),
+                );
+            }
+            RateLimitVerdict::Total => {
+                log!(
+                    "Warning: {} messages to objects with a nil isa \
+                     so far. The guest app has use-after-free bugs; \
+                     the log stays quiet until the next total.",
+                    hits,
+                );
+            }
+            RateLimitVerdict::Quiet => {}
         }
         env.cpu.regs_mut()[0..2].fill(0);
         return;
@@ -798,27 +943,45 @@ fn objc_msgSend_inner(
                     *entry += 1;
                     *entry
                 };
+                let caller = dispatch_caller(env);
 
-                if count <= PER_PAIR_LOG_LIMIT {
-                    log!(
-                        "Warning: {} {:?} ({}class \"{}\", {:?}){} does not respond to selector \"{}\"! Returning 0.{}",
-                        if is_metaclass { "Class" } else { "Object" },
-                        receiver,
-                        if is_metaclass { "meta" } else { "" },
-                        class_name_for_log,
-                        orig_class,
-                        if super2.is_some() {
-                            "'s superclass"
-                        } else {
-                            ""
-                        },
-                        sel_str,
-                        if count == PER_PAIR_LOG_LIMIT {
-                            " (suppressing further warnings for this selector)"
-                        } else {
-                            ""
-                        },
-                    );
+                match rate_limit_verdict(count, PER_PAIR_LOG_LIMIT) {
+                    RateLimitVerdict::Log => {
+                        log!(
+                            "Warning: {} {:?} ({}class \"{}\", {:?}){} does not \
+                             respond to selector \"{}\"! Returning 0. \
+                             caller={:#010x}{}{}",
+                            if is_metaclass { "Class" } else { "Object" },
+                            receiver,
+                            if is_metaclass { "meta" } else { "" },
+                            class_name_for_log,
+                            orig_class,
+                            if super2.is_some() {
+                                "'s superclass"
+                            } else {
+                                ""
+                            },
+                            sel_str,
+                            caller,
+                            if count == PER_PAIR_LOG_LIMIT {
+                                " (suppressing further warnings for this selector)"
+                            } else {
+                                ""
+                            },
+                            stack_receiver_note(env, receiver),
+                        );
+                    }
+                    RateLimitVerdict::Total => {
+                        log!(
+                            "Warning: {} messages to unimplemented selector \
+                             \"{}\" on class \"{}\" so far; the log stays \
+                             quiet until the next total.",
+                            count,
+                            sel_str,
+                            class_name_for_log,
+                        );
+                    }
+                    RateLimitVerdict::Quiet => {}
                 }
             }
 
@@ -1179,9 +1342,18 @@ Type mismatch when sending message {} to {:?}!
             let class_name = env.objc.try_get_class_name(class).map(|s| s.to_owned());
             let orig_name = env.objc.try_get_class_name(orig_class).map(|s| s.to_owned());
             let type_name = host_object.type_name();
+            let caller = dispatch_caller(env);
             log!(
-                "Item {class:?} ({:?}) in superclass chain of object {receiver:?}'s class {orig_class:?} ({:?}) has an unexpected host object type ({}). Selector: \"{}\". Behaving as if message was sent to nil.",
-                class_name, orig_name, type_name, sel_name
+                "Item {class:?} ({:?}) in superclass chain of object \
+                 {receiver:?}'s class {orig_class:?} ({:?}) has an unexpected \
+                 host object type ({}). Selector: \"{}\". caller={:#010x}. \
+                 Behaving as if message was sent to nil.{}",
+                class_name,
+                orig_name,
+                type_name,
+                sel_name,
+                caller,
+                stack_receiver_note(env, receiver),
             );
             env.cpu.regs_mut()[0..2].fill(0);
             return;
@@ -1208,16 +1380,42 @@ fn objc_ret_u32(env: &mut Environment, value: u32) {
     env.cpu.regs_mut()[1] = 0;
 }
 
+/// How a rate-limited diagnostic should report this hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RateLimitVerdict {
+    /// Log the full line; `hits` is within the limit.
+    Log,
+    /// Log a one-line running total.
+    Total,
+    /// Stay quiet.
+    Quiet,
+}
+
+/// Hits between running-total reports once a diagnostic is suppressed.
+const RATE_LIMIT_TOTAL_EVERY: usize = 10_000;
+
+/// Decide how a repeated diagnostic reports this hit. The first `limit` hits
+/// log in full, then only a running total: a guest that floods the log with one
+/// message must not also be able to hide that it is still doing it.
+fn rate_limit_verdict(hits: usize, limit: usize) -> RateLimitVerdict {
+    if hits <= limit {
+        RateLimitVerdict::Log
+    } else if hits == limit + 1 || hits % RATE_LIMIT_TOTAL_EVERY == 0 {
+        RateLimitVerdict::Total
+    } else {
+        RateLimitVerdict::Quiet
+    }
+}
+
 /// Rate-limit the "faked class" log lines. An app can call the same
 /// unimplemented SDK method on every frame (Epic Island logged 31 identical
 /// Flurry `logEvent:withParameters:` lines), which buries everything else in
-/// the log. The first few calls are logged in full, then one note, then
-/// silence.
+/// the log. The first few calls are logged in full, then only a running total.
 fn should_log_faked_class_call(class_name: &str, selector: &str) -> bool {
     use std::collections::HashMap;
     use std::sync::Mutex;
-    static SEEN: Mutex<Option<HashMap<(String, String), u32>>> = Mutex::new(None);
-    const MAX_LOGS_PER_METHOD: u32 = 3;
+    static SEEN: Mutex<Option<HashMap<(String, String), usize>>> = Mutex::new(None);
+    const MAX_LOGS_PER_METHOD: usize = 3;
 
     let mut guard = SEEN.lock().unwrap();
     let seen = guard.get_or_insert_with(HashMap::new);
@@ -1225,17 +1423,20 @@ fn should_log_faked_class_call(class_name: &str, selector: &str) -> bool {
         .entry((class_name.to_owned(), selector.to_owned()))
         .or_insert(0);
     *count += 1;
-    if *count <= MAX_LOGS_PER_METHOD {
-        return true;
+    match rate_limit_verdict(*count, MAX_LOGS_PER_METHOD) {
+        RateLimitVerdict::Log => true,
+        RateLimitVerdict::Total => {
+            log!(
+                "Further calls to faked class \"{}\" method \"{}\" are not \
+                 logged ({} so far).",
+                class_name,
+                selector,
+                count,
+            );
+            false
+        }
+        RateLimitVerdict::Quiet => false,
     }
-    if *count == MAX_LOGS_PER_METHOD + 1 {
-        log!(
-            "Further calls to faked class \"{}\" method \"{}\" will not be logged.",
-            class_name,
-            selector
-        );
-    }
-    false
 }
 
 /// Return value for a message to a faked third-party SDK class (see
@@ -3080,5 +3281,103 @@ mod fake_class_tests {
             fake_class_message_result("FlurryAPI", true, "hasUserSetFeintAccess"),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::{rate_limit_verdict, RateLimitVerdict, RATE_LIMIT_TOTAL_EVERY};
+
+    #[test]
+    fn logs_the_limit_then_reports_totals() {
+        let verdicts: Vec<_> = (1..=7)
+            .map(|hits| rate_limit_verdict(hits, 3))
+            .collect();
+        assert_eq!(
+            verdicts,
+            vec![
+                RateLimitVerdict::Log,
+                RateLimitVerdict::Log,
+                RateLimitVerdict::Log,
+                RateLimitVerdict::Total,
+                RateLimitVerdict::Quiet,
+                RateLimitVerdict::Quiet,
+                RateLimitVerdict::Quiet,
+            ]
+        );
+    }
+
+    // A suppressed diagnostic must still surface its running total, otherwise
+    // a guest stuck in a loop looks identical to a quiet one in the log.
+    #[test]
+    fn keeps_reporting_totals_after_suppression() {
+        assert_eq!(
+            rate_limit_verdict(RATE_LIMIT_TOTAL_EVERY - 1, 8),
+            RateLimitVerdict::Quiet
+        );
+        assert_eq!(
+            rate_limit_verdict(RATE_LIMIT_TOTAL_EVERY, 8),
+            RateLimitVerdict::Total
+        );
+        assert_eq!(
+            rate_limit_verdict(RATE_LIMIT_TOTAL_EVERY + 1, 8),
+            RateLimitVerdict::Quiet
+        );
+        assert_eq!(
+            rate_limit_verdict(2 * RATE_LIMIT_TOTAL_EVERY, 8),
+            RateLimitVerdict::Total
+        );
+    }
+}
+
+#[cfg(test)]
+mod dispatch_chain_tests {
+    use super::{
+        DispatchDepth, CHAIN_RECORD_DEPTH, DISPATCH_CHAIN, DISPATCH_DEPTH,
+    };
+    use super::{id, SEL};
+
+    #[test]
+    fn ring_holds_only_deep_dispatches_and_unwinds() {
+        DISPATCH_DEPTH.with(|cell| cell.set(0));
+        DISPATCH_CHAIN.with(|chain| chain.borrow_mut().clear());
+
+        let total = CHAIN_RECORD_DEPTH + 3;
+        let receiver = id::from_bits(0x1000);
+        let selector = SEL::from_bits(1);
+        let guards: Vec<_> = (0..total)
+            .map(|_| DispatchDepth::enter(receiver, selector))
+            .collect();
+
+        assert_eq!(DISPATCH_DEPTH.with(|cell| cell.get()), total);
+        // Only depths CHAIN_RECORD_DEPTH..=total are recorded.
+        assert_eq!(
+            DISPATCH_CHAIN.with(|chain| chain.borrow().len()),
+            total - CHAIN_RECORD_DEPTH + 1
+        );
+
+        drop(guards);
+        assert_eq!(DISPATCH_DEPTH.with(|cell| cell.get()), 0);
+        assert!(DISPATCH_CHAIN.with(|chain| chain.borrow().is_empty()));
+    }
+
+    #[test]
+    fn a_foreign_entry_at_the_tail_is_left_alone() {
+        DISPATCH_DEPTH.with(|cell| cell.set(0));
+        let receiver = id::from_bits(0x2000);
+        let selector = SEL::from_bits(2);
+        let guard = DispatchDepth::enter(receiver, selector);
+        DISPATCH_CHAIN.with(|chain| {
+            chain.borrow_mut().clear();
+            chain.borrow_mut().push_back((0x99, 0x9));
+        });
+
+        drop(guard);
+        // The other thread's entry must survive this dispatch's teardown.
+        assert_eq!(
+            DISPATCH_CHAIN.with(|chain| chain.borrow().back().copied()),
+            Some((0x99, 0x9))
+        );
+        assert_eq!(DISPATCH_DEPTH.with(|cell| cell.get()), 0);
     }
 }

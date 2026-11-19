@@ -69,6 +69,10 @@ pub struct Thread {
     /// Address range of this thread's stack, used to check if addresses are in
     /// range while producing a stack trace.
     pub stack: Option<std::ops::RangeInclusive<u32>>,
+    /// How deep in `objc_msgSend` nesting this thread was when it last gave up
+    /// the host thread. The counter itself is a host thread-local shared by
+    /// every guest thread, so `switch_thread` swaps it per thread.
+    dispatch_depth: usize,
 }
 
 impl Thread {
@@ -1159,6 +1163,7 @@ impl Environment {
             guest_context: None,
             host_context: Some(main_thread_init_routine),
             stack: Some(mem::Mem::MAIN_THREAD_STACK_LOW_END..=mem::Mem::MAIN_THREAD_STACK_HIGH_END),
+            dispatch_depth: 0,
             thread_local_framework_state: Default::default(),
         };
 
@@ -1367,6 +1372,7 @@ impl Environment {
             guest_context: None,
             host_context: None,
             stack: Some(mem::Mem::MAIN_THREAD_STACK_LOW_END..=mem::Mem::MAIN_THREAD_STACK_HIGH_END),
+            dispatch_depth: 0,
             thread_local_framework_state: Default::default(),
         };
 
@@ -1613,6 +1619,18 @@ impl Environment {
         self.stack_trace_all();
     }
 
+    /// The guest thread whose stack contains `addr`, if any. Diagnostics use
+    /// this to recognise a guest passing a stack address where an object
+    /// pointer belongs.
+    pub(crate) fn thread_stack_containing(&self, addr: u32) -> Option<usize> {
+        self.threads.iter().position(|thread| {
+            thread
+                .stack
+                .as_ref()
+                .is_some_and(|stack| stack.contains(&addr))
+        })
+    }
+
     /// One line per live guest thread: state, block reason and PC/LR. Printed
     /// before the register and stack dumps so a stall can be read at a glance
     /// (which thread is spinning, which one is parked, and on what).
@@ -1838,6 +1856,7 @@ impl Environment {
             guest_context: Some(Box::new(cpu::CpuContext::new())),
             host_context: Some(thread_routine),
             stack: Some(stack_alloc.to_bits()..=(stack_high_addr - 1)),
+            dispatch_depth: 0,
             thread_local_framework_state: Default::default(),
         });
 
@@ -2573,6 +2592,16 @@ impl Environment {
             self.current_thread,
             new_thread
         );
+        // The objc_msgSend recursion counter is a host thread-local, but every
+        // guest thread of a process runs on that same host thread, so carry
+        // each guest thread's own depth across the switch. Without this a
+        // thread that suspends deep inside a dispatch hands its depth to the
+        // next thread, which then trips the guard on a shallow, legitimately
+        // short chain.
+        let previous_depth = crate::objc::take_dispatch_depth();
+        self.threads[self.current_thread].dispatch_depth = previous_depth;
+        let new_depth = self.threads[new_thread].dispatch_depth;
+        crate::objc::set_dispatch_depth(new_depth);
         let mut guest_ctx = self.threads[new_thread].guest_context.take().unwrap();
         self.cpu.swap_context(&mut guest_ctx);
         assert!(self.threads[self.current_thread].guest_context.is_none());
@@ -4261,6 +4290,18 @@ impl Environment {
         assert!(!self.threads[self.current_thread].is_blocked());
     }
 
+    /// Dump every guest thread when the scheduler finds nothing runnable.
+    /// Called once, immediately before the process aborts: the bare panic left
+    /// no way to tell which guest object was never released.
+    fn report_deadlock(&self) {
+        echo_no_panic!(
+            "DEADLOCK: no guest thread is runnable and no timer will wake one."
+        );
+        self.dump_thread_summary();
+        self.dump_all_regs();
+        self.stack_trace_all();
+    }
+
     /// Find the next thread to execute, and set it up to be switched to.
     ///
     /// This also handles all the required bookkeeping (unlocking mutexes,
@@ -4270,6 +4311,9 @@ impl Environment {
         // GDB can allow schedule_next_thread to be called twice in a row -
         // we make sure that this works by immediately fufilling conditions
         // (relocking mutexes, decrementing semaphores, etc.)!
+        // Retries before this call declares a deadlock; see below.
+        const DEADLOCK_RETRIES: u32 = 3;
+        let mut deadlock_retries = 0;
         loop {
             // Try to find a new thread to execute, starting with the thread
             // following the one currently executing.
@@ -4473,26 +4517,24 @@ impl Environment {
                 // there will be soon, since timing is approximate).
                 continue;
             } else {
-                // All threads are blocked but none are sleeping — potential
-                // deadlock. Before panicking, give conditions with timeouts
-                // a brief grace period (10ms). This handles the edge case
-                // where a condition-wait with timeout hasn't been detected
-                // as "sleeping" because the scheduler loop hasn't
-                // re-evaluated it yet. After the grace period, if still
-                // stuck, abort with a clear diagnostic.
-                static DEADLOCK_GRACE_COUNT: std::sync::atomic::AtomicU32 =
-                    std::sync::atomic::AtomicU32::new(0);
-                let count = DEADLOCK_GRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if count < 3 {
+                // All threads are blocked but none is sleeping — potential
+                // deadlock. Before aborting, give conditions with timeouts a
+                // brief grace period (10ms) in case the scheduler loop has not
+                // re-evaluated them yet. The retry count must not outlive this
+                // call, or three unrelated transient stalls over the life of
+                // the app would add up to a deadlock.
+                deadlock_retries += 1;
+                if deadlock_retries <= DEADLOCK_RETRIES {
                     log!(
-                        "Warning: All threads appear blocked (attempt {}/3). \
+                        "Warning: All threads appear blocked (attempt {}/{}). \
                          Sleeping 10ms before retrying…",
-                        count + 1
+                        deadlock_retries,
+                        DEADLOCK_RETRIES
                     );
                     std::thread::sleep(Duration::from_millis(10));
                     continue;
                 }
-                DEADLOCK_GRACE_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+                self.report_deadlock();
                 panic!("No active threads, program has deadlocked!");
             }
         }
@@ -4605,6 +4647,7 @@ pub(crate) fn touch_test_environment() -> Environment {
         guest_context: None,
         host_context: None,
         stack: None,
+        dispatch_depth: 0,
         thread_local_framework_state: Default::default(),
     });
     env.dyld.do_initial_linking_with_no_bins(&mut env.mem, &mut env.objc);
