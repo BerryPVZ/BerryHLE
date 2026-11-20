@@ -85,9 +85,19 @@ impl Sub<CGColorHostObject> for CGColorHostObject {
 
 pub type CGColorRef = CFTypeRef;
 pub fn CGColorRelease(env: &mut Environment, c: CGColorRef) {
-    if !c.is_null() {
-        CFRelease(env, c);
+    if c.is_null() {
+        return;
     }
+    // Apple's constant colors ignore release; keep the cached object alive.
+    if env
+        .framework_state
+        .core_graphics
+        .constant_colors
+        .contains(&c)
+    {
+        return;
+    }
+    CFRelease(env, c);
 }
 pub fn CGColorRetain(env: &mut Environment, c: CGColorRef) -> CGColorRef {
     if !c.is_null() {
@@ -153,7 +163,12 @@ fn CGColorCreateGenericRGB(
 }
 
 fn CGColorEqualToColor(env: &mut Environment, a: CGColorRef, b: CGColorRef) -> bool {
-    to_rgba(&env.objc, a) == to_rgba(&env.objc, b)
+    // Real CG: two NULLs are equal, exactly one NULL is not.
+    match (a.is_null(), b.is_null()) {
+        (true, true) => true,
+        (true, false) | (false, true) => false,
+        (false, false) => to_rgba(&env.objc, a) == to_rgba(&env.objc, b),
+    }
 }
 
 fn CGColorCreateGenericGray(env: &mut Environment, gray: CGFloat, alpha: CGFloat) -> CGColorRef {
@@ -246,31 +261,59 @@ fn CGColorIsValid(_env: &mut Environment, color: CGColorRef) -> bool {
     !color.is_null()
 }
 
+/// `CFTypeID CGColorGetTypeID(void)`
+fn CGColorGetTypeID(env: &mut Environment) -> u32 {
+    // Must equal CFGetTypeID() of a CGColor, which uses the class pointer.
+    env.objc
+        .get_known_class("_touchHLE_CGColor", &mut env.mem)
+        .to_bits()
+}
+
+/// `CGPatternRef CGColorGetPattern(CGColorRef)`
+/// Pattern colours aren't supported (CGColorCreateWithPattern returns clear),
+/// so no colour has a pattern.
+fn CGColorGetPattern(_env: &mut Environment, _color: CGColorRef) -> crate::mem::MutVoidPtr {
+    crate::mem::Ptr::null()
+}
+
 // MARK: - CGColorGetConstantColor
 
 // Returns a constant `CGColor` for well-known names
 // (`kCGColorBlack`, `kCGColorWhite`, `kCGColorClear`).
+// The argument is a CFStringRef: those constants are exported below as
+// NSString constants, so it must not be read as a C string.
 // The returned colour is *not* retained by the caller.
-fn CGColorGetConstantColor(env: &mut Environment, name: ConstPtr<u8>) -> CGColorRef {
+fn CGColorGetConstantColor(env: &mut Environment, name: crate::objc::id) -> CGColorRef {
     if name.is_null() {
         return crate::objc::nil;
     }
-    let s = env.mem.cstr_at_utf8(name).unwrap_or_default().to_owned();
-    let rgba: (CGFloat, CGFloat, CGFloat, CGFloat) = match s.as_str() {
-        "kCGColorWhite" => (1.0, 1.0, 1.0, 1.0),
-        "kCGColorBlack" => (0.0, 0.0, 0.0, 1.0),
-        "kCGColorClear" => (0.0, 0.0, 0.0, 0.0),
+    let s = crate::frameworks::foundation::ns_string::to_rust_string(env, name).into_owned();
+    let index = match s.as_str() {
+        "kCGColorWhite" => 0,
+        "kCGColorBlack" => 1,
+        "kCGColorClear" => 2,
         other => {
             log!(
                 "CGColorGetConstantColor: unknown color name {:?}, returning clear",
                 other
             );
-            (0.0, 0.0, 0.0, 0.0)
+            2
         }
     };
-    // Constant colours are not owned by the caller — return autoreleased.
+    // Constant colours are immortal and not owned by the caller. Cache them
+    // for the app's lifetime so they survive every autorelease pool drain.
+    let cached = env.framework_state.core_graphics.constant_colors[index];
+    if !cached.is_null() {
+        return cached;
+    }
+    let rgba = match index {
+        0 => (1.0, 1.0, 1.0, 1.0),
+        1 => (0.0, 0.0, 0.0, 1.0),
+        _ => (0.0, 0.0, 0.0, 0.0),
+    };
     let color = from_rgba(env, rgba);
-    crate::objc::autorelease(env, color)
+    env.framework_state.core_graphics.constant_colors[index] = color;
+    color
 }
 
 // MARK: - sRGB / gamma
@@ -352,7 +395,7 @@ fn CGColorCreateCopyByMatchingToColorSpace(
 
 // MARK: - Additional accessors
 
-/// Returns whether two CGColors have the same colour space.
+/// Returns true if the color is not fully opaque (alpha < 1.0).
 fn CGColorHasAlpha(env: &mut Environment, color: CGColorRef) -> bool {
     if color.is_null() {
         return false;
@@ -389,6 +432,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGColorGetComponents(_)),
     export_c_func!(CGColorGetNumberOfComponents(_)),
     export_c_func!(CGColorGetConstantColor(_)),
+    export_c_func!(CGColorGetTypeID()),
+    export_c_func!(CGColorGetPattern(_)),
     export_c_func!(CGColorIsValid(_)),
     export_c_func!(CGColorHasAlpha(_)),
     export_c_func!(CGColorGetLuminance(_)),

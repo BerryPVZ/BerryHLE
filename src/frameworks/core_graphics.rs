@@ -67,7 +67,8 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
 
 #[derive(Default)]
 pub struct State {
-    // cg_context: cg_context::State,
+    // Per-Environment so guest pointers stay valid for the app's lifetime.
+    constant_colors: [crate::objc::id; 3],
 }
 
 pub type CGFloat = f32;

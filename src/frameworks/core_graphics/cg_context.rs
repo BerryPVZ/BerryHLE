@@ -347,7 +347,7 @@ fn CGContextSetFlatness(env: &mut Environment, context: CGContextRef, flatness: 
 
 // MARK: - Blend mode / shadow
 
-fn CGContextSetBlendMode(env: &mut Environment, context: CGContextRef, mode: i32) {
+pub(crate) fn CGContextSetBlendMode(env: &mut Environment, context: CGContextRef, mode: i32) {
     if context.is_null() {
         return;
     }

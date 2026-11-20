@@ -173,6 +173,40 @@ fn post_notification(
     release(env, notification);
 }
 
+// `CFNotificationSuspensionBehavior` and the posting options are plain
+// enums in the C header, not linkable symbols, so they are Rust constants only.
+#[allow(dead_code)]
+pub const CFNotificationSuspensionBehaviorDrop: u32 = 1;
+#[allow(dead_code)]
+pub const CFNotificationSuspensionBehaviorCoalesce: u32 = 2;
+#[allow(dead_code)]
+pub const CFNotificationSuspensionBehaviorHold: u32 = 3;
+#[allow(dead_code)]
+pub const CFNotificationSuspensionBehaviorDeliverImmediately: u32 = 4;
+#[allow(dead_code)]
+pub const kCFNotificationDeliverImmediately: CFOptionFlags = 1 << 0;
+#[allow(dead_code)]
+pub const kCFNotificationPostToAllSessions: CFOptionFlags = 1 << 1;
+
+// touchHLE has a single notification center and no other processes, so the
+// Darwin and distributed centers resolve to the same object as the local one.
+// Observers registered on either flavour still fire for posts made through
+// any of them.
+fn CFNotificationCenterGetDarwinNotifyCenter(env: &mut Environment) -> CFNotificationCenterRef {
+    CFNotificationCenterGetLocalCenter(env)
+}
+
+fn CFNotificationCenterGetDistributedCenter(env: &mut Environment) -> CFNotificationCenterRef {
+    CFNotificationCenterGetLocalCenter(env)
+}
+
+// Must equal CFGetTypeID() of a center, which is the NSNotificationCenter
+// instance returned by the Get*Center functions.
+fn CFNotificationCenterGetTypeID(env: &mut Environment) -> u32 {
+    let class: crate::objc::Class = msg_class![env; NSNotificationCenter class];
+    class.to_bits()
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFNotificationCenterGetLocalCenter()),
     export_c_func!(CFNotificationCenterAddObserver(_, _, _, _, _, _)),
@@ -180,4 +214,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFNotificationCenterRemoveEveryObserver(_, _)),
     export_c_func!(CFNotificationCenterPostNotification(_, _, _, _, _)),
     export_c_func!(CFNotificationCenterPostNotificationWithOptions(_, _, _, _, _, _)),
+    export_c_func!(CFNotificationCenterGetDarwinNotifyCenter()),
+    export_c_func!(CFNotificationCenterGetDistributedCenter()),
+    export_c_func!(CFNotificationCenterGetTypeID()),
 ];
