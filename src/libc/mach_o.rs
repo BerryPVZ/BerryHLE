@@ -1098,15 +1098,33 @@ fn NXGetAllArchInfos(env: &mut Environment) -> ConstPtr<NXArchInfoGuest> {
     const_ptr
 }
 
+// =========================================================================
+// MARK: - getsectdatafromheader
+/// `char *getsectdatafromheader(const struct mach_header *, const char *segname,
+///     const char *sectname, uint32_t *size)`
+///
+/// Apple's implementation resolves the section through the header and returns
+/// its loaded data address; `getsectiondata` already does exactly that.
+fn getsectdatafromheader(
+    env: &mut Environment,
+    header: ConstVoidPtr,
+    segname: ConstPtr<u8>,
+    sectname: ConstPtr<u8>,
+    size_out: MutPtr<u32>,
+) -> MutVoidPtr {
+    getsectiondata(env, header, segname, sectname, size_out).cast_void()
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(get_end()),
     export_c_func!(get_etext()),
     export_c_func!(getsectiondata(_, _, _, _)),
     export_c_func!(host_info(_, _, _, _)),
     export_c_func!(_NSGetMachExecuteHeader()),
+    export_c_func!(getsectbynamefromheader(_, _, _)),
+    export_c_func!(getsectdatafromheader(_, _, _, _)),
     export_c_func!(_dyld_image_count()),
     export_c_func!(_dyld_get_image_header(_)),
-    export_c_func!(getsectbynamefromheader(_, _, _)),
     export_c_func!(getsectbynamefromheader_64(_, _, _)),
     export_c_func!(_dyld_get_image_name(_)),
     export_c_func!(_dyld_get_image_vmaddr_slide(_)),
