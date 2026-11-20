@@ -1105,6 +1105,8 @@ fn NXGetAllArchInfos(env: &mut Environment) -> ConstPtr<NXArchInfoGuest> {
 ///
 /// Apple's implementation resolves the section through the header and returns
 /// its loaded data address; `getsectiondata` already does exactly that.
+/// Unlike `getsectiondata`, a missing section sets `*size` to zero:
+/// https://github.com/apple-oss-distributions/cctools/blob/main/libmacho/getsecbyname.c
 fn getsectdatafromheader(
     env: &mut Environment,
     header: ConstVoidPtr,
@@ -1112,7 +1114,11 @@ fn getsectdatafromheader(
     sectname: ConstPtr<u8>,
     size_out: MutPtr<u32>,
 ) -> MutVoidPtr {
-    getsectiondata(env, header, segname, sectname, size_out).cast_void()
+    let data = getsectiondata(env, header, segname, sectname, size_out);
+    if data.is_null() && !size_out.is_null() {
+        env.mem.write(size_out, 0);
+    }
+    data.cast_void()
 }
 
 pub const FUNCTIONS: FunctionExports = &[
