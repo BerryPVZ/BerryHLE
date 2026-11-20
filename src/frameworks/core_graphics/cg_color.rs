@@ -85,9 +85,19 @@ impl Sub<CGColorHostObject> for CGColorHostObject {
 
 pub type CGColorRef = CFTypeRef;
 pub fn CGColorRelease(env: &mut Environment, c: CGColorRef) {
-    if !c.is_null() {
-        CFRelease(env, c);
+    if c.is_null() {
+        return;
     }
+    // Apple's constant colors ignore release; keep the cached object alive.
+    if env
+        .framework_state
+        .core_graphics
+        .constant_colors
+        .contains(&c)
+    {
+        return;
+    }
+    CFRelease(env, c);
 }
 pub fn CGColorRetain(env: &mut Environment, c: CGColorRef) -> CGColorRef {
     if !c.is_null() {
