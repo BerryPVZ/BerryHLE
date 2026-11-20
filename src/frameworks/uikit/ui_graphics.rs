@@ -11,7 +11,7 @@ use crate::frameworks::core_graphics::cg_bitmap_context::{
 };
 use crate::frameworks::core_graphics::cg_context::{
     CGContextClearRect, CGContextClipToRect, CGContextFillRect, CGContextRef, CGContextRelease,
-    CGContextRetain,
+    CGContextRestoreGState, CGContextRetain, CGContextSaveGState, CGContextSetBlendMode,
 };
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::mem::{MutVoidPtr, Ptr};
@@ -23,9 +23,11 @@ pub(super) struct State {
     pub(super) context_stack: Vec<CGContextRef>,
 }
 
-/// `kCGBlendModeClear`. It is the only blend mode that is honoured here: the
-/// rect helpers clear instead of fill. Every other mode draws normally.
+/// `kCGBlendModeClear` and `kCGBlendModeCopy`. Clear replaces the rect with
+/// transparency; Copy replaces it with the fill colour. Other modes still
+/// draw normally because the renderer only distinguishes Copy from the rest.
 const kCGBlendModeClear: i32 = 16;
+const kCGBlendModeCopy: i32 = 17;
 
 /// Largest offscreen bitmap we will allocate (256 MiB). A garbage size from
 /// the guest must not exhaust host memory.
@@ -239,6 +241,12 @@ fn paint_rect(env: &mut Environment, rect: CGRect, blend_mode: i32) {
     }
     if blend_mode == kCGBlendModeClear {
         CGContextClearRect(env, ctx, rect);
+    } else if blend_mode == kCGBlendModeCopy {
+        // Copy must replace the destination, not alpha-blend over it.
+        CGContextSaveGState(env, ctx);
+        CGContextSetBlendMode(env, ctx, kCGBlendModeCopy);
+        CGContextFillRect(env, ctx, rect);
+        CGContextRestoreGState(env, ctx);
     } else {
         CGContextFillRect(env, ctx, rect);
     }
