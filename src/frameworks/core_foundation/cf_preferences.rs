@@ -332,7 +332,7 @@ fn CFPreferencesSynchronize(
     msg![env; user_defaults synchronize]
 }
 
-/// Returns an owned array of every key set. NULL when there are none.
+/// Returns an owned array of every key set. Empty when there are none.
 /// Note that `dictionaryRepresentation` merges all domains, so registered
 /// defaults and `AppleLanguages` are included.
 fn CFPreferencesCopyKeyList(
@@ -345,17 +345,22 @@ fn CFPreferencesCopyKeyList(
     let user_defaults = standard_defaults(env);
     let dict: id = msg![env; user_defaults dictionaryRepresentation];
     if dict == nil {
-        return nil;
+        return empty_array(env);
     }
     let keys: id = msg![env; dict allKeys];
     if keys == nil {
-        return nil;
+        return empty_array(env);
     }
     let count: u32 = msg![env; keys count];
     if count == 0 {
-        return nil;
+        return empty_array(env);
     }
     msg![env; keys copy]
+}
+
+fn empty_array(env: &mut Environment) -> id {
+    let array: id = msg_class![env; NSArray alloc];
+    msg![env; array init]
 }
 
 /// A sandboxed app sees only its own domain, so the list holds just the
