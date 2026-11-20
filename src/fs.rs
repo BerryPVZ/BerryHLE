@@ -35,10 +35,6 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::fs::File;
 use std::io::{Read, Seek, Write};
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
-#[cfg(windows)]
-use std::os::windows::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 

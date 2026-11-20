@@ -9,11 +9,9 @@ use crate::environment::Environment;
 use crate::export_c_func;
 use crate::libc::errno::{set_errno, EINVAL, EIO, ENOMEM};
 use crate::libc::posix_io;
-use crate::libc::posix_io::{
-    off_t, open_direct, FileDescriptor, SEEK_CUR, SEEK_END, SEEK_SET,
-};
+use crate::libc::posix_io::{off_t, open_direct, FileDescriptor, SEEK_SET};
 use crate::mem::{
-    ConstPtr, ConstVoidPtr, GuestISize, GuestUSize, Mem, MutVoidPtr, Ptr, PAGE_SIZE,
+    ConstPtr, GuestISize, GuestUSize, Mem, MutVoidPtr, Ptr, PAGE_SIZE,
     PAGE_SIZE_ALIGN_MASK,
 };
 use std::collections::HashMap;
@@ -955,6 +953,16 @@ fn writeback_extent(
     (available > 0).then_some((file_offset, count))
 }
 
+/// Write at an absolute offset without moving the file position. Unix exposes
+/// this as `write_at`, Windows as `seek_write`.
+#[cfg(unix)]
+fn write_file_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+    file.write_at(buf, offset)
+}
+#[cfg(windows)]
+fn write_file_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+    file.seek_write(buf, offset)
+}
 /// Write `[start, end)` of one shared mapping back to its file, leaving the
 /// file descriptor's position where it was.
 fn write_back(
@@ -983,7 +991,8 @@ fn write_back(
     let bytes = env.mem.bytes_at(Ptr::<u8, false>::from_bits(start), count);
     let mut written = 0;
     while written < bytes.len() {
-        match backing.file.write_at(
+        match write_file_at(
+            &backing.file,
             &bytes[written..],
             file_offset as u64 + written as u64,
         ) {
