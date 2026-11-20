@@ -184,6 +184,7 @@ fn UIGraphicsBeginPDFContextToData(
 
 /// Push a detached bitmap so PDF drawing cannot land on the screen.
 fn begin_pdf_context(env: &mut Environment, bounds: CGRect) {
+    env.framework_state.uikit.ui_graphics.pdf_bounds = None;
     UIGraphicsBeginImageContextWithOptions(env, bounds.size, false, 1.0);
     if UIGraphicsGetCurrentContext(env).is_null() {
         return;
