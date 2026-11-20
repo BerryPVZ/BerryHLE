@@ -138,10 +138,11 @@ fn invalidate_inner(env: &mut Environment, s: CFSocketRef) {
 
 // MARK: - Type ID
 
-// Placeholder type ID ('CFSk'). Delete this and its FUNCTIONS entry if
-// cf_type.rs already exports CFSocketGetTypeID.
-fn CFSocketGetTypeID(_env: &mut Environment) -> u32 {
-    0x4346536b
+// Must equal CFGetTypeID() of a socket, which uses the class pointer.
+fn CFSocketGetTypeID(env: &mut Environment) -> u32 {
+    env.objc
+        .get_known_class("_touchHLE_CFSocket", &mut env.mem)
+        .to_bits()
 }
 
 // MARK: - Lifecycle

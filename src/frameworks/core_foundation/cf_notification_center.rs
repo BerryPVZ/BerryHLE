@@ -200,10 +200,11 @@ fn CFNotificationCenterGetDistributedCenter(env: &mut Environment) -> CFNotifica
     CFNotificationCenterGetLocalCenter(env)
 }
 
-// Placeholder type ID ('CFNC'), in the same spirit as the fake IDs used for
-// CFString and CFStringTokenizer.
-fn CFNotificationCenterGetTypeID(_env: &mut Environment) -> u32 {
-    0x43464e43
+// Must equal CFGetTypeID() of a center, which is the NSNotificationCenter
+// instance returned by the Get*Center functions.
+fn CFNotificationCenterGetTypeID(env: &mut Environment) -> u32 {
+    let class: crate::objc::Class = msg_class![env; NSNotificationCenter class];
+    class.to_bits()
 }
 
 pub const FUNCTIONS: FunctionExports = &[
