@@ -3906,8 +3906,19 @@ impl Environment {
                             self.cpu.regs()[cpu::Cpu::LR]
                         );
                     }
-                    if null_write_probe_should_resume(self.window.is_some()) {
+                    if self.window.is_some() && null_write_probe_should_resume(probe_number) {
                         recovered_null_write = true;
+                    } else if self.window.is_some() {
+                        log_no_panic!(
+                            "Stopping interactive guest after {} null-page writes to prevent further memory corruption",
+                            probe_number
+                        );
+                        self.dump_all_regs();
+                        self.stack_trace_current();
+                        panic!(
+                            "Stopped interactive guest after {} null-page writes; refusing to continue memory corruption",
+                            probe_number
+                        );
                     }
                 }
             }
@@ -5052,8 +5063,8 @@ mod guest_trap_call_site_tests {
     }
 }
 
-fn null_write_probe_should_resume(has_window: bool) -> bool {
-    has_window
+fn null_write_probe_should_resume(probe_number: usize) -> bool {
+    probe_number < crate::mem::NULL_WRITE_PROBE_LIMIT
 }
 
 #[cfg(test)]
@@ -5082,8 +5093,8 @@ mod guest_cpu_error_tests {
 
     #[test]
     fn null_write_probe_is_not_recovered_in_headless_mode() {
-        assert!(!null_write_probe_should_resume(false));
-        assert!(null_write_probe_should_resume(true));
+        assert!(null_write_probe_should_resume(1));
+        assert!(!null_write_probe_should_resume(crate::mem::NULL_WRITE_PROBE_LIMIT));
     }
 }
 

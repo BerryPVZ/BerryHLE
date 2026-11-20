@@ -357,7 +357,7 @@ mod released_page_range_tests {
 /// instruction wrote through NULL: the `LAST_GUEST_PC` snapshot is taken at
 /// host-call boundaries, so for a store made while dynarmic is running it is
 /// stale (Asphalt 8's drift event reports the previous call, `_atan2f`).
-const NULL_WRITE_PROBE_LIMIT: usize = 64;
+pub(crate) const NULL_WRITE_PROBE_LIMIT: usize = 64;
 static NULL_WRITE_PROBE_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static NULL_WRITE_PROBE_PENDING: std::sync::atomic::AtomicUsize =
@@ -402,8 +402,8 @@ pub fn guest_heap_limit_bytes() -> u64 {
     GUEST_HEAP_LIMIT_BYTES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Address and size of the last allocation included in the attribution table.
-pub(crate) fn last_allocation() -> (VAddr, u64) {
+/// A cheap, signal-safe summary of the most recent allocation at least 8 MiB.
+pub(crate) fn last_large_allocation() -> (VAddr, u64) {
     let allocation = LAST_ALLOCATION.load(std::sync::atomic::Ordering::Relaxed);
     ((allocation >> 32) as VAddr, allocation & u64::from(u32::MAX))
 }
@@ -521,13 +521,11 @@ static LAST_ALLOCATION: std::sync::atomic::AtomicU64 =
 /// 1 GiB and so on) the biggest sites are logged, so a leak shows its caller
 /// instead of just filling the heap.
 pub(crate) fn note_allocation_site(site: VAddr, size: GuestUSize) {
-    if size >= ALLOCATION_SITE_MIN_SIZE {
+    if u64::from(size) >= LARGE_ALLOCATION_LOG_BYTES {
         LAST_ALLOCATION.store(
             (u64::from(site) << 32) | u64::from(size),
             std::sync::atomic::Ordering::Relaxed,
         );
-    }
-    if u64::from(size) >= LARGE_ALLOCATION_LOG_BYTES {
         let logged = LARGE_ALLOCATION_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if logged < LARGE_ALLOCATION_LOG_LIMIT {
             log!(
@@ -1668,7 +1666,7 @@ impl Mem {
         if self.zero_memory_on_free {
             if let Some((start, len)) = released_page_range(addr, size) {
                 let host_ptr = unsafe { self.bytes.cast::<u8>().add(start) };
-                unsafe { host::release_guest_pages(host_ptr.cast(), len) };
+                let _ = unsafe { host::release_guest_pages(host_ptr.cast(), len) };
             }
         }
 

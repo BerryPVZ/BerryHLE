@@ -438,9 +438,9 @@ mod imp {
             crate::environment::LAST_GUEST_PC.load(Ordering::Relaxed),
             crate::environment::LAST_GUEST_LR.load(Ordering::Relaxed)
         );
-        let (last_allocation_site, last_allocation_size) = crate::mem::last_allocation();
+        let (last_allocation_site, last_allocation_size) = crate::mem::last_large_allocation();
         let msg = format!(
-            "{}guest heap: {} / {} bytes (0 means uncapped); last large allocation: {} bytes at {:#010x}\n",
+            "{}guest heap: {} / {} bytes (0 means uncapped); last guest allocation >= 8 MiB: {} bytes at {:#010x}\n",
             msg,
             crate::mem::guest_heap_bytes(),
             crate::mem::guest_heap_limit_bytes(),

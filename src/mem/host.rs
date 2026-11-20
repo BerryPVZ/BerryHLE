@@ -199,14 +199,11 @@ pub(super) unsafe fn free_guest_memory(
     unsafe { free_memory(address, size) }
 }
 
-/// Gives the pages of a freed guest allocation back to the host, so that an
-/// app's host footprint follows what it currently uses instead of the
-/// high-water mark of the allocator's free lists. This is best-effort; the
-/// advice may be ignored by the host.
+/// Advises the host that pages of a freed guest allocation can be reclaimed.
+/// The advice is best-effort; the host may ignore it.
 ///
-/// Failure is deliberately ignored: the memory is dead either way, and a host
-/// that refuses the advice (a hardened allocator, a page size mismatch) still
-/// leaves the mapping valid.
+/// The caller can report a failed request, but success does not guarantee the
+/// host has immediately removed pages from resident memory.
 ///
 /// # Safety
 /// - `address` and `size` must be inside the guest memory mapping, aligned to
@@ -216,18 +213,24 @@ pub(super) unsafe fn free_guest_memory(
 pub(super) unsafe fn release_guest_pages(
     address: *mut core::ffi::c_void,
     size: usize,
-) {
+) -> bool {
     let host_page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if host_page_size <= 0 {
-        return;
+        return false;
     }
     let Some((address, size)) = host_page_range(address as usize, size, host_page_size as usize)
     else {
-        return;
+        return false;
     };
-    unsafe {
-        libc::madvise(address as *mut _, size, libc::MADV_DONTNEED);
+    let result = unsafe { libc::madvise(address as *mut _, size, libc::MADV_DONTNEED) };
+    if result != 0 {
+        log_dbg!(
+            "Could not advise host to reclaim {} guest-memory bytes: {}",
+            size,
+            std::io::Error::last_os_error()
+        );
     }
+    result == 0
 }
 
 /// # Safety
@@ -236,23 +239,24 @@ pub(super) unsafe fn release_guest_pages(
 pub(super) unsafe fn release_guest_pages(
     address: *mut core::ffi::c_void,
     size: usize,
-) {
+) -> bool {
     use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_RESET, PAGE_READWRITE};
     use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 
     let mut system_info = unsafe { std::mem::zeroed::<SYSTEM_INFO>() };
     unsafe { GetSystemInfo(&mut system_info) };
+    if system_info.dwPageSize == 0 {
+        return false;
+    }
     let Some((address, size)) = host_page_range(
         address as usize,
         size,
         system_info.dwPageSize as usize,
     ) else {
-        return;
+        return false;
     };
 
-    unsafe {
-        VirtualAlloc(address as *const _, size, MEM_RESET, PAGE_READWRITE);
-    }
+    !unsafe { VirtualAlloc(address as *const _, size, MEM_RESET, PAGE_READWRITE) }.is_null()
 }
 
 fn host_page_range(address: usize, size: usize, page_size: usize) -> Option<(usize, usize)> {
