@@ -21,6 +21,8 @@ use crate::Environment;
 #[derive(Default)]
 pub(super) struct State {
     pub(super) context_stack: Vec<CGContextRef>,
+    /// Page size while a PDF context is open; `None` otherwise.
+    pub(super) pdf_bounds: Option<CGRect>,
 }
 
 /// `kCGBlendModeClear` and `kCGBlendModeCopy`. Clear replaces the rect with
@@ -161,26 +163,40 @@ fn UIGraphicsEndImageContext(env: &mut Environment) {
 // MARK: - PDF context (stubs: no PDF is ever produced)
 
 fn UIGraphicsBeginPDFContextToFile(
-    _env: &mut Environment,
+    env: &mut Environment,
     _path: id, // NSString*
-    _bounds: CGRect,
+    bounds: CGRect,
     _document_info: id, // NSDictionary*
-) -> bool {
-    log_dbg!("UIGraphicsBeginPDFContextToFile: unsupported, returning false");
-    false
+) {
+    log_dbg!("UIGraphicsBeginPDFContextToFile: unsupported, drawing offscreen");
+    begin_pdf_context(env, bounds);
 }
 
 fn UIGraphicsBeginPDFContextToData(
-    _env: &mut Environment,
+    env: &mut Environment,
     _data: id, // NSMutableData*
-    _bounds: CGRect,
+    bounds: CGRect,
     _document_info: id, // NSDictionary*
 ) {
-    log_dbg!("UIGraphicsBeginPDFContextToData: unsupported");
+    log_dbg!("UIGraphicsBeginPDFContextToData: unsupported, drawing offscreen");
+    begin_pdf_context(env, bounds);
 }
 
-fn UIGraphicsEndPDFContext(_env: &mut Environment) {
+/// Push a detached bitmap so PDF drawing cannot land on the screen.
+fn begin_pdf_context(env: &mut Environment, bounds: CGRect) {
+    UIGraphicsBeginImageContextWithOptions(env, bounds.size, false, 1.0);
+    if UIGraphicsGetCurrentContext(env).is_null() {
+        return;
+    }
+    env.framework_state.uikit.ui_graphics.pdf_bounds = Some(bounds);
+}
+
+fn UIGraphicsEndPDFContext(env: &mut Environment) {
     log_dbg!("UIGraphicsEndPDFContext: unsupported");
+    let state = &mut env.framework_state.uikit.ui_graphics;
+    if state.pdf_bounds.take().is_some() {
+        UIGraphicsEndImageContext(env);
+    }
 }
 
 fn UIGraphicsBeginPDFPage(_env: &mut Environment) {
@@ -195,14 +211,12 @@ fn UIGraphicsBeginPDFPageWithInfo(
     log_dbg!("UIGraphicsBeginPDFPageWithInfo: unsupported");
 }
 
-fn UIGraphicsGetPDFContextBounds(_env: &mut Environment) -> CGRect {
-    CGRect {
-        origin: CGPoint { x: 0.0, y: 0.0 },
-        size: CGSize {
-            width: 0.0,
-            height: 0.0,
-        },
-    }
+fn UIGraphicsGetPDFContextBounds(env: &mut Environment) -> CGRect {
+    env.framework_state
+        .uikit
+        .ui_graphics
+        .pdf_bounds
+        .unwrap_or_default()
 }
 
 // Annotation calls: with no PDF being produced there is nothing to annotate.
