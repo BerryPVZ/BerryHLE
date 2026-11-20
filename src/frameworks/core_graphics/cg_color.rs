@@ -278,21 +278,32 @@ fn CGColorGetConstantColor(env: &mut Environment, name: crate::objc::id) -> CGCo
         return crate::objc::nil;
     }
     let s = crate::frameworks::foundation::ns_string::to_rust_string(env, name).into_owned();
-    let rgba: (CGFloat, CGFloat, CGFloat, CGFloat) = match s.as_str() {
-        "kCGColorWhite" => (1.0, 1.0, 1.0, 1.0),
-        "kCGColorBlack" => (0.0, 0.0, 0.0, 1.0),
-        "kCGColorClear" => (0.0, 0.0, 0.0, 0.0),
+    let index = match s.as_str() {
+        "kCGColorWhite" => 0,
+        "kCGColorBlack" => 1,
+        "kCGColorClear" => 2,
         other => {
             log!(
                 "CGColorGetConstantColor: unknown color name {:?}, returning clear",
                 other
             );
-            (0.0, 0.0, 0.0, 0.0)
+            2
         }
     };
-    // Constant colours are not owned by the caller — return autoreleased.
+    // Constant colours are immortal and not owned by the caller. Cache them
+    // for the app's lifetime so they survive every autorelease pool drain.
+    let cached = env.framework_state.core_graphics.constant_colors[index];
+    if !cached.is_null() {
+        return cached;
+    }
+    let rgba = match index {
+        0 => (1.0, 1.0, 1.0, 1.0),
+        1 => (0.0, 0.0, 0.0, 1.0),
+        _ => (0.0, 0.0, 0.0, 0.0),
+    };
     let color = from_rgba(env, rgba);
-    crate::objc::autorelease(env, color)
+    env.framework_state.core_graphics.constant_colors[index] = color;
+    color
 }
 
 // MARK: - sRGB / gamma
