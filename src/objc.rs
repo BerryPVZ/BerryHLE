@@ -71,8 +71,8 @@ pub use objects::{
     id, impl_HostObject_with_superclass, nil, AnyHostObject, HostObject, TrivialHostObject,
 };
 pub use properties::{
-    class_getInstanceVariable, object_getInstanceVariable, object_getIvar, object_setIvar,
-    todo_objc_setter,
+    class_getInstanceVariable, ivar_getName, ivar_getOffset, object_getInstanceVariable,
+    object_getIvar, object_setIvar, todo_objc_setter,
 };
 pub use selectors::{selector, SEL};
 
@@ -440,6 +440,8 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(class_getInstanceSize(_)),
     export_c_func!(class_createInstance(_, _)),
     export_c_func!(class_getInstanceVariable(_, _)),
+    export_c_func!(ivar_getOffset(_)),
+    export_c_func!(ivar_getName(_)),
     export_c_func!(object_getIvar(_, _)),
     export_c_func!(object_getInstanceVariable(_, _, _)),
     export_c_func!(object_setIvar(_, _, _)),

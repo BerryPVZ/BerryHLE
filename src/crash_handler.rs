@@ -438,6 +438,15 @@ mod imp {
             crate::environment::LAST_GUEST_PC.load(Ordering::Relaxed),
             crate::environment::LAST_GUEST_LR.load(Ordering::Relaxed)
         );
+        let (last_allocation_site, last_allocation_size) = crate::mem::last_allocation();
+        let msg = format!(
+            "{}guest heap: {} / {} bytes (0 means uncapped); last large allocation: {} bytes at {:#010x}\n",
+            msg,
+            crate::mem::guest_heap_bytes(),
+            crate::mem::guest_heap_limit_bytes(),
+            last_allocation_size,
+            last_allocation_site
+        );
         // Identify the aborting OS thread and dump a NATIVE backtrace:
         // the guest PC ring only tracks the emulation thread, so if the
         // crash came from a worker (audio/net/JIT helper), this is the only

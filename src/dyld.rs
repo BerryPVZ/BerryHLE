@@ -2096,7 +2096,7 @@ impl Dyld {
         // Lazy linking happens only when guest code calls this import. Unknown
         // functions have unknown return types and side effects, so fail here
         // rather than fabricating a return value.
-        unresolved_function_called(symbol, svc_pc)
+        unresolved_function_called(symbol, svc_pc, cpu.regs()[Cpu::LR])
     }
 
     /// Creates a guest function that will call a host function with the name
@@ -2345,16 +2345,18 @@ fn local_code_symbol(bin: &MachO, symbol: &str) -> Option<u32> {
         .then_some(address)
 }
 
-fn unresolved_function_called(symbol: &str, stub_pc: u32) -> ! {
+fn unresolved_function_called(symbol: &str, stub_pc: u32, caller_lr: u32) -> ! {
     log!(
-        "Error: unresolved function {} called through stub at {:#x}",
+        "Error: unresolved function {} called through stub at {:#x} (caller LR={:#010x})",
         symbol,
-        stub_pc
+        stub_pc,
+        caller_lr
     );
     panic!(
-        "unresolved guest function {} called through stub at {:#x}",
+        "unresolved guest function {} called through stub at {:#x} (caller LR={:#010x})",
         symbol,
-        stub_pc
+        stub_pc,
+        caller_lr
     )
 }
 
@@ -2582,8 +2584,10 @@ mod lazy_link_recovery_tests {
 
     #[test]
     fn unresolved_function_reports_symbol_and_stub_address() {
-        let panic = std::panic::catch_unwind(|| unresolved_function_called("_missing", 0x1234))
-            .unwrap_err();
+        let panic = std::panic::catch_unwind(|| {
+            unresolved_function_called("_missing", 0x1234, 0x5678)
+        })
+        .unwrap_err();
         let message = panic
             .downcast_ref::<String>()
             .map(String::as_str)
@@ -2591,6 +2595,7 @@ mod lazy_link_recovery_tests {
             .unwrap();
         assert!(message.contains("_missing"));
         assert!(message.contains("0x1234"));
+        assert!(message.contains("0x00005678"));
     }
 
     fn mock_binary(symbol: &str, address: u32, section_name: &str, external: bool) -> MachO {

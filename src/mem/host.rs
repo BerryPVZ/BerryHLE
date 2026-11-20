@@ -199,6 +199,86 @@ pub(super) unsafe fn free_guest_memory(
     unsafe { free_memory(address, size) }
 }
 
+/// Gives the pages of a freed guest allocation back to the host, so that an
+/// app's host footprint follows what it currently uses instead of the
+/// high-water mark of the allocator's free lists. This is best-effort; the
+/// advice may be ignored by the host.
+///
+/// Failure is deliberately ignored: the memory is dead either way, and a host
+/// that refuses the advice (a hardened allocator, a page size mismatch) still
+/// leaves the mapping valid.
+///
+/// # Safety
+/// - `address` and `size` must be inside the guest memory mapping, aligned to
+///   the host page size.
+/// - No live allocation may cover the range.
+#[cfg(unix)]
+pub(super) unsafe fn release_guest_pages(
+    address: *mut core::ffi::c_void,
+    size: usize,
+) {
+    let host_page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if host_page_size <= 0 {
+        return;
+    }
+    let Some((address, size)) = host_page_range(address as usize, size, host_page_size as usize)
+    else {
+        return;
+    };
+    unsafe {
+        libc::madvise(address as *mut _, size, libc::MADV_DONTNEED);
+    }
+}
+
+/// # Safety
+/// Same requirements as the Unix version above.
+#[cfg(windows)]
+pub(super) unsafe fn release_guest_pages(
+    address: *mut core::ffi::c_void,
+    size: usize,
+) {
+    use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_RESET, PAGE_READWRITE};
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+
+    let mut system_info = unsafe { std::mem::zeroed::<SYSTEM_INFO>() };
+    unsafe { GetSystemInfo(&mut system_info) };
+    let Some((address, size)) = host_page_range(
+        address as usize,
+        size,
+        system_info.dwPageSize as usize,
+    ) else {
+        return;
+    };
+
+    unsafe {
+        VirtualAlloc(address as *const _, size, MEM_RESET, PAGE_READWRITE);
+    }
+}
+
+fn host_page_range(address: usize, size: usize, page_size: usize) -> Option<(usize, usize)> {
+    if page_size == 0 || !page_size.is_power_of_two() {
+        return None;
+    }
+    let start = address.checked_add(page_size - 1)? & !(page_size - 1);
+    let end = address.checked_add(size)? & !(page_size - 1);
+    if end <= start {
+        None
+    } else {
+        Some((start, end - start))
+    }
+}
+
+#[cfg(test)]
+mod host_page_range_tests {
+    use super::host_page_range;
+
+    #[test]
+    fn keeps_only_full_host_pages_inside_released_guest_range() {
+        assert_eq!(host_page_range(0x1001, 0x8000, 0x4000), Some((0x4000, 0x4000)));
+        assert_eq!(host_page_range(0x1001, 0x2000, 0x4000), None);
+    }
+}
+
 #[cfg(windows)]
 mod lazy_commit {
     use std::sync::Mutex;

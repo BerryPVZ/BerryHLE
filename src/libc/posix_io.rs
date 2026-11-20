@@ -156,6 +156,8 @@ pub const O_CREAT: OpenFlag = 0x200;
 pub const O_TRUNC: OpenFlag = 0x400;
 pub const O_EXCL: OpenFlag = 0x800;
 pub const O_NOCTTY: OpenFlag = 0x20000;
+pub const O_DSYNC: OpenFlag = 0x00400000;
+pub const O_CLOEXEC: OpenFlag = 0x01000000;
 
 /// File control command flags.
 /// This alias is for readability, POSIX just uses `int`.
@@ -196,6 +198,14 @@ const F_VOLPOSMODE: FileControlCommand = 4;
 /// This alias is for readability, POSIX just uses `int`.
 pub type FDFlag = i32;
 pub const FD_CLOEXEC: FDFlag = 1;
+
+fn descriptor_flags_from_open(flags: OpenFlag) -> FDFlag {
+    if flags & O_CLOEXEC != 0 {
+        FD_CLOEXEC
+    } else {
+        0
+    }
+}
 
 /// Record Locking flags.
 /// This alias is for readability, POSIX just uses `short`
@@ -519,7 +529,9 @@ pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> Fil
         | O_CREAT
         | O_TRUNC
         | O_EXCL
-        | O_NOCTTY;
+        | O_NOCTTY
+        | O_DSYNC
+        | O_CLOEXEC;
     let unknown_flags = flags & !known_flags;
     if unknown_flags != 0 {
         log!(
@@ -601,8 +613,8 @@ pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> Fil
             file: GuestFile::random(),
             needs_flush: false,
             reached_eof: false,
-            flags: 0,
-            status_flags: flags & (O_ACCMODE | O_APPEND | O_NONBLOCK),
+            flags: descriptor_flags_from_open(flags),
+            status_flags: flags & (O_ACCMODE | O_APPEND | O_NONBLOCK | O_DSYNC),
             path: Some(path_string.clone()),
             locks: Vec::new(),
             flock_state: None,
@@ -653,8 +665,8 @@ pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> Fil
                 file,
                 needs_flush,
                 reached_eof: false,
-                flags: 0,
-                status_flags: flags & (O_ACCMODE | O_APPEND | O_NONBLOCK),
+                flags: descriptor_flags_from_open(flags),
+                status_flags: flags & (O_ACCMODE | O_APPEND | O_NONBLOCK | O_DSYNC),
                 path: Some(actual_path_string.clone()),
                 locks: Vec::new(),
                 flock_state: None,
@@ -939,6 +951,11 @@ pub fn write(
     let buffer_slice = env.mem.bytes_at(buffer.cast(), size);
     match file.file.write(buffer_slice) {
         Ok(bytes_written) => {
+            let sync_result = if bytes_written > 0 && file.status_flags & O_DSYNC != 0 {
+                file.file.sync_data()
+            } else {
+                Ok(())
+            };
             if bytes_written < buffer_slice.len() {
                 log!(
                     "Warning: write({:?}, {:?}, {:#x}) wrote only {:#x} bytes",
@@ -955,6 +972,10 @@ pub fn write(
                     size,
                     bytes_written
                 );
+            }
+            if let Err(error) = sync_result {
+                log!("Warning: O_DSYNC write failed to sync {:?}: {}", file.path, error);
+                set_errno(env, EIO);
             }
             bytes_written.try_into().unwrap_or(-1)
         }
@@ -2029,7 +2050,19 @@ fn release_range_from_locks(locks: &mut Vec<LockRange>, release: &LockRange) {
 
 #[cfg(test)]
 mod tests {
-    use super::{path_after_app_bundle_component, strip_udk_game_bundle_prefix};
+    use super::{
+        descriptor_flags_from_open, path_after_app_bundle_component,
+        strip_udk_game_bundle_prefix, FD_CLOEXEC, O_CLOEXEC, O_DSYNC,
+    };
+
+    #[test]
+    fn apple_open_flags_are_distinct_and_cloexec_maps_to_descriptor_flag() {
+        assert_eq!(O_CLOEXEC, 0x01000000);
+        assert_eq!(O_DSYNC, 0x00400000);
+        assert_eq!(descriptor_flags_from_open(O_CLOEXEC), FD_CLOEXEC);
+        assert_eq!(descriptor_flags_from_open(O_CLOEXEC | O_DSYNC), FD_CLOEXEC);
+        assert_eq!(descriptor_flags_from_open(O_DSYNC), 0);
+    }
 
     #[test]
     fn finds_case_insensitive_complete_app_bundle_components() {

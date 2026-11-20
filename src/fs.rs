@@ -35,6 +35,10 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::fs::File;
 use std::io::{Read, Seek, Write};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -614,6 +618,18 @@ pub enum GuestFile {
 }
 
 impl GuestFile {
+    /// Clone a regular host file for an mmap backing that must outlive its
+    /// guest descriptor.
+    pub fn try_clone_host_file(&self) -> std::io::Result<File> {
+        match self {
+            GuestFile::File(file) => file.try_clone(),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "mmap writeback requires a regular host file",
+            )),
+        }
+    }
+
     fn from_host_file(file: File) -> GuestFile {
         GuestFile::File(file)
     }
@@ -644,6 +660,21 @@ impl GuestFile {
                 Ok(())
             }
             // Syncing a character device is a no-op.
+            GuestFile::Random(_) | GuestFile::PipeRead(_) | GuestFile::PipeWrite(_) => Ok(()),
+            GuestFile::Socket => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Sync operation not supported on socket",
+            )),
+        }
+    }
+    pub fn sync_data(&self) -> std::io::Result<()> {
+        match self {
+            GuestFile::File(file) => file.sync_data(),
+            GuestFile::IpaBundleFile(_) | GuestFile::ResourceFile(_) => Ok(()),
+            GuestFile::Directory => {
+                log!("Warning: syncing directory as a guest file.");
+                Ok(())
+            }
             GuestFile::Random(_) | GuestFile::PipeRead(_) | GuestFile::PipeWrite(_) => Ok(()),
             GuestFile::Socket => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,

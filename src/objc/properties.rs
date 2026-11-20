@@ -480,6 +480,43 @@ pub fn class_getInstanceVariable(
         .unwrap_or_else(MutVoidPtr::null)
 }
 
+/// Returns the byte offset of an Objective-C instance variable.
+pub fn ivar_getOffset(env: &mut Environment, ivar: MutVoidPtr) -> GuestISize {
+    if ivar.is_null() {
+        return 0;
+    }
+    let Some(bytes) = env.mem.get_bytes_fallible(ivar.cast_const(), 4) else {
+        return 0;
+    };
+    let offset_pointer = ConstPtr::<GuestUSize>::from_bits(u32::from_le_bytes(
+        bytes.try_into().unwrap(),
+    ));
+    if offset_pointer.is_null() {
+        return 0;
+    }
+    let Some(bytes) = env.mem.get_bytes_fallible(offset_pointer.cast(), 4) else {
+        return 0;
+    };
+    i32::from_le_bytes(bytes.try_into().unwrap())
+}
+
+/// Returns the name pointer stored in Objective-C instance-variable metadata.
+pub fn ivar_getName(env: &mut Environment, ivar: MutVoidPtr) -> ConstPtr<u8> {
+    if ivar.is_null() {
+        return ConstPtr::null();
+    }
+    let Some(name_addr) = ivar.to_bits().checked_add(4) else {
+        return ConstPtr::null();
+    };
+    let Some(bytes) = env
+        .mem
+        .get_bytes_fallible(ConstVoidPtr::from_bits(name_addr), 4)
+    else {
+        return ConstPtr::null();
+    };
+    ConstPtr::from_bits(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
 /// Reads an object reference from the specified ivar, returning nil for nil or invalid inputs.
 pub fn object_getIvar(env: &mut Environment, object: id, ivar: MutVoidPtr) -> id {
     let class_name = if object == nil {
@@ -1129,5 +1166,30 @@ mod trainer_metadata_tests {
             host.add_ivars_from_bin(list.cast_const(), &mem);
             assert_eq!(host.scalar_ivars.contains_key("_money"), expected);
         }
+    }
+
+    #[test]
+    fn ivar_getters_read_runtime_metadata_and_accept_null() {
+        let mut env = crate::environment::touch_test_environment();
+        let offset = env.mem.alloc_and_write(0xffff_fff0u32).cast_const();
+        let name = env.mem.alloc_and_write_cstr(b"_sample").cast_const();
+        let type_ = env.mem.alloc_and_write_cstr(b"i").cast_const();
+        let metadata: MutPtr<ivar_t> = env.mem.alloc(guest_size_of::<ivar_t>()).cast();
+        env.mem.write(
+            metadata,
+            ivar_t {
+                offset,
+                name,
+                type_,
+                alignment: 2,
+                size: 4,
+            },
+        );
+
+        let metadata = MutVoidPtr::from_bits(metadata.to_bits());
+        assert_eq!(ivar_getOffset(&mut env, metadata), -16);
+        assert_eq!(ivar_getName(&mut env, metadata), name);
+        assert_eq!(ivar_getOffset(&mut env, MutVoidPtr::null()), 0);
+        assert!(ivar_getName(&mut env, MutVoidPtr::null()).is_null());
     }
 }

@@ -66,7 +66,7 @@ fn touchHLE_cpu_write_impl<T: SafeWrite>(mem: *mut touchHLE_Mem, addr: VAddr, va
     // into the null segment, so the emulator can print the exact faulting PC
     // and stack. Returning false for it, as before, lets the guest write
     // through NULL and carry on with no clue where it happened.
-    addr < null_segment_size && crate::mem::null_write_probe_claim()
+    addr < null_segment_size && crate::mem::null_write_probe_claim(addr).is_some()
 }
 
 // Export functions for use by C++

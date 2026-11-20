@@ -9,12 +9,24 @@ use crate::environment::Environment;
 use crate::export_c_func;
 use crate::libc::errno::{set_errno, EINVAL, EIO, ENOMEM};
 use crate::libc::posix_io;
-use crate::libc::posix_io::{off_t, open_direct, FileDescriptor, SEEK_SET};
-use crate::mem::{ConstPtr, GuestUSize, Mem, MutVoidPtr, PAGE_SIZE, PAGE_SIZE_ALIGN_MASK};
+use crate::libc::posix_io::{
+    off_t, open_direct, FileDescriptor, SEEK_CUR, SEEK_END, SEEK_SET,
+};
+use crate::mem::{
+    ConstPtr, ConstVoidPtr, GuestISize, GuestUSize, Mem, MutVoidPtr, Ptr, PAGE_SIZE,
+    PAGE_SIZE_ALIGN_MASK,
+};
 use std::collections::HashMap;
+use std::fs::File;
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
+use std::sync::Arc;
 
 #[allow(dead_code)]
 const MAP_FILE: i32 = 0x0000;
+const MAP_SHARED: i32 = 0x0001;
 const MAP_FIXED: i32 = 0x0010;
 const MAP_ANON: i32 = 0x1000;
 
@@ -24,6 +36,8 @@ const MAP_FAILED: MutVoidPtr = MutVoidPtr::from_bits(0xFFFFFFFF);
 pub struct State {
     /// Keeping track of `mmap` allocations
     allocations: HashMap<MutVoidPtr, GuestUSize>,
+    /// File-backed `MAP_SHARED` mappings, whose dirty pages belong in the file.
+    writebacks: HashMap<MutVoidPtr, FileBacking>,
     /// Page ranges that a partial `munmap` released out of a larger mapping.
     ///
     /// The pages stay backed by the mapping that owns them, so the rest of that
@@ -46,6 +60,21 @@ struct UnmappedRange {
     end: GuestUSize,
 }
 
+/// Where a `MAP_SHARED` file mapping's dirty pages have to go back to.
+/// Where a file-backed `MAP_SHARED` mapping got its bytes from, so they can go
+/// back when the mapping is written back or unmapped.
+///
+/// Two mappings of one file do not alias in guest memory; each keeps its own
+/// copy until a write back.
+#[derive(Clone, Debug)]
+struct FileBacking {
+    base: MutVoidPtr,
+    file: Arc<File>,
+    /// Offset in the file that the first mapped byte came from.
+    offset: off_t,
+    len: GuestUSize,
+}
+
 /// Round `addr` down and `addr + len` up to whole pages, the way `munmap`
 /// rounds its arguments. Returns `None` if the range is empty or overflows.
 fn page_range(addr: MutVoidPtr, len: GuestUSize) -> Option<(GuestUSize, GuestUSize)> {
@@ -53,6 +82,99 @@ fn page_range(addr: MutVoidPtr, len: GuestUSize) -> Option<(GuestUSize, GuestUSi
     let start = addr.to_bits() & !mask;
     let end = addr.to_bits().checked_add(len)?.checked_add(mask)? & !mask;
     (end > start).then_some((start, end))
+}
+
+fn trim_writebacks(
+    writebacks: &mut HashMap<MutVoidPtr, FileBacking>,
+    start: GuestUSize,
+    end: GuestUSize,
+) {
+    if end <= start {
+        return;
+    }
+    let old = std::mem::take(writebacks);
+    for (_, backing) in old {
+        let backing_start = backing.base.to_bits();
+        let backing_end = backing_start.saturating_add(backing.len);
+        if end <= backing_start || start >= backing_end {
+            writebacks.insert(backing.base, backing);
+            continue;
+        }
+        if backing_start < start {
+            let mut left = backing.clone();
+            left.len = start - backing_start;
+            writebacks.insert(left.base, left);
+        }
+        if end < backing_end {
+            let mut right = backing;
+            let offset = end - backing_start;
+            right.base = MutVoidPtr::from_bits(end);
+            right.offset = right.offset.saturating_add(offset as off_t);
+            right.len = backing_end - end;
+            writebacks.insert(right.base, right);
+        }
+    }
+}
+
+#[cfg(test)]
+mod writeback_trimming_tests {
+    use super::*;
+
+    fn insert(
+        writebacks: &mut HashMap<MutVoidPtr, FileBacking>,
+        base: GuestUSize,
+        len: GuestUSize,
+    ) {
+        writebacks.insert(
+            MutVoidPtr::from_bits(base),
+            FileBacking {
+                base: MutVoidPtr::from_bits(base),
+                file: Arc::new(File::open(std::env::current_exe().unwrap()).unwrap()),
+                offset: 0,
+                len,
+            },
+        );
+    }
+
+    #[test]
+    fn trims_middle_and_advances_right_file_offset() {
+        let mut writebacks = HashMap::new();
+        insert(&mut writebacks, 0x1000, 0x5000);
+
+        trim_writebacks(&mut writebacks, 0x2000, 0x4000);
+
+        assert_eq!(writebacks.len(), 2);
+        assert_eq!(writebacks[&MutVoidPtr::from_bits(0x1000)].len, 0x1000);
+        let right = &writebacks[&MutVoidPtr::from_bits(0x4000)];
+        assert_eq!(right.len, 0x2000);
+        assert_eq!(right.offset, 0x3000);
+    }
+
+    #[test]
+    fn trims_prefix_suffix_and_complete_extent() {
+        let mut writebacks = HashMap::new();
+        insert(&mut writebacks, 0x1000, 0x3000);
+        trim_writebacks(&mut writebacks, 0x1000, 0x2000);
+        assert_eq!(writebacks.len(), 1);
+        assert_eq!(writebacks[&MutVoidPtr::from_bits(0x2000)].offset, 0x1000);
+
+        trim_writebacks(&mut writebacks, 0x3000, 0x4000);
+        assert_eq!(writebacks.len(), 1);
+        assert_eq!(writebacks[&MutVoidPtr::from_bits(0x2000)].len, 0x1000);
+
+        trim_writebacks(&mut writebacks, 0x1000, 0x4000);
+        assert!(writebacks.is_empty());
+    }
+
+    #[test]
+    fn leaves_non_overlapping_and_empty_ranges_unchanged() {
+        let mut writebacks = HashMap::new();
+        insert(&mut writebacks, 0x1000, 0x1000);
+        trim_writebacks(&mut writebacks, 0x3000, 0x4000);
+        trim_writebacks(&mut writebacks, 0x3000, 0x2000);
+        assert_eq!(writebacks.len(), 1);
+        assert_eq!(writebacks[&MutVoidPtr::from_bits(0x1000)].len, 0x1000);
+    }
 }
 
 /// Remember that the guest released `[start, end)` out of the mapping of
@@ -288,32 +410,61 @@ fn mmap(
             set_errno(env, EIO);
             return MAP_FAILED;
         }
-        let read = posix_io::read(env, fd, ptr, len);
-        if read < 0 {
+        // Read the mapped range in full. A single read stops at the end of a
+        // short file, which is fine, but it can also stop short of the range
+        // for other reasons and leave a hole in the middle of the mapping;
+        // keep asking until the mapping is full or the file runs out. The
+        // remainder stays zeroed by the calloc above.
+        let mut read_total: GuestUSize = 0;
+        let mut read_error: GuestISize = 0;
+        while read_total < len {
+            let dest = MutVoidPtr::from_bits(ptr.to_bits() + read_total);
+            let read = posix_io::read(env, fd, dest, len - read_total);
+            if read <= 0 {
+                read_error = read;
+                break;
+            }
+            read_total = read_total.saturating_add(read as GuestUSize);
+        }
+        if read_error < 0 {
             log!(
                 "Warning: mmap: read from fd {} at {:?}, offset {} failed ({}); \
                  padding remainder with zeros",
                 fd,
                 ptr,
                 offset,
-                read,
+                read_error,
             );
-        } else if (read as u32) < len {
+        } else if read_total < len {
             log!(
                 "Warning: mmap: read only {} of {} bytes from fd {} at {:?}, \
                  offset {}; padding remainder with zeros",
-                read,
+                read_total,
                 len,
                 fd,
                 ptr,
                 offset
             );
-            // Remainder is already zeroed (calloc)
         }
     }
 
     crate::mem::note_allocation_site(env.cpu.regs()[crate::cpu::Cpu::LR], len);
     track_allocation(&mut env.libc_state.mmap.allocations, ptr, len);
+    // A recycled address must not keep the previous mapping's file backing.
+    env.libc_state.mmap.writebacks.remove(&ptr);
+    if flags & MAP_ANON == 0 && flags & MAP_SHARED != 0 {
+        match env.libc_state.posix_io.guest_file(fd).and_then(|file| {
+            file.try_clone_host_file().ok()
+        }) {
+            Some(file) => {
+                env.libc_state.mmap.writebacks.insert(
+                    ptr,
+                    FileBacking { base: ptr, file: Arc::new(file), offset, len },
+                );
+            }
+            None => log!("Warning: mmap: shared writeback unavailable for fd {}", fd),
+        }
+    }
     // A brand-new mapping cannot inherit "these pages are free" records from a
     // previous mapping that the allocator recycled the address from.
     let end = ptr.to_bits().saturating_add(len);
@@ -359,6 +510,13 @@ fn mmap_fixed(
     fd: FileDescriptor,
     offset: off_t,
 ) -> MutVoidPtr {
+    // Flush old shared pages before replacing them. Preserve their metadata
+    // until the fixed allocation succeeds, in case replacement fails.
+    let replaced_range = page_range(addr, len);
+    if let Some((start, end)) = replaced_range {
+        flush_guest_range(env, start, end);
+    }
+
     let (len, is_new_mapping) = match map_fixed_zeroed(
         &mut env.mem,
         &mut env.libc_state.mmap.allocations,
@@ -374,6 +532,10 @@ fn mmap_fixed(
             return MAP_FAILED;
         }
     };
+
+    if let Some((start, end)) = page_range(addr, len) {
+        trim_writebacks(&mut env.libc_state.mmap.writebacks, start, end);
+    }
 
     // The mapped range is now in use again, so it is not free address space.
     let end = addr.to_bits().saturating_add(len);
@@ -394,7 +556,38 @@ fn mmap_fixed(
             set_errno(env, EIO);
             return MAP_FAILED;
         }
-        posix_io::read(env, fd, addr, len);
+        let mut read_total: GuestUSize = 0;
+        let mut read_error: GuestISize = 0;
+        while read_total < len {
+            let dest = MutVoidPtr::from_bits(addr.to_bits() + read_total);
+            let read = posix_io::read(env, fd, dest, len - read_total);
+            if read <= 0 {
+                read_error = read;
+                break;
+            }
+            read_total = read_total.saturating_add(read as GuestUSize);
+        }
+        if read_error < 0 {
+            log!("Warning: mmap MAP_FIXED: read from fd {} at {:?}, offset {} failed ({}); padding remainder with zeros", fd, addr, offset, read_error);
+        } else if read_total < len {
+            log!("Warning: mmap MAP_FIXED: read only {} of {} bytes from fd {} at {:?}, offset {}; padding remainder with zeros", read_total, len, fd, addr, offset);
+        }
+        if flags & MAP_SHARED != 0 {
+            match env.libc_state.posix_io.guest_file(fd).and_then(|file| {
+                file.try_clone_host_file().ok()
+            }) {
+                Some(file) => {
+                    env.libc_state.mmap.writebacks.insert(
+                        addr,
+                        FileBacking { base: addr, file: Arc::new(file), offset, len },
+                    );
+                }
+                None => log!(
+                    "Warning: mmap MAP_FIXED: shared writeback unavailable for fd {}",
+                    fd
+                ),
+            }
+        }
     }
 
     set_errno(env, 0);
@@ -469,6 +662,7 @@ fn release_mapping(env: &mut Environment, addr: MutVoidPtr, len: GuestUSize) {
     let start = addr.to_bits();
     let end = start.saturating_add(len);
     clear_unmapped_ranges(&mut env.libc_state.mmap.unmapped, start, end);
+    trim_writebacks(&mut env.libc_state.mmap.writebacks, start, end);
     env.libc_state.mmap.allocations.remove(&addr);
     env.mem.free(addr);
 }
@@ -477,6 +671,23 @@ fn munmap(env: &mut Environment, addr: MutVoidPtr, len: GuestUSize) -> i32 {
     // TODO: handle errno properly
     set_errno(env, 0);
     log_dbg!("munmap({:?}, {})", addr, len);
+
+    // A shared mapping's dirty pages belong in its file: unmapping writes them
+    // back, the same way the kernel does. Use the recorded length for the
+    // zero-length call, which means "the whole mapping".
+    let flush_len = if len == 0 {
+        env.libc_state.mmap.allocations.get(&addr).copied().unwrap_or(0)
+    } else {
+        len
+    };
+    let flush_start = addr.to_bits();
+    if !flush_guest_range(
+        env,
+        flush_start,
+        flush_start.saturating_add(flush_len),
+    ) {
+        log!("Warning: munmap({:?}, {}) could not write back all shared data", addr, len);
+    }
 
     if len == 0 {
         // Darwin returns EINVAL for `munmap(addr, 0)`, but several apps
@@ -531,6 +742,7 @@ fn munmap(env: &mut Environment, addr: MutVoidPtr, len: GuestUSize) -> i32 {
                 start,
                 end,
             );
+            trim_writebacks(&mut env.libc_state.mmap.writebacks, start, end);
         }
         log_dbg!(
             "munmap({:?}, {}): partial unmap of the {}-byte mapping at {:?}, remembering the range as free",
@@ -690,20 +902,120 @@ fn munlock(env: &mut Environment, addr: ConstPtr<u8>, len: GuestUSize) -> i32 {
     0
 }
 
-/// `int msync(void *addr, size_t len, int flags)` — synchronize a mapped
-/// region with the file that backs it. touchHLE's `mmap` copies file
-/// content into a guest allocation and never writes it back, and guest
-/// memory is not paged, so there is nothing to flush: report success as
-/// a no-op (Darwin returns 0 on success; returning -1 would make guests
-/// that treat msync failures as fatal — e.g. engines persisting save
-/// data through mmap — abort their write path).
+/// Write the part of every shared mapping that overlaps `[start, end)` back to
+/// its file.
+fn flush_guest_range(
+    env: &mut Environment,
+    start: GuestUSize,
+    end: GuestUSize,
+) -> bool {
+    // Collect first: the write needs `&mut env`, and the map is borrowed.
+    let mut pending: Vec<(FileBacking, GuestUSize, GuestUSize)> = Vec::new();
+    for backing in env.libc_state.mmap.writebacks.values() {
+        let mapping_start = backing.base.to_bits();
+        let mapping_end = mapping_start.saturating_add(backing.len);
+        let start = start.max(mapping_start);
+        let end = end.min(mapping_end);
+        if start < end {
+            pending.push((backing.clone(), start, end));
+        }
+    }
+    let mut succeeded = true;
+    for (backing, start, end) in pending {
+        succeeded &= write_back(env, &backing, start, end);
+    }
+    succeeded
+}
+
+/// The biggest write that can land in the file for `[start, end)` of a
+/// mapping: its file offset and byte count, clamped to the current file size.
+///
+/// The clamp is not cosmetic. A real `mmap` faults past the end of the file
+/// rather than extending it, so the zero-filled tail of a mapping over a short
+/// file must never become file data.
+fn writeback_extent(
+    base: GuestUSize,
+    offset: off_t,
+    len: GuestUSize,
+    start: GuestUSize,
+    end: GuestUSize,
+    file_size: off_t,
+) -> Option<(off_t, GuestUSize)> {
+    if end <= start || file_size < 0 {
+        return None;
+    }
+    let mapping_end = base.checked_add(len)?;
+    if start < base || end > mapping_end {
+        return None;
+    }
+    let mapped_offset = start.checked_sub(base)?;
+    let file_offset = offset.checked_add(mapped_offset as off_t)?;
+    let available = file_size.checked_sub(file_offset)?;
+    let count = (end - start).min(available as GuestUSize);
+    (available > 0).then_some((file_offset, count))
+}
+
+/// Write `[start, end)` of one shared mapping back to its file, leaving the
+/// file descriptor's position where it was.
+fn write_back(
+    env: &mut Environment,
+    backing: &FileBacking,
+    start: GuestUSize,
+    end: GuestUSize,
+) -> bool {
+    let file_size = match backing.file.metadata() {
+        Ok(metadata) => metadata.len().min(off_t::MAX as u64) as off_t,
+        Err(error) => {
+            log!("Warning: mmap: could not stat shared backing file: {}", error);
+            return false;
+        }
+    };
+    let Some((file_offset, count)) = writeback_extent(
+        backing.base.to_bits(),
+        backing.offset,
+        backing.len,
+        start,
+        end,
+        file_size,
+    ) else {
+        return true;
+    };
+    let bytes = env.mem.bytes_at(Ptr::<u8, false>::from_bits(start), count);
+    let mut written = 0;
+    while written < bytes.len() {
+        match backing.file.write_at(
+            &bytes[written..],
+            file_offset as u64 + written as u64,
+        ) {
+            Ok(0) => break,
+            Ok(count) => written += count,
+            Err(error) => {
+                log!("Warning: mmap: shared writeback failed at offset {}: {}", file_offset + written as off_t, error);
+                return false;
+            }
+        }
+    }
+    if written != bytes.len() {
+        log!("Warning: mmap: shared writeback wrote {} of {} bytes at offset {}", written, bytes.len(), file_offset);
+        false
+    } else {
+        true
+    }
+}
+
+/// `int msync(void *addr, size_t len, int flags)` — write a shared mapping's
+/// dirty pages back to the file that backs it. Guest memory is not paged, so
+/// there is no cache to flush; the write back is what makes `MAP_SHARED` mean
+/// anything at all. A range with no shared mapping is a successful no-op.
 ///
 /// Reference: POSIX msync(2) — returns 0 on success, -1 with errno on
 /// failure.
 fn msync(env: &mut Environment, addr: MutVoidPtr, len: GuestUSize, flags: i32) -> i32 {
-    log_dbg!("msync({:?}, {}, {:#x}) -> 0 (no-op)", addr, len, flags);
-    set_errno(env, 0);
-    0
+    log_dbg!("msync({:?}, {}, {:#x})", addr, len, flags);
+    let start = addr.to_bits();
+    let success = flush_guest_range(env, start, start.saturating_add(len));
+    set_errno(env, if success { 0 } else { EIO });
+    if success { 0 } else { -1 }
 }
 
 pub const FUNCTIONS: FunctionExports = &[
@@ -789,7 +1101,8 @@ mod map_fixed_tests {
     }
 
     #[test]
-    fn rejects_bad_arguments() {        let mut mem = new_test_mem();
+    fn rejects_bad_arguments() {
+        let mut mem = new_test_mem();
         let mut allocations = HashMap::new();
         let unaligned: MutVoidPtr = Ptr::from_bits(0x2000_0010);
         assert_eq!(
@@ -952,5 +1265,72 @@ mod partial_munmap_tests {
             Ptr::from_bits(start + PAGE_SIZE),
             PAGE_SIZE
         ));
+    }
+}
+
+#[cfg(test)]
+mod writeback_extent_tests {
+    use super::*;
+
+    const BASE: GuestUSize = 0x2000_0000;
+
+    fn extent(
+        offset: off_t,
+        len: GuestUSize,
+        start: GuestUSize,
+        end: GuestUSize,
+        file_size: off_t,
+    ) -> Option<(off_t, GuestUSize)> {
+        writeback_extent(BASE, offset, len, start, end, file_size)
+    }
+
+    #[test]
+    fn writes_the_whole_mapping_when_the_file_covers_it() {
+        assert_eq!(
+            extent(0, 0x10000, BASE, BASE + 0x10000, 0x10000),
+            Some((0, 0x10000))
+        );
+    }
+
+    /// The zero-filled tail of a mapping over a short file is not file data:
+    /// a real `mmap` faults there instead of extending the file.
+    #[test]
+    fn clamps_a_mapping_that_is_longer_than_the_file() {
+        assert_eq!(
+            extent(0, 0x10000, BASE, BASE + 0x10000, 0x4000),
+            Some((0, 0x4000))
+        );
+    }
+
+    #[test]
+    fn writes_nothing_at_or_past_the_end_of_the_file() {
+        let start = BASE + 0x4000;
+        assert_eq!(
+            extent(0, 0x10000, start, start + 0x1000, 0x4000),
+            None
+        );
+    }
+
+    #[test]
+    fn adds_the_mapping_offset_to_the_file_offset() {
+        let start = BASE + 0x2000;
+        assert_eq!(
+            extent(0x1000, 0x10000, start, start + 0x1000, 0x10000),
+            Some((0x3000, 0x1000))
+        );
+    }
+
+    #[test]
+    fn rejects_a_start_before_the_mapping() {
+        let start = BASE - 0x1000;
+        let end = start + 0x1000;
+        assert_eq!(extent(0, 0x10000, start, end, 0x10000), None);
+    }
+
+    #[test]
+    fn rejects_empty_outside_and_negative_file_ranges() {
+        assert_eq!(extent(0, 0x1000, BASE, BASE, 0x1000), None);
+        assert_eq!(extent(0, 0x1000, BASE, BASE + 0x2000, 0x1000), None);
+        assert_eq!(extent(0, 0x1000, BASE, BASE + 0x1000, -1), None);
     }
 }

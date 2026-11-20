@@ -309,6 +309,47 @@ type Bytes = [u8; GUEST_MEMORY_SIZE];
 pub const PAGE_SIZE: GuestUSize = 4096;
 pub const PAGE_SIZE_ALIGN_MASK: GuestUSize = 0xfff;
 
+/// Freed chunks at least this large hand their page-aligned part back to the
+/// host; below it the system call costs more than the pages are worth.
+const RELEASE_PAGES_SIZE: GuestUSize = 1024 * 1024;
+
+/// The page-aligned part of a freed chunk that can be released to the host.
+///
+/// The ends are rounded inwards so the released range never overlaps a
+/// neighbour that is still allocated.
+fn released_page_range(
+    addr: GuestUSize,
+    size: GuestUSize,
+) -> Option<(usize, usize)> {
+    let start = addr.saturating_add(PAGE_SIZE - 1) & !PAGE_SIZE_ALIGN_MASK;
+    let end = addr.saturating_add(size) & !PAGE_SIZE_ALIGN_MASK;
+    let len = end.saturating_sub(start);
+    (len >= RELEASE_PAGES_SIZE).then_some((start as usize, len as usize))
+}
+
+#[cfg(test)]
+mod released_page_range_tests {
+    use super::{released_page_range, PAGE_SIZE};
+
+    #[test]
+    fn keeps_only_the_pages_fully_inside_the_chunk() {
+        // Starting one byte into a page and ending just short of one leaves
+        // the interior alone, and that interior is a whole number of pages.
+        let addr = 8 * PAGE_SIZE + 1;
+        let size = 1024 * 1024 + 2 * PAGE_SIZE;
+        assert_eq!(
+            released_page_range(addr, size),
+            Some((9 * PAGE_SIZE as usize, 1024 * 1024 + PAGE_SIZE as usize))
+        );
+    }
+
+    #[test]
+    fn leaves_small_chunks_alone() {
+        assert_eq!(released_page_range(16 * PAGE_SIZE, 16 * PAGE_SIZE), None);
+        assert_eq!(released_page_range(16 * PAGE_SIZE, 0), None);
+    }
+}
+
 /// The type that owns the guest memory and provides accessors for it.
 /// One-shot diagnostic probe. The first guest store into the null segment is
 /// turned into a memory abort so `Environment::debug_cpu_error` can report the
@@ -316,10 +357,13 @@ pub const PAGE_SIZE_ALIGN_MASK: GuestUSize = 0xfff;
 /// instruction wrote through NULL: the `LAST_GUEST_PC` snapshot is taken at
 /// host-call boundaries, so for a store made while dynarmic is running it is
 /// stale (Asphalt 8's drift event reports the previous call, `_atan2f`).
-static NULL_WRITE_PROBE_FIRED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-static NULL_WRITE_PROBE_PENDING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+const NULL_WRITE_PROBE_LIMIT: usize = 64;
+static NULL_WRITE_PROBE_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static NULL_WRITE_PROBE_PENDING: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static NULL_WRITE_PROBE_ADDRESS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
 
 /// Total size of the live guest heap allocations, in bytes, mirrored for the
 /// performance overlay's VMEM counter. The authoritative bookkeeping lives in
@@ -356,6 +400,12 @@ pub fn guest_heap_bytes() -> u64 {
 /// The RAM limiter's cap in bytes, or zero when the guest heap is uncapped.
 pub fn guest_heap_limit_bytes() -> u64 {
     GUEST_HEAP_LIMIT_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Address and size of the last allocation included in the attribution table.
+pub(crate) fn last_allocation() -> (VAddr, u64) {
+    let allocation = LAST_ALLOCATION.load(std::sync::atomic::Ordering::Relaxed);
+    ((allocation >> 32) as VAddr, allocation & u64::from(u32::MAX))
 }
 
 /// How many out-of-memory warnings have been printed since the last reset.
@@ -461,6 +511,8 @@ static ALLOCATION_SITES: std::sync::Mutex<Vec<(VAddr, u64, u64)>> =
     std::sync::Mutex::new(Vec::new());
 static ALLOCATION_SITE_NEXT_REPORT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(ALLOCATION_SITE_FIRST_REPORT);
+static LAST_ALLOCATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Records that `size` bytes were allocated on the guest's behalf from the
 /// host call that returns to `site`.
@@ -469,6 +521,12 @@ static ALLOCATION_SITE_NEXT_REPORT: std::sync::atomic::AtomicU64 =
 /// 1 GiB and so on) the biggest sites are logged, so a leak shows its caller
 /// instead of just filling the heap.
 pub(crate) fn note_allocation_site(site: VAddr, size: GuestUSize) {
+    if size >= ALLOCATION_SITE_MIN_SIZE {
+        LAST_ALLOCATION.store(
+            (u64::from(site) << 32) | u64::from(size),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
     if u64::from(size) >= LARGE_ALLOCATION_LOG_BYTES {
         let logged = LARGE_ALLOCATION_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if logged < LARGE_ALLOCATION_LOG_LIMIT {
@@ -531,28 +589,59 @@ pub(crate) fn note_allocation_site(site: VAddr, size: GuestUSize) {
     }
 }
 
-/// Claim the one-shot null-write probe. Returns `true` for exactly one caller
-/// in the whole process, which must arrange for the resulting memory abort to
-/// be reported. Two flags rather than one: reusing a single flag let the
-/// reporting side clear it, so every later nil write re-armed the probe and
-/// the full register dump was printed again.
-pub fn null_write_probe_claim() -> bool {
+/// Claim one of the bounded null-write diagnostics for this app run.
+pub fn null_write_probe_claim(address: VAddr) -> Option<usize> {
     use std::sync::atomic::Ordering;
-    if NULL_WRITE_PROBE_FIRED.swap(true, Ordering::Relaxed) {
-        return false;
+    let number = NULL_WRITE_PROBE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if number > NULL_WRITE_PROBE_LIMIT {
+        return None;
     }
-    NULL_WRITE_PROBE_PENDING.store(true, Ordering::Relaxed);
-    true
+    NULL_WRITE_PROBE_ADDRESS.store(address, Ordering::Relaxed);
+    NULL_WRITE_PROBE_PENDING.store(number, Ordering::Relaxed);
+    Some(number)
 }
 
-/// Whether a claimed null-write probe is still waiting to be reported.
-pub fn null_write_probe_pending() -> bool {
-    NULL_WRITE_PROBE_PENDING.load(std::sync::atomic::Ordering::Relaxed)
+/// The claimed null-write diagnostic awaiting reporting, if any.
+pub fn null_write_probe_pending() -> Option<(usize, VAddr)> {
+    use std::sync::atomic::Ordering;
+    let number = NULL_WRITE_PROBE_PENDING.load(Ordering::Relaxed);
+    (number != 0).then(|| {
+        (
+            number,
+            NULL_WRITE_PROBE_ADDRESS.load(Ordering::Relaxed),
+        )
+    })
 }
 
 /// Mark the claimed probe as reported.
 pub fn null_write_probe_clear() {
-    NULL_WRITE_PROBE_PENDING.store(false, std::sync::atomic::Ordering::Relaxed);
+    NULL_WRITE_PROBE_PENDING.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Start a fresh bounded diagnostic budget for a newly launched app.
+pub fn reset_null_write_probes() {
+    use std::sync::atomic::Ordering;
+    NULL_WRITE_PROBE_PENDING.store(0, Ordering::Relaxed);
+    NULL_WRITE_PROBE_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod null_write_probe_tests {
+    use super::*;
+
+    #[test]
+    fn reports_each_null_write_up_to_the_run_limit() {
+        reset_null_write_probes();
+        for number in 1..=NULL_WRITE_PROBE_LIMIT {
+            assert_eq!(null_write_probe_claim(number as VAddr), Some(number));
+            assert_eq!(null_write_probe_pending(), Some((number, number as VAddr)));
+            null_write_probe_clear();
+        }
+        assert_eq!(null_write_probe_claim(0), None);
+        reset_null_write_probes();
+        assert_eq!(null_write_probe_claim(7), Some(1));
+        null_write_probe_clear();
+    }
 }
 
 pub struct Mem {
@@ -597,17 +686,13 @@ pub struct Mem {
     /// See [crate::Environment] for more info.
     pub(super) zero_memory_on_free: bool,
 
-    /// HACK: 64 KiB backing region for null-page / OOB stub accesses, shared
-    /// by reads and writes. Zero-filled, so reading `*(void**)NULL` returns
-    /// NULL, and large enough that page-straddling `read<T>` / `write<T>` /
-    /// `bytes_at` calls near `0xfff` never truncate or overrun the buffer.
+    /// HACK: 64 KiB backing region for null-page / OOB stub accesses. Zero-
+    /// filled, so reading `*(void**)NULL` returns NULL, and large enough that
+    /// page-straddling scalar accesses near `0xfff` never overrun the buffer.
     null_page: *mut u8,
-    /// Pinned read-only fallback buffers `(ptr_addr, len)` for rare null/OOB
-    /// slices larger than `NULL_STUB_SIZE`. Once allocated, each buffer is
-    /// immutable until `Drop for Mem`, avoiding any aliasing or retag hazard.
+    /// Pinned fallback buffers for slices larger than the fixed null stub.
     oversize_null_reads: std::sync::Mutex<Vec<(usize, usize)>>,
-    /// Exclusive fallback buffer for mutable null/OOB slices larger than
-    /// `NULL_STUB_SIZE`.
+    /// Reusable contiguous backing for oversized null/OOB writes.
     oversize_null_write: Vec<u8>,
 }
 
@@ -1577,6 +1662,14 @@ impl Mem {
         note_large_release(size);
         if self.zero_memory_on_free {
             self.bytes_at_mut(ptr.cast(), size).fill(0);
+        }
+        // Only zero-on-free allocations can be discarded without changing
+        // the contents observed when the allocator reuses them.
+        if self.zero_memory_on_free {
+            if let Some((start, len)) = released_page_range(addr, size) {
+                let host_ptr = unsafe { self.bytes.cast::<u8>().add(start) };
+                unsafe { host::release_guest_pages(host_ptr.cast(), len) };
+            }
         }
 
         log_dbg!("Freed {:?} ({:#x} bytes)", ptr, size);

@@ -289,6 +289,26 @@ fn getsectbynamefromheader(
     }
 }
 
+fn getsectbynamefromheader_64(
+    env: &mut Environment,
+    mhp: ConstPtr<u8>,
+    segname: ConstPtr<u8>,
+    sectname: ConstPtr<u8>,
+) -> ConstPtr<u8> {
+    if mhp.is_null() || segname.is_null() || sectname.is_null() {
+        return Ptr::null();
+    }
+    let sizeofcmds = env.mem.read((mhp + MACH_HEADER_64_SIZEOFCMDS_OFFSET).cast::<u32>());
+    let cmds_len = sizeofcmds.min(MAX_LOAD_COMMANDS_BYTES);
+    let header = env.mem.bytes_at(mhp, SIZEOF_MACH_HEADER_64 + cmds_len);
+    let segname_bytes = env.mem.bytes_at(segname, NAME_FIELD_LEN);
+    let sectname_bytes = env.mem.bytes_at(sectname, NAME_FIELD_LEN);
+    match find_section_offset_64(header, segname_bytes, sectname_bytes) {
+        Some(offset) => mhp + offset,
+        None => Ptr::null(),
+    }
+}
+
 // `struct mach_header` (32-bit) and `struct section`, `<mach-o/loader.h>`.
 const SIZEOF_MACH_HEADER: u32 = 28;
 const MACH_HEADER_NCMDS_OFFSET: u32 = 16;
@@ -299,6 +319,14 @@ const SIZEOF_SECTION: u32 = 68;
 const SECTION_SEGNAME_OFFSET: u32 = 16;
 const NAME_FIELD_LEN: u32 = 16;
 const LC_SEGMENT: u32 = 0x1;
+const SIZEOF_MACH_HEADER_64: u32 = 32;
+const MACH_HEADER_64_NCMDS_OFFSET: u32 = 16;
+const MACH_HEADER_64_SIZEOFCMDS_OFFSET: u32 = 20;
+const SIZEOF_SEGMENT_COMMAND_64: u32 = 72;
+const SEGMENT_COMMAND_64_NSECTS_OFFSET: u32 = 64;
+const SIZEOF_SECTION_64: u32 = 80;
+const SECTION_64_SEGNAME_OFFSET: u32 = 16;
+const LC_SEGMENT_64: u32 = 0x19;
 /// A corrupt header must not make us read the whole guest address space.
 const MAX_LOAD_COMMANDS_BYTES: u32 = 4 * 1024 * 1024;
 
@@ -327,30 +355,121 @@ fn find_section_offset(header: &[u8], segname: &[u8], sectname: &[u8]) -> Option
 
     let ncmds = u32_at(header, MACH_HEADER_NCMDS_OFFSET)?;
     let mut cmd = SIZEOF_MACH_HEADER;
+    let commands_end = SIZEOF_MACH_HEADER.checked_add(u32_at(header, MACH_HEADER_SIZEOFCMDS_OFFSET)?)?;
+    if commands_end as usize > header.len() {
+        return None;
+    }
     for _ in 0..ncmds {
         let cmd_id = u32_at(header, cmd)?;
-        let cmdsize = u32_at(header, cmd + 4)?;
+        let cmdsize = u32_at(header, cmd.checked_add(4)?)?;
         if cmdsize < 8 {
             return None;
         }
+        let cmd_end = cmd.checked_add(cmdsize)?;
+        if cmd_end > commands_end {
+            return None;
+        }
         if cmd_id == LC_SEGMENT {
+            if cmdsize < SIZEOF_SEGMENT_COMMAND {
+                return None;
+            }
             let nsects = u32_at(header, cmd + SEGMENT_COMMAND_NSECTS_OFFSET)?;
+            let sections_size = nsects.checked_mul(SIZEOF_SECTION)?;
+            let sections_end = cmd
+                .checked_add(SIZEOF_SEGMENT_COMMAND)?
+                .checked_add(sections_size)?;
+            if sections_end > cmd_end {
+                return None;
+            }
             for i in 0..nsects {
-                let section = cmd + SIZEOF_SEGMENT_COMMAND + i * SIZEOF_SECTION;
-                let section_bytes = header.get(section as usize..)?;
-                let end = SIZEOF_SECTION as usize;
-                if section_bytes.len() < end {
+                let section = cmd
+                    .checked_add(SIZEOF_SEGMENT_COMMAND)?
+                    .checked_add(i.checked_mul(SIZEOF_SECTION)?)?;
+                let section_end = section.checked_add(SIZEOF_SECTION)?;
+                if section_end > cmd_end {
                     return None;
                 }
+                let section_bytes = header.get(section as usize..section_end as usize)?;
                 let segname_field = &section_bytes[SECTION_SEGNAME_OFFSET as usize..];
                 if name_matches(segname_field, segname) && name_matches(section_bytes, sectname) {
                     return Some(section);
                 }
             }
         }
-        cmd += cmdsize;
+        cmd = cmd_end;
     }
     None
+}
+
+fn find_section_offset_64(header: &[u8], segname: &[u8], sectname: &[u8]) -> Option<u32> {
+    fn u32_at(bytes: &[u8], offset: u32) -> Option<u32> {
+        let field = bytes.get(offset as usize..offset as usize + 4)?;
+        Some(u32::from_le_bytes(field.try_into().ok()?))
+    }
+
+    let ncmds = u32_at(header, MACH_HEADER_64_NCMDS_OFFSET)?;
+    let mut cmd = SIZEOF_MACH_HEADER_64;
+    let commands_end = cmd.checked_add(u32_at(header, MACH_HEADER_64_SIZEOFCMDS_OFFSET)?)?;
+    if commands_end as usize > header.len() {
+        return None;
+    }
+    for _ in 0..ncmds {
+        let cmd_id = u32_at(header, cmd)?;
+        let cmdsize = u32_at(header, cmd.checked_add(4)?)?;
+        if cmdsize < 8 {
+            return None;
+        }
+        let cmd_end = cmd.checked_add(cmdsize)?;
+        if cmd_end > commands_end {
+            return None;
+        }
+        if cmd_id == LC_SEGMENT_64 {
+            if cmdsize < SIZEOF_SEGMENT_COMMAND_64 {
+                return None;
+            }
+            let nsects = u32_at(header, cmd.checked_add(SEGMENT_COMMAND_64_NSECTS_OFFSET)?)?;
+            let sections_size = nsects.checked_mul(SIZEOF_SECTION_64)?;
+            let sections_end = cmd
+                .checked_add(SIZEOF_SEGMENT_COMMAND_64)?
+                .checked_add(sections_size)?;
+            if sections_end > cmd_end {
+                return None;
+            }
+            for i in 0..nsects {
+                let section = cmd
+                    .checked_add(SIZEOF_SEGMENT_COMMAND_64)?
+                    .checked_add(i.checked_mul(SIZEOF_SECTION_64)?)?;
+                let section_end = section.checked_add(SIZEOF_SECTION_64)?;
+                if section_end > cmd_end {
+                    return None;
+                }
+                let bytes = header.get(section as usize..section_end as usize)?;
+                let section_name = &bytes[..NAME_FIELD_LEN as usize];
+                let segment_name = &bytes[SECTION_64_SEGNAME_OFFSET as usize..];
+                if fixed_name_matches(section_name, sectname)
+                    && fixed_name_matches(segment_name, segname)
+                {
+                    return Some(section);
+                }
+            }
+        }
+        cmd = cmd_end;
+    }
+    None
+}
+
+fn fixed_name_matches(field: &[u8], wanted: &[u8]) -> bool {
+    for i in 0..NAME_FIELD_LEN as usize {
+        let Some(&a) = field.get(i) else { return false };
+        let Some(&b) = wanted.get(i) else { return false };
+        if a != b {
+            return false;
+        }
+        if a == 0 {
+            return true;
+        }
+    }
+    true
 }
 
 // MARK: - NX architecture info (mach-o/arch.h)
@@ -987,7 +1106,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(_NSGetMachExecuteHeader()),
     export_c_func!(_dyld_image_count()),
     export_c_func!(_dyld_get_image_header(_)),
-export_c_func!(getsectbynamefromheader(_, _, _)),
+    export_c_func!(getsectbynamefromheader(_, _, _)),
+    export_c_func!(getsectbynamefromheader_64(_, _, _)),
     export_c_func!(_dyld_get_image_name(_)),
     export_c_func!(_dyld_get_image_vmaddr_slide(_)),
     export_c_func!(_dyld_register_func_for_add_image(_)),
@@ -1029,6 +1149,28 @@ mod getsectbynamefromheader_tests {
             section[16..32].copy_from_slice(&name("__DATA"));
             header.extend_from_slice(&section);
         }
+        header
+    }
+
+    fn header_64_with_section() -> Vec<u8> {
+        let segment_len = SIZEOF_SEGMENT_COMMAND_64 + SIZEOF_SECTION_64;
+        let mut header = vec![0u8; SIZEOF_MACH_HEADER_64 as usize];
+        header[0..4].copy_from_slice(&0xfeed_facfu32.to_le_bytes());
+        header[16..20].copy_from_slice(&1u32.to_le_bytes());
+        header[20..24].copy_from_slice(&segment_len.to_le_bytes());
+
+        let mut segment = vec![0u8; SIZEOF_SEGMENT_COMMAND_64 as usize];
+        segment[0..4].copy_from_slice(&LC_SEGMENT_64.to_le_bytes());
+        segment[4..8].copy_from_slice(&segment_len.to_le_bytes());
+        segment[8..24].copy_from_slice(&name("__DATA"));
+        segment[64..68].copy_from_slice(&1u32.to_le_bytes());
+        header.extend_from_slice(&segment);
+
+        let mut section = vec![0u8; SIZEOF_SECTION_64 as usize];
+        section[..16].copy_from_slice(&name("__objc_data"));
+        section[16..32].copy_from_slice(&name("__DATA"));
+        section[48..56].copy_from_slice(&0x1_2345u64.to_le_bytes());
+        header.extend_from_slice(&section);
         header
     }
 
@@ -1084,5 +1226,33 @@ mod getsectbynamefromheader_tests {
         assert_eq!(find_section_offset(&header, &data, &dat), None);
         assert_eq!(find_section_offset(&header, &text, &data_section), None);
         assert_eq!(find_section_offset(&[], &data, &data_section), None);
+    }
+
+    #[test]
+    fn finds_64_bit_section_and_rejects_malformed_command_bounds() {
+        let mut header = header_64_with_section();
+        let expected = SIZEOF_MACH_HEADER_64 + SIZEOF_SEGMENT_COMMAND_64;
+        assert_eq!(
+            find_section_offset_64(&header, &name("__DATA"), &name("__objc_data")),
+            Some(expected)
+        );
+        header[SIZEOF_MACH_HEADER_64 as usize + 4..SIZEOF_MACH_HEADER_64 as usize + 8]
+            .copy_from_slice(&8u32.to_le_bytes());
+        assert_eq!(
+            find_section_offset_64(&header, &name("__DATA"), &name("__objc_data")),
+            None
+        );
+        let mut header = header_64_with_section();
+        header[SIZEOF_MACH_HEADER_64 as usize + 64..SIZEOF_MACH_HEADER_64 as usize + 68]
+            .copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(
+            find_section_offset_64(&header, &name("__DATA"), &name("__objc_data")),
+            None
+        );
+        header[20..24].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            find_section_offset_64(&header, &name("__DATA"), &name("__objc_data")),
+            None
+        );
     }
 }

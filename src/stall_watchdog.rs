@@ -5,7 +5,8 @@
 //! them atomics — from its own thread. It never touches guest state.
 
 use crate::environment::{
-    HOST_CALL_RING_IDX, LAST_GUEST_LR, LAST_GUEST_PC, LAST_HOST_CALL_THREAD,
+    GUEST_CPU_RUNNING, HOST_CALL_RING_IDX, LAST_GUEST_LR, LAST_GUEST_PC,
+    LAST_HOST_CALL_THREAD,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -37,6 +38,7 @@ struct Progress {
     guest_lr: u32,
     host_calls: usize,
     thread: u32,
+    cpu_running: bool,
 }
 
 fn progress() -> Progress {
@@ -45,11 +47,20 @@ fn progress() -> Progress {
         guest_lr: LAST_GUEST_LR.load(Ordering::Relaxed),
         host_calls: HOST_CALL_RING_IDX.load(Ordering::Relaxed),
         thread: LAST_HOST_CALL_THREAD.load(Ordering::Relaxed),
+        cpu_running: GUEST_CPU_RUNNING.load(Ordering::Relaxed),
     }
 }
 
 fn should_report(idle: Duration, reported_at: Option<Instant>, now: Instant) -> bool {
     idle >= STALL_AFTER && reported_at.map_or(true, |at| now.duration_since(at) >= REPORT_EVERY)
+}
+
+fn cpu_state_description(cpu_running: bool) -> &'static str {
+    if cpu_running {
+        "still active; guest may be spinning in JIT"
+    } else {
+        "not active; guest may be idle or host-side work may be stalled"
+    }
 }
 
 /// Starts the watchdog thread. Safe to call more than once: only the first
@@ -80,8 +91,9 @@ pub fn start() {
                 reported_at = Some(Instant::now());
                 DUMP_REQUESTED.store(true, Ordering::Relaxed);
                 log!(
-                    "Stall watchdog: no guest activity for {}s (guest PC={:#010x}, LR={:#010x}, thread={}, {} host calls so far). Recent host calls:{}",
+                    "Stall watchdog: no host-call progress for {}s; CPU execution call {} (guest PC={:#010x}, LR={:#010x}, thread={}, {} host calls so far). Recent host calls:{}",
                     idle.as_secs(),
+                    cpu_state_description(last.cpu_running),
                     last.guest_pc,
                     last.guest_lr,
                     last.thread,
@@ -119,5 +131,14 @@ mod tests {
             Some(now - REPORT_EVERY),
             now
         ));
+    }
+
+    #[test]
+    fn cpu_state_descriptions_avoid_claiming_a_deadlock() {
+        let active = cpu_state_description(true);
+        let inactive = cpu_state_description(false);
+        assert!(active.contains("may be spinning"));
+        assert!(inactive.contains("may be idle"));
+        assert!(!inactive.contains("deadlocked"));
     }
 }

@@ -108,6 +108,10 @@ pub static LAST_GUEST_PC: std::sync::atomic::AtomicU32 = std::sync::atomic::Atom
 /// Last guest LR seen by the CPU loop, for crash diagnostics.
 pub static LAST_GUEST_LR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// True while the emulation thread is inside Dynarmic's run/step call.
+pub static GUEST_CPU_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Ring buffer of the last N guest PCs, for crash diagnostics.
 pub static GUEST_PC_RING: [std::sync::atomic::AtomicU32; 32] = {
     #[allow(clippy::declare_interior_mutable_const)]
@@ -617,6 +621,7 @@ impl Environment {
         if ENVIRONMENT_INSTANCE_EXISTS.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Err("Only one (real) Environment can exist at a time!".to_string());
         }
+        crate::mem::reset_null_write_probes();
 
         // Certain apps need to launch in a non-portrait orientation, and this
         // should be handled before creating the window because handling of
@@ -1369,6 +1374,7 @@ impl Environment {
             return Err("Only one (real) Environment can exist at a time!".to_string());
         }
         ENVIRONMENT_INSTANCE_EXISTS.store(true, std::sync::atomic::Ordering::Relaxed);
+        crate::mem::reset_null_write_probes();
         let bundle = bundle::Bundle::new_fake_bundle();
         let fs = fs::Fs::new_fake_fs();
 
@@ -3871,26 +3877,42 @@ impl Environment {
                 return;
             }
 
-            // A memory abort raised by the one-shot null-write probe (see
-            // `touchHLE_cpu_write_impl`). Interactive runs report it and carry
-            // on for compatibility; headless runs must preserve the failure.
-            if matches!(error, cpu::CpuError::MemoryError) && crate::mem::null_write_probe_pending()
-            {
-                crate::mem::null_write_probe_clear();
-                log_no_panic!(
-                    "NULL-WRITE PROBE: the guest stored into the null page. \
-                     PC={:#x} LR={:#x} (thread {}, thumb={}). Code at PC: [{}]",
-                    self.cpu.regs()[cpu::Cpu::PC],
-                    self.cpu.regs()[cpu::Cpu::LR],
-                    self.current_thread,
-                    is_thumb,
-                    self.guest_code_words(self.cpu.regs()[cpu::Cpu::PC])
-                );
-                self.dump_all_regs();
-                self.stack_trace_current();
-                if null_write_probe_should_resume(self.window.is_some()) {
-                    return;
+            // Interactive runs report null writes and carry on for
+            // compatibility; headless runs preserve the first failure.
+            let mut recovered_null_write = false;
+            if matches!(error, cpu::CpuError::MemoryError) {
+                if let Some((probe_number, address)) = crate::mem::null_write_probe_pending() {
+                    crate::mem::null_write_probe_clear();
+                    if probe_number == 1 {
+                        log_no_panic!(
+                            "NULL-WRITE PROBE #{}: guest stored to {:#010x}; PC={:#x} LR={:#x} (thread {}, thumb={}). Code at PC: [{}]",
+                            probe_number,
+                            address,
+                            self.cpu.regs()[cpu::Cpu::PC],
+                            self.cpu.regs()[cpu::Cpu::LR],
+                            self.current_thread,
+                            is_thumb,
+                            self.guest_code_words(self.cpu.regs()[cpu::Cpu::PC])
+                        );
+                        self.dump_all_regs();
+                        self.stack_trace_current();
+                    } else {
+                        log_no_panic!(
+                            "NULL-WRITE PROBE #{}: guest thread {} stored to {:#010x}; PC={:#x} LR={:#x}",
+                            probe_number,
+                            self.current_thread,
+                            address,
+                            self.cpu.regs()[cpu::Cpu::PC],
+                            self.cpu.regs()[cpu::Cpu::LR]
+                        );
+                    }
+                    if null_write_probe_should_resume(self.window.is_some()) {
+                        recovered_null_write = true;
+                    }
                 }
+            }
+            if recovered_null_write {
+                return;
             }
 
             panic!("Error during CPU execution: {error:?}");
@@ -4148,9 +4170,18 @@ impl Environment {
                 .remaining_ticks
                 .is_none_or(|remaining_ticks| remaining_ticks > 0)
             {
+                struct CpuRunGuard;
+                impl Drop for CpuRunGuard {
+                    fn drop(&mut self) {
+                        GUEST_CPU_RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                GUEST_CPU_RUNNING.store(true, std::sync::atomic::Ordering::Relaxed);
+                let run_guard = CpuRunGuard;
                 let state = self
                     .cpu
                     .run_or_step(&mut self.mem, self.remaining_ticks.as_mut());
+                drop(run_guard);
                 let diag_pc = self.cpu.regs()[crate::cpu::Cpu::PC];
                 std::sync::atomic::AtomicU32::store(
                     &crate::environment::LAST_GUEST_PC,
