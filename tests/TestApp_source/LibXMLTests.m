@@ -51,7 +51,11 @@ extern xmlXPathObject *xmlXPathEvalExpression(const unsigned char *,
                                               xmlXPathContext *);
 extern void xmlXPathFreeObject(xmlXPathObject *);
 extern unsigned char *xmlGetProp(xmlNode *, const unsigned char *);
-extern void xmlFree(void *);
+// libxml2's globals.h declares `XMLPUBVAR xmlFreeFunc xmlFree;`: a function
+// pointer variable, not a function. Declaring it as a function would branch to
+// the variable's storage and fail on iOS and HyperHLE alike.
+typedef void (*xmlFreeFunc)(void *);
+extern xmlFreeFunc xmlFree;
 
 #define XML_CHECK(condition)                                                   \
   do {                                                                         \
