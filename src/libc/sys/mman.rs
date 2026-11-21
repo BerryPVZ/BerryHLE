@@ -935,21 +935,19 @@ fn flush_guest_range(
     succeeded
 }
 
-/// The biggest write that can land in the file for `[start, end)` of a
-/// mapping: its file offset and byte count, clamped to the current file size.
-///
-/// The clamp is not cosmetic. A real `mmap` faults past the end of the file
-/// rather than extending it, so the zero-filled tail of a mapping over a short
-/// file must never become file data.
+/// The file offset and byte count for a writeback of `[start, end)` of a
+/// mapping. The whole range is returned, including bytes past the current end
+/// of the file: the mapping was sized by the guest, and iOS persists writes to
+/// a writable shared mapping by growing the file, which is how apps that size
+/// a file through its mapping (a world file, a database) work at all.
 fn writeback_extent(
     base: GuestUSize,
     offset: off_t,
     len: GuestUSize,
     start: GuestUSize,
     end: GuestUSize,
-    file_size: off_t,
 ) -> Option<(off_t, GuestUSize)> {
-    if end <= start || file_size < 0 {
+    if end <= start {
         return None;
     }
     let mapping_end = base.checked_add(len)?;
@@ -958,9 +956,7 @@ fn writeback_extent(
     }
     let mapped_offset = start.checked_sub(base)?;
     let file_offset = offset.checked_add(mapped_offset as off_t)?;
-    let available = file_size.checked_sub(file_offset)?;
-    let count = (end - start).min(available as GuestUSize);
-    (available > 0).then_some((file_offset, count))
+    Some((file_offset, end - start))
 }
 
 /// Write at an absolute offset without moving the file position. Unix exposes
@@ -994,10 +990,33 @@ fn write_back(
         backing.len,
         start,
         end,
-        file_size,
     ) else {
         return true;
     };
+    // mmap(2) on Darwin zero-fills pages that extend past the end of the
+    // mapped object, and MAP_SHARED shares modifications, so a write there is
+    // a write to the file, which grows to cover it. Dropping the bytes instead
+    // leaves the file short and the next mapping of it reads back zeros.
+    let new_size = file_offset.checked_add(count as off_t);
+    if let Some(new_size) = new_size {
+        if new_size > file_size {
+            if let Err(error) = backing.file.set_len(new_size as u64) {
+                log!(
+                    "Warning: mmap: could not grow shared backing file to {} bytes: {}",
+                    new_size,
+                    error
+                );
+                return false;
+            }
+        }
+    }
+    log_dbg!(
+        "mmap: writeback of {} bytes at file offset {} (file was {} bytes, now {} bytes)",
+        count,
+        file_offset,
+        file_size,
+        new_size.unwrap_or(file_size)
+    );
     let bytes = env.mem.bytes_at(Ptr::<u8, false>::from_bits(start), count);
     let mut written = 0;
     while written < bytes.len() {
@@ -1298,35 +1317,26 @@ mod writeback_extent_tests {
         len: GuestUSize,
         start: GuestUSize,
         end: GuestUSize,
-        file_size: off_t,
     ) -> Option<(off_t, GuestUSize)> {
-        writeback_extent(BASE, offset, len, start, end, file_size)
+        writeback_extent(BASE, offset, len, start, end)
     }
 
     #[test]
     fn writes_the_whole_mapping_when_the_file_covers_it() {
         assert_eq!(
-            extent(0, 0x10000, BASE, BASE + 0x10000, 0x10000),
+            extent(0, 0x10000, BASE, BASE + 0x10000),
             Some((0, 0x10000))
         );
     }
 
-    /// The zero-filled tail of a mapping over a short file is not file data:
-    /// a real `mmap` faults there instead of extending the file.
+    /// A mapping longer than its file is legal on Darwin: the extension is
+    /// zero-filled and a MAP_SHARED write there grows the file, so the write
+    /// must reach the file rather than be dropped.
     #[test]
-    fn clamps_a_mapping_that_is_longer_than_the_file() {
+    fn keeps_a_write_past_the_end_of_the_file() {
         assert_eq!(
-            extent(0, 0x10000, BASE, BASE + 0x10000, 0x4000),
-            Some((0, 0x4000))
-        );
-    }
-
-    #[test]
-    fn writes_nothing_at_or_past_the_end_of_the_file() {
-        let start = BASE + 0x4000;
-        assert_eq!(
-            extent(0, 0x10000, start, start + 0x1000, 0x4000),
-            None
+            extent(0, 0x10000, BASE + 0x4000, BASE + 0x5000),
+            Some((0x4000, 0x1000))
         );
     }
 
@@ -1334,7 +1344,7 @@ mod writeback_extent_tests {
     fn adds_the_mapping_offset_to_the_file_offset() {
         let start = BASE + 0x2000;
         assert_eq!(
-            extent(0x1000, 0x10000, start, start + 0x1000, 0x10000),
+            extent(0x1000, 0x10000, start, start + 0x1000),
             Some((0x3000, 0x1000))
         );
     }
@@ -1343,13 +1353,12 @@ mod writeback_extent_tests {
     fn rejects_a_start_before_the_mapping() {
         let start = BASE - 0x1000;
         let end = start + 0x1000;
-        assert_eq!(extent(0, 0x10000, start, end, 0x10000), None);
+        assert_eq!(extent(0, 0x10000, start, end), None);
     }
 
     #[test]
-    fn rejects_empty_outside_and_negative_file_ranges() {
-        assert_eq!(extent(0, 0x1000, BASE, BASE, 0x1000), None);
-        assert_eq!(extent(0, 0x1000, BASE, BASE + 0x2000, 0x1000), None);
-        assert_eq!(extent(0, 0x1000, BASE, BASE + 0x1000, -1), None);
+    fn rejects_empty_and_outside_ranges() {
+        assert_eq!(extent(0, 0x1000, BASE, BASE), None);
+        assert_eq!(extent(0, 0x1000, BASE, BASE + 0x2000), None);
     }
 }
