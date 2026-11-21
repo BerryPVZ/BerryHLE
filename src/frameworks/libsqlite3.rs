@@ -34,6 +34,13 @@ struct StmtEntry {
     /// (or the next call to `sqlite3_column_name` for the same column) so we
     /// keep one guest allocation per column index, reused across calls.
     column_name_ptrs: HashMap<i32, u32>,
+    /// Rows of a SELECT, fetched by the first `sqlite3_step` so that later
+    /// calls walk the result set like SQLite's cursor instead of replaying
+    /// the first row. Real SQLite's `<https://www.sqlite.org/c3ref/step.html>`
+    /// advances one row per call and ends with SQLITE_DONE.
+    rows: Vec<Vec<ColumnValue>>,
+    row_index: usize,
+    fetched: bool,
     done: bool,
 }
 
@@ -296,6 +303,9 @@ pub fn sqlite3_prepare_v2(
             columns: Vec::new(),
             column_names: Vec::new(),
             column_name_ptrs: HashMap::new(),
+            rows: Vec::new(),
+            row_index: 0,
+            fetched: false,
             done: false,
         },
     );
@@ -445,6 +455,26 @@ pub fn sqlite3_step(_env: &mut Environment, stmt_handle: u32) -> u32 {
         return SQLITE_DONE;
     }
 
+    // Serve a result set that the first call already fetched.
+    {
+        let mut stmts = SQLITE_STATEMENTS.lock().unwrap();
+        match stmts.get_mut(&stmt_handle) {
+            Some(entry) if entry.fetched => {
+                if entry.row_index < entry.rows.len() {
+                    let row = entry.rows[entry.row_index].clone();
+                    entry.columns = row;
+                    entry.row_index += 1;
+                    return SQLITE_ROW;
+                }
+                entry.done = true;
+                entry.columns.clear();
+                return SQLITE_DONE;
+            }
+            Some(_) => {}
+            None => return SQLITE_MISUSE,
+        }
+    }
+
     let handles = SQLITE_CONNECTIONS.lock().unwrap();
     let conn = match handles.get(&db_handle) {
         Some(c) => c,
@@ -505,55 +535,74 @@ pub fn sqlite3_step(_env: &mut Environment, stmt_handle: u32) -> u32 {
             }
         }
     } else {
-        // SELECT statement - get one row
+        // SELECT statement. SQLite keeps one cursor per prepared statement,
+        // so fetch the whole result set once and serve later `sqlite3_step`
+        // calls from it: re-preparing on every call would replay the first
+        // row forever and never report SQLITE_DONE.
         let mut rows = real_stmt.raw_query();
-        match rows.next() {
-            Ok(Some(row)) => {
-                let mut columns = Vec::with_capacity(col_count);
-                for i in 0..col_count {
-                    let val = match row.get_ref(i) {
-                        Ok(rusqlite::types::ValueRef::Null) => ColumnValue::Null,
-                        Ok(rusqlite::types::ValueRef::Integer(v)) => ColumnValue::Int(v),
-                        Ok(rusqlite::types::ValueRef::Real(v)) => ColumnValue::Double(v),
-                        Ok(rusqlite::types::ValueRef::Text(v)) => {
-                            ColumnValue::Text(String::from_utf8_lossy(v).into_owned())
-                        }
-                        Ok(rusqlite::types::ValueRef::Blob(v)) => ColumnValue::Blob(v.to_vec()),
-                        Err(_) => ColumnValue::Null,
-                    };
-                    columns.push(val);
+        let mut fetched: Vec<Vec<ColumnValue>> = Vec::new();
+        let mut query_error: Option<String> = None;
+        loop {
+            match rows.next() {
+                Ok(Some(row)) => {
+                    let mut columns = Vec::with_capacity(col_count);
+                    for i in 0..col_count {
+                        let val = match row.get_ref(i) {
+                            Ok(rusqlite::types::ValueRef::Null) => ColumnValue::Null,
+                            Ok(rusqlite::types::ValueRef::Integer(v)) => ColumnValue::Int(v),
+                            Ok(rusqlite::types::ValueRef::Real(v)) => ColumnValue::Double(v),
+                            Ok(rusqlite::types::ValueRef::Text(v)) => {
+                                ColumnValue::Text(String::from_utf8_lossy(v).into_owned())
+                            }
+                            Ok(rusqlite::types::ValueRef::Blob(v)) => {
+                                ColumnValue::Blob(v.to_vec())
+                            }
+                            Err(_) => ColumnValue::Null,
+                        };
+                        columns.push(val);
+                    }
+                    fetched.push(columns);
                 }
-                // Store columns
-                drop(rows);
-                drop(real_stmt);
-                drop(handles);
-                let mut stmts = SQLITE_STATEMENTS.lock().unwrap();
-                if let Some(entry) = stmts.get_mut(&stmt_handle) {
-                    entry.columns = columns;
-                    entry.column_names = column_names_snapshot;
+                Ok(None) => break,
+                Err(e) => {
+                    query_error = Some(format!("{}", e));
+                    break;
                 }
-                SQLITE_ROW
             }
-            Ok(None) => {
-                drop(rows);
-                drop(real_stmt);
-                drop(handles);
-                let mut stmts = SQLITE_STATEMENTS.lock().unwrap();
-                if let Some(entry) = stmts.get_mut(&stmt_handle) {
+        }
+        drop(rows);
+        drop(real_stmt);
+        drop(handles);
+        let mut stmts = SQLITE_STATEMENTS.lock().unwrap();
+        if let Some(entry) = stmts.get_mut(&stmt_handle) {
+            entry.column_names = column_names_snapshot;
+            entry.rows = fetched;
+            entry.row_index = 1;
+            entry.fetched = true;
+            let first = entry.rows.first().cloned();
+            match first {
+                Some(first) => entry.columns = first,
+                None => {
                     entry.done = true;
                     entry.columns.clear();
-                    // Keep `column_names` so post-loop calls to
-                    // `sqlite3_column_name` still resolve, mirroring real
-                    // SQLite's behaviour after SQLITE_DONE.
-                    entry.column_names = column_names_snapshot;
                 }
-                SQLITE_DONE
             }
-            Err(e) => {
-                log!("libsqlite3: sqlite3_step query error: {}", e);
-                set_error(db_handle, format!("{}", e));
-                SQLITE_ERROR
+        }
+        if let Some(e) = query_error {
+            log!("libsqlite3: sqlite3_step query error: {}", e);
+            set_error(db_handle, e);
+            if let Some(entry) = stmts.get_mut(&stmt_handle) {
+                entry.done = true;
+                entry.fetched = false;
+                entry.rows.clear();
+                entry.columns.clear();
             }
+            return SQLITE_ERROR;
+        }
+        match stmts.get(&stmt_handle) {
+            Some(entry) if entry.done => SQLITE_DONE,
+            Some(_) => SQLITE_ROW,
+            None => SQLITE_MISUSE,
         }
     }
 }
@@ -564,6 +613,9 @@ pub fn sqlite3_reset(_env: &mut Environment, stmt_handle: u32) -> u32 {
     match stmts.get_mut(&stmt_handle) {
         Some(entry) => {
             entry.done = false;
+            entry.fetched = false;
+            entry.row_index = 0;
+            entry.rows.clear();
             entry.columns.clear();
             SQLITE_OK
         }
@@ -918,3 +970,65 @@ pub const DYLIB: HostDylib = HostDylib {
     constant_exports: &[],
     function_exports: &[FUNCTIONS],
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mem::MutPtr;
+
+    fn test_env() -> crate::environment::Environment {
+        let options = crate::options::Options {
+            headless: true,
+            popup_errors: false,
+            ..Default::default()
+        };
+        let icon = crate::image::Image::from_pixels(1, 1, vec![0; 4]);
+        crate::environment::Environment::new_without_app(options, icon).unwrap()
+    }
+
+    /// A `SELECT` must walk one row per `sqlite3_step` and end with
+    /// `SQLITE_DONE`, the way real SQLite's cursor does; replaying the first
+    /// row forever makes a guest's `while (step() == SQLITE_ROW)` loop hang.
+    /// https://www.sqlite.org/c3ref/step.html
+    #[test]
+    fn step_walks_every_row_of_a_select() {
+        let _lock = crate::environment::ENVIRONMENT_TEST_LOCK.lock().unwrap();
+        let mut env = test_env();
+        let env = &mut env;
+
+        let name = env.mem.alloc_and_write_cstr(b":memory:");
+        let pp_db = env.mem.alloc(4);
+        assert_eq!(sqlite3_open(env, name.to_bits(), pp_db.to_bits()), SQLITE_OK);
+        let p_db = env.mem.read(MutPtr::<u32>::from_bits(pp_db.to_bits()));
+
+        let sql = env.mem.alloc_and_write_cstr(b"CREATE TABLE t(x)");
+        let pp_stmt = env.mem.alloc(4);
+        assert_eq!(
+            sqlite3_prepare_v2(env, p_db, sql.to_bits(), -1, pp_stmt.to_bits(), 0),
+            SQLITE_OK
+        );
+        let stmt = env.mem.read(MutPtr::<u32>::from_bits(pp_stmt.to_bits()));
+        assert_eq!(sqlite3_step(env, stmt), SQLITE_DONE);
+
+        let sql = env.mem.alloc_and_write_cstr(b"INSERT INTO t VALUES (1),(2),(3)");
+        assert_eq!(
+            sqlite3_prepare_v2(env, p_db, sql.to_bits(), -1, pp_stmt.to_bits(), 0),
+            SQLITE_OK
+        );
+        let stmt = env.mem.read(MutPtr::<u32>::from_bits(pp_stmt.to_bits()));
+        assert_eq!(sqlite3_step(env, stmt), SQLITE_DONE);
+
+        let sql = env.mem.alloc_and_write_cstr(b"SELECT x FROM t ORDER BY x");
+        assert_eq!(
+            sqlite3_prepare_v2(env, p_db, sql.to_bits(), -1, pp_stmt.to_bits(), 0),
+            SQLITE_OK
+        );
+        let stmt = env.mem.read(MutPtr::<u32>::from_bits(pp_stmt.to_bits()));
+        for expected in 1..=3 {
+            assert_eq!(sqlite3_step(env, stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int(env, stmt, 0), expected);
+        }
+        assert_eq!(sqlite3_step(env, stmt), SQLITE_DONE);
+        assert_eq!(sqlite3_step(env, stmt), SQLITE_DONE);
+    }
+}
