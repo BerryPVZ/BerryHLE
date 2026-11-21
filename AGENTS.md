@@ -2,7 +2,7 @@
 
 Two products in this tree:
 
-1. **touchHLE** (Rust) — an HLE iPhone OS app emulator. The main one: a Rust host
+1. **touchHLE** (Rust) — an HLE iPhone OS app emulator. Its Rust host
    reimplements iOS frameworks and runs guest ARM code (Dynarmic JIT, with an
    interpreter fallback).
 2. **AppDB** (Python/FastAPI) — a compatibility report web app at `appdb/`.
@@ -12,7 +12,7 @@ Also present: `telegram_bot/` (app-fix request bot), `android/` (Gradle app),
 
 ## Rules for emulator changes
 
-These come from bugs that reached trunk. They apply to every agent and environment.
+These come from bugs that reached trunk and apply to every agent.
 
 1. **Run the test suite.** `cargo test` covers the unit tests and TestApp. If you
    cannot run TestApp, write "TestApp not run" and why. Never delete, skip or
@@ -35,12 +35,12 @@ These come from bugs that reached trunk. They apply to every agent and environme
 5. **Search before adding.** Check for an existing class, method, function or
    constant first; the `no_duplicate_*` tests fail on duplicates.
 
-## Code change guide
-Apply edits precisely. Read the file first. Use `edit` with an exact
-`oldString`, including blank lines and indentation, and enough context to match
-once; use `replaceAll` only when every occurrence should change. Use `write` for
-a new file or a full replacement, never shell redirection or `sed`. Run
-`git diff --check` after editing.
+## Applying edits
+
+Read the file first. Use `edit` with an exact `oldString`, including blank
+lines and indentation, and enough context to match once; set `replaceAll` only
+when every occurrence should change. Use `write` for new files or full rewrites,
+never shell redirection or `sed`. Run `git diff --check` after editing.
 
 ## Where things live
 
@@ -96,9 +96,8 @@ a new file or a full replacement, never shell redirection or `sed`. Run
   `openal-soft`, `libxml2`, `stb`).
 - Fresh builds need `export CMAKE_POLICY_VERSION_MINIMUM=3.5`: CMake 4.4 rejects
   `sdl2-sys`'s old `cmake_minimum_required`.
-- `cargo test` — 652 tests in 5 suites (649 unit, 2 in `tests/integration.rs`,
-  1 trainer atlas), 12 ignored doc-tests, ~25 s warm. TestApp needs `tests/llvm`
-  (LLVM 12; its `clang` is x86_64, so Rosetta on Apple Silicon) and
+- `cargo test` — 743 unit tests and 2 integration tests. TestApp needs
+  `tests/llvm` (LLVM 12; its `clang` is x86_64, so Rosetta on Apple Silicon) and
   `tests/common-3.0.sdk`.
 - One test: `cargo test --lib <name>`. TestApp only:
   `cargo test --test integration test_app`.
@@ -130,59 +129,52 @@ warnings. `cargo clippy` needs the `PATH` above.
 
 ## Optional agent tooling
 
-Use a tool only if installed; skip its bullet otherwise. Nothing here is
-required to work on the repo.
+Optional: skip any tool that is not installed.
 
 - **Code graph (graphify)** — if `graphify-out/graph.json` exists, run
-  `graphify query "<question>"` before grep or file reads, and pass this rule to
-  subagents; use `graphify path A B` for relationships, `graphify explain X` for
-  one concept, and `graphify section "<heading>"` for one Markdown section. Use
-  `graphify-out/wiki/index.md` for navigation and `GRAPH_REPORT.md` only for
-  broad architecture. After code changes run `graphify update .` (AST-only, no
-  API cost); never hand-edit `graphify-out/`.
-- **Search tools (bettergrep, betterglob, betterread)** — these plugins keep the
-  `grep`, `glob` and `read` names but add filters, limits and continuation
-  footers. Use them when installed; otherwise use the normal tools. `betterread`
-  does not load a nested `AGENTS.md`, so open `appdb/AGENTS.md` directly.
-- **Symbol navigation (serena)** — call `initial_instructions` first, then use
-  `find_symbol` to locate a definition, `find_referencing_symbols` for callers,
-  and `replace_symbol_body` for a whole-symbol edit. Prefer these over text
-  search for named symbols, especially in large files.
+  `graphify query "<question>"` before grep or reads and pass that rule to
+  subagents. `graphify path A B` maps relationships, `explain X` covers one
+  concept, and `section "<heading>"` prints one Markdown section. Navigate with
+  `graphify-out/wiki/index.md`; read `GRAPH_REPORT.md` only for broad
+  architecture. After code changes run `graphify update .`; never hand-edit
+  `graphify-out/`.
+- **Search tools (bettergrep, betterglob, betterread)** — plugins that keep the
+  `grep`, `glob`, `read` names with filters, limits and continuation footers.
+  `betterread` skips nested `AGENTS.md`, so open `appdb/AGENTS.md` directly.
+- **Symbol navigation (serena)** — call `initial_instructions` first. Use
+  `find_symbol` for definitions, `find_referencing_symbols` for callers, and
+  `replace_symbol_body` for whole-symbol edits; prefer them to text search for
+  named symbols.
 - **Library docs (context7)** — for a library, framework, SDK, API or CLI
-  question, call `resolve-library-id`, then `query-docs`. Use `query-code` when
-  the docs do not answer an exact signature, default or error, and cite the file
-  and line. Skip it for refactoring or debugging that does not depend on a
-  library API.
+  question, call `resolve-library-id` then `query-docs`. Use `query-code` when
+  docs lack an exact signature, default or error; cite the file and line. Skip
+  for refactoring or debugging independent of a library API.
 - **Memory (mnemon, claudemem, hindsight, openviking)** — recall before
   answering anything that may depend on past sessions, decisions or preferences.
-  During a large plan or exploration, store findings, decisions and the plan as
-  you go, not only at the end: that is what survives compaction and session
-  switches. Never store secrets or transient state.
-- **Caveman (skill, blocks, native)** — if the skill is installed, its terse
-  style applies only while active; code, comments, commits and docs stay normal.
-  `caveman-blocks` appends hints to tool results: follow them. If
-  `caveman-native` is installed, its hooks inject context and shrink tool
-  output: leave compression to it. Otherwise compress large output with the
-  caveman tool, keep the `ccr_` handle, and retrieve details when needed.
-  Compress by need, not routinely.
+  During a large plan, store findings, decisions and the plan as you go; that
+  survives compaction and session switches. Never store secrets or transient
+  state.
+- **Caveman (skill, blocks, native)** — if installed, its terse style applies
+  only while active; code, comments, commits and docs stay normal. Follow
+  `caveman-blocks` hints. `caveman-native` hooks inject context and shrink
+  output, so leave compression to them; otherwise compress large output with
+  the caveman tool and keep the `ccr_` handle. Compress by need.
 - **Context mode (context-mode plugin)** — if enabled, run shell commands and
-  file reads through `ctx_execute` and print only the answer; pass `file:` and
-  read `$CTX_FILE`, and set `intent` when output may be large. Use `ctx_batch`
-  for several commands or queries, especially outside the project. Store output
-  you will reuse with `ctx_index` (path, text or URL), find it with `ctx_search`
-  (scope `session`, `worktree` or `project`), and call `ctx_resume` after
-  compaction. Apply code changes with the agent's `write`/`edit`/patch tools.
-  Each call is a fresh subprocess, so `cd` and env changes do not persist.
-- **Context management (billion-context / ACP)** — history is summarized in
-  long sessions. `acp_status` shows usage and compressible ranges,
-  `search_context` finds an old block, `decompress` restores it, and `compress`
-  folds consumed ranges. A summary is not a plan of record: put anything a later
-  session must act on in memory, not only in a compressed block.
-- **Ponytail (lite/full/ultra)** — smallest complete change: reuse what exists,
-  add no speculative abstraction, and finish the callers, tests and fixtures it
-  needs. The level changes verbosity, not correctness. Load it with `/ponytail`
-  or when the user asks for the smallest fix.
-- **Skills (grilling, grill-me, find-skills, ...)** — when a request is
-  ambiguous or a plan is expensive to get wrong, load the skill and question the
-  user before implementing; skip it for small, well-specified fixes. Use
-  `find-skills` when you need a capability that is not installed.
+  reads through `ctx_execute`, printing only the answer; pass `file:` and read
+  `$CTX_FILE`, and set `intent` for large output. Use `ctx_batch` for several
+  commands or queries. Store reusable output with `ctx_index`, find it with
+  `ctx_search` (scope `session`, `worktree` or `project`), and call
+  `ctx_resume` after compaction. Keep `write`/`edit` direct. Each call is a
+  fresh subprocess, so `cd` and env changes do not persist.
+- **Context management (billion-context / ACP)** — `acp_status` shows usage and
+  compressible ranges, `search_context` finds an old block, `decompress`
+  restores it, and `compress` folds consumed ranges. A summary is not a plan of
+  record: put durable work in memory.
+- **Ponytail (lite/full/ultra)** — the smallest complete change: reuse what
+  exists, add no speculative abstraction, and finish the callers, tests and
+  fixtures it needs. The level changes verbosity, not correctness. Load with
+  `/ponytail`.
+- **Skills (grilling, grill-me, find-skills, ...)** — for an ambiguous request
+  or an expensive-to-reverse plan, load the skill and question the user first;
+  skip for small, well-specified fixes. Use `find-skills` to find missing
+  capabilities.
