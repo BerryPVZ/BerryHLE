@@ -1517,7 +1517,7 @@ fn fcntl(
             store.fst_bytesalloc = store.fst_length;
             let allocated = store.fst_bytesalloc;
             env.mem.write(store_ptr, store);
-            log_dbg!(
+            log!(
                 "fcntl({}, F_PREALLOCATE, {}) => grew file to {} bytes",
                 fd,
                 allocated,
@@ -1681,7 +1681,12 @@ pub fn ftruncate(env: &mut Environment, fd: FileDescriptor, len: off_t) -> i32 {
         return -1;
     };
     match file.file.set_len(len as u64) {
-        Ok(()) => 0,
+        Ok(()) => {
+            // File sizing is what makes large mappings usable, so it belongs in
+            // the default log rather than only in debug logs.
+            log!("ftruncate({}, {}) => 0", fd, len);
+            0
+        }
         Err(_) => -1,
     }
 }

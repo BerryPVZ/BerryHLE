@@ -449,6 +449,15 @@ fn mmap(
                 ptr,
                 offset
             );
+        } else {
+            log!(
+                "mmap: fd {} at {:?}, offset {}, {} bytes ({} read from file)",
+                fd,
+                ptr,
+                offset,
+                len,
+                read_total
+            );
         }
     }
 
