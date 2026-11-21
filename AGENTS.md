@@ -148,8 +148,12 @@ required to work on the repo.
   plan or exploration, record findings, decisions and the plan itself as you go,
   not only at the end: that is what survives context compaction and session
   switches. Never store secrets or transient state.
-- **Context compression (caveman)** — compress a large tool output or file before
-  it enters context, keep the `ccr_` handle, and retrieve when details are needed.
+- **Caveman (skill, blocks, native)** — if the caveman skill is installed, its
+  terse style applies only while active; code, comments, commits and docs stay
+  normal. `caveman-blocks` appends hints to tool results: follow them. If
+  `caveman-native` is installed, its hooks already inject context and shrink tool
+  output: leave compression to it. Otherwise compress large output with the
+  caveman tool, keep the `ccr_` handle, and retrieve details when needed.
   Compress by need, not routinely.
 - **Context mode (context-mode plugin)** — if the `ctx_execute`, `ctx_batch`,
   `ctx_index` and `ctx_search` tools exist, run shell commands through
