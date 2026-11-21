@@ -6342,16 +6342,6 @@ fn setup_settings(
             true,
         ));
     }
-    // Opt-in, and may be enabled per-app in the options files. Leaving the
-    // switch alone keeps those defaults; flipping it (either way) is an
-    // explicit override for every later launch.
-    display_rows.push(SettingsRow::Toggle(
-        "Rotation fix",
-        "Turns the game image to match the app's own autorotation instead of the old iPad guess. Turn it on if the image comes out upside down or a quarter turn off.",
-        "rotationFix:",
-        picker_settings.rotation_fix.unwrap_or(false),
-        true,
-    ));
     sections.push(("DISPLAY", display_rows));
     // Compatibility fixes: off unless a switch is flipped or the bundled
     // per-app defaults enable them. Each applies on the next launch.
@@ -6375,6 +6365,23 @@ fn setup_settings(
             "The game rotates its own drawing and touches, so the emulator stops rotating the window and keeps the root view in portrait. Needed by Exploration.",
             "manualUIRotation:",
             picker_settings.manual_ui_rotation.unwrap_or(false),
+            true,
+        ),
+        // Opt-in, and may be enabled per-app in the options files. Leaving the
+        // switch alone keeps those defaults; flipping it (either way) is an
+        // explicit override for every later launch.
+        SettingsRow::Toggle(
+            "Rotation fix",
+            "Turns the game image to match the app's own autorotation instead of the old iPad guess. Turn it on if the image comes out upside down or a quarter turn off.",
+            "rotationFix:",
+            picker_settings.rotation_fix.unwrap_or(false),
+            true,
+        ),
+        SettingsRow::Toggle(
+            "Movie player fix",
+            "Changes how in-game videos are loaded and shown. It may help some games, but can stop videos from appearing in others.",
+            "moviePlayerFix:",
+            picker_settings.fix_movie_player.unwrap_or(false),
             true,
         ),
     ];
@@ -6500,13 +6507,6 @@ fn setup_settings(
                 ("Bottom\nRight", "overlayCornerBottomRight"),
                 ("Bottom\nLeft", "overlayCornerBottomLeft"),
             ],
-        ),
-        SettingsRow::Toggle(
-            "Movie player fix",
-            "Changes how in-game videos are loaded and shown. It may help some games, but can stop videos from appearing in others.",
-            "moviePlayerFix:",
-            picker_settings.fix_movie_player.unwrap_or(false),
-            true,
         ),
     ];
     graphics_rows.push(SettingsRow::Toggle(
