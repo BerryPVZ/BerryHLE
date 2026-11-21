@@ -3957,19 +3957,12 @@ impl Environment {
                             self.cpu.regs()[cpu::Cpu::LR]
                         );
                     }
-                    if self.window.is_some() && null_write_probe_should_resume(probe_number) {
+                    // Stores into the null segment are discarded by the memory
+                    // layer, so they never corrupt anything the guest can see.
+                    // Old apps write through nil objects routinely, so the
+                    // session must carry on; headless runs stay strict.
+                    if !null_write_probe_is_fatal(self.window.is_some()) {
                         recovered_null_write = true;
-                    } else if self.window.is_some() {
-                        log_no_panic!(
-                            "Stopping interactive guest after {} null-page writes to prevent further memory corruption",
-                            probe_number
-                        );
-                        self.dump_all_regs();
-                        self.stack_trace_current();
-                        panic!(
-                            "Stopped interactive guest after {} null-page writes; refusing to continue memory corruption",
-                            probe_number
-                        );
                     }
                 }
             }
@@ -5310,8 +5303,11 @@ mod guest_trap_call_site_tests {
     }
 }
 
-fn null_write_probe_should_resume(probe_number: usize) -> bool {
-    probe_number < crate::mem::NULL_WRITE_PROBE_LIMIT
+/// A null-segment store is fatal only for headless runs, where the first
+/// failure is preserved. Interactive runs report it and keep going, because
+/// the store is discarded and the guest can carry on.
+fn null_write_probe_is_fatal(interactive: bool) -> bool {
+    !interactive
 }
 
 #[cfg(test)]
@@ -5340,8 +5336,8 @@ mod guest_cpu_error_tests {
 
     #[test]
     fn null_write_probe_is_not_recovered_in_headless_mode() {
-        assert!(null_write_probe_should_resume(1));
-        assert!(!null_write_probe_should_resume(crate::mem::NULL_WRITE_PROBE_LIMIT));
+        assert!(!null_write_probe_is_fatal(true));
+        assert!(null_write_probe_is_fatal(false));
     }
 }
 
