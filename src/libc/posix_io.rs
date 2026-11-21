@@ -39,6 +39,15 @@ impl State {
             .and_then(|file_or_none| file_or_none.as_mut())
     }
 
+    /// Guest path `fd` was opened with, for diagnostics (mmap reports the
+    /// file it maps, and `Fs` resolves guest paths to host paths elsewhere).
+    pub fn path_for_fd(&self, fd: FileDescriptor) -> Option<&str> {
+        self.files
+            .get(fd_to_file_idx(fd))
+            .and_then(|file_or_none| file_or_none.as_ref())
+            .and_then(|file| file.path.as_deref())
+    }
+
     /// Whether `fd` refers to a currently-open regular file descriptor (i.e.
     /// not one of the std streams, and not a closed/invalid descriptor).
     pub fn is_fd_open(&self, fd: FileDescriptor) -> bool {

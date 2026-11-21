@@ -3961,7 +3961,7 @@ impl Environment {
                     // layer, so they never corrupt anything the guest can see.
                     // Old apps write through nil objects routinely, so the
                     // session must carry on; headless runs stay strict.
-                    if !null_write_probe_is_fatal(self.window.is_some()) {
+                    if !null_write_probe_is_fatal(self.window.is_some(), probe_number) {
                         recovered_null_write = true;
                     }
                 }
@@ -5303,11 +5303,15 @@ mod guest_trap_call_site_tests {
     }
 }
 
-/// A null-segment store is fatal only for headless runs, where the first
-/// failure is preserved. Interactive runs report it and keep going, because
-/// the store is discarded and the guest can carry on.
-fn null_write_probe_is_fatal(interactive: bool) -> bool {
-    !interactive
+/// A null-segment store is fatal for headless runs, where the first failure is
+/// preserved, and for any run past the diagnostic budget, where the guest has
+/// already been told about plenty of them and a real device would have raised
+/// SIGSEGV. Interactive runs below the budget report it and keep going,
+/// because the store is discarded and the guest can carry on.
+fn null_write_probe_is_fatal(interactive: bool, probe_number: usize) -> bool {
+    // Past the diagnostic budget an interactive guest stops like a real
+    // SIGSEGV would, instead of discarding stores and spinning forever.
+    !interactive || probe_number > crate::mem::NULL_WRITE_PROBE_LIMIT
 }
 
 #[cfg(test)]
@@ -5336,8 +5340,16 @@ mod guest_cpu_error_tests {
 
     #[test]
     fn null_write_probe_is_not_recovered_in_headless_mode() {
-        assert!(!null_write_probe_is_fatal(true));
-        assert!(null_write_probe_is_fatal(false));
+        assert!(!null_write_probe_is_fatal(true, 1));
+        assert!(!null_write_probe_is_fatal(
+            true,
+            crate::mem::NULL_WRITE_PROBE_LIMIT
+        ));
+        assert!(null_write_probe_is_fatal(
+            true,
+            crate::mem::NULL_WRITE_PROBE_LIMIT + 1
+        ));
+        assert!(null_write_probe_is_fatal(false, 1));
     }
 }
 

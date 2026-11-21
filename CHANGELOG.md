@@ -15,6 +15,10 @@ Changes are categorised as follows:
 
 ## NEXT
 
+Compatibility:
+
+- Guest `mmap` of a file with `MAP_SHARED` now aliases the host page cache instead of copying the file into private guest pages. Every mapping of one file, and the file descriptor itself, then sees the same bytes, which is how Darwin behaves: an app that maps a database twice, or reads the mapping back through `read()`, now sees its own writes. Blockheads maps its LMDB world database twice for each save and read the second mapping as zeros, so it wrote an empty world and froze at world creation on a zero-length chunk. A shared mapping longer than its file now grows the file to the mapped length, as Darwin does, `msync` flushes the aliased pages with `MS_SYNC`, and unmapping or replacing the range turns the pages back into anonymous memory. Where the host cannot alias (unaligned address or offset, or an unsupported platform) the old copy and write-back path is still used.
+
 Quality and performance:
 
 - A guest loop that keeps retrying after an Objective-C message returns nil no longer fills megabytes of log per second. The `objc_msgSend` recursion guard logged every time it bailed out with a nil return, with no rate limit; Blockheads' world creation hit it with `worldWidthMacro` and wrote 2 GB of identical lines in one session, spending nearly all its time in the log's mutex and write syscall. The first eight hits are now logged with the receiving object's class name and the dispatch depth (to name the recursing path), then the warnings are suppressed with a single notice. This only bounds the diagnostic — the app still gets nil and the loop still spins, so a game that relies on the value may still stall, but the log now says which class is recursing and no longer grows without limit.

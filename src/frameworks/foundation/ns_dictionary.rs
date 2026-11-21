@@ -22,7 +22,7 @@ use crate::frameworks::foundation::ns_enumerator::{
 use crate::frameworks::foundation::ns_file_manager::{
     NSFileModificationDate, NSFileSize, NSFileType,
 };
-use crate::dyld::{export_c_func, FunctionExports};
+use crate::dyld::{export_c_func, export_c_func_aliased, FunctionExports};
 use crate::fs::GuestPath;
 use crate::libc::stdlib::qsort::qsort_generic;
 use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr, Ptr, SafeRead};
@@ -463,8 +463,14 @@ fn all_keys_common(env: &mut Environment, this: id) -> id {
     autorelease(env, res)
 }
 
-pub const FUNCTIONS: FunctionExports =
-    &[export_c_func!(NSDictionaryOfVariableBindings(_, _))];
+pub const FUNCTIONS: FunctionExports = &[
+    export_c_func!(NSDictionaryOfVariableBindings(_, _)),
+    // Apple exports the macro's symbol with two leading underscores.
+    export_c_func_aliased!(
+        "_NSDictionaryOfVariableBindings",
+        NSDictionaryOfVariableBindings(_, _)
+    ),
+];
 
 pub const CLASSES: ClassExports = objc_classes! {
 

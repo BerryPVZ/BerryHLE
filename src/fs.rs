@@ -231,7 +231,11 @@ impl GuestPath {
     /// purposes.
     /// For Foundation case, use `[NSString stringByAppendingPathComponent:]`
     pub fn join<P: AsRef<str>>(&self, path: P) -> GuestPathBuf {
-        GuestPathBuf::from(format!("{}/{}", self.as_str(), path.as_ref()))
+        // A path ending in "/" must not produce "//", which some apps treat as
+        // a different name.
+        let base = self.as_str();
+        let base = base.strip_suffix('/').unwrap_or(base);
+        GuestPathBuf::from(format!("{}/{}", base, path.as_ref()))
     }
 
     /// Splits the path into a parent path and a file name.

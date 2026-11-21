@@ -36,6 +36,13 @@ pub struct State {
     allocations: HashMap<MutVoidPtr, GuestUSize>,
     /// File-backed `MAP_SHARED` mappings, whose dirty pages belong in the file.
     writebacks: HashMap<MutVoidPtr, FileBacking>,
+    /// `MAP_SHARED` mappings that the host aliased straight into guest memory.
+    ///
+    /// The host's page cache is the shared state then, so these need no write
+    /// back and every mapping of the file, plus the descriptor itself, agrees.
+    /// The value is the mapped length, needed to restore anonymous pages when
+    /// the guest unmaps them.
+    shared_files: HashMap<MutVoidPtr, GuestUSize>,
     /// Page ranges that a partial `munmap` released out of a larger mapping.
     ///
     /// The pages stay backed by the mapping that owns them, so the rest of that
@@ -73,6 +80,36 @@ struct FileBacking {
     len: GuestUSize,
 }
 
+/// Identity of the file behind a shared mapping, as (device, inode).
+///
+/// Darwin has one page cache per file, so every `MAP_SHARED` mapping of a file
+/// sees writes made through any other. Ours keep private copies, so two live
+/// mappings of one file (an app holding a second connection to its
+/// memory-mapped database, say) diverge, and flushing at unmap time is too
+/// late for the reader. Warn when that happens.
+fn file_identity(file: &File) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata().ok()?;
+    Some((metadata.dev(), metadata.ino()))
+}
+/// Warn when `file` already backs another live shared mapping.
+fn warn_about_second_mapping(
+    writebacks: &HashMap<MutVoidPtr, FileBacking>,
+    file: &File,
+    base: MutVoidPtr,
+) {
+    let Some(identity) = file_identity(file) else { return };
+    for (other_base, backing) in writebacks.iter() {
+        if file_identity(&backing.file) == Some(identity) {
+            log!(
+                "Warning: mmap: {:?} maps the same file as {:?}; shared mappings do not alias in HyperHLE, so writes through one are invisible to the other",
+                base,
+                other_base
+            );
+            return;
+        }
+    }
+}
 /// Round `addr` down and `addr + len` up to whole pages, the way `munmap`
 /// rounds its arguments. Returns `None` if the range is empty or overflows.
 fn page_range(addr: MutVoidPtr, len: GuestUSize) -> Option<(GuestUSize, GuestUSize)> {
@@ -299,6 +336,154 @@ fn honour_address_hint(
     true
 }
 
+/// Round a mapping length up to whole pages.
+fn page_rounded(len: GuestUSize) -> GuestUSize {
+    (len.saturating_add(PAGE_SIZE - 1)) & !PAGE_SIZE_ALIGN_MASK
+}
+
+/// Give `[addr, addr + len)` private anonymous pages again.
+///
+/// A `MAP_SHARED` file mapping aliases the host's page cache. Once the guest
+/// drops it the address must be private memory again, or later stores would
+/// land in the file.
+#[cfg(unix)]
+fn restore_anonymous_pages(mem: &Mem, addr: MutVoidPtr, len: GuestUSize) {
+    let mapped_len = page_rounded(len) as usize;
+    let host = mem.host_ptr(addr).cast();
+    unsafe {
+        libc::munmap(host, mapped_len);
+        let restored = libc::mmap(
+            host,
+            mapped_len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+            -1,
+            0,
+        );
+        if restored == libc::MAP_FAILED {
+            log!(
+                "Warning: mmap: could not restore anonymous pages at {:?}: {}",
+                addr,
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+#[cfg(not(unix))]
+fn restore_anonymous_pages(_mem: &Mem, _addr: MutVoidPtr, _len: GuestUSize) {}
+
+/// Drop every aliased shared file mapping overlapping `[start, end)`.
+fn release_shared_pages(env: &mut Environment, start: GuestUSize, end: GuestUSize) {
+    // Collect first: restoring needs `&mut env`, and the map is borrowed.
+    let overlapping: Vec<(MutVoidPtr, GuestUSize)> = env
+        .libc_state
+        .mmap
+        .shared_files
+        .iter()
+        .filter(|(base, len)| {
+            let base = base.to_bits();
+            base < end && base.saturating_add(**len) > start
+        })
+        .map(|(base, len)| (*base, *len))
+        .collect();
+    for (base, len) in overlapping {
+        env.libc_state.mmap.shared_files.remove(&base);
+        restore_anonymous_pages(&env.mem, base, len);
+    }
+}
+
+/// Alias `len` bytes of `fd` at `offset` straight into guest memory at `addr`.
+///
+/// Darwin keeps one page cache per file: a `MAP_SHARED` mapping, another
+/// mapping of the same file and `read`/`write` on a descriptor all see the same
+/// bytes. Copying the file into guest memory cannot provide that, so the host
+/// `mmap` does the aliasing; guest memory is one host mapping, so the file
+/// lands at the guest address directly.
+///
+/// Returns false when the host cannot alias it, and the caller copies instead.
+#[cfg(unix)]
+fn alias_shared_file(
+    env: &mut Environment,
+    addr: MutVoidPtr,
+    fd: FileDescriptor,
+    offset: off_t,
+    len: GuestUSize,
+) -> bool {
+    if addr.to_bits() & PAGE_SIZE_ALIGN_MASK != 0 || offset & (PAGE_SIZE as off_t - 1) != 0 {
+        return false;
+    }
+    let Some(file) = env
+        .libc_state
+        .posix_io
+        .guest_file(fd)
+        .and_then(|file| file.try_clone_host_file().ok())
+    else {
+        return false;
+    };
+    let mapped_len = page_rounded(len);
+    let mapping_end = offset.saturating_add(mapped_len as off_t);
+    let file_size = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    if (file_size as off_t) < mapping_end {
+        // Darwin lets a mapping extend past the end of the file; a store into
+        // the extra pages lengthens the file. Our page cache is the file, so
+        // make room first or the store would fault.
+        if posix_io::ftruncate(env, fd, mapping_end) != 0 {
+            log!(
+                "Warning: mmap: could not grow fd {} to {} bytes for a {} byte shared mapping",
+                fd,
+                mapping_end,
+                len
+            );
+            return false;
+        }
+        log!(
+            "mmap: grew fd {} to {} bytes for a {} byte shared mapping",
+            fd,
+            mapping_end,
+            len
+        );
+    }
+    if !alias_file(&env.mem, addr, &file, offset, mapped_len) {
+        log_dbg!(
+            "mmap: host alias of fd {} at {:?} failed: {}; copying instead",
+            fd,
+            addr,
+            std::io::Error::last_os_error()
+        );
+        return false;
+    }
+    env.libc_state.mmap.shared_files.insert(addr, mapped_len);
+    true
+}
+
+/// Point the pages at `addr` at the file's pages, so the host page cache is the
+/// only copy: every mapping of the file, and the descriptor, then sees writes.
+#[cfg(unix)]
+fn alias_file(mem: &Mem, addr: MutVoidPtr, file: &File, offset: off_t, len: GuestUSize) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let aliased = unsafe {
+        libc::mmap(
+            mem.host_ptr(addr).cast(),
+            len as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_FIXED,
+            file.as_raw_fd(),
+            offset,
+        )
+    };
+    aliased != libc::MAP_FAILED
+}
+#[cfg(not(unix))]
+fn alias_shared_file(
+    _env: &mut Environment,
+    _addr: MutVoidPtr,
+    _fd: FileDescriptor,
+    _offset: off_t,
+    _len: GuestUSize,
+) -> bool {
+    false
+}
+
 /// For files, our implementation of mmap is really simple:
 /// it's just load entirety of file in memory!
 fn mmap(
@@ -395,6 +580,18 @@ fn mmap(
                 ptr
             );
         }
+        // A shared mapping is the only kind whose writes must reach the file
+        // and every other mapping of it, so let the host's page cache do it.
+        if (flags & MAP_SHARED) != 0 && alias_shared_file(env, ptr, fd, offset, len) {
+            log_dbg!(
+                "mmap: fd {} shared mapping aliased the host page cache at {:?}, offset {}, {} bytes",
+                fd,
+                ptr,
+                offset,
+                len
+            );
+            return ptr;
+        }
         // Darwin's `mmap` reads the pages itself and leaves the descriptor's
         // file offset where it was, so save it and put it back after reading:
         // a guest that keeps writing through the same descriptor would
@@ -451,8 +648,9 @@ fn mmap(
             );
         } else {
             log!(
-                "mmap: fd {} at {:?}, offset {}, {} bytes ({} read from file)",
+                "mmap: fd {} ({}) at {:?}, offset {}, {} bytes ({} read from file)",
                 fd,
+                env.libc_state.posix_io.path_for_fd(fd).unwrap_or("?"),
                 ptr,
                 offset,
                 len,
@@ -470,6 +668,11 @@ fn mmap(
             file.try_clone_host_file().ok()
         }) {
             Some(file) => {
+                warn_about_second_mapping(
+                    &env.libc_state.mmap.writebacks,
+                    &file,
+                    ptr,
+                );
                 env.libc_state.mmap.writebacks.insert(
                     ptr,
                     FileBacking { base: ptr, file: Arc::new(file), offset, len },
@@ -528,6 +731,9 @@ fn mmap_fixed(
     let replaced_range = page_range(addr, len);
     if let Some((start, end)) = replaced_range {
         flush_guest_range(env, start, end);
+        // The replacement zeroes these pages (or fills them from a file), so a
+        // shared file mapping here must stop being the file first.
+        release_shared_pages(env, start, end);
     }
 
     let (len, is_new_mapping) = match map_fixed_zeroed(
@@ -555,6 +761,10 @@ fn mmap_fixed(
     clear_unmapped_ranges(&mut env.libc_state.mmap.unmapped, addr.to_bits(), end);
 
     if (flags & MAP_ANON) == 0 {
+        if (flags & MAP_SHARED) != 0 && alias_shared_file(env, addr, fd, offset, len) {
+            set_errno(env, 0);
+            return addr;
+        }
         let saved_offset = posix_io::lseek(env, fd, 0, SEEK_CUR);
         let new_offset = posix_io::lseek(env, fd, offset, SEEK_SET);
         if new_offset != offset {
@@ -680,6 +890,9 @@ fn release_mapping(env: &mut Environment, addr: MutVoidPtr, len: GuestUSize) {
     let end = start.saturating_add(len);
     clear_unmapped_ranges(&mut env.libc_state.mmap.unmapped, start, end);
     trim_writebacks(&mut env.libc_state.mmap.writebacks, start, end);
+    // An aliased file mapping must become private memory before the allocator
+    // gets the range back, or its bookkeeping would land in the file.
+    release_shared_pages(env, start, end);
     env.libc_state.mmap.allocations.remove(&addr);
     env.mem.free(addr);
 }
@@ -1060,7 +1273,32 @@ fn write_back(
 fn msync(env: &mut Environment, addr: MutVoidPtr, len: GuestUSize, flags: i32) -> i32 {
     log_dbg!("msync({:?}, {}, {:#x})", addr, len, flags);
     let start = addr.to_bits();
-    let success = flush_guest_range(env, start, start.saturating_add(len));
+    let end = start.saturating_add(len);
+    let success = flush_guest_range(env, start, end);
+    // Aliased mappings are the file itself, so the host has them already; ask
+    // it to push them out for callers that care about durability.
+    #[cfg(unix)]
+    {
+        let aliased: Vec<(MutVoidPtr, GuestUSize)> = env
+            .libc_state
+            .mmap
+            .shared_files
+            .iter()
+            .filter(|(base, len)| {
+                let base = base.to_bits();
+                base < end && base.saturating_add(**len) > start
+            })
+            .map(|(base, len)| (*base, *len))
+            .collect();
+        for (base, mapped_len) in aliased {
+            let host = env.mem.host_ptr(base).cast();
+            // Sync regardless of the guest's flags: durability is the point of
+            // this call, and MS_ASYNC would let it return before the write.
+            unsafe {
+                libc::msync(host, page_rounded(mapped_len) as usize, libc::MS_SYNC);
+            }
+        }
+    }
     set_errno(env, if success { 0 } else { EIO });
     if success { 0 } else { -1 }
 }
@@ -1171,6 +1409,41 @@ mod map_fixed_tests {
             Err(EINVAL)
         );
         assert!(allocations.is_empty());
+    }
+    /// Darwin keeps one page cache per file, so a store through one MAP_SHARED
+    /// mapping is visible through every other mapping and through the file.
+    #[cfg(unix)]
+    #[test]
+    fn shared_mappings_of_one_file_share_pages() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!(
+            "touchhle-shared-mapping-{}-{}.bin",
+            std::process::id(),
+            line!()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&[0u8; 2 * PAGE_SIZE as usize]).unwrap();
+        let payload = b"written through the first mapping";
+        let mem = new_test_mem();
+        let first = MutVoidPtr::from_bits(0x10000);
+        let second = MutVoidPtr::from_bits(0x20000);
+        assert!(alias_file(&mem, first, &file, 0, PAGE_SIZE));
+        assert!(alias_file(&mem, second, &file, 0, PAGE_SIZE));
+        unsafe {
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), mem.host_ptr(first), payload.len());
+            let seen = std::slice::from_raw_parts(mem.host_ptr(second), payload.len());
+            assert_eq!(seen, payload);
+            // The copies outlive the mem, so drop them before the file.
+            libc::munmap(mem.host_ptr(first).cast(), PAGE_SIZE as usize);
+            libc::munmap(mem.host_ptr(second).cast(), PAGE_SIZE as usize);
+        }
+        std::fs::remove_file(&path).unwrap();
     }
 }
 

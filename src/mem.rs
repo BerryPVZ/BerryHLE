@@ -591,11 +591,11 @@ pub(crate) fn note_allocation_site(site: VAddr, size: GuestUSize) {
 pub fn null_write_probe_claim(address: VAddr) -> Option<usize> {
     use std::sync::atomic::Ordering;
     let number = NULL_WRITE_PROBE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if number > NULL_WRITE_PROBE_LIMIT {
-        return None;
-    }
     NULL_WRITE_PROBE_ADDRESS.store(address, Ordering::Relaxed);
     NULL_WRITE_PROBE_PENDING.store(number, Ordering::Relaxed);
+    // Every store aborts, however many there have been: the caller decides how
+    // many it can report, and past the budget a store is a real fault, the way
+    // Darwin would raise SIGSEGV, instead of a silent discard forever.
     Some(number)
 }
 
@@ -635,7 +635,12 @@ mod null_write_probe_tests {
             assert_eq!(null_write_probe_pending(), Some((number, number as VAddr)));
             null_write_probe_clear();
         }
-        assert_eq!(null_write_probe_claim(0), None);
+        // Past the reporting budget the store still aborts, so the caller can
+        // stop the guest instead of discarding writes forever.
+        let past_limit = NULL_WRITE_PROBE_LIMIT + 1;
+        assert_eq!(null_write_probe_claim(0), Some(past_limit));
+        assert_eq!(null_write_probe_pending(), Some((past_limit, 0)));
+        null_write_probe_clear();
         reset_null_write_probes();
         assert_eq!(null_write_probe_claim(7), Some(1));
         null_write_probe_clear();
@@ -1152,6 +1157,13 @@ impl Mem {
         Some(unsafe {
             std::slice::from_raw_parts_mut(self.bytes.cast::<u8>().add(start), count as usize)
         })
+    }
+
+    /// Host address backing `addr`. Guest memory is one host mapping, so
+    /// `mmap` can alias a file straight into it.
+    #[inline]
+    pub fn host_ptr(&self, addr: MutVoidPtr) -> *mut u8 {
+        unsafe { self.bytes.cast::<u8>().add(addr.to_bits() as usize) }
     }
 
     /// Get a slice for reading `count` bytes.
