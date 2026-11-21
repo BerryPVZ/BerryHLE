@@ -41,11 +41,13 @@ mod weak;
 pub(crate) use messages::{set_dispatch_depth, take_dispatch_depth};
 
 pub use classes::{
-    __objc_deallocOnMainThreadHelper, class_addIvar, class_addMethod, class_conformsToProtocol,
+    __objc_deallocOnMainThreadHelper, class_addIvar, class_addMethod, class_addProtocol,
+    class_conformsToProtocol,
     class_copyIvarList, class_copyMethodList, class_copyPropertyList, class_copyProtocolList,
     class_createInstance,
     class_getClassMethod, class_getInstanceMethod, class_getInstanceSize,
-    class_getMethodImplementation, class_getMethodImplementation_stret, class_getName,
+    class_getIvarLayout, class_getMethodImplementation, class_getMethodImplementation_stret,
+    class_getName,
     class_getProperty, class_getSuperclass, class_isMetaClass, class_replaceMethod,
     class_respondsToSelector, class_setSuperclass, method_copyArgumentType, method_copyReturnType,
     method_exchangeImplementations, method_getArgumentType, method_getImplementation,
@@ -464,6 +466,7 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(class_copyIvarList(_, _)),
     export_c_func!(class_copyProtocolList(_, _)),
     export_c_func!(class_conformsToProtocol(_, _)),
+    export_c_func!(class_addProtocol(_, _)),
     export_c_func!(class_replaceMethod(_, _, _, _)),
     export_c_func!(method_getImplementation(_)),
     export_c_func!(method_setImplementation(_, _)),
@@ -483,6 +486,7 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func_aliased!("_objc_msgForward_stret", objc_msgForward_stret(_, _, _)),
     // Additional ObjC runtime helpers needed by iOS 5/6 binaries.
     export_c_func!(class_getName(_)),
+    export_c_func!(class_getIvarLayout(_)),
     export_c_func!(objc_lookUpClass(_)),
     export_c_func!(objc_getRequiredClass(_)),
     export_c_func!(objc_allocateClassPair(_, _, _)),

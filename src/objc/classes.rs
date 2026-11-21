@@ -3049,6 +3049,44 @@ pub fn class_conformsToProtocol(env: &mut crate::Environment, cls: Class, protoc
     class_conforms_to_protocol(&env.objc, &env.mem, cls, protocol)
 }
 
+/// `BOOL class_addProtocol(Class cls, Protocol *protocol)`.
+///
+/// Records that the class adopts the protocol, so later
+/// [class_conformsToProtocol] and `conformsToProtocol:` calls see it. Apple's
+/// contract is to return `NO` when the class already conforms:
+/// <https://developer.apple.com/documentation/objectivec/1418952-class_addprotocol>
+pub fn class_addProtocol(env: &mut crate::Environment, cls: Class, protocol: id) -> bool {
+    if cls.is_null() || protocol.is_null() {
+        return false;
+    }
+    if class_conforms_to_protocol(&env.objc, &env.mem, cls, protocol) {
+        return false;
+    }
+    let is_class = env
+        .objc
+        .get_host_object(cls)
+        .is_some_and(|host_obj| host_obj.as_any().downcast_ref::<ClassHostObject>().is_some());
+    if !is_class {
+        return false;
+    }
+    env.objc
+        .borrow_mut::<ClassHostObject>(cls)
+        .protocols
+        .push(protocol);
+    true
+}
+
+/// `const uint8_t *class_getIvarLayout(Class cls)`.
+///
+/// Apple returns the description of strong/weak ivar references the class
+/// carries in its own metadata. This runtime tracks ivars by name/offset and
+/// has no layout string to hand back, so this returns `NULL`, which Apple
+/// documents for a class with no layout information:
+/// <https://developer.apple.com/documentation/objectivec/1418688-class_getivarlayout>
+pub fn class_getIvarLayout(_env: &mut crate::Environment, _cls: Class) -> ConstPtr<u8> {
+    ConstPtr::null()
+}
+
 /// `struct objc_method_description`, as returned by
 /// [protocol_getMethodDescription].
 #[allow(non_camel_case_types)]
