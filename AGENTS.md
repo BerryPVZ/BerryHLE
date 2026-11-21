@@ -36,34 +36,11 @@ These come from bugs that reached trunk. They apply to every agent and environme
    constant first; the `no_duplicate_*` tests fail on duplicates.
 
 ## Code change guide
-1. Find the cause. Reproduce or trace the failing call, check Apple's
-   documentation and current touchHLE behavior, and state the invariant the
-   patch must preserve.
-2. Search first. Reuse an existing class, function, constant, option or helper;
-   extend it instead of adding a parallel path. Check for duplicate APIs.
-3. Pick the owning layer. Fix the subsystem, not the caller or one game. Shared
-   behavior must match iOS; per-game differences use an option in
-   `src/options.rs` and a line in `touchHLE_default_options.txt`.
-4. Scope the edit. List affected callers, tests, fixtures and docs. Finish every
-   caller the change breaks and keep unrelated edits out.
-5. Keep it small. Make the smallest complete change: follow the surrounding
-   pattern, avoid speculative abstraction, and delete code the change replaces.
-6. Preserve safety. Keep input validation, error handling, memory ownership
-   (`Ptr`/`MutPtr`), threading, and rollback behavior intact.
-7. Test the cause. Add a regression test for a bug (TestApp or a Rust unit
-   test), run the relevant suite, and report any suite you could not run. Never
-   skip or weaken a failing test.
-8. Match the style. Hand-format like the surrounding code, never run
-   `cargo fmt`, keep new comments within 80 columns, and add no new clippy
-   warnings.
-9. Apply edits precisely. Read the file first. Use `edit` with an exact
-   `oldString`, including blank lines and indentation, and enough context to
-   match once; use `replaceAll` only when every occurrence should change. Use
-   `write` for a new file or a full replacement, never shell redirection or
-   `sed`. Run `git diff --check` after editing.
-10. Commit cleanly. Use a lowercase area prefix, cite the iOS behavior or
-    source, and update `README.md`, `CHANGELOG.md` and `OPTIONS_HELP.txt` for
-    user-visible changes.
+Apply edits precisely. Read the file first. Use `edit` with an exact
+`oldString`, including blank lines and indentation, and enough context to match
+once; use `replaceAll` only when every occurrence should change. Use `write` for
+a new file or a full replacement, never shell redirection or `sed`. Run
+`git diff --check` after editing.
 
 ## Where things live
 
