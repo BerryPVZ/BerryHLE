@@ -808,6 +808,13 @@ fn CGContextClip(_env: &mut Environment, context: CGContextRef) {
         context
     );
 }
+/// `void CGContextEOClip(CGContextRef c)` — like [CGContextClip] but using the
+/// even-odd winding rule. Since path clipping is not implemented, the winding
+/// rule makes no difference:
+/// <https://developer.apple.com/documentation/coregraphics/1454747-cgcontexteoclip>
+fn CGContextEOClip(env: &mut Environment, context: CGContextRef) {
+    CGContextClip(env, context);
+}
 
 fn CGContextClipToMask(
     _env: &mut Environment,
@@ -1532,6 +1539,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGContextClearRect(_, _)),
     export_c_func!(CGContextClipToRect(_, _)),
     export_c_func!(CGContextClip(_)),
+    export_c_func!(CGContextEOClip(_)),
     export_c_func!(CGContextConcatCTM(_, _)),
     export_c_func!(CGContextGetCTM(_)),
     export_c_func!(CGContextRotateCTM(_, _)),
