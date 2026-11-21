@@ -409,7 +409,13 @@ fn alias_shared_file(
     offset: off_t,
     len: GuestUSize,
 ) -> bool {
-    if addr.to_bits() & PAGE_SIZE_ALIGN_MASK != 0 || offset & (PAGE_SIZE as off_t - 1) != 0 {
+    // A file mapping covers whole pages, so an unaligned length would alias
+    // past the allocation the caller made for it. The copy path handles
+    // odd lengths, because it only ever writes `len` bytes.
+    if addr.to_bits() & PAGE_SIZE_ALIGN_MASK != 0
+        || len & PAGE_SIZE_ALIGN_MASK != 0
+        || offset & (PAGE_SIZE as off_t - 1) != 0
+    {
         return false;
     }
     let Some(file) = env
