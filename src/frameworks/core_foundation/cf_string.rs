@@ -275,6 +275,7 @@ fn CFStringConvertIANACharSetNameToEncoding(
     let name = ns_string::to_rust_string(env, name);
     iana_name_to_encoding(&name)
 }
+
 fn iana_name_to_encoding(name: &str) -> CFStringEncoding {
     match name.to_ascii_lowercase().as_str() {
         "macintosh" => kCFStringEncodingMacRoman,

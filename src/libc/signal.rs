@@ -504,15 +504,15 @@ fn signal_name(signum: i32) -> &'static str {
 /// `const char *const sys_siglist[NSIG]` — POSIX/BSD signal-name table.
 /// On Apple platforms (`sys/signal.h`) the array has `NSIG` (= 32)
 /// entries. Each slot is a pointer to a C string describing the
-/// signal (`"Terminated"`, `"Segmentation fault"`, …). Per the
-/// libc source `<sys/signal.c>`, the values are stable and exposed
-/// as a non-lazy symbol.
+/// signal (`"Terminated"`, `"Segmentation fault"`, …). Per Apple's libc
+/// (`gen/FreeBSD/siglist.c`), the values are stable and exposed as a
+/// non-lazy symbol.
 ///
 /// We build the table at first reference time by allocating 32
 /// guest-side `char *` slots, each pointing at the canonical name
-/// from Apple's `sys/signal.h`.
+/// from `gen/FreeBSD/siglist.c`.
 const SIG_NAMES: [&str; 32] = [
-    "Unknown",
+    "Signal 0",
     "Hangup",
     "Interrupt",
     "Quit",
@@ -547,12 +547,12 @@ const SIG_NAMES: [&str; 32] = [
 ];
 
 /// Short signal names exposed as `sys_signame`, indexed by signal number
-/// like `SIG_NAMES`. Apple's `/usr/include/sys/signal.h` names them without
-/// the `SIG` prefix.
+/// like `SIG_NAMES`. Apple's table (`gen/FreeBSD/siglist.c`) uses the
+/// lower-case form without the `SIG` prefix.
 const SIG_SHORT_NAMES: [&str; 32] = [
-    "UNKNOWN", "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "EMT", "FPE", "KILL", "BUS", "SEGV",
-    "SYS", "PIPE", "ALRM", "TERM", "URG", "STOP", "TSTP", "CONT", "CHLD", "TTIN", "TTOU", "IO",
-    "XCPU", "XFSZ", "VTALRM", "PROF", "WINCH", "INFO", "USR1", "USR2",
+    "Signal 0", "hup", "int", "quit", "ill", "trap", "abrt", "emt", "fpe", "kill", "bus", "segv",
+    "sys", "pipe", "alrm", "term", "urg", "stop", "tstp", "cont", "chld", "ttin", "ttou", "io",
+    "xcpu", "xfsz", "vtalrm", "prof", "winch", "info", "usr1", "usr2",
 ];
 /// Allocates a guest-side `const char *[names.len()]` table, one
 /// null-terminated C string per entry.

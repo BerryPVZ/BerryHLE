@@ -928,6 +928,7 @@ fn wcsxfrm_l(
 fn wcscoll(env: &mut Environment, a: ConstPtr<wchar_t>, b: ConstPtr<wchar_t>) -> i32 {
     wcscoll_l(env, a, b, MutVoidPtr::null())
 }
+
 /// `size_t wcsxfrm(wchar_t *dst, const wchar_t *src, size_t n)`.
 fn wcsxfrm(
     env: &mut Environment,
@@ -937,6 +938,7 @@ fn wcsxfrm(
 ) -> GuestUSize {
     wcsxfrm_l(env, dest, src, n, MutVoidPtr::null())
 }
+
 /// `size_t mbrtowc(wchar_t *pwc, const char *s, size_t n, mbstate_t *ps)`.
 fn mbrtowc(
     env: &mut Environment,
@@ -956,6 +958,7 @@ fn wcrtomb(
 ) -> GuestUSize {
     wcrtomb_l(env, s, wc, ps, MutVoidPtr::null())
 }
+
 /// iswspace — test if wide char is whitespace.
 fn iswspace(_env: &mut Environment, c: wint_t) -> i32 {
     matches!(c, 0x09 | 0x0A | 0x0B | 0x0C | 0x0D | 0x20) as i32

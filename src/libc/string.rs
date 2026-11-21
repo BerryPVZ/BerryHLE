@@ -730,6 +730,7 @@ fn strxfrm_l(
 fn strcoll(env: &mut Environment, a: ConstPtr<u8>, b: ConstPtr<u8>) -> i32 {
     strcoll_l(env, a, b, MutVoidPtr::null())
 }
+
 /// `size_t strxfrm(char *dst, const char *src, size_t n)`.
 fn strxfrm(
     env: &mut Environment,
