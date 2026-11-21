@@ -97,6 +97,19 @@ fn set_error(db_handle: u32, msg: String) {
 /// Location for databases the guest filesystem cannot map to a host path
 /// (read-only bundle files, or the empty filename that means "temporary").
 fn private_sqlite_path(env: &Environment, filename: &str) -> String {
+    let dir = crate::paths::user_data_base_path().join(crate::paths::SQLITE_DIR);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log!("libsqlite3: failed to create sqlite dir {:?}: {}", dir, e);
+    }
+    legacy_sqlite_path(env, filename)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Where earlier builds kept every database, before SQLite opened the file the
+/// guest filesystem resolves to. Still consulted so an existing save survives
+/// the move (see [adopt_legacy_database]).
+fn legacy_sqlite_path(env: &Environment, filename: &str) -> std::path::PathBuf {
     let safe_name = filename
         .replace('/', "_")
         .replace('\\', "_")
@@ -111,15 +124,35 @@ fn private_sqlite_path(env: &Environment, filename: &str) -> String {
         .replace(':', "_")
         .replace(' ', "_");
 
-    let dir = crate::paths::user_data_base_path().join(crate::paths::SQLITE_DIR);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        log!("libsqlite3: failed to create sqlite dir {:?}: {}", dir, e);
-    }
-
-    dir.join(format!("{}_{}", app_ns, safe_name))
-        .to_string_lossy()
-        .into_owned()
+    crate::paths::user_data_base_path()
+        .join(crate::paths::SQLITE_DIR)
+        .join(format!("{}_{}", app_ns, safe_name))
 }
+
+/// Copy a database written by an earlier build into the guest-visible file
+/// before SQLite opens it, so an upgrade does not lose the app's saves.
+fn adopt_legacy_database(env: &Environment, filename: &str, path: &str) {
+    if std::path::Path::new(path).exists() {
+        return;
+    }
+    let legacy = legacy_sqlite_path(env, filename);
+    if legacy.to_string_lossy() == path || !legacy.exists() {
+        return;
+    }
+    match std::fs::copy(&legacy, path) {
+        Ok(_) => log!(
+            "libsqlite3: adopted the earlier database {:?} for {:?}",
+            legacy,
+            filename
+        ),
+        Err(e) => log!(
+            "libsqlite3: could not adopt the earlier database {:?}: {}",
+            legacy,
+            e
+        ),
+    }
+}
+
 pub fn sqlite3_open(env: &mut Environment, filename_ptr: u32, pp_db: u32) -> u32 {
     let filename = read_cstring(env, filename_ptr);
 
@@ -149,6 +182,9 @@ pub fn sqlite3_open(env: &mut Environment, filename_ptr: u32, pp_db: u32) -> u32
         path
     );
 
+    if path != ":memory:" {
+        adopt_legacy_database(env, &filename, &path);
+    }
     match Connection::open(&path) {
         Ok(conn) => {
             let handle = alloc_handle();

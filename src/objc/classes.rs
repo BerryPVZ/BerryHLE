@@ -3069,10 +3069,7 @@ pub fn class_addProtocol(env: &mut crate::Environment, cls: Class, protocol: id)
     if !is_class {
         return false;
     }
-    env.objc
-        .borrow_mut::<ClassHostObject>(cls)
-        .protocols
-        .push(protocol);
+    env.objc.borrow_mut::<ClassHostObject>(cls).protocols.push(protocol);
     true
 }
 

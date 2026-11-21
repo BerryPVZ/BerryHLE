@@ -11,7 +11,7 @@ use crate::frameworks::core_foundation::time::{
 };
 use crate::frameworks::foundation::ns_date_components::NSDateComponentsHostObject;
 use crate::frameworks::foundation::ns_string::get_static_str;
-use crate::frameworks::foundation::{NSInteger, NSTimeInterval, NSUInteger};
+use crate::frameworks::foundation::{NSInteger, NSNotFound, NSTimeInterval, NSUInteger};
 use crate::mem::Ptr;
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, ClassExports, HostObject, NSZonePtr,
@@ -344,7 +344,7 @@ pub const CLASSES: ClassExports = objc_classes! {
                         inUnit:(NSCalendarUnit)larger_unit
                        forDate:(id)date {
     if date == nil {
-        return NSUInteger::MAX;
+        return NSNotFound as NSUInteger;
     }
     let time_interval: NSTimeInterval = msg![env; date timeIntervalSinceReferenceDate];
     let greg_date = CFAbsoluteTimeGetGregorianDate(env, time_interval, nil);
@@ -356,13 +356,13 @@ pub const CLASSES: ClassExports = objc_classes! {
         (NSDayCalendarUnit, NSYearCalendarUnit) => day_of_year,
         (NSMonthCalendarUnit, NSYearCalendarUnit) => greg_date.month as NSUInteger,
         (NSDayCalendarUnit, NSMonthCalendarUnit) => greg_date.day as NSUInteger,
-        (NSHourCalendarUnit, NSDayCalendarUnit) => greg_date.hours as NSUInteger + 1,
-        (NSMinuteCalendarUnit, NSHourCalendarUnit) => greg_date.minutes as NSUInteger + 1,
-        (NSSecondCalendarUnit, NSMinuteCalendarUnit) => greg_date.seconds as NSUInteger + 1,
+        (NSHourCalendarUnit, NSDayCalendarUnit) => (greg_date.hours as NSUInteger) + 1,
+        (NSMinuteCalendarUnit, NSHourCalendarUnit) => (greg_date.minutes as NSUInteger) + 1,
+        (NSSecondCalendarUnit, NSMinuteCalendarUnit) => (greg_date.seconds as NSUInteger) + 1,
         (NSWeekdayCalendarUnit, NSMonthCalendarUnit) => (greg_date.day as NSUInteger - 1) / 7 + 1,
         (NSWeekdayCalendarUnit, NSYearCalendarUnit) => (day_of_year - 1) / 7 + 1,
         (NSWeekCalendarUnit, NSYearCalendarUnit) => (day_of_year - 1) / 7 + 1,
-        _ => NSUInteger::MAX,
+        _ => NSNotFound as NSUInteger,
     }
 }
 

@@ -73,12 +73,17 @@ impl GuestArg for CLLocationCoordinate2D {
 /// Apple: a coordinate is valid when latitude is between -90 and 90 and
 /// longitude is between -180 and 180:
 /// <https://developer.apple.com/documentation/corelocation/cllocationcoordinate2disvalid(_:)>
-fn CLLocationCoordinate2DIsValid(_env: &mut Environment, coordinate: CLLocationCoordinate2D) -> bool {
+fn CLLocationCoordinate2DIsValid(
+    _env: &mut Environment,
+    coordinate: CLLocationCoordinate2D,
+) -> bool {
     let latitude = coordinate.latitude;
     let longitude = coordinate.longitude;
     (-90.0..=90.0).contains(&latitude) && (-180.0..=180.0).contains(&longitude)
 }
+
 pub const FUNCTIONS: FunctionExports = &[export_c_func!(CLLocationCoordinate2DIsValid(_))];
+
 // MARK: - CLAuthorizationStatus constants
 const CL_AUTHORIZATION_STATUS_NOT_DETERMINED: CLAuthorizationStatus = 0;
 const CL_AUTHORIZATION_STATUS_RESTRICTED: CLAuthorizationStatus = 1;

@@ -463,6 +463,9 @@ fn all_keys_common(env: &mut Environment, this: id) -> id {
     autorelease(env, res)
 }
 
+pub const FUNCTIONS: FunctionExports =
+    &[export_c_func!(NSDictionaryOfVariableBindings(_, _))];
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -1926,8 +1929,7 @@ pub fn NSDictionaryOfVariableBindings(
     }
     dict_from_keys_and_objects(env, &keys_and_objects)
 }
-pub const FUNCTIONS: FunctionExports =
-    &[export_c_func!(NSDictionaryOfVariableBindings(_, _))];
+
 /// Direct constructor for use by host code, similar to
 /// `[[NSMutableDictionary alloc] initWithObjectsAndKeys:]` but without
 /// variadics and with a more intuitive argument order.
