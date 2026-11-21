@@ -670,7 +670,7 @@ fn thread_id_from_mach_thread_port(port: mach_port_t, thread_count: usize) -> Op
     (thread_id < thread_count).then_some(thread_id)
 }
 
-fn _pthread_from_mach_thread_np(env: &mut Environment, port: mach_port_t) -> pthread_t {
+fn pthread_from_mach_thread_np(env: &mut Environment, port: mach_port_t) -> pthread_t {
     let Some(thread_id) = thread_id_from_mach_thread_port(port, env.threads.len()) else {
         return Ptr::null();
     };
@@ -947,7 +947,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(pthread_kill(_, _)),
     // Darwin extensions
     export_c_func!(pthread_mach_thread_np(_)),
-    export_c_func!(_pthread_from_mach_thread_np(_)),
+    export_c_func!(pthread_from_mach_thread_np(_)),
     export_c_func!(pthread_get_stackaddr_np(_)),
     export_c_func!(pthread_get_stacksize_np(_)),
     export_c_func!(pthread_getschedparam(_, _, _)),
@@ -978,6 +978,6 @@ mod tests {
     fn private_reverse_mapping_symbol_is_exported() {
         assert!(FUNCTIONS
             .iter()
-            .any(|(symbol, _)| *symbol == "__pthread_from_mach_thread_np"));
+            .any(|(symbol, _)| *symbol == "_pthread_from_mach_thread_np"));
     }
 }
