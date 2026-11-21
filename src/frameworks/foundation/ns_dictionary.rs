@@ -360,6 +360,31 @@ fn init_with_dictionary_common(env: &mut Environment, this: id, other_dict: id) 
     this
 }
 
+/// Helper function to share `initWithDictionary:copyItems:` implementations.
+/// Apple sends each value `-copyWithZone:nil` (that is `-copy`) when
+/// `copy_items` is true; the keys are copied unconditionally.
+fn init_with_dictionary_copy_items_common(
+    env: &mut Environment,
+    this: id,
+    other_dict: id,
+    copy_items: bool,
+) -> id {
+    let this = init_with_dictionary_common(env, this, other_dict);
+    if !copy_items {
+        return this;
+    }
+    let host_object: &mut DictionaryHostObject = env.objc.borrow_mut(this);
+    let mut map = std::mem::take(&mut host_object.map);
+    for (_, value) in map.values_mut().flatten() {
+        let original: id = *value;
+        let copy: id = msg![env; original copy];
+        release(env, original);
+        *value = copy;
+    }
+    env.objc.borrow_mut::<DictionaryHostObject>(this).map = map;
+    this
+}
+
 /// Helper function so share `initWithObjects:ForKeys:` implementations
 fn init_with_objects_for_keys_common(env: &mut Environment, this: id, objects: id, keys: id) -> id {
     let keys_size: NSUInteger = msg![env; keys count];
@@ -1094,6 +1119,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)initWithDictionary:(id)dictionary {
     init_with_dictionary_common(env, this, dictionary)
 }
+- (id)initWithDictionary:(id)dictionary copyItems:(bool)copy_items {
+    init_with_dictionary_copy_items_common(env, this, dictionary, copy_items)
+}
 // Category method used by some ad/analytics SDKs (Burstly-era
 // "NSDictionary+JSON"): serialize the receiver to a JSON string, dropping
 // the keys listed in `exclude_keys` and renaming keys per `translations`
@@ -1359,6 +1387,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)initWithDictionary:(id)dictionary {
     init_with_dictionary_common(env, this, dictionary)
+}
+- (id)initWithDictionary:(id)dictionary copyItems:(bool)copy_items {
+    init_with_dictionary_copy_items_common(env, this, dictionary, copy_items)
 }
 
 - (id)init {
@@ -1908,4 +1939,45 @@ fn build_description(env: &mut Environment, dict: id) -> id {
     let desc_imm = msg![env; desc copy];
     release(env, desc);
     autorelease(env, desc_imm)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `-[NSDictionary initWithDictionary:copyItems:]` sends each value
+    /// `-copyWithZone:nil` when `copyItems` is YES, so later mutations of the
+    /// source's mutable values do not reach the copy.
+    /// https://developer.apple.com/documentation/foundation/nsdictionary/1410126-init
+    #[test]
+    fn initWith_dictionary_copy_items_copies_values() {
+        let _lock = crate::environment::ENVIRONMENT_TEST_LOCK.lock().unwrap();
+        let options = crate::options::Options {
+            headless: true,
+            popup_errors: false,
+            ..Default::default()
+        };
+        let icon = crate::image::Image::from_pixels(1, 1, vec![0; 4]);
+        let mut env = Environment::new_without_app(options, icon).unwrap();
+        let env = &mut env;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let key_cstr = env.mem.alloc_and_write_cstr(b"key");
+        let key: id = msg_class![env; NSString stringWithUTF8String:key_cstr];
+        let value: id = msg_class![env; NSMutableString new];
+        () = msg![env; value appendString:key];
+        let source: id = msg_class![env; NSMutableDictionary new];
+        () = msg![env; source setObject:value forKey:key];
+        let copy: id = msg_class![env; NSDictionary alloc];
+        let copy: id = msg![env; copy initWithDictionary:source copyItems:true];
+        let copied_value: id = msg![env; copy objectForKey:key];
+        assert_ne!(copied_value, value, "copyItems:YES must copy the value");
+        assert!(msg![env; copied_value isEqual:value]);
+        () = msg![env; value appendString:key];
+        let copied_value_again: id = msg![env; copy objectForKey:key];
+        assert_eq!(copied_value_again, copied_value);
+        assert!(!msg![env; copied_value isEqual:value]);
+        let count: NSUInteger = msg![env; copy count];
+        assert_eq!(count, 1);
+        () = msg![env; pool drain];
+    }
 }
