@@ -65,6 +65,7 @@ Quality and performance:
 
 Compatibility:
 
+- More of the C library and Objective-C runtime is available: the plain `strcoll`, `strxfrm`, `wcscoll`, `wcsxfrm`, `mbrtowc` and `wcrtomb` functions (Darwin exports both these and the `_l` locale variants, and callers linked to NULL before), `labs`, `sys_signame`, `CFStringConvertIANACharSetNameToEncoding`, `protocol_copyProtocolList` and `protocol_copyMethodDescriptionList`. `CGContextClip` also exists now, though it logs that path clipping is not implemented.
 - `NSDictionary` and `NSMutableDictionary` now implement `-initWithDictionary:copyItems:`, which returns a dictionary holding the other dictionary's entries, with each value copied when the flag is set ([Apple documentation](https://developer.apple.com/documentation/foundation/nsdictionary/1410126-init)). Respawnables builds a dictionary this way, got nil back from the unimplemented selector, and kept writing through the nil pointer.
 - Exploration, Talking Tom, early Minecraft, Survivalcraft and Earn to Die now work. The fixes cover GLES1 byte arrays and view coordinates under manual rotation, HFSX UTF-16 directory order for image sequences, nib selection and archived control target actions, and a Mono runtime path with executable `dlsym`, real EAGL sharegroups and `Super` dispatch. Closing the game window now runs its shutdown saves and returns to the app picker.
 - `libxml2` now reports XPath namespace and document nodes in the layout apps expect, so XPath code that walked those structs no longer reads the wrong fields.

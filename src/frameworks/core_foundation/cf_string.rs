@@ -45,6 +45,9 @@ pub const kCFStringEncodingWindowsLatin1: CFStringEncoding = 0x0500;
 pub const kCFStringEncodingUTF32: CFStringEncoding = 0x0c000100;
 pub const kCFStringEncodingUTF32BE: CFStringEncoding = 0x18000100;
 pub const kCFStringEncodingUTF32LE: CFStringEncoding = 0x1c000100;
+/// Returned by the `...IANACharSetNameToEncoding` lookups when the name is not
+/// one CFString knows.
+pub const kCFStringEncodingInvalidId: CFStringEncoding = 0xffff_ffff;
 
 // String normalization forms
 pub type CFStringNormalizationForm = CFIndex;
@@ -256,6 +259,40 @@ fn CFStringConvertEncodingToIANACharSetName(
     ns_string::get_static_str(env, name)
 }
 
+/// `CFStringEncoding CFStringConvertIANACharSetNameToEncoding(CFStringRef name)`
+///
+/// Apple docs: returns the encoding registered under the IANA character-set
+/// `name`, or `kCFStringEncodingInvalidId` when there is none. The lookup
+/// ignores case and accepts the aliases IANA lists for the same charset, which
+/// is what old apps pass when they parse a `charset=` parameter.
+fn CFStringConvertIANACharSetNameToEncoding(
+    env: &mut Environment,
+    name: CFStringRef,
+) -> CFStringEncoding {
+    if name.is_null() {
+        return kCFStringEncodingInvalidId;
+    }
+    let name = ns_string::to_rust_string(env, name);
+    iana_name_to_encoding(&name)
+}
+fn iana_name_to_encoding(name: &str) -> CFStringEncoding {
+    match name.to_ascii_lowercase().as_str() {
+        "macintosh" => kCFStringEncodingMacRoman,
+        "us-ascii" | "ascii" | "usascii" | "ansi_x3.4-1968" => kCFStringEncodingASCII,
+        "utf-8" | "utf8" => kCFStringEncodingUTF8,
+        "utf-16" | "utf16" => kCFStringEncodingUTF16,
+        "utf-16be" | "utf16be" => kCFStringEncodingUTF16BE,
+        "utf-16le" | "utf16le" => kCFStringEncodingUTF16LE,
+        "utf-32" | "utf32" => kCFStringEncodingUTF32,
+        "utf-32be" | "utf32be" => kCFStringEncodingUTF32BE,
+        "utf-32le" | "utf32le" => kCFStringEncodingUTF32LE,
+        "iso-8859-1" | "iso8859-1" | "iso_8859-1" | "latin1" =>
+            kCFStringEncodingISOLatin1,
+        "windows-1252" | "cp1252" => kCFStringEncodingWindowsLatin1,
+        "x-nextstep" => kCFStringEncodingNextStepLatin,
+        _ => kCFStringEncodingInvalidId,
+    }
+}
 fn CFStringGetMostCompatibleMacStringEncoding(
     _env: &mut Environment,
     encoding: CFStringEncoding,
@@ -2369,6 +2406,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFStringGetSystemEncoding()),
     export_c_func!(CFStringGetFastestEncoding(_)),
     export_c_func!(CFStringConvertEncodingToIANACharSetName(_)),
+    export_c_func!(CFStringConvertIANACharSetNameToEncoding(_)),
     export_c_func!(CFStringGetSmallestEncoding(_)),
     export_c_func!(CFStringGetMostCompatibleMacStringEncoding(_)),
     // Immutable constructors
@@ -2442,3 +2480,26 @@ pub const FUNCTIONS: FunctionExports = &[
     // Type info — CFStringGetTypeID is exported from cf_type; not duplicated.
     export_c_func!(CFStringCreateExternalRepresentation(_, _, _, _)),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Round-trip the names `CFStringConvertEncodingToIANACharSetName`
+    /// produces, plus the aliases real bundles reference.
+    #[test]
+    fn iana_name_to_encoding_maps_known_names() {
+        assert_eq!(iana_name_to_encoding("UTF-8"), kCFStringEncodingUTF8);
+        assert_eq!(iana_name_to_encoding("utf8"), kCFStringEncodingUTF8);
+        assert_eq!(
+            iana_name_to_encoding("ISO-8859-1"),
+            kCFStringEncodingISOLatin1
+        );
+        assert_eq!(iana_name_to_encoding("macintosh"), kCFStringEncodingMacRoman);
+        assert_eq!(
+            iana_name_to_encoding("us-ascii"),
+            kCFStringEncodingASCII
+        );
+        assert_eq!(iana_name_to_encoding("no-such-charset"), kCFStringEncodingInvalidId);
+    }
+}

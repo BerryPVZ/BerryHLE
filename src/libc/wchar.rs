@@ -923,6 +923,39 @@ fn wcsxfrm_l(
     }
 }
 
+/// `int wcscoll(const wchar_t *s1, const wchar_t *s2)` — the locale-free
+/// variant of `wcscoll_l`; code-point order, as darwin's C locale returns.
+fn wcscoll(env: &mut Environment, a: ConstPtr<wchar_t>, b: ConstPtr<wchar_t>) -> i32 {
+    wcscoll_l(env, a, b, MutVoidPtr::null())
+}
+/// `size_t wcsxfrm(wchar_t *dst, const wchar_t *src, size_t n)`.
+fn wcsxfrm(
+    env: &mut Environment,
+    dest: MutPtr<wchar_t>,
+    src: ConstPtr<wchar_t>,
+    n: GuestUSize,
+) -> GuestUSize {
+    wcsxfrm_l(env, dest, src, n, MutVoidPtr::null())
+}
+/// `size_t mbrtowc(wchar_t *pwc, const char *s, size_t n, mbstate_t *ps)`.
+fn mbrtowc(
+    env: &mut Environment,
+    pwc: MutPtr<wchar_t>,
+    s: ConstPtr<u8>,
+    n: GuestUSize,
+    ps: MutVoidPtr,
+) -> GuestUSize {
+    mbrtowc_l(env, pwc, s, n, ps, MutVoidPtr::null())
+}
+/// `size_t wcrtomb(char *s, wchar_t wc, mbstate_t *ps)`.
+fn wcrtomb(
+    env: &mut Environment,
+    s: MutPtr<u8>,
+    wc: wchar_t,
+    ps: MutVoidPtr,
+) -> GuestUSize {
+    wcrtomb_l(env, s, wc, ps, MutVoidPtr::null())
+}
 /// iswspace — test if wide char is whitespace.
 fn iswspace(_env: &mut Environment, c: wint_t) -> i32 {
     matches!(c, 0x09 | 0x0A | 0x0B | 0x0C | 0x0D | 0x20) as i32
@@ -1132,6 +1165,10 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(wcsnrtombs_l(_, _, _, _, _, _)),
     export_c_func!(wcscoll_l(_, _, _)),
     export_c_func!(wcsxfrm_l(_, _, _, _)),
+    export_c_func!(wcscoll(_, _)),
+    export_c_func!(wcsxfrm(_, _, _)),
+    export_c_func!(mbrtowc(_, _, _, _)),
+    export_c_func!(wcrtomb(_, _, _)),
     export_c_func!(wcstod(_, _)),
     export_c_func!(wcstof(_, _)),
     // Classification

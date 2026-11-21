@@ -3156,6 +3156,146 @@ fn find_protocol_method_types(
     Ptr::null()
 }
 
+/// Collects the methods of one of a protocol's four method lists, following
+/// the protocols it adopts. `protocol_copyMethodDescriptionList` returns all
+/// of them at once, unlike `find_protocol_method_types` which stops at one.
+fn collect_protocol_method_descriptions(
+    mem: &Mem,
+    proto: id,
+    is_required: bool,
+    is_instance: bool,
+    depth: u32,
+    out: &mut Vec<(ConstPtr<u8>, ConstPtr<u8>)>,
+) {
+    // Layout of the 32-bit `protocol_t`, in words: isa, name, protocols,
+    // instanceMethods, classMethods, optionalInstanceMethods,
+    // optionalClassMethods, ...
+    if proto.is_null() || depth > 16 {
+        return;
+    }
+    let words: ConstPtr<u32> = Ptr::from_bits(proto.to_bits());
+    let list_index = match (is_required, is_instance) {
+        (true, true) => 3,
+        (true, false) => 4,
+        (false, true) => 5,
+        (false, false) => 6,
+    };
+    let list: ConstPtr<u32> = Ptr::from_bits(mem.read(words + list_index));
+    if !list.is_null() {
+        let entsize = (mem.read(list) & !3).max(8);
+        let count: u32 = mem.read(list + 1);
+        for i in 0..count.min(4096) {
+            let entry: ConstPtr<ConstPtr<u8>> = Ptr::from_bits(list.to_bits() + 8 + i * entsize);
+            let name = mem.read(entry);
+            let types = mem.read(entry + 1);
+            if name.is_null() || out.iter().any(|(known, _)| *known == name) {
+                continue;
+            }
+            out.push((name, types));
+        }
+    }
+    let adopted: ConstPtr<u32> = Ptr::from_bits(mem.read(words + 2));
+    if !adopted.is_null() {
+        let count: u32 = mem.read(adopted);
+        for i in 0..count.min(256) {
+            let other: id = Ptr::from_bits(mem.read(adopted + 1 + i));
+            collect_protocol_method_descriptions(
+                mem,
+                other,
+                is_required,
+                is_instance,
+                depth + 1,
+                out,
+            );
+        }
+    }
+}
+
+/// `Protocol * __unsafe_unretained *protocol_copyProtocolList(Protocol *proto,
+/// unsigned int *outCount)` per Apple's Objective-C Runtime Reference
+/// (<https://developer.apple.com/documentation/objectivec/1418855-protocol_copyprotocollist>).
+/// The returned protocols are the ones `proto` adopts, not the ones that
+/// adopt it.
+pub fn protocol_copyProtocolList(
+    env: &mut crate::Environment,
+    proto: id,
+    out_count: crate::mem::MutPtr<u32>,
+) -> crate::mem::MutPtr<ConstVoidPtr> {
+    if !out_count.is_null() {
+        env.mem.write(out_count, 0);
+    }
+    if proto.is_null() {
+        return Ptr::null();
+    }
+    let words: ConstPtr<u32> = Ptr::from_bits(proto.to_bits());
+    let adopted: ConstVoidPtr = Ptr::from_bits(env.mem.read(words + 2));
+    let protocols = protocol_list_entries(&env.mem, adopted);
+    let Ok(count) = u32::try_from(protocols.len()) else {
+        return Ptr::null();
+    };
+    if count == 0 {
+        return Ptr::null();
+    }
+    let Some(size) = count.checked_mul(guest_size_of::<ConstVoidPtr>()) else {
+        return Ptr::null();
+    };
+    let buffer: crate::mem::MutPtr<ConstVoidPtr> = env.mem.alloc(size).cast();
+    for (index, protocol) in protocols.iter().enumerate() {
+        env.mem.write(buffer + index as u32, protocol.cast_const().cast());
+    }
+    if !out_count.is_null() {
+        env.mem.write(out_count, count);
+    }
+    buffer
+}
+
+/// `struct objc_method_description *protocol_copyMethodDescriptionList(
+/// Protocol *p, BOOL isRequiredMethod, BOOL isInstanceMethod,
+/// unsigned int *outCount)` per Apple's Objective-C Runtime Reference
+/// (<https://developer.apple.com/documentation/objectivec/1418813-protocol_copymethoddescriptionl>).
+/// The caller owns the returned array (`free()`-able) and the entries are
+/// written as two 32-bit words, matching the packed guest struct.
+pub fn protocol_copyMethodDescriptionList(
+    env: &mut crate::Environment,
+    proto: id,
+    is_required: bool,
+    is_instance: bool,
+    out_count: crate::mem::MutPtr<u32>,
+) -> crate::mem::MutPtr<objc_method_description> {
+    if !out_count.is_null() {
+        env.mem.write(out_count, 0);
+    }
+    let mut descriptions = Vec::new();
+    collect_protocol_method_descriptions(
+        &env.mem,
+        proto,
+        is_required,
+        is_instance,
+        0,
+        &mut descriptions,
+    );
+    let Ok(count) = u32::try_from(descriptions.len()) else {
+        return Ptr::null();
+    };
+    if count == 0 {
+        return Ptr::null();
+    }
+    let Some(size) = count.checked_mul(guest_size_of::<objc_method_description>()) else {
+        return Ptr::null();
+    };
+    let buffer: crate::mem::MutPtr<objc_method_description> = env.mem.alloc(size).cast();
+    for (index, (name, types)) in descriptions.iter().enumerate() {
+        let entry: crate::mem::MutPtr<u32> =
+            Ptr::from_bits(buffer.to_bits() + index as u32 * 8);
+        env.mem.write(entry, name.to_bits());
+        env.mem.write(entry + 1, types.to_bits());
+    }
+    if !out_count.is_null() {
+        env.mem.write(out_count, count);
+    }
+    buffer
+}
+
 /// `int objc_getClassList(Class *buffer, int bufferLen)` per Apple's
 /// Objective-C Runtime Reference
 /// (<https://developer.apple.com/documentation/objectivec/1418579-objc_getclasslist>):

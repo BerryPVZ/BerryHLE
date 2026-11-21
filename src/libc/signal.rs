@@ -546,25 +546,42 @@ const SIG_NAMES: [&str; 32] = [
     "User defined signal 2",
 ];
 
-pub const CONSTANTS: ConstantExports = &[(
-    "_sys_siglist",
-    HostConstant::Custom(|env| {
-        let table: crate::mem::MutPtr<u32> = env.mem.alloc(32 * 4).cast();
-        for (i, &name) in SIG_NAMES.iter().enumerate() {
-            // Allocate a null-terminated C string in guest memory.
-            let bytes = name.as_bytes();
-            let s = env.mem.alloc((bytes.len() + 1) as u32);
-            env.mem
-                .bytes_at_mut(s.cast(), (bytes.len() + 1) as u32)
-                .copy_from_slice(
-                    &bytes
-                        .iter()
-                        .copied()
-                        .chain(std::iter::once(0u8))
-                        .collect::<Vec<_>>(),
-                );
-            env.mem.write(table + (i as u32), s.to_bits());
-        }
-        Ptr::from_bits(table.to_bits())
-    }),
-)];
+/// Short signal names exposed as `sys_signame`, indexed by signal number
+/// like `SIG_NAMES`. Apple's `/usr/include/sys/signal.h` names them without
+/// the `SIG` prefix.
+const SIG_SHORT_NAMES: [&str; 32] = [
+    "UNKNOWN", "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "EMT", "FPE", "KILL", "BUS", "SEGV",
+    "SYS", "PIPE", "ALRM", "TERM", "URG", "STOP", "TSTP", "CONT", "CHLD", "TTIN", "TTOU", "IO",
+    "XCPU", "XFSZ", "VTALRM", "PROF", "WINCH", "INFO", "USR1", "USR2",
+];
+/// Allocates a guest-side `const char *[names.len()]` table, one
+/// null-terminated C string per entry.
+fn signal_name_table(env: &mut crate::Environment, names: &[&str]) -> crate::mem::ConstVoidPtr {
+    let table: crate::mem::MutPtr<u32> = env.mem.alloc(names.len() as u32 * 4).cast();
+    for (i, &name) in names.iter().enumerate() {
+        // Allocate a null-terminated C string in guest memory.
+        let bytes = name.as_bytes();
+        let s = env.mem.alloc((bytes.len() + 1) as u32);
+        env.mem
+            .bytes_at_mut(s.cast(), (bytes.len() + 1) as u32)
+            .copy_from_slice(
+                &bytes
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(0u8))
+                    .collect::<Vec<_>>(),
+            );
+        env.mem.write(table + (i as u32), s.to_bits());
+    }
+    Ptr::from_bits(table.to_bits())
+}
+pub const CONSTANTS: ConstantExports = &[
+    (
+        "_sys_siglist",
+        HostConstant::Custom(|env| signal_name_table(env, &SIG_NAMES)),
+    ),
+    (
+        "_sys_signame",
+        HostConstant::Custom(|env| signal_name_table(env, &SIG_SHORT_NAMES)),
+    ),
+];

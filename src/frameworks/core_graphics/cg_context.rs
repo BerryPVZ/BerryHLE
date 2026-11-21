@@ -798,6 +798,17 @@ fn CGContextResetClip(_env: &mut Environment, _context: CGContextRef) {
     log_dbg!("CGContextResetClip: stubbed");
 }
 
+/// `void CGContextClip(CGContextRef c)` — intersects the clipping region
+/// with the current path. The software rasteriser only implements the
+/// full-bounds clip (see [CGContextClipToRect]), so the path is ignored
+/// rather than losing the whole context.
+fn CGContextClip(_env: &mut Environment, context: CGContextRef) {
+    log_dbg!(
+        "CGContextClip({:?}): path clipping is not implemented, ignoring.",
+        context
+    );
+}
+
 fn CGContextClipToMask(
     _env: &mut Environment,
     _context: CGContextRef,
@@ -1520,6 +1531,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGContextFillRect(_, _)),
     export_c_func!(CGContextClearRect(_, _)),
     export_c_func!(CGContextClipToRect(_, _)),
+    export_c_func!(CGContextClip(_)),
     export_c_func!(CGContextConcatCTM(_, _)),
     export_c_func!(CGContextGetCTM(_)),
     export_c_func!(CGContextRotateCTM(_, _)),

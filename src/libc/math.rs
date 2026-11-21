@@ -86,6 +86,10 @@ fn current_rounding_direction(env: &Environment) -> FERoundingDirection {
 fn abs(_env: &mut Environment, arg: i32) -> i32 {
     arg.abs()
 }
+/// `long labs(long n)`. `long` is 32-bit in the iOS ABI, as `int` is.
+fn labs(env: &mut Environment, arg: i32) -> i32 {
+    abs(env, arg)
+}
 fn fabs(_env: &mut Environment, arg: f64) -> f64 {
     arg.abs()
 }
@@ -1713,6 +1717,7 @@ fn _ZN9SingletonI12TimerManagerE11getInstanceEv(env: &mut Environment) -> u32 {
 
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(abs(_)),
+    export_c_func!(labs(_)),
     export_c_func!(fabs(_)),
     // Trigonometric functions
     export_c_func!(sin(_)),

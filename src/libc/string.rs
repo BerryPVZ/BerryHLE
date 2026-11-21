@@ -724,6 +724,22 @@ fn strxfrm_l(
     len
 }
 
+/// `int strcoll(const char *s1, const char *s2)` — the locale-free variant of
+/// `strcoll_l`. touchHLE has a single C/ASCII locale, so collation is byte
+/// order, which is what darwin returns for the C locale.
+fn strcoll(env: &mut Environment, a: ConstPtr<u8>, b: ConstPtr<u8>) -> i32 {
+    strcoll_l(env, a, b, MutVoidPtr::null())
+}
+/// `size_t strxfrm(char *dst, const char *src, size_t n)`.
+fn strxfrm(
+    env: &mut Environment,
+    dest: MutPtr<u8>,
+    src: ConstPtr<u8>,
+    n: GuestUSize,
+) -> GuestUSize {
+    strxfrm_l(env, dest, src, n, MutVoidPtr::null())
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(strtok(_, _)),
     export_c_func!(bzero(_, _)),
@@ -779,6 +795,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(strerror_r(_, _, _)),
     export_c_func!(strcoll_l(_, _, _)),
     export_c_func!(strxfrm_l(_, _, _, _)),
+    export_c_func!(strcoll(_, _)),
+    export_c_func!(strxfrm(_, _, _)),
     export_c_func!(basename(_)),
     export_c_func!(bcopy(_, _, _)),
     export_c_func!(strnlen(_, _)),

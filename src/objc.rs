@@ -59,8 +59,9 @@ pub use classes::{
     objc_release, objc_retain, objc_retainAutorelease, objc_retainAutoreleaseReturnValue,
     objc_retainAutoreleasedReturnValue, objc_retainBlock, objc_storeStrong,
     objc_unsafeClaimAutoreleasedReturnValue, object_getClass, object_getClassName,
-    object_getIndexedIvars, protocol_conformsToProtocol, protocol_getMethodDescription,
-    protocol_getName, swift_getInitializedObjCClass, Class, ClassExports, ClassTemplate,
+    object_getIndexedIvars, protocol_conformsToProtocol, protocol_copyMethodDescriptionList,
+    protocol_copyProtocolList, protocol_getMethodDescription, protocol_getName,
+    swift_getInitializedObjCClass, Class, ClassExports, ClassTemplate,
 };
 pub use messages::{
     autorelease, msg, msg_class, msg_send, msg_send_no_initialize, msg_send_no_type_checking,
@@ -492,6 +493,8 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(objc_getProtocol(_)),
     export_c_func!(protocol_getName(_)),
     export_c_func!(protocol_getMethodDescription(_, _, _, _)),
+    export_c_func!(protocol_copyProtocolList(_, _)),
+    export_c_func!(protocol_copyMethodDescriptionList(_, _, _, _)),
     export_c_func!(objc_getClassList(_, _)),
     export_c_func!(objc_copyClassList(_)),
     export_c_func!(protocol_conformsToProtocol(_, _)),
