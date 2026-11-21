@@ -900,7 +900,7 @@ impl Mem {
                 // Insert a sentinel to emit the notice only once.
                 set.insert(0xFFFF_FFFE);
                 log!(
-                    "touchHLE::mem: further NULL-PAGE {} warnings silenced \
+                    "further NULL-PAGE {} warnings silenced \
                      after {} unique sites",
                     if is_write { "WRITE" } else { "READ" },
                     MAX_UNIQUE_LOGS
@@ -913,7 +913,7 @@ impl Mem {
             // Huge size is almost always a corrupted/-1 length; capture a
             // backtrace to identify the offending host function.
             log!(
-                "touchHLE::mem: backtrace for huge-size NULL-PAGE/OOB access:\n{}",
+                "backtrace for huge-size NULL-PAGE/OOB access:\n{}",
                 std::backtrace::Backtrace::force_capture()
             );
         }
@@ -950,7 +950,7 @@ impl Mem {
             let guest_pc = crate::environment::LAST_GUEST_PC.load(Ordering::Relaxed);
             if LAST_RING_GUEST_PC.swap(guest_pc, Ordering::Relaxed) != guest_pc {
                 log!(
-                    "touchHLE::mem: recent host calls (oldest first):{}",
+                    "recent host calls (oldest first):{}",
                     Self::host_call_ring_dump()
                 );
             }
@@ -980,7 +980,7 @@ impl Mem {
         let thread = crate::environment::LAST_HOST_CALL_THREAD.load(Ordering::Relaxed);
         let symbol = Self::last_host_call_symbol();
         log!(
-            "touchHLE::mem:   guest PC={:#x} LR={:#x} (thread {}); host fn \
+            "  guest PC={:#x} LR={:#x} (thread {}); host fn \
              {} called with:{}; code at PC: [{}]; code at LR: [{}]",
             guest_pc,
             guest_lr,
@@ -991,7 +991,7 @@ impl Mem {
             Self::guest_code_dump(mem, guest_lr)
         );
         log!(
-            "touchHLE::mem:   host backtrace:\n{}",
+            "  host backtrace:\n{}",
             std::backtrace::Backtrace::force_capture()
         );
     }
@@ -1321,14 +1321,14 @@ impl Mem {
         let n = LOGGED.fetch_add(1, Ordering::Relaxed);
         if n < MAX_LOGS {
             log!(
-                "touchHLE::mem: ignoring wild host pointer {:#x} handed to a GL array \
+                "ignoring wild host pointer {:#x} handed to a GL array \
                  binding (guest memory is {:#x}..{:#x}); using NULL instead",
                 host_ptr,
                 guest_mem_start,
                 guest_mem_end
             );
         } else if n == MAX_LOGS {
-            log!("touchHLE::mem: further wild host pointer warnings silenced");
+            log!("further wild host pointer warnings silenced");
         }
     }
 
