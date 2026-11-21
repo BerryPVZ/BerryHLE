@@ -3278,7 +3278,14 @@ impl Window {
         {
             let drawable_size = self.window.drawable_size();
             if self.fullscreen {
-                return geometry::fit_viewport((app_width, app_height), drawable_size);
+                // Fullscreen keeps the desktop aspect-ratio setting: fit and
+                // centre with bars, or stretch to the screen when the user
+                // asked for no aspect-ratio preservation.
+                return if self.preserve_aspect_ratio {
+                    geometry::fit_viewport((app_width, app_height), drawable_size)
+                } else {
+                    (0, 0, drawable_size.0, drawable_size.1)
+                };
             }
             let native_ratio_matches = {
                 let lhs = drawable_size.0 as u64 * app_height as u64;
