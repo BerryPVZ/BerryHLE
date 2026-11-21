@@ -5,7 +5,7 @@
  */
 //! `NSSortDescriptor`.
 
-use super::ns_string;
+use super::{ns_string, NSUInteger};
 use crate::frameworks::foundation::NSComparisonResult;
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
@@ -234,6 +234,19 @@ pub const CLASSES: ClassExports = objc_classes! {
         msg![env; a_key isEqual:b_key]
     };
     keys_eq && a_asc == b_asc
+}
+- (NSUInteger)hash {
+    // Agree with -isEqual:, which compares the key and the direction. The
+    // NSObject default hashes the pointer, so two equal descriptors would miss
+    // each other as dictionary keys.
+    let key: id = msg![env; this key];
+    let ascending: bool = msg![env; this ascending];
+    let key_hash: NSUInteger = if key == nil {
+        0
+    } else {
+        msg![env; key hash]
+    };
+    super::hash_helper(&(key_hash, ascending))
 }
 
 - (id)description {

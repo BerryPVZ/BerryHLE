@@ -330,6 +330,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     let b = env.objc.borrow::<NSDecimalNumberHostObject>(other).value;
     a == b
 }
+- (NSUInteger)hash {
+    // Agree with -isEqual:, which compares the value. The NSObject default
+    // hashes the pointer, so two equal numbers would miss each other as
+    // dictionary keys.
+    let value = env.objc.borrow::<NSDecimalNumberHostObject>(this).value;
+    super::hash_helper(&value.to_bits())
+}
 
 // MARK: - Accessors
 

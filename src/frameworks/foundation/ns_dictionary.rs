@@ -935,6 +935,20 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     msg![env; this isEqualToDictionary:other]
 }
+- (NSUInteger)hash {
+    // Agree with -isEqual:, which compares the entries. The NSObject default
+    // hashes the pointer, so two equal dictionaries would miss each other as
+    // dictionary keys.
+    let keys: id = msg![env; this allKeys];
+    let count: NSUInteger = msg![env; keys count];
+    let mut hash: NSUInteger = count;
+    for i in 0..count {
+        let key: id = msg![env; keys objectAtIndex:i];
+        let key_hash: NSUInteger = msg![env; key hash];
+        hash = hash.wrapping_add(key_hash);
+    }
+    hash
+}
 - (bool)isEqualToDictionary:(id)other { // NSDictionary *
     if other == nil {
         return false;

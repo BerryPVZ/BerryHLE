@@ -5,7 +5,7 @@
  */
 //! `NSUUID`.
 
-use crate::frameworks::foundation::ns_string;
+use crate::frameworks::foundation::{ns_string, NSUInteger};
 use crate::objc::{
     id, msg, msg_class, nil, objc_classes, retain, ClassExports, HostObject, NSZonePtr,
 };
@@ -214,7 +214,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     a == b
 }
 
-- (u32)hash { // NSUInteger
+- (NSUInteger)hash {
+    // Agree with -isEqual:, which compares the UUID bytes: the NSObject
+    // default hashes the pointer, so equal UUIDs made separately would miss
+    // each other as dictionary keys.
     let bytes = env.objc.borrow::<NSUUIDHostObject>(this).bytes.0;
     // FNV-1a over the 16 bytes.
     let mut h: u32 = 2166136261;
@@ -222,7 +225,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         h ^= b as u32;
         h = h.wrapping_mul(16777619);
     }
-    h
+    h as NSUInteger
 }
 
 // =========================================================================
