@@ -48,12 +48,12 @@ unsafe impl SafeRead for ivar_list_t {}
 ///
 /// The name, field names and field layout are based on what Ghidra outputs.
 #[repr(C, packed)]
-struct ivar_t {
-    offset: ConstPtr<GuestUSize>,
-    name: ConstPtr<u8>,
-    type_: ConstPtr<u8>,
-    alignment: u32,
-    size: u32,
+pub(super) struct ivar_t {
+    pub(super) offset: ConstPtr<GuestUSize>,
+    pub(super) name: ConstPtr<u8>,
+    pub(super) type_: ConstPtr<u8>,
+    pub(super) alignment: u32,
+    pub(super) size: u32,
 }
 unsafe impl SafeRead for ivar_t {}
 
@@ -481,6 +481,7 @@ pub fn class_getInstanceVariable(
 }
 
 /// Returns the byte offset of an Objective-C instance variable.
+/// https://developer.apple.com/documentation/objectivec/ivar_getoffset(_:)
 pub fn ivar_getOffset(env: &mut Environment, ivar: MutVoidPtr) -> GuestISize {
     if ivar.is_null() {
         return 0;
@@ -568,6 +569,25 @@ pub fn object_getInstanceVariable(
     let value = object_ivar_value(&env.objc, &env.mem, object, ivar.cast_const()).unwrap_or(nil);
     if !out_value.is_null() {
         env.mem.write(out_value, value.cast());
+    }
+    ivar
+}
+
+/// The named form of object_setIvar, also used for MonoTouch's peer handle.
+/// https://github.com/apple-oss-distributions/objc4/blob/objc4-532.2/runtime/objc-class.mm
+pub fn object_setInstanceVariable(
+    env: &mut Environment,
+    object: id,
+    name: ConstPtr<u8>,
+    value: MutVoidPtr,
+) -> MutVoidPtr {
+    if object == nil || name.is_null() {
+        return Ptr::null();
+    }
+    let class = ObjC::read_isa(object, &env.mem);
+    let ivar = class_getInstanceVariable(env, class, name);
+    if !ivar.is_null() {
+        object_setIvar(env, object, ivar, value.cast());
     }
     ivar
 }

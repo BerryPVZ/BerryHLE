@@ -262,6 +262,12 @@ pub struct Options {
     pub gles2_compat: bool,
     pub corruption: CorruptionOptions,
     pub direct_memory_access: bool,
+    /// Bind through lazy-symbol data pointers without changing instructions.
+    /// Needed by engines that hash their executable code during startup.
+    pub preserve_dyld_stubs: bool,
+    /// `--dladdr`: enable the real `dladdr()` implementation. Off by default;
+    /// the failure stub is safer for legacy games that hang during startup.
+    pub dladdr: bool,
     /// CPU affinity policy for the emulator thread on Android
     /// (`--affinity=`): `None` = default (big cores), or one of
     /// `all` / `off` / `big` / an explicit CPU list like `4-7`.
@@ -359,6 +365,9 @@ pub struct Options {
     /// legacy 180-degree presentation compensation. Off by default to retain
     /// the iPad/non-portrait heuristic; opt in with `--rotation-fix`.
     pub rotation_fix: bool,
+    /// Leave the root view in portrait coordinates for engines that rotate
+    /// their OpenGL drawing and touch coordinates themselves.
+    pub manual_ui_rotation: bool,
     /// Force EAGL `initWithAPI:` to create an OpenGL ES 1.1 (fixed-function)
     /// context even when the app requested an OpenGL ES 2.0/3.x context.
     ///
@@ -472,6 +481,8 @@ impl Default for Options {
             gles2_compat: false,
             corruption: CorruptionOptions::default(),
             direct_memory_access: true,
+            preserve_dyld_stubs: false,
+            dladdr: false,
             affinity: None,
             gdb_listen_addrs: None,
             preferred_languages: None,
@@ -510,6 +521,7 @@ impl Default for Options {
             mach_semaphore_spurious_wake_ms: None,
             present_rotate: None,
             rotation_fix: false,
+            manual_ui_rotation: false,
             force_gles1_context: std::env::var("TOUCHHLE_FORCE_GLES1_CONTEXT")
                 .map(|value| {
                     let value = value.trim();
@@ -789,6 +801,14 @@ impl Options {
             self.affinity = Some(value.to_string());
         } else if arg == "--disable-direct-memory-access" {
             self.direct_memory_access = false;
+        } else if arg == "--preserve-dyld-stubs" {
+            self.preserve_dyld_stubs = true;
+        } else if arg == "--no-preserve-dyld-stubs" {
+            self.preserve_dyld_stubs = false;
+        } else if arg == "--dladdr" {
+            self.dladdr = true;
+        } else if arg == "--no-dladdr" {
+            self.dladdr = false;
         } else if let Some(address) = arg.strip_prefix("--gdb=") {
             let addrs = address
                 .to_socket_addrs()
@@ -877,6 +897,10 @@ impl Options {
             self.rotation_fix = false;
         } else if arg == "--no-present-rotate" {
             self.present_rotate = None;
+        } else if arg == "--manual-ui-rotation" {
+            self.manual_ui_rotation = true;
+        } else if arg == "--no-manual-ui-rotation" {
+            self.manual_ui_rotation = false;
         } else if arg == "--perf-hints" {
             self.perf_hints = true;
         } else if arg == "--no-perf-hints" {

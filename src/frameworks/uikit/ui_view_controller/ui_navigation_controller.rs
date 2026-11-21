@@ -6,7 +6,7 @@
 //! `UINavigationController`.
 
 use crate::dyld::{ConstantExports, HostConstant};
-use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
+use crate::frameworks::core_graphics::{CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::frameworks::foundation::{ns_array, NSUInteger};
 use crate::mem::{ConstVoidPtr, MutPtr};
@@ -17,12 +17,12 @@ use crate::objc::{
 use crate::Environment;
 
 #[derive(Default)]
-pub(crate) struct UINavigationControllerHostObject {
+struct UINavigationControllerHostObject {
     superclass: super::UIViewControllerHostObject,
-    pub(crate) delegate: id,
+    delegate: id,
     navigation_stack: Vec<id>,
-    layout_running: bool,
     navigation_bar: id,
+    laying_out: bool,
     toolbar: id,
     /// Whether the navigation bar is hidden.
     navigation_bar_hidden: bool,
@@ -40,14 +40,75 @@ pub(crate) struct UINavigationControllerHostObject {
 }
 impl_HostObject_with_superclass!(UINavigationControllerHostObject);
 
-impl UINavigationControllerHostObject {
-    pub(crate) fn new() -> Self {
-        Self {
-            toolbar_hidden: true,
-            interactve_pop_gesture_enabled: true,
-            ..Default::default()
-        }
+/// Legacy UIKit owns the bar and fits the top controller below opaque bars.
+/// https://developer.apple.com/library/archive/documentation/WindowsViews/Conceptual/ViewControllerPGforiOSLegacy/NavigationControllers/NavigationControllers.html
+fn layout_navigation_controller(env: &mut Environment, this: id) {
+    let host = env.objc.borrow::<UINavigationControllerHostObject>(this);
+    let view = host.superclass.view;
+    if view == nil || host.laying_out {
+        return;
     }
+    env.objc
+        .borrow_mut::<UINavigationControllerHostObject>(this)
+        .laying_out = true;
+    let bounds: CGRect = msg![env; view bounds];
+    let bar: id = msg![env; this navigationBar];
+    let hidden = env
+        .objc
+        .borrow::<UINavigationControllerHostObject>(this)
+        .navigation_bar_hidden;
+    let fitting: CGSize = msg![env; bar sizeThatFits:(bounds.size)];
+    let bar_height = fitting.height.min(bounds.size.height);
+    let mut bar_frame = bounds;
+    bar_frame.size.height = bar_height;
+    () = msg![env; bar setFrame:bar_frame];
+    () = msg![env; bar setHidden:hidden];
+
+    let top: id = msg![env; this topViewController];
+    if top != nil {
+        let child: id = msg![env; top view];
+        let translucent: bool = msg![env; bar isTranslucent];
+        let full_screen: bool = msg![env; top wantsFullScreenLayout];
+        let inset = if hidden || (translucent && full_screen) {
+            0.0
+        } else {
+            bar_height
+        };
+        let mut frame = bounds;
+        frame.origin.y += inset;
+        frame.size.height = (frame.size.height - inset).max(0.0);
+        () = msg![env; child setFrame:frame];
+        () = msg![env; child layoutSubviews];
+    }
+    let parent: id = msg![env; bar superview];
+    if parent != view {
+        () = msg![env; view addSubview:bar];
+    } else {
+        () = msg![env; view bringSubviewToFront:bar];
+    }
+    () = msg![env; bar layoutSubviews];
+    env.objc
+        .borrow_mut::<UINavigationControllerHostObject>(this)
+        .laying_out = false;
+}
+
+fn update_navigation_items(env: &mut Environment, this: id) {
+    let stack = env
+        .objc
+        .borrow::<UINavigationControllerHostObject>(this)
+        .navigation_stack
+        .clone();
+    let mut items = Vec::with_capacity(stack.len());
+    for controller in stack {
+        let item: id = msg![env; controller navigationItem];
+        retain(env, item);
+        items.push(item);
+    }
+    let items = ns_array::from_vec(env, items);
+    let bar: id = msg![env; this navigationBar];
+    () = msg![env; bar setItems:items];
+    release(env, items);
+    layout_navigation_controller(env, this);
 }
 
 pub const CLASSES: ClassExports = objc_classes! {
@@ -61,7 +122,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 // =========================================================================
 
 + (id)allocWithZone:(NSZonePtr)_zone {
-    let host_object = Box::new(UINavigationControllerHostObject::new());
+    let host_object = Box::new(UINavigationControllerHostObject {
+        toolbar_hidden: true,
+        interactve_pop_gesture_enabled: true,
+        ..Default::default()
+    });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
 
@@ -69,6 +134,21 @@ pub const CLASSES: ClassExports = objc_classes! {
     let this: id = msg![env; this init];
     let _: () = msg![env; this pushViewController:root_vc animated:false];
     this
+}
+
+- (())loadView {
+    let screen: id = msg_class![env; UIScreen mainScreen];
+    let frame: CGRect = msg![env; screen applicationFrame];
+    let view: id = msg_class![env; TouchHLENavigationControllerView alloc];
+    let view: id = msg![env; view initWithFrame:frame];
+    () = msg![env; this setView:view];
+    release(env, view);
+    layout_navigation_controller(env, this);
+}
+
+- (())viewWillLayoutSubviews {
+    () = msg_super![env; this viewWillLayoutSubviews];
+    layout_navigation_controller(env, this);
 }
 
 - (id)initWithCoder:(id)coder {
@@ -111,82 +191,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; this init]
 }
 
-// The container owns both its bar and its child layout. See Apple's
-// View Controller Catalog, "Anatomy of a Navigation Interface".
-// https://developer.apple.com/library/archive/documentation/WindowsViews/Conceptual/ViewControllerCatalog/Chapters/NavigationControllers.html
-- (())loadView {
-    let bounds = if env.window.is_some() {
-        let screen: id = msg_class![env; UIScreen mainScreen];
-        msg![env; screen bounds]
-    } else { CGRect { origin: CGPoint::default(), size: CGSize { width: 320.0, height: 480.0 } } };
-    let root: id = msg_class![env; _touchHLE_NavigationControllerView alloc];
-    let root: id = msg![env; root initWithFrame:bounds];
-    () = msg![env; this setView:root];
-    release(env, root);
-}
-- (())viewDidLayoutSubviews {
-    () = msg_super![env; this viewDidLayoutSubviews];
-    () = msg![env; this _touchHLE_layoutNavigation];
-}
-- (())_touchHLE_layoutNavigation {
-    let root = env.objc.borrow::<UINavigationControllerHostObject>(this).superclass.view;
-    if root == nil { return; }
-    let h = env.objc.borrow_mut::<UINavigationControllerHostObject>(this);
-    if h.layout_running || h.navigation_stack.is_empty() { return; }
-    h.layout_running = true;
-    let stack = h.navigation_stack.clone();
-    let bounds: CGRect = msg![env; root bounds];
-    let top = *stack.last().unwrap();
-    let bar: id = msg![env; this navigationBar];
-    let hidden = env.objc.borrow::<UINavigationControllerHostObject>(this).navigation_bar_hidden;
-    let item: id = msg![env; top navigationItem];
-    let prompt: id = msg![env; item prompt];
-    // Trust a declared landscape orientation, otherwise follow the shape of the
-    // view: fullscreen games rarely call `setStatusBarOrientation:` even though
-    // their root view is already landscape.
-    let orientation: i32 = msg![env; this interfaceOrientation];
-    let landscape = orientation == 3 || orientation == 4 || bounds.size.width > bounds.size.height;
-    let height = if hidden { 0.0 } else {
-        (if landscape { 32.0 } else { 44.0 }) + if prompt == nil { 0.0 } else { 30.0 }
-    };
-    // Frame first: `setItems:` lays the bar out itself, and it must lay out at
-    // the size it is about to have rather than the size it had last pass.
-    let frame = CGRect { origin: CGPoint { x: bounds.origin.x, y: bounds.origin.y }, size: CGSize { width: bounds.size.width, height } };
-    () = msg![env; bar setFrame:frame];
-    () = msg![env; bar setHidden:hidden];
-    // Claiming the delegate on every pass would discard a delegate the app
-    // installed. Only take the position when it is free; an app that replaces
-    // it then owns back-button handling, as on real iOS.
-    let bar_delegate: id = msg![env; bar delegate];
-    if bar_delegate == nil {
-        () = msg![env; bar setDelegate:this];
-    }
-    let mut items = Vec::new();
-    for &controller in &stack { let item: id = msg![env; controller navigationItem]; items.push(retain(env, item)); }
-    let items = ns_array::from_vec(env, items);
-    () = msg![env; bar setItems:items];
-    release(env, items);
-    let content = CGRect { origin: CGPoint { x: bounds.origin.x, y: bounds.origin.y + height }, size: CGSize { width: bounds.size.width, height: (bounds.size.height - height).max(0.0) } };
-    for controller in stack {
-        let view: id = msg![env; controller view];
-        () = msg![env; view setHidden:(controller != top)];
-        if controller == top {
-            () = msg![env; controller viewWillLayoutSubviews];
-            () = msg![env; view setFrame:content];
-            () = msg![env; view layoutSubviews];
-            () = msg![env; controller viewDidLayoutSubviews];
-        }
-    }
-    let parent: id = msg![env; bar superview];
-    if parent != root { () = msg![env; root addSubview:bar]; }
-    else { () = msg![env; root bringSubviewToFront:bar]; }
-    env.objc.borrow_mut::<UINavigationControllerHostObject>(this).layout_running = false;
-}
-- (bool)navigationBar:(id)_bar shouldPopItem:(id)_item {
-    let _: id = msg![env; this popViewControllerAnimated:true];
-    false // The controller has already synchronized the bar's item stack.
-}
-
 // =========================================================================
 // MARK: - Delegate
 // =========================================================================
@@ -204,8 +208,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - Push / pop
 // =========================================================================
 
-- (())pushViewController:(id)view_controller animated:(bool)_animated {
+- (())pushViewController:(id)view_controller animated:(bool)animated {
     if view_controller == nil { return; }
+
+    let previous: id = msg![env; this topViewController];
 
     {
         let stack = &mut env
@@ -220,9 +226,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     retain(env, view_controller);
     let _: () = msg![env; view_controller setNavigationController:this];
-    // A navigation stack is a container relationship, including its root.
-    // https://developer.apple.com/library/archive/featuredarticles/ViewControllerPGforiPhoneOS/ImplementingaContainerViewController.html
-    let _: () = msg![env; view_controller setParentViewController:this];
+    () = msg![env; view_controller setParentViewController:this];
 
     // Delegate: willShow. Use `register_host_selector` so we don't panic when
     // the app's delegate doesn't implement (and therefore never references)
@@ -248,12 +252,20 @@ pub const CLASSES: ClassExports = objc_classes! {
     // otherwise leave the screen blank.
     let self_view: id = msg![env; this view];
     let vc_view:   id = msg![env; view_controller view];
-    let bounds: CGRect = msg![env; self_view bounds];
-    let _: () = msg![env; vc_view setFrame:bounds];
+    if previous != nil {
+        let old_view = env.objc.borrow::<super::UIViewControllerHostObject>(previous).view;
+        let parent: id = msg![env; old_view superview];
+        if parent == self_view {
+            () = msg![env; previous viewWillDisappear:animated];
+            () = msg![env; old_view removeFromSuperview];
+            () = msg![env; previous viewDidDisappear:animated];
+        }
+    }
+    update_navigation_items(env, this);
     let _: () = msg![env; view_controller viewWillAppear:false];
     let _: () = msg![env; self_view addSubview:vc_view];
+    layout_navigation_controller(env, this);
     let _: () = msg![env; view_controller viewDidAppear:false];
-    () = msg![env; this _touchHLE_layoutNavigation];
 
     // Delegate: didShow.
     let delegate = env.objc.borrow::<UINavigationControllerHostObject>(this).delegate;
@@ -294,7 +306,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let _: () = msg![env; popped viewDidDisappear:animated];
 
     let _: () = msg![env; popped setNavigationController:nil];
-    let _: () = msg![env; popped setParentViewController:nil];
+    () = msg![env; popped setParentViewController:nil];
 
     // Show the new top VC.
     let new_top = env.objc
@@ -304,7 +316,11 @@ pub const CLASSES: ClassExports = objc_classes! {
         .copied()
         .unwrap_or(nil);
     if new_top != nil {
+        let self_view: id = msg![env; this view];
+        let child: id = msg![env; new_top view];
         let _: () = msg![env; new_top viewWillAppear:animated];
+        () = msg![env; self_view addSubview:child];
+        update_navigation_items(env, this);
         let _: () = msg![env; new_top viewDidAppear:animated];
         // Delegate: didShow new top.
         let delegate = env.objc.borrow::<UINavigationControllerHostObject>(this).delegate;
@@ -322,7 +338,6 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
     }
 
-    () = msg![env; this _touchHLE_layoutNavigation];
     autorelease(env, popped)
 }
 
@@ -345,27 +360,28 @@ pub const CLASSES: ClassExports = objc_classes! {
         .drain((idx + 1)..)
         .collect();
 
-    let popped_arr_vcs = to_pop.clone();
-    for &controller in &popped_arr_vcs { retain(env, controller); }
+    let popped_arr_vcs: Vec<id> = to_pop.iter().map(|&vc| { retain(env, vc); vc }).collect();
     for &vc in &to_pop {
         let vc_view: id = msg![env; vc view];
         let _: () = msg![env; vc viewWillDisappear:animated];
         let _: () = msg![env; vc_view removeFromSuperview];
         let _: () = msg![env; vc viewDidDisappear:animated];
         let _: () = msg![env; vc setNavigationController:nil];
-        let _: () = msg![env; vc setParentViewController:nil];
+        () = msg![env; vc setParentViewController:nil];
         release(env, vc);
     }
 
     if view_controller != nil {
+        let self_view: id = msg![env; this view];
+        let child: id = msg![env; view_controller view];
         let _: () = msg![env; view_controller viewWillAppear:animated];
+        () = msg![env; self_view addSubview:child];
+        update_navigation_items(env, this);
         let _: () = msg![env; view_controller viewDidAppear:animated];
     }
 
     // Build return array of popped VCs.
-    let retained = popped_arr_vcs;
-    let arr = ns_array::from_vec(env, retained);
-    () = msg![env; this _touchHLE_layoutNavigation];
+    let arr = ns_array::from_vec(env, popped_arr_vcs);
     autorelease(env, arr)
 }
 
@@ -467,19 +483,22 @@ pub const CLASSES: ClassExports = objc_classes! {
         let vc_view: id = msg![env; vc view];
         let _: () = msg![env; vc_view removeFromSuperview];
         let _: () = msg![env; vc setNavigationController:nil];
-        let _: () = msg![env; vc setParentViewController:nil];
+        () = msg![env; vc setParentViewController:nil];
         release(env, vc);
     }
 
     let count: NSUInteger = msg![env; controllers count];
-    if count == 0 { return; }
+    if count == 0 {
+        update_navigation_items(env, this);
+        return;
+    }
 
     let mut tmp: Vec<id> = Vec::new();
     for i in 0..(count - 1) {
         let vc: id = msg![env; controllers objectAtIndex:i];
         retain(env, vc);
         let _: () = msg![env; vc setNavigationController:this];
-        let _: () = msg![env; vc setParentViewController:this];
+        () = msg![env; vc setParentViewController:this];
         tmp.push(vc);
     }
     env.objc
@@ -500,7 +519,21 @@ pub const CLASSES: ClassExports = objc_classes! {
     let bar: id = msg_class![env; UINavigationBar alloc];
     let bar: id = msg![env; bar init];
     env.objc.borrow_mut::<UINavigationControllerHostObject>(this).navigation_bar = bar;
+    () = msg![env; bar setDelegate:this];
     bar
+}
+
+- (bool)navigationBar:(id)_bar shouldPopItem:(id)item {
+    let top: id = msg![env; this topViewController];
+    let top_item: id = msg![env; top navigationItem];
+    if item == top_item {
+        // Popping the controller updates the entire bar stack. Prevent the
+        // bar from also removing an item after the controller has done so.
+        let _: id = msg![env; this popViewControllerAnimated:true];
+        false
+    } else {
+        true
+    }
 }
 
 - (bool)isNavigationBarHidden {
@@ -516,7 +549,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<UINavigationControllerHostObject>(this).navigation_bar_hidden = hidden;
     let bar = msg![env; this navigationBar];
     let _: () = msg![env; bar setHidden:hidden];
-    () = msg![env; this _touchHLE_layoutNavigation];
+    layout_navigation_controller(env, this);
 }
 
 // =========================================================================
@@ -594,7 +627,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     };
     for vc in stack {
         let _: () = msg![env; vc setNavigationController:nil];
-        let _: () = msg![env; vc setParentViewController:nil];
+        () = msg![env; vc setParentViewController:nil];
         release(env, vc);
     }
     release(env, bar);
@@ -617,12 +650,27 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @end
 
-@implementation _touchHLE_NavigationControllerView: UIView
-- (())layoutSubviews {
-    () = msg_super![env; this layoutSubviews];
-    let controller: id = msg![env; this nextResponder];
-    if controller != nil { () = msg![env; controller _touchHLE_layoutNavigation]; }
+// Internal container whose layout remains tied to its owning controller
+// when a modal is sized or rotated after its child has already loaded.
+@implementation TouchHLENavigationControllerView: UIView
+
+- (())setFrame:(CGRect)frame {
+    () = msg_super![env; this setFrame:frame];
+    () = msg![env; this layoutSubviews];
 }
+
+- (())setBounds:(CGRect)bounds {
+    () = msg_super![env; this setBounds:bounds];
+    () = msg![env; this layoutSubviews];
+}
+
+- (())layoutSubviews {
+    let controller = crate::frameworks::uikit::ui_view::view_controller(env, this);
+    if controller != nil {
+        layout_navigation_controller(env, controller);
+    }
+}
+
 @end
 
 };
@@ -630,6 +678,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 #[cfg(test)]
 mod navigation_container_tests {
     use super::*;
+    use crate::frameworks::core_graphics::CGPoint;
 
     #[test]
     fn navigation_controls_release_children_without_retaining_action_targets() {
@@ -720,7 +769,8 @@ mod navigation_container_tests {
         () = msg![env; navigation pushViewController:second animated:false];
         let parent: id = msg![env; second parentViewController];
         assert_eq!(parent, navigation);
-        assert!(msg![env; root_view isHidden]);
+        // iOS keeps the covered view's isHidden flag false and takes the view
+        // out of the hierarchy instead, which this layout pass mirrors.
         assert!(!msg![env; second_view isHidden]);
         let returned: id = msg![env; navigation popViewControllerAnimated:false];
         assert_eq!(returned, second);
@@ -739,6 +789,7 @@ mod navigation_container_tests {
         () = msg![env; pool drain];
     }
 }
+
 
 // =========================================================================
 // MARK: - Constants

@@ -561,6 +561,8 @@ struct AppPickerDelegateHostObject {
     rotation_fix: Option<bool>,
     /// `Some(..)` only when the user just flipped the switch.
     fix_movie_player: Option<bool>,
+    /// `Some(..)` only when the user just flipped the switch.
+    manual_ui_rotation: Option<bool>,
     corruption_mode: Option<CorruptionMode>,
     corruption_mode_changed: bool,
     corruption_startup_delay: Option<StartupDelayPreset>,
@@ -744,6 +746,7 @@ struct PickerSettings {
     /// an options file which enables the fix (e.g. GTA III defaults).
     rotation_fix: Option<bool>,
     fix_movie_player: Option<bool>,
+    manual_ui_rotation: Option<bool>,
     corruption_mode: CorruptionMode,
     corruption_startup_delay: StartupDelayPreset,
     corruption_cooldown: CooldownPreset,
@@ -1096,6 +1099,7 @@ impl PickerSettings {
                 }
                 "rotation_fix" => set_bool_override(value, &mut settings.rotation_fix),
                 "fix_movie_player" => set_bool_override(value, &mut settings.fix_movie_player),
+                "manual_ui_rotation" => set_bool_override(value, &mut settings.manual_ui_rotation),
                 "corruption_mode" => {
                     if let Some(mode) = CorruptionMode::from_short_name(value) {
                         settings.corruption_mode = mode;
@@ -1197,6 +1201,7 @@ impl PickerSettings {
             // continue to supply their compatibility defaults at launch.
             rotation_fix: options.rotation_fix.then_some(true),
             fix_movie_player: options.fix_movie_player.then_some(true),
+            manual_ui_rotation: options.manual_ui_rotation.then_some(true),
             corruption_mode: CorruptionMode::Off,
             corruption_startup_delay: StartupDelayPreset::default(),
             corruption_cooldown: CooldownPreset::default(),
@@ -1258,6 +1263,7 @@ impl PickerSettings {
              overlay_corner={}\n\
              rotation_fix={}\n\
              fix_movie_player={}\n\
+             manual_ui_rotation={}\n\
              corruption_mode={}\n\
              corruption_startup_delay={}\n\
              corruption_cooldown={}\n\
@@ -1311,6 +1317,7 @@ impl PickerSettings {
             self.overlay_corner.short_name(),
             optional_bool(self.rotation_fix),
             optional_bool(self.fix_movie_player),
+            optional_bool(self.manual_ui_rotation),
             self.corruption_mode.short_name(),
             self.corruption_startup_delay.short_name(),
             self.corruption_cooldown.short_name(),
@@ -2157,6 +2164,10 @@ const CLASSES: ClassExports = objc_classes! {
 - (())rotationFix:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).rotation_fix = Some(switch_state);
+}
+- (())manualUIRotation:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).manual_ui_rotation = Some(switch_state);
 }
 - (())moviePlayerFix:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
@@ -3521,6 +3532,8 @@ log!("Warning: Couldn't inspect the last app's bundle; some app-specific options
             picker_settings.rotation_fix = Some(rotation_fix);
         } else if let Some(fix_movie_player) = std::mem::take(&mut host_obj.fix_movie_player) {
             picker_settings.fix_movie_player = Some(fix_movie_player);
+        } else if let Some(manual_ui_rotation) = std::mem::take(&mut host_obj.manual_ui_rotation) {
+            picker_settings.manual_ui_rotation = Some(manual_ui_rotation);
         } else if std::mem::take(&mut host_obj.corruption_mode_changed) {
             picker_settings.corruption_mode =
                 host_obj.corruption_mode.unwrap_or(CorruptionMode::Off);
@@ -3774,6 +3787,9 @@ option_args.extend(quick_options_ram_limiter_arguments(
         picker_settings.rotation_fix,
         picker_settings.fix_movie_player,
     ));
+    if let Some(enabled) = picker_settings.manual_ui_rotation {
+        option_args.push(quick_options_manual_ui_rotation_argument(enabled).to_string());
+    }
 
     if let Some(tag) = device_state.selected {
         let tag = tag as NSInteger;
@@ -6306,6 +6322,13 @@ fn setup_settings(
         picker_settings.rotation_fix.unwrap_or(false),
         true,
     ));
+    display_rows.push(SettingsRow::Toggle(
+        "Manual UI rotation",
+        "The game rotates its own UI; the emulator leaves the window orientation alone. Needed by a few old games.",
+        "manualUIRotation:",
+        picker_settings.manual_ui_rotation.unwrap_or(false),
+        true,
+    ));
     sections.push(("DISPLAY", display_rows));
     let overlay_mode_options: &'static [(&'static str, &'static str)] =
         if cfg!(any(target_os = "android", target_os = "ios")) {
@@ -7955,6 +7978,7 @@ fn toggle_value_for_selector(settings: &PickerSettings, selector: &str) -> Optio
         "printFPS:" => settings.print_fps,
         "popupErrors:" => settings.popup_errors,
         "rotationFix:" => settings.rotation_fix.unwrap_or(false),
+        "manualUIRotation:" => settings.manual_ui_rotation.unwrap_or(false),
         "moviePlayerFix:" => settings.fix_movie_player.unwrap_or(false),
         "showLockScreen:" => settings.show_lock_screen,
         _ => return None,
@@ -8478,6 +8502,13 @@ fn quick_options_fix_movie_player_argument(enabled: bool) -> &'static str {
 /// switch (`None`) emits nothing: `--no-rotation-fix` / `--no-fix-movie-player`
 /// are explicit overrides that would cancel the app-specific defaults in
 /// touchHLE_default_options.txt (GTA III needs both fixes).
+fn quick_options_manual_ui_rotation_argument(enabled: bool) -> &'static str {
+    if enabled {
+        "--manual-ui-rotation"
+    } else {
+        "--no-manual-ui-rotation"
+    }
+}
 fn quick_options_fix_arguments(
     rotation_fix: Option<bool>,
     fix_movie_player: Option<bool>,
@@ -8834,6 +8865,14 @@ mod quick_options_fix_tests {
             "--no-fix-movie-player"
         );
 
+        assert_eq!(
+            quick_options_manual_ui_rotation_argument(true),
+            "--manual-ui-rotation"
+        );
+        assert_eq!(
+            quick_options_manual_ui_rotation_argument(false),
+            "--no-manual-ui-rotation"
+        );
         assert!(quick_options_fix_arguments(None, None).is_empty());
         assert_eq!(
             quick_options_fix_arguments(Some(true), None),

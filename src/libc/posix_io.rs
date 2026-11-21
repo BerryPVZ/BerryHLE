@@ -772,7 +772,7 @@ pub fn read(
         let starts_at_beginning = file.file.stream_position().ok() == Some(0);
         let archive_path = file.path.clone();
         let read_result = {
-            let buffer_slice = env.mem.bytes_at_mut(buffer.cast(), size);
+            let buffer_slice = env.mem.bytes_at_mut_for_io(buffer.cast(), size);
             file.file.read(buffer_slice)
         };
         if let Ok(bytes_read) = &read_result {
@@ -948,7 +948,7 @@ pub fn write(
         return -1;
     };
 
-    let buffer_slice = env.mem.bytes_at(buffer.cast(), size);
+    let buffer_slice = env.mem.bytes_at_for_io(buffer.cast(), size);
     match file.file.write(buffer_slice) {
         Ok(bytes_written) => {
             let sync_result = if bytes_written > 0 && file.status_flags & O_DSYNC != 0 {

@@ -84,6 +84,7 @@ pub(crate) struct UIViewControllerHostObject {
     modal_transition_style: UIModalTransitionStyle,
     modal_presentation_style: UIModalPresentationStyle,
     editing: bool,
+    wants_full_screen_layout: bool,
     is_being_presented: bool,
     is_being_dismissed: bool,
     /// Interface orientation the controller last rotated to, kept so
@@ -513,15 +514,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow::<UIViewControllerHostObject>(this).is_being_dismissed
 }
 
-- (())setWantsFullScreenLayout:(bool)_wants {
-    // Apple docs: When set to YES, the view controller's view extends
-    // underneath the status bar and navigation bar. On real iOS this
-    // affects layout insets. In touchHLE we always render full-screen,
-    // so this is effectively a no-op but we accept it silently.
+- (())setWantsFullScreenLayout:(bool)wants {
+    // Legacy UIKit's default is NO. Containers also consider bar opacity
+    // before extending the content view under their bars.
+    env.objc.borrow_mut::<UIViewControllerHostObject>(this).wants_full_screen_layout = wants;
 }
 - (bool)wantsFullScreenLayout {
-    // Always report YES since touchHLE renders games full-screen.
-    true
+    env.objc.borrow::<UIViewControllerHostObject>(this).wants_full_screen_layout
 }
 - (())setExtendedLayoutIncludesOpaqueBars:(bool)value {
     // iOS 7+ layout hint: whether the extended layout includes the area
@@ -806,12 +805,23 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc
         .borrow_mut::<UIViewControllerHostObject>(modal_vc)
         .is_being_presented = true;
+    // UIKit sizes a full-screen modal to its presentation container, not to
+    // the design-time frame in its nib. UIWindow applies orientation below.
+    // https://developer.apple.com/library/archive/featuredarticles/ViewControllerPGforiPhoneOS/PresentingaViewController.html
+    let style: UIModalPresentationStyle = msg![env; modal_vc modalPresentationStyle];
+    if style == 0 {
+        let bounds: CGRect = msg![env; window bounds];
+        () = msg![env; modal_view setFrame:bounds];
+    }
     () = msg![env; modal_vc viewWillAppear:animated];
     // UIWindow's -addSubview: applies the auto-rotation transform when the
     // view has an associated UIViewController and posts the appropriate
     // appearance hooks for the new view, so we route through the window
     // directly instead of adding the view to the presenter's view.
     () = msg![env; window addSubview:modal_view];
+    () = msg![env; modal_vc viewWillLayoutSubviews];
+    () = msg![env; modal_view layoutSubviews];
+    () = msg![env; modal_vc viewDidLayoutSubviews];
     let style = env
         .objc
         .borrow::<UIViewControllerHostObject>(modal_vc)
@@ -1265,25 +1275,14 @@ fn check_and_resolve_nib(env: &mut Environment, bundle: id, base_name: id) -> id
     }
     let type_: id = get_static_str(env, "nib");
     let base_name_str = to_rust_string(env, base_name);
-    // Перебираем варианты регистра и суффиксов
-    let bases = [base_name_str.to_string(), base_name_str.to_lowercase()];
-    let suffixes = [
-        "", "~iphone", "~ipad", "-iPhone", "-iPad", "_iPhone", "_iPad",
-    ];
-    for base in &bases {
-        for suffix in &suffixes {
-            let candidate = format!("{}{}", base, suffix);
-            let candidate_ns: id = from_rust_string(env, candidate);
-
-            // Проверяем существование файла
-            let path: id = msg![env; bundle pathForResource:candidate_ns ofType:type_];
-            if path != nil {
-                release(env, path);
-                return autorelease(env, candidate_ns);
-            }
-            release(env, candidate_ns);
-        }
+    let candidate_ns = from_rust_string(env, base_name_str.into_owned());
+    // NSBundle handles localization and the current device's ~iphone/~ipad
+    // resource variant. Do not load the other device's nib as a fallback.
+    let path: id = msg![env; bundle pathForResource:candidate_ns ofType:type_];
+    if path != nil {
+        return autorelease(env, candidate_ns);
     }
+    release(env, candidate_ns);
     nil
 }
 
@@ -1292,13 +1291,10 @@ fn resolve_nib_name_from_class(env: &mut Environment, bundle: id, class_name: id
         return nil;
     }
 
-    // 1. Пробуем полное имя класса (напр. MainViewController)
-    let res = check_and_resolve_nib(env, bundle, class_name);
-    if res != nil {
-        return res;
-    }
-
-    // 2. Пробуем имя без суффикса "Controller" (напр. MainView)
+    // UIKit checks the class name without "Controller" first, then the full
+    // class name. Choosing the full name first can load an unrelated nib.
+    // https://developer.apple.com/documentation/uikit/uiviewcontroller/nibname
+    // https://github.com/touchHLE/touchHLE/blob/trunk/src/frameworks/uikit/ui_view_controller.rs
     let class_str = to_rust_string(env, class_name);
     if let Some(short_name) = class_str.strip_suffix("Controller") {
         let short_ns = from_rust_string(env, short_name.to_string());
@@ -1309,7 +1305,7 @@ fn resolve_nib_name_from_class(env: &mut Environment, bundle: id, class_name: id
         }
     }
 
-    nil
+    check_and_resolve_nib(env, bundle, class_name)
 }
 
 // Helpers used by `ui_storyboard.rs` to attach storyboard state to a

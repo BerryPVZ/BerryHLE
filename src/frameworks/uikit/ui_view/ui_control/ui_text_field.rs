@@ -5,16 +5,17 @@
  */
 //! `UITextField`.
 
+use super::{send_actions, UIControlEventEditingChanged};
 use crate::dyld::{ConstantExports, HostConstant};
 use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::frameworks::foundation::{ns_string, NSInteger, NSRange, NSUInteger};
 use crate::frameworks::uikit::ui_font::{UITextAlignment, UITextAlignmentLeft};
+use crate::frameworks::uikit::ui_view::ui_alert_view;
 use crate::frameworks::uikit::ui_view::ui_window::{
     UIKeyboardDidHideNotification, UIKeyboardDidShowNotification, UIKeyboardWillHideNotification,
     UIKeyboardWillShowNotification,
 };
-use crate::frameworks::uikit::ui_view::ui_alert_view;
 use crate::impl_HostObject_with_superclass;
 use crate::objc::{
     id, msg, msg_class, msg_super, nil, objc_classes, release, retain, todo_objc_setter,
@@ -188,6 +189,17 @@ fn field_content_rect(env: &mut Environment, field: id, mut bounds: CGRect) -> C
     bounds
 }
 
+fn layout_text_label(env: &mut Environment, text_field: id) {
+    let label = env
+        .objc
+        .borrow::<UITextFieldHostObject>(text_field)
+        .text_label;
+    if label != nil {
+        let bounds: CGRect = msg![env; text_field bounds];
+        () = msg![env; label setFrame:bounds];
+    }
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -226,11 +238,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     env.objc.borrow_mut::<UITextFieldHostObject>(this).text_label = text_label;
     let _: () = msg![env; this addSubview:text_label];
-        // `-font` and `-textColor` are never nil on iOS, and the placeholder
-        // label laid out below reuses both, so seed the stored values from the
-        // same defaults the text label already uses.
-        let _: () = msg![env; this setFont:default_font];
-        let _: () = msg![env; this setTextColor:text_color];
+    // `-font` and `-textColor` are never nil on iOS, and the placeholder
+    // label laid out below reuses both, so seed the stored values from the
+    // same defaults the text label already uses.
+    let _: () = msg![env; this setFont:default_font];
+    let _: () = msg![env; this setTextColor:text_color];
+    layout_text_label(env, this);
 
     this
 }
@@ -308,6 +321,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
     }
 
+    layout_text_label(env, this);
     this
 }
 
@@ -382,6 +396,16 @@ pub const CLASSES: ClassExports = objc_classes! {
         let rect: CGRect = msg![env; this placeholderRectForBounds:bounds];
         () = msg![env; label setFrame:rect];
     }
+}
+
+- (())setFrame:(CGRect)frame {
+    () = msg_super![env; this setFrame:frame];
+    layout_text_label(env, this);
+}
+
+- (())setBounds:(CGRect)bounds {
+    () = msg_super![env; this setBounds:bounds];
+    layout_text_label(env, this);
 }
 
 - (id)text {
@@ -596,6 +620,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     if text == nil { return false; }
     let len: NSUInteger = msg![env; text length];
     len > 0
+}
+
+// UIKeyInput methods use the same delegate checks and control events as the
+// host keyboard. Programmatic setText: does not send EditingChanged actions.
+// https://developer.apple.com/documentation/uikit/uikeyinput
+- (())insertText:(id)text {
+    let text = ns_string::to_rust_string(env, text).into_owned();
+    handle_text(env, this, text);
 }
 
 - (())deleteBackward {

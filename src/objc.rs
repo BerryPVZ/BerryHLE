@@ -41,7 +41,7 @@ mod weak;
 pub(crate) use messages::{set_dispatch_depth, take_dispatch_depth};
 
 pub use classes::{
-    __objc_deallocOnMainThreadHelper, class_addMethod, class_conformsToProtocol,
+    __objc_deallocOnMainThreadHelper, class_addIvar, class_addMethod, class_conformsToProtocol,
     class_copyIvarList, class_copyMethodList, class_copyPropertyList, class_copyProtocolList,
     class_createInstance,
     class_getClassMethod, class_getInstanceMethod, class_getInstanceSize,
@@ -72,7 +72,7 @@ pub use objects::{
 };
 pub use properties::{
     class_getInstanceVariable, ivar_getName, ivar_getOffset, object_getInstanceVariable,
-    object_getIvar, object_setIvar, todo_objc_setter,
+    object_getIvar, object_setInstanceVariable, object_setIvar, todo_objc_setter,
 };
 pub use selectors::{selector, SEL};
 
@@ -82,8 +82,8 @@ use crate::objc::classes::{objc_msgForward, objc_msgForward_stret};
 use crate::Environment;
 use classes::{ClassHostObject, FakeClass, UnimplementedClass};
 use messages::{
-    objc_enumerationMutation, objc_msgSendSuper2, objc_msgSendSuper2_stret, objc_msgSend_stret,
-    MsgSendSignature, MsgSendSuperSignature,
+    objc_enumerationMutation, objc_msgSendSuper, objc_msgSendSuper2, objc_msgSendSuper2_stret,
+    objc_msgSendSuper_stret, objc_msgSend_stret, MsgSendSignature, MsgSendSuperSignature,
 };
 use methods::method_list_t;
 use objects::{objc_object, HostObjectEntry};
@@ -401,6 +401,8 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(objc_msgSend_stret(_, _, _)),
     export_c_func!(objc_msgSendSuper2_stret(_, _, _)),
     export_c_func!(objc_msgSendSuper2(_, _)),
+    export_c_func!(objc_msgSendSuper(_, _)),
+    export_c_func!(objc_msgSendSuper_stret(_, _, _)),
     export_c_func!(objc_getProperty(_, _, _, _)),
     export_c_func!(objc_setProperty(_, _, _, _, _, _)),
     export_c_func!(objc_setProperty_nonatomic_copy(_, _, _, _)),
@@ -445,12 +447,14 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(ivar_getName(_)),
     export_c_func!(object_getIvar(_, _)),
     export_c_func!(object_getInstanceVariable(_, _, _)),
+    export_c_func!(object_setInstanceVariable(_, _, _)),
     export_c_func!(object_setIvar(_, _, _)),
     export_c_func!(class_isMetaClass(_)),
     export_c_func!(class_getInstanceMethod(_, _)),
     export_c_func!(class_getClassMethod(_, _)),
     export_c_func!(class_respondsToSelector(_, _)),
     export_c_func!(class_addMethod(_, _, _, _)),
+    export_c_func!(class_addIvar(_, _, _, _, _)),
     export_c_func!(class_getProperty(_, _)),
     export_c_func!(property_getName(_)),
     export_c_func!(property_getAttributes(_)),
