@@ -14,7 +14,7 @@ use super::{
     _nib_archive_decoder, ns_array, ns_keyed_archiver, ns_keyed_unarchiver, ns_string, ns_url,
     NSComparisonResult, NSUInteger,
 };
-use crate::abi::{CallFromHost, GuestFunction, VaList};
+use crate::abi::{CallFromHost, DotDotDot, GuestFunction, VaList};
 use crate::frameworks::core_foundation::{CFHashCode, CFIndex};
 use crate::frameworks::foundation::ns_enumerator::{
     fast_enumeration_helper, NSFastEnumerationState,
@@ -22,6 +22,7 @@ use crate::frameworks::foundation::ns_enumerator::{
 use crate::frameworks::foundation::ns_file_manager::{
     NSFileModificationDate, NSFileSize, NSFileType,
 };
+use crate::dyld::{export_c_func, FunctionExports};
 use crate::fs::GuestPath;
 use crate::libc::stdlib::qsort::qsort_generic;
 use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr, Ptr, SafeRead};
@@ -1900,6 +1901,33 @@ pub fn dict_from_keys_and_objects(env: &mut Environment, keys_and_objects: &[(id
     dict
 }
 
+/// The function behind Apple's `NSDictionaryOfVariableBindings()` macro:
+/// `#define NSDictionaryOfVariableBindings(...) _NSDictionaryOfVariableBindings(@"" # __VA_ARGS__, __VA_ARGS__, nil)`
+/// (<https://developer.apple.com/documentation/foundation/nsdictionaryofvariablebindings>).
+/// The first argument is one string naming the variables in order, then their
+/// values follow, terminated by nil.
+pub fn NSDictionaryOfVariableBindings(
+    env: &mut Environment,
+    names: id,
+    values: DotDotDot,
+) -> id {
+    if names.is_null() {
+        return nil;
+    }
+    let names = to_rust_string(env, names);
+    let mut values = values.start();
+    let mut keys_and_objects = Vec::new();
+    for name in names.split(',') {
+        let value: id = values.next(env);
+        if value.is_null() {
+            break;
+        }
+        keys_and_objects.push((from_rust_string(env, name.trim().to_string()), value));
+    }
+    dict_from_keys_and_objects(env, &keys_and_objects)
+}
+pub const FUNCTIONS: FunctionExports =
+    &[export_c_func!(NSDictionaryOfVariableBindings(_, _))];
 /// Direct constructor for use by host code, similar to
 /// `[[NSMutableDictionary alloc] initWithObjectsAndKeys:]` but without
 /// variadics and with a more intuitive argument order.

@@ -330,6 +330,42 @@ pub const CLASSES: ClassExports = objc_classes! {
     autorelease(env, components)
 }
 
+// `- (NSUInteger)ordinalityOfUnit:(NSCalendarUnit)smaller
+//                          inUnit:(NSCalendarUnit)larger
+//                         forDate:(NSDate *)date;`
+//
+// Per Apple's
+// [NSCalendar Reference](https://developer.apple.com/documentation/foundation/nscalendar/1415804-ordinalityofunit):
+// "Returns the ordinal number of the smaller unit within the larger one, such
+// as the day of the year or the hour of the day." Counting starts at 1 and
+// returns NSNotFound when the two units are not nested. Blockheads calls this
+// while generating a world; a missing selector previously gave it 0.
+- (NSUInteger)ordinalityOfUnit:(NSCalendarUnit)smaller_unit
+                        inUnit:(NSCalendarUnit)larger_unit
+                       forDate:(id)date {
+    if date == nil {
+        return NSUInteger::MAX;
+    }
+    let time_interval: NSTimeInterval = msg![env; date timeIntervalSinceReferenceDate];
+    let greg_date = CFAbsoluteTimeGetGregorianDate(env, time_interval, nil);
+    let mut day_of_year = greg_date.day as NSUInteger;
+    for month in 1..greg_date.month as i32 {
+        day_of_year += days_in_month(greg_date.year, month) as NSUInteger;
+    }
+    match (smaller_unit, larger_unit) {
+        (NSDayCalendarUnit, NSYearCalendarUnit) => day_of_year,
+        (NSMonthCalendarUnit, NSYearCalendarUnit) => greg_date.month as NSUInteger,
+        (NSDayCalendarUnit, NSMonthCalendarUnit) => greg_date.day as NSUInteger,
+        (NSHourCalendarUnit, NSDayCalendarUnit) => greg_date.hours as NSUInteger + 1,
+        (NSMinuteCalendarUnit, NSHourCalendarUnit) => greg_date.minutes as NSUInteger + 1,
+        (NSSecondCalendarUnit, NSMinuteCalendarUnit) => greg_date.seconds as NSUInteger + 1,
+        (NSWeekdayCalendarUnit, NSMonthCalendarUnit) => (greg_date.day as NSUInteger - 1) / 7 + 1,
+        (NSWeekdayCalendarUnit, NSYearCalendarUnit) => (day_of_year - 1) / 7 + 1,
+        (NSWeekCalendarUnit, NSYearCalendarUnit) => (day_of_year - 1) / 7 + 1,
+        _ => NSUInteger::MAX,
+    }
+}
+
 // `- (NSDateComponents *)components:(NSCalendarUnit)unitFlags
 //                          fromDate:(NSDate *)startDate
 //                            toDate:(NSDate *)endDate
