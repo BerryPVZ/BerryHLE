@@ -606,7 +606,12 @@ impl PipeBuffer {
 
 #[derive(Debug)]
 pub enum GuestFile {
-    Directory,
+    /// An open directory, with the offset a seek would report.
+    ///
+    /// Darwin lets a guest seek a directory descriptor even though the entries
+    /// themselves are read with `opendir()`/`readdir()`, so the offset is kept
+    /// here instead of failing every seek.
+    Directory(u64),
     File(File),
     IpaBundleFile(IpaFile),
     ResourceFile(paths::ResourceFile),
@@ -652,7 +657,7 @@ impl GuestFile {
     }
 
     fn from_directory() -> GuestFile {
-        GuestFile::Directory
+        GuestFile::Directory(0)
     }
 
     /// Construct a `/dev/random` / `/dev/urandom` character device.
@@ -664,7 +669,7 @@ impl GuestFile {
         match self {
             GuestFile::File(file) => file.sync_all(),
             GuestFile::IpaBundleFile(_) | GuestFile::ResourceFile(_) => Ok(()),
-            GuestFile::Directory => {
+            GuestFile::Directory(_) => {
                 log!("Warning: syncing directory as a guest file.");
                 Ok(())
             }
@@ -680,7 +685,7 @@ impl GuestFile {
         match self {
             GuestFile::File(file) => file.sync_data(),
             GuestFile::IpaBundleFile(_) | GuestFile::ResourceFile(_) => Ok(()),
-            GuestFile::Directory => {
+            GuestFile::Directory(_) => {
                 log!("Warning: syncing directory as a guest file.");
                 Ok(())
             }
@@ -698,7 +703,7 @@ impl GuestFile {
                 std::io::ErrorKind::PermissionDenied,
                 "Attempt to resize a read-only file",
             )),
-            GuestFile::Directory => Err(std::io::Error::new(
+            GuestFile::Directory(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::IsADirectory,
                 "Attempt to resize a directory as a guest file",
             )),
@@ -759,7 +764,7 @@ impl GuestFile {
                     "Cannot duplicate a resource file descriptor",
                 ))
             }
-            GuestFile::Directory => Ok(GuestFile::Directory),
+            GuestFile::Directory(offset) => Ok(GuestFile::Directory(*offset)),
             // A fresh, independent random source is an acceptable duplicate:
             // both handles yield unrelated random bytes, just like the kernel
             // device.
@@ -827,7 +832,7 @@ impl Read for GuestFile {
                 std::io::ErrorKind::Unsupported,
                 "attempt to read from the write end of a pipe",
             )),
-            GuestFile::Directory => Err(std::io::Error::new(
+            GuestFile::Directory(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::IsADirectory,
                 "Attempt to read from a directory as a guest file",
             )),
@@ -869,7 +874,7 @@ impl Write for GuestFile {
                 pipe.bytes.extend(buf);
                 Ok(buf.len())
             }
-            GuestFile::Directory => Err(std::io::Error::new(
+            GuestFile::Directory(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::IsADirectory,
                 "Attempt to write to a directory as a guest file",
             )),
@@ -890,7 +895,7 @@ impl Write for GuestFile {
                 "Attempt to flush a read-only file",
             )),
             GuestFile::Random(_) | GuestFile::PipeRead(_) | GuestFile::PipeWrite(_) => Ok(()),
-            GuestFile::Directory => Err(std::io::Error::new(
+            GuestFile::Directory(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::IsADirectory,
                 "Attempt to flush a directory as a guest file",
             )),
@@ -908,17 +913,23 @@ impl Seek for GuestFile {
             GuestFile::File(file) => file.seek(pos),
             GuestFile::IpaBundleFile(file) => file.seek(pos),
             GuestFile::ResourceFile(file) => file.get().seek(pos),
-            GuestFile::Directory => {
-                // Note: directories as supposed to be seekable on iOS!
-                // https://stackoverflow.com/questions/65911066/what-does-lseek-mean-for-a-directory-file-descriptor
-                // As far as I can (f)tell, apps are really not using that
-                // properly and returning -1 on fseek/ftell is fine.
-                // TODO: implement seeking properly and return "cookie" values
-                log!("Warning: Seeking a directory as a guest file!");
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::IsADirectory,
-                    "Attempt to seek a directory as a guest file",
-                ))
+            GuestFile::Directory(offset) => {
+                // Darwin allows seeking a directory descriptor, and guests do
+                // rely on it: Overkill 2 seeks around a directory while it
+                // looks up its assets, and failing the seek made every lookup
+                // miss. Only the offset is tracked; the entries are read with
+                // `opendir()`/`readdir()`, not from this offset.
+                let new_offset = match pos {
+                    std::io::SeekFrom::Start(position) => position,
+                    std::io::SeekFrom::Current(delta) => {
+                        offset.saturating_add_signed(delta)
+                    }
+                    // `fstat()` reports a size of 0 for a directory, so there
+                    // is nowhere else for `SEEK_END` to start from.
+                    std::io::SeekFrom::End(delta) => 0u64.saturating_add_signed(delta),
+                };
+                *offset = new_offset;
+                Ok(new_offset)
             }
             // Seeking a character device is a no-op: the offset is
             // meaningless, so report position 0 rather than failing.
@@ -2264,6 +2275,18 @@ mod tests {
         assert!(fs
             .resolve_case_insensitive_path(GuestPath::new("Data/not-present"))
             .is_none());
+    }
+
+    // Darwin allows seeking a directory descriptor, and guests do rely on it:
+    // Overkill 2 seeks around a directory while it looks up its assets.
+    #[test]
+    fn seeking_a_directory_tracks_the_offset() {
+        use std::io::{Seek, SeekFrom};
+
+        let mut directory = GuestFile::from_directory();
+        assert_eq!(directory.seek(SeekFrom::Start(5)).unwrap(), 5);
+        assert_eq!(directory.seek(SeekFrom::Current(-2)).unwrap(), 3);
+        assert_eq!(directory.seek(SeekFrom::End(0)).unwrap(), 0);
     }
 
     #[test]

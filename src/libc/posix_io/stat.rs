@@ -212,7 +212,7 @@ fn fstat_inner(env: &mut Environment, fd: FileDescriptor, buf: MutPtr<stat>) -> 
         GuestFile::File(_)
         | GuestFile::IpaBundleFile(_)
         | GuestFile::ResourceFile(_)
-        | GuestFile::Directory => file.path.clone(),
+        | GuestFile::Directory(_) => file.path.clone(),
         _ => None,
     };
 
@@ -234,7 +234,7 @@ fn fstat_inner(env: &mut Environment, fd: FileDescriptor, buf: MutPtr<stat>) -> 
                 }
             };
         }
-        GuestFile::Directory => {
+        GuestFile::Directory(_) => {
             stat.st_mode |= S_IFDIR;
             // TODO: st_size
         }
