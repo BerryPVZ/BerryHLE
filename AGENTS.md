@@ -61,8 +61,8 @@ These come from bugs that reached trunk. They apply to every agent and environme
    match once; use `replaceAll` only when every occurrence should change. Use
    `write` for a new file or a full replacement, never shell redirection or
    `sed`. Run `git diff --check` after editing.
-10. Commit cleanly. Use a lowercase area prefix, cite the iOS behavior or source,
-    and update `README.md`, `CHANGELOG.md` and `OPTIONS_HELP.txt` for
+10. Commit cleanly. Use a lowercase area prefix, cite the iOS behavior or
+    source, and update `README.md`, `CHANGELOG.md` and `OPTIONS_HELP.txt` for
     user-visible changes.
 
 ## Where things live
