@@ -53,6 +53,23 @@ pub struct State {
     pending_autorotation: Vec<(id, id)>,
 }
 
+/// A fullscreen window must cover the native screen before UIKit rotates its
+/// root view. Older engines can initially supply the interface-oriented size.
+/// Keep smaller or offset windows in the coordinate space the app requested.
+fn window_frame_before_autorotation(frame: CGRect, screen: CGRect) -> CGRect {
+    let close = |a: f32, b: f32| (a - b).abs() < 0.01;
+    if screen.size.width < screen.size.height
+        && close(frame.origin.x, screen.origin.x)
+        && close(frame.origin.y, screen.origin.y)
+        && close(frame.size.width, screen.size.height)
+        && close(frame.size.height, screen.size.width)
+    {
+        screen
+    } else {
+        frame
+    }
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -730,18 +747,18 @@ fn autorotate_view(
                 | crate::window::DeviceOrientation::LandscapeRight
         ) {
             if let Some(screen) = screen_bounds {
-                let frame: CGRect = msg![env; window frame];
+                let old_window_frame: CGRect = msg![env; window frame];
                 // Window geometry remains in the screen's base coordinate
                 // space. A full-screen landscape rectangle supplied during
-                // launch must fit that screen before the controller's
-                // orientation transform is applied. Leave partial windows and
-                // windows positioned away from the screen origin alone.
+                // launch must fit the native screen before the controller's
+                // orientation transform is applied. Partial windows and
+                // windows positioned away from the screen origin stay as the
+                // app asked.
                 // https://developer.apple.com/library/archive/documentation/WindowsViews/Conceptual/ViewPG_iPhoneOS/CreatingWindows/CreatingWindows.html
-                if frame.origin == screen.origin
-                    && frame.size.width == screen.size.height
-                    && frame.size.height == screen.size.width
-                {
-                    () = msg![env; window setFrame:screen];
+                let window_frame =
+                    window_frame_before_autorotation(old_window_frame, screen);
+                if window_frame != old_window_frame {
+                    () = msg![env; window setFrame:window_frame];
                 }
             }
         }
@@ -891,6 +908,70 @@ mod autorotation_tests {
         assert_eq!(
             interface_orientation_for(crate::window::DeviceOrientation::Portrait),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod landscape_frame_tests {
+    use super::*;
+    use crate::frameworks::core_graphics::CGSize;
+    use crate::window::DeviceFamily;
+
+    fn rect(x: f32, y: f32, width: f32, height: f32) -> CGRect {
+        CGRect {
+            origin: CGPoint { x, y },
+            size: CGSize { width, height },
+        }
+    }
+
+    #[test]
+    fn fullscreen_windows_use_native_screen_space_for_every_preset() {
+        for family in [
+            DeviceFamily::iPhone,
+            DeviceFamily::iPhone3G,
+            DeviceFamily::iPhone3GS,
+            DeviceFamily::iPhone4,
+            DeviceFamily::iPhone4s,
+            DeviceFamily::iPhone5,
+            DeviceFamily::iPhone5c,
+            DeviceFamily::iPhone6,
+            DeviceFamily::iPad,
+            DeviceFamily::iPad2,
+            DeviceFamily::iPad3,
+            DeviceFamily::iPad4,
+            DeviceFamily::iPad5,
+            DeviceFamily::iPadMini,
+            DeviceFamily::iPadMini2,
+            DeviceFamily::iPadMini3,
+            DeviceFamily::iPodTouch,
+            DeviceFamily::iPodTouch2,
+            DeviceFamily::iPodTouch3,
+            DeviceFamily::iPodTouch4,
+            DeviceFamily::iPodTouch5,
+        ] {
+            let (width, height) = family.portrait_size();
+            let screen = rect(0.0, 0.0, width as f32, height as f32);
+            let landscape = rect(0.0, 0.0, height as f32, width as f32);
+            assert_eq!(window_frame_before_autorotation(landscape, screen), screen);
+            assert_eq!(window_frame_before_autorotation(screen, screen), screen);
+        }
+    }
+
+    #[test]
+    fn preserves_partial_offset_and_interface_space_windows() {
+        let screen = rect(0.0, 0.0, 320.0, 480.0);
+        for frame in [
+            rect(0.0, 0.0, 200.0, 160.0),
+            rect(10.0, 20.0, 480.0, 320.0),
+            rect(0.0, 0.0, 480.0, 300.0),
+        ] {
+            assert_eq!(window_frame_before_autorotation(frame, screen), frame);
+        }
+        let interface_screen = rect(0.0, 0.0, 480.0, 320.0);
+        assert_eq!(
+            window_frame_before_autorotation(screen, interface_screen),
+            screen
         );
     }
 }

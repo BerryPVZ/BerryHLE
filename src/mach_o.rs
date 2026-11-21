@@ -1790,12 +1790,12 @@ mod segment_validation_tests {
 
     #[test]
     fn fat_loader_rejects_64bit_only_with_word_size_message() {
-        // One slice, declared 64-bit (ABI64 flag in its cputype) with a valid
-        // 64-bit Mach-O header: the fat container must parse for the loader
-        // to name the word size, so zeroed bytes would not reach that check.
+        // The FAT parser reads each slice header before architecture selection.
+        // Use a valid 64-bit header so this tests word-size rejection rather
+        // than rejection of a malformed file.
         let slice = thin64(0x0100_000c, 3);
         let mut bytes = Vec::new();
-        let words = [
+        for word in [
             0xcafebabeu32,
             1,
             0x0100_000cu32,
@@ -1803,8 +1803,7 @@ mod segment_validation_tests {
             28,
             slice.len() as u32,
             0,
-        ];
-        for word in words {
+        ] {
             bytes.extend_from_slice(&word.to_be_bytes());
         }
         bytes.extend_from_slice(&slice);
