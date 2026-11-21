@@ -9,7 +9,7 @@ use crate::environment::Environment;
 use crate::export_c_func;
 use crate::libc::errno::{set_errno, EINVAL, EIO, ENOMEM};
 use crate::libc::posix_io;
-use crate::libc::posix_io::{off_t, open_direct, FileDescriptor, SEEK_SET};
+use crate::libc::posix_io::{off_t, open_direct, FileDescriptor, SEEK_CUR, SEEK_SET};
 use crate::mem::{
     ConstPtr, GuestISize, GuestUSize, Mem, MutVoidPtr, Ptr, PAGE_SIZE,
     PAGE_SIZE_ALIGN_MASK,
@@ -395,8 +395,11 @@ fn mmap(
                 ptr
             );
         }
-        // Seek to the requested offset. If the seek fails (e.g. bad fd),
-        // return MAP_FAILED (-1 as pointer) instead of crashing.
+        // Darwin's `mmap` reads the pages itself and leaves the descriptor's
+        // file offset where it was, so save it and put it back after reading:
+        // a guest that keeps writing through the same descriptor would
+        // otherwise restart at offset 0 and never extend the file.
+        let saved_offset = posix_io::lseek(env, fd, 0, SEEK_CUR);
         let new_offset = posix_io::lseek(env, fd, offset, SEEK_SET);
         if new_offset != offset {
             log!(
@@ -423,6 +426,9 @@ fn mmap(
                 break;
             }
             read_total = read_total.saturating_add(read as GuestUSize);
+        }
+        if saved_offset >= 0 {
+            posix_io::lseek(env, fd, saved_offset, SEEK_SET);
         }
         if read_error < 0 {
             log!(
@@ -540,6 +546,7 @@ fn mmap_fixed(
     clear_unmapped_ranges(&mut env.libc_state.mmap.unmapped, addr.to_bits(), end);
 
     if (flags & MAP_ANON) == 0 {
+        let saved_offset = posix_io::lseek(env, fd, 0, SEEK_CUR);
         let new_offset = posix_io::lseek(env, fd, offset, SEEK_SET);
         if new_offset != offset {
             log!(
@@ -564,6 +571,9 @@ fn mmap_fixed(
                 break;
             }
             read_total = read_total.saturating_add(read as GuestUSize);
+        }
+        if saved_offset >= 0 {
+            posix_io::lseek(env, fd, saved_offset, SEEK_SET);
         }
         if read_error < 0 {
             log!("Warning: mmap MAP_FIXED: read from fd {} at {:?}, offset {} failed ({}); padding remainder with zeros", fd, addr, offset, read_error);
