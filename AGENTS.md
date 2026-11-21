@@ -155,13 +155,13 @@ required to work on the repo.
   output: leave compression to it. Otherwise compress large output with the
   caveman tool, keep the `ccr_` handle, and retrieve details when needed.
   Compress by need, not routinely.
-- **Context mode (context-mode plugin)** — if the `ctx_execute`, `ctx_batch`,
-  `ctx_index` and `ctx_search` tools exist, run shell commands through
-  `ctx_execute` and print only the answer; read a file by passing `file:` and
-  using `$CTX_FILE` instead of dumping it. Use `ctx_batch` for several commands
-  and `ctx_index` + `ctx_search` for long output you will query again. Keep
-  `edit`/`write` direct: a mutation needs exact text. Each call is a fresh
-  subprocess in the project directory, so `cd` and env changes do not persist.
+- **Context mode (context-mode plugin)** — if enabled, always run shell
+  commands and file reads through `ctx_execute`, printing only the answer; pass
+  `file:` and use `$CTX_FILE` to read a file. Use `ctx_batch` for commands that
+  touch directories outside the project, and `ctx_index` + `ctx_search` for
+  output you will query again. Apply code changes with the agent's own
+  `write`/`edit`/patch tools, not context mode. Each call is a fresh subprocess,
+  so `cd` and env changes do not persist.
 - **Context management (billion-context / ACP)** — in long sessions, history is
   summarized automatically. `acp_status` shows usage and compressible ranges,
   `search_context` finds an old block by keyword, `decompress` restores it. A
