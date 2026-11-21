@@ -563,6 +563,8 @@ struct AppPickerDelegateHostObject {
     fix_movie_player: Option<bool>,
     /// `Some(..)` only when the user just flipped the switch.
     manual_ui_rotation: Option<bool>,
+    preserve_dyld_stubs: Option<bool>,
+    dladdr: Option<bool>,
     corruption_mode: Option<CorruptionMode>,
     corruption_mode_changed: bool,
     corruption_startup_delay: Option<StartupDelayPreset>,
@@ -747,6 +749,8 @@ struct PickerSettings {
     rotation_fix: Option<bool>,
     fix_movie_player: Option<bool>,
     manual_ui_rotation: Option<bool>,
+    preserve_dyld_stubs: Option<bool>,
+    dladdr: Option<bool>,
     corruption_mode: CorruptionMode,
     corruption_startup_delay: StartupDelayPreset,
     corruption_cooldown: CooldownPreset,
@@ -1100,6 +1104,8 @@ impl PickerSettings {
                 "rotation_fix" => set_bool_override(value, &mut settings.rotation_fix),
                 "fix_movie_player" => set_bool_override(value, &mut settings.fix_movie_player),
                 "manual_ui_rotation" => set_bool_override(value, &mut settings.manual_ui_rotation),
+                "preserve_dyld_stubs" => set_bool_override(value, &mut settings.preserve_dyld_stubs),
+                "dladdr" => set_bool_override(value, &mut settings.dladdr),
                 "corruption_mode" => {
                     if let Some(mode) = CorruptionMode::from_short_name(value) {
                         settings.corruption_mode = mode;
@@ -1202,6 +1208,8 @@ impl PickerSettings {
             rotation_fix: options.rotation_fix.then_some(true),
             fix_movie_player: options.fix_movie_player.then_some(true),
             manual_ui_rotation: options.manual_ui_rotation.then_some(true),
+            preserve_dyld_stubs: options.preserve_dyld_stubs.then_some(true),
+            dladdr: options.dladdr.then_some(true),
             corruption_mode: CorruptionMode::Off,
             corruption_startup_delay: StartupDelayPreset::default(),
             corruption_cooldown: CooldownPreset::default(),
@@ -1264,6 +1272,8 @@ impl PickerSettings {
              rotation_fix={}\n\
              fix_movie_player={}\n\
              manual_ui_rotation={}\n\
+             preserve_dyld_stubs={}\n\
+             dladdr={}\n\
              corruption_mode={}\n\
              corruption_startup_delay={}\n\
              corruption_cooldown={}\n\
@@ -1318,6 +1328,8 @@ impl PickerSettings {
             optional_bool(self.rotation_fix),
             optional_bool(self.fix_movie_player),
             optional_bool(self.manual_ui_rotation),
+            optional_bool(self.preserve_dyld_stubs),
+            optional_bool(self.dladdr),
             self.corruption_mode.short_name(),
             self.corruption_startup_delay.short_name(),
             self.corruption_cooldown.short_name(),
@@ -2168,6 +2180,14 @@ const CLASSES: ClassExports = objc_classes! {
 - (())manualUIRotation:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).manual_ui_rotation = Some(switch_state);
+}
+- (())preserveDYLDStubs:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).preserve_dyld_stubs = Some(switch_state);
+}
+- (())dladdr:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).dladdr = Some(switch_state);
 }
 - (())moviePlayerFix:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
@@ -3534,6 +3554,10 @@ log!("Warning: Couldn't inspect the last app's bundle; some app-specific options
             picker_settings.fix_movie_player = Some(fix_movie_player);
         } else if let Some(manual_ui_rotation) = std::mem::take(&mut host_obj.manual_ui_rotation) {
             picker_settings.manual_ui_rotation = Some(manual_ui_rotation);
+        } else if let Some(preserve_dyld_stubs) = std::mem::take(&mut host_obj.preserve_dyld_stubs) {
+            picker_settings.preserve_dyld_stubs = Some(preserve_dyld_stubs);
+        } else if let Some(dladdr) = std::mem::take(&mut host_obj.dladdr) {
+            picker_settings.dladdr = Some(dladdr);
         } else if std::mem::take(&mut host_obj.corruption_mode_changed) {
             picker_settings.corruption_mode =
                 host_obj.corruption_mode.unwrap_or(CorruptionMode::Off);
@@ -3789,6 +3813,12 @@ option_args.extend(quick_options_ram_limiter_arguments(
     ));
     if let Some(enabled) = picker_settings.manual_ui_rotation {
         option_args.push(quick_options_manual_ui_rotation_argument(enabled).to_string());
+    }
+    if let Some(enabled) = picker_settings.preserve_dyld_stubs {
+        option_args.push(quick_options_preserve_dyld_stubs_argument(enabled).to_string());
+    }
+    if let Some(enabled) = picker_settings.dladdr {
+        option_args.push(quick_options_dladdr_argument(enabled).to_string());
     }
 
     if let Some(tag) = device_state.selected {
@@ -6312,9 +6342,9 @@ fn setup_settings(
             true,
         ));
     }
-    // Both compatibility fixes are opt-in and may be enabled per-app in the
-    // options files. Leaving a switch alone keeps those defaults; flipping it
-    // (either way) is an explicit override for every later launch.
+    // Opt-in, and may be enabled per-app in the options files. Leaving the
+    // switch alone keeps those defaults; flipping it (either way) is an
+    // explicit override for every later launch.
     display_rows.push(SettingsRow::Toggle(
         "Rotation fix",
         "Turns the game image to match the app's own autorotation instead of the old iPad guess. Turn it on if the image comes out upside down or a quarter turn off.",
@@ -6322,14 +6352,33 @@ fn setup_settings(
         picker_settings.rotation_fix.unwrap_or(false),
         true,
     ));
-    display_rows.push(SettingsRow::Toggle(
-        "Manual UI rotation",
-        "The game rotates its own UI; the emulator leaves the window orientation alone. Needed by a few old games.",
-        "manualUIRotation:",
-        picker_settings.manual_ui_rotation.unwrap_or(false),
-        true,
-    ));
     sections.push(("DISPLAY", display_rows));
+    // Compatibility fixes: off unless a switch is flipped or the bundled
+    // per-app defaults enable them. Each applies on the next launch.
+    let fix_rows = vec![
+        SettingsRow::Toggle(
+            "Preserve DYLD stubs",
+            "Keeps the app's own linker stubs instead of rewriting imports at startup. Needed by engines that checksum their code, such as Earn to Die. Other games can break with this on.",
+            "preserveDYLDStubs:",
+            picker_settings.preserve_dyld_stubs.unwrap_or(false),
+            true,
+        ),
+        SettingsRow::Toggle(
+            "Enable dladdr()",
+            "Answer dladdr() for real instead of returning failure. Some old games hang while resolving their own images; this helps only those games.",
+            "dladdr:",
+            picker_settings.dladdr.unwrap_or(false),
+            true,
+        ),
+        SettingsRow::Toggle(
+            "Manual UI rotation",
+            "The game rotates its own drawing and touches, so the emulator stops rotating the window and keeps the root view in portrait. Needed by Exploration.",
+            "manualUIRotation:",
+            picker_settings.manual_ui_rotation.unwrap_or(false),
+            true,
+        ),
+    ];
+    sections.push(("FIXES", fix_rows));
     let overlay_mode_options: &'static [(&'static str, &'static str)] =
         if cfg!(any(target_os = "android", target_os = "ios")) {
             &[
@@ -7979,6 +8028,8 @@ fn toggle_value_for_selector(settings: &PickerSettings, selector: &str) -> Optio
         "popupErrors:" => settings.popup_errors,
         "rotationFix:" => settings.rotation_fix.unwrap_or(false),
         "manualUIRotation:" => settings.manual_ui_rotation.unwrap_or(false),
+        "preserveDYLDStubs:" => settings.preserve_dyld_stubs.unwrap_or(false),
+        "dladdr:" => settings.dladdr.unwrap_or(false),
         "moviePlayerFix:" => settings.fix_movie_player.unwrap_or(false),
         "showLockScreen:" => settings.show_lock_screen,
         _ => return None,
@@ -8498,10 +8549,6 @@ fn quick_options_fix_movie_player_argument(enabled: bool) -> &'static str {
     }
 }
 
-/// Launch arguments for the two compatibility fix switches. An untouched
-/// switch (`None`) emits nothing: `--no-rotation-fix` / `--no-fix-movie-player`
-/// are explicit overrides that would cancel the app-specific defaults in
-/// touchHLE_default_options.txt (GTA III needs both fixes).
 fn quick_options_manual_ui_rotation_argument(enabled: bool) -> &'static str {
     if enabled {
         "--manual-ui-rotation"
@@ -8509,6 +8556,24 @@ fn quick_options_manual_ui_rotation_argument(enabled: bool) -> &'static str {
         "--no-manual-ui-rotation"
     }
 }
+fn quick_options_preserve_dyld_stubs_argument(enabled: bool) -> &'static str {
+    if enabled {
+        "--preserve-dyld-stubs"
+    } else {
+        "--no-preserve-dyld-stubs"
+    }
+}
+fn quick_options_dladdr_argument(enabled: bool) -> &'static str {
+    if enabled {
+        "--dladdr"
+    } else {
+        "--no-dladdr"
+    }
+}
+/// Launch arguments for the two compatibility fix switches. An untouched
+/// switch (`None`) emits nothing: `--no-rotation-fix` / `--no-fix-movie-player`
+/// are explicit overrides that would cancel the app-specific defaults in
+/// touchHLE_default_options.txt (GTA III needs both fixes).
 fn quick_options_fix_arguments(
     rotation_fix: Option<bool>,
     fix_movie_player: Option<bool>,
@@ -8873,6 +8938,16 @@ mod quick_options_fix_tests {
             quick_options_manual_ui_rotation_argument(false),
             "--no-manual-ui-rotation"
         );
+        assert_eq!(
+            quick_options_preserve_dyld_stubs_argument(true),
+            "--preserve-dyld-stubs"
+        );
+        assert_eq!(
+            quick_options_preserve_dyld_stubs_argument(false),
+            "--no-preserve-dyld-stubs"
+        );
+        assert_eq!(quick_options_dladdr_argument(true), "--dladdr");
+        assert_eq!(quick_options_dladdr_argument(false), "--no-dladdr");
         assert!(quick_options_fix_arguments(None, None).is_empty());
         assert_eq!(
             quick_options_fix_arguments(Some(true), None),
