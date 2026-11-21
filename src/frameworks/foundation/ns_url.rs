@@ -677,10 +677,14 @@ pub const CLASSES: ClassExports = objc_classes! {
         // https://developer.apple.com/documentation/foundation/nsurl/urlbyappendingpathcomponent(_:isdirectory:)
         let base = to_rust_string(env, ns_string);
         let component = to_rust_string(env, path_component);
-        let mut new_string = format!("{}/{}", base.trim_end_matches('/'), component);
+        // The component joins the path, so a query or fragment stays last:
+        let split_at = base.find(|c| c == '?' || c == '#').unwrap_or(base.len());
+        let (base_path, base_suffix) = base.split_at(split_at);
+        let mut new_string = format!("{}/{}", base_path.trim_end_matches('/'), component);
         if is_directory {
             new_string.push('/');
         }
+        new_string.push_str(base_suffix);
         let new_string = from_rust_string(env, new_string);
         return msg_class![env; NSURL URLWithString:new_string];
     }
@@ -923,6 +927,12 @@ mod tests {
         let joined: id = msg![env; base URLByAppendingPathComponent:component];
         let text: id = msg![env; joined absoluteString];
         assert_eq!(&*to_rust_string(env, text), "http://example.com/a/b");
+        // A query comes after the path, so appending keeps it last.
+        let query_text = from_rust_string(env, "http://example.com/a?x=1".to_string());
+        let query_base: id = msg_class![env; NSURL URLWithString:query_text];
+        let joined: id = msg![env; query_base URLByAppendingPathComponent:component];
+        let text: id = msg![env; joined absoluteString];
+        assert_eq!(&*to_rust_string(env, text), "http://example.com/a/b?x=1");
         () = msg![env; pool drain];
     }
 }
