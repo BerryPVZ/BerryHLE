@@ -543,6 +543,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     a == b
 }
 
+- (NSUInteger)hash {
+    // Two NSData objects with the same bytes are equal, so they must hash the
+    // same. The NSObject default hashes the pointer, which would make an
+    // equal-but-distinct NSData miss as a dictionary key.
+    // e.g. an NSDictionary keyed by the result of -dataUsingEncoding:.
+    super::hash_helper(&to_rust_slice(env, this))
+}
+
 - (bool)isEqual:(id)other {
     if this == other {
         return true;
@@ -879,5 +887,39 @@ mod tests {
         let short =
             base64_encode_with_options(&[0u8; 48], NSDataBase64Encoding64CharacterLineLength);
         assert_eq!(short.len(), 64);
+    }
+
+    /// Equal `NSData` objects must hash equally, or they fail as dictionary
+    /// keys: `NSDictionary` looks a key up by `-hash` before confirming with
+    /// `-isEqual:`.
+    /// https://developer.apple.com/documentation/foundation/nsdata/1413194-hash
+    #[test]
+    fn equal_data_hashes_equally() {
+        let _lock = crate::environment::ENVIRONMENT_TEST_LOCK.lock().unwrap();
+        let options = crate::options::Options {
+            headless: true,
+            popup_errors: false,
+            ..Default::default()
+        };
+        let icon = crate::image::Image::from_pixels(1, 1, vec![0; 4]);
+        let mut env = crate::environment::Environment::new_without_app(options, icon).unwrap();
+        let env = &mut env;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let a: id = msg_class![env; NSMutableData new];
+        let b: id = msg_class![env; NSMutableData new];
+        let bytes = env.mem.alloc(3).cast::<u8>();
+        env.mem.bytes_at_mut(bytes, 3).copy_from_slice(&[1, 2, 3]);
+        let bytes: ConstPtr<u8> = bytes.cast_const();
+        () = msg![env; a appendBytes:bytes length:3usize];
+        () = msg![env; b appendBytes:bytes length:3usize];
+        let hash_a: usize = msg![env; a hash];
+        let hash_b: usize = msg![env; b hash];
+        assert_eq!(hash_a, hash_b);
+        let dict: id = msg_class![env; NSMutableDictionary new];
+        let value: id = msg_class![env; NSNumber numberWithInt:42i32];
+        () = msg![env; dict setObject:value forKey:a];
+        let found: id = msg![env; dict objectForKey:b];
+        assert_eq!(found, value, "an equal NSData must find the stored value");
+        () = msg![env; pool drain];
     }
 }
