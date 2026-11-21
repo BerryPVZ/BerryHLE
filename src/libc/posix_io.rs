@@ -226,6 +226,21 @@ struct flock {
 }
 unsafe impl SafeRead for flock {}
 
+/// Darwin's `struct fstore`, the argument of `F_PREALLOCATE`. A 32-bit flags
+/// word, a 32-bit position mode, then three 64-bit `off_t`s, which puts the
+/// 64-bit fields at offsets 8, 16 and 24 on both 32-bit and 64-bit Darwin.
+#[repr(C)]
+#[derive(Debug, Default)]
+#[allow(non_camel_case_types)]
+struct fstore {
+    fst_flags: u32,
+    fst_posmode: i32,
+    fst_offset: off_t,
+    fst_length: off_t,
+    fst_bytesalloc: off_t,
+}
+unsafe impl SafeRead for fstore {}
+
 pub type FLockFlag = i32;
 pub const LOCK_SH: FLockFlag = 1;
 pub const LOCK_EX: FLockFlag = 2;
@@ -1476,15 +1491,50 @@ fn fcntl(
             log_dbg!("fcntl({}, F_RDAHEAD, {}) — ignored", fd, arg);
         }
         F_PREALLOCATE => {
-            log_dbg!("fcntl({}, F_PREALLOCATE) — ignored", fd);
+            // A Darwin app sizes a database file before mapping it by asking
+            // the filesystem for space: xnu copyins an `fstore_t`, allocates
+            // the extent, and copies back how many bytes it allocated. The
+            // file has to really grow, or a later `mmap` of it covers EOF.
+            // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_descrip.c
+            let store_ptr: MutPtr<fstore> = args.start().next(env);
+            let mut store = env.mem.read(store_ptr);
+            let current_size = match env.libc_state.posix_io.file_for_fd(fd) {
+                Some(file) => file.file.stream_len().unwrap_or(0) as off_t,
+                None => {
+                    set_errno(env, EBADF);
+                    return -1;
+                }
+            };
+            let target = if store.fst_posmode == F_VOLPOSMODE {
+                store.fst_offset.saturating_add(store.fst_length)
+            } else {
+                current_size.saturating_add(store.fst_length)
+            };
+            let result = ftruncate(env, fd, target);
+            if result != 0 {
+                return result;
+            }
+            store.fst_bytesalloc = store.fst_length;
+            let allocated = store.fst_bytesalloc;
+            env.mem.write(store_ptr, store);
+            log_dbg!(
+                "fcntl({}, F_PREALLOCATE, {}) => grew file to {} bytes",
+                fd,
+                allocated,
+                target
+            );
         }
         F_TRUNCATEOVERSIZE => {
             let _size: i64 = args.start().next(env);
             log_dbg!("fcntl({}, F_TRUNCATEOVERSIZE) — ignored", fd);
         }
         F_SETSIZE => {
-            let size: i64 = args.start().next(env);
-            log_dbg!("fcntl({}, F_SETSIZE, {}) — ignored", fd, size);
+            // xnu's F_SETSIZE takes a pointer to the new length and truncates
+            // or extends the file to it: `copyin(argp, &offset, sizeof(off_t))`.
+            // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_descrip.c
+            let size_ptr: ConstPtr<off_t> = args.start().next(env);
+            let size = env.mem.read(size_ptr);
+            return ftruncate(env, fd, size);
         }
         F_FULLFSYNC => {
             log_dbg!("fcntl({}, F_FULLFSYNC) — no-op", fd);
@@ -2051,9 +2101,21 @@ fn release_range_from_locks(locks: &mut Vec<LockRange>, release: &LockRange) {
 #[cfg(test)]
 mod tests {
     use super::{
-        descriptor_flags_from_open, path_after_app_bundle_component,
+        descriptor_flags_from_open, fstore, path_after_app_bundle_component,
         strip_udk_game_bundle_prefix, FD_CLOEXEC, O_CLOEXEC, O_DSYNC,
     };
+
+    /// The guest lays out `fstore_t` itself, so our copy has to agree with
+    /// Darwin's: two 32-bit fields, then three 64-bit `off_t`s.
+    #[test]
+    fn fstore_matches_darwins_layout() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(offset_of!(fstore, fst_posmode), 4);
+        assert_eq!(offset_of!(fstore, fst_offset), 8);
+        assert_eq!(offset_of!(fstore, fst_length), 16);
+        assert_eq!(offset_of!(fstore, fst_bytesalloc), 24);
+        assert_eq!(size_of::<fstore>(), 32);
+    }
 
     #[test]
     fn apple_open_flags_are_distinct_and_cloexec_maps_to_descriptor_flag() {
