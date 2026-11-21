@@ -667,10 +667,23 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)URLByAppendingPathComponent:(id)path_component // NSString*
                       isDirectory:(bool)is_directory {
-    let &NSURLHostObject::FileURL { ns_string, .. } = env.objc.borrow(this) else {
-        log!("Warning: URLByAppendingPathComponent: called on non-file URL");
-        return this;
+    let (ns_string, is_file_url) = match env.objc.borrow::<NSURLHostObject>(this) {
+        NSURLHostObject::FileURL { ns_string, .. } => (*ns_string, true),
+        NSURLHostObject::OtherURL { ns_string } => (*ns_string, false),
     };
+    if !is_file_url {
+        // Every URL has a path, not only file URLs, and iOS appends the
+        // component to it instead of returning the receiver unchanged:
+        // https://developer.apple.com/documentation/foundation/nsurl/urlbyappendingpathcomponent(_:isdirectory:)
+        let base = to_rust_string(env, ns_string);
+        let component = to_rust_string(env, path_component);
+        let mut new_string = format!("{}/{}", base.trim_end_matches('/'), component);
+        if is_directory {
+            new_string.push('/');
+        }
+        let new_string = from_rust_string(env, new_string);
+        return msg_class![env; NSURL URLWithString:new_string];
+    }
     let mut path: id = msg![env; ns_string stringByAppendingPathComponent:path_component];
     if is_directory {
         path = msg![env; path stringByAppendingString:(get_static_str(env, "/"))];
@@ -882,5 +895,34 @@ pub fn to_rust_path(env: &mut Environment, url: id) -> Cow<'static, GuestPath> {
     match to_rust_string(env, path_string) {
         Cow::Borrowed(path) => Cow::Borrowed(path.as_ref()),
         Cow::Owned(path_buf) => Cow::Owned(path_buf.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A URL of any scheme has a path, and iOS appends the component to it.
+    /// Returning the receiver unchanged leaves the caller with the base URL.
+    /// https://developer.apple.com/documentation/foundation/nsurl/urlbyappendingpathcomponent(_:isdirectory:)
+    #[test]
+    fn appending_a_path_component_works_on_a_non_file_url() {
+        let _lock = crate::environment::ENVIRONMENT_TEST_LOCK.lock().unwrap();
+        let options = crate::options::Options {
+            headless: true,
+            popup_errors: false,
+            ..Default::default()
+        };
+        let icon = crate::image::Image::from_pixels(1, 1, vec![0; 4]);
+        let mut env = crate::environment::Environment::new_without_app(options, icon).unwrap();
+        let env = &mut env;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let base_text = from_rust_string(env, "http://example.com/a".to_string());
+        let base: id = msg_class![env; NSURL URLWithString:base_text];
+        let component = from_rust_string(env, "b".to_string());
+        let joined: id = msg![env; base URLByAppendingPathComponent:component];
+        let text: id = msg![env; joined absoluteString];
+        assert_eq!(&*to_rust_string(env, text), "http://example.com/a/b");
+        () = msg![env; pool drain];
     }
 }
