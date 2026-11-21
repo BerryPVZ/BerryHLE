@@ -372,6 +372,7 @@ fn run_session<T: Iterator<Item = String>>(
     let mut bundle_path: Option<PathBuf> = None;
     let mut just_info = false;
     let mut option_args = Vec::new();
+    let mut picker_option_args = Vec::new();
     let mut options = options::Options::default();
     let mut app_args = None::<Vec<String>>;
     for arg in args {
@@ -424,7 +425,7 @@ fn run_session<T: Iterator<Item = String>>(
         );
         let (bundle_path, mut extra_options) =
             environment::app_picker::app_picker(options, !returning_to_picker)?;
-        option_args.append(&mut extra_options);
+        picker_option_args.append(&mut extra_options);
         bundle_path
     };
     // When PowerShell does tab-completion on a directory, for some reason it
@@ -629,6 +630,13 @@ fn run_session<T: Iterator<Item = String>>(
             }
         }
         Ok(())
+    }
+    // App picker choices are applied before the file options, so this app's
+    // bundled compatibility defaults override them. Command-line options are
+    // reapplied last and still win.
+    for option_arg in &picker_option_args {
+        let parse_result = options.parse_argument(option_arg);
+        assert!(parse_result == Ok(true));
     }
     let default_options_file = paths::default_options_file();
     let default_options_path = default_options_file.as_str();
