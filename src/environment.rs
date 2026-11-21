@@ -1086,6 +1086,11 @@ impl Environment {
                 let stack_base = std::ptr::addr_of!(yielder) as usize;
                 run_guest_coroutine(yielder, env, move |env| {
                     env.threads[0].host_stack_base = stack_base;
+                    // Some apps use the stack inside the static initializer.
+                    // While properly behaving apps should be fine, some app
+                    // will try to poke the top of the stack, so we'll give
+                    // it some room.
+                    env.cpu.regs_mut()[Cpu::SP] = 0xFFFFF000;
 
                     // Call `+load` method on classes where it's defined.
                     // TODO: `+load` methods from our image should take priority
