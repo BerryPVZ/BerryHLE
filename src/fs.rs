@@ -926,7 +926,9 @@ impl Seek for GuestFile {
                     }
                     // `fstat()` reports a size of 0 for a directory, so there
                     // is nowhere else for `SEEK_END` to start from.
-                    std::io::SeekFrom::End(delta) => 0u64.saturating_add_signed(delta),
+                    std::io::SeekFrom::End(delta) => {
+                        0u64.saturating_add_signed(delta)
+                    }
                 };
                 *offset = new_offset;
                 Ok(new_offset)
