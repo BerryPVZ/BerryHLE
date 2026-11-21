@@ -5,6 +5,10 @@
 /HyperHLE_apps/*.ipa
 /HyperHLE_apps/*.app
 HyperHLE_log.txt
+# Legacy names: copied forward on first launch and never deleted.
+/touchHLE_sandbox
+/touchHLE_apps/
+touchHLE_log.txt
 /touchHLE_dumps
 
 # Xcode (integration testing app)
