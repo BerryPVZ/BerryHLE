@@ -1085,6 +1085,7 @@ impl Environment {
             Coroutine::with_stack(main_thread_init_stack, move |yielder, env: Environment| {
                 let stack_base = std::ptr::addr_of!(yielder) as usize;
                 run_guest_coroutine(yielder, env, move |env| {
+                    echo!("CPU emulation begins now.");
                     env.threads[0].host_stack_base = stack_base;
                     // Some apps use the stack inside the static initializer.
                     // While properly behaving apps should be fine, some app
