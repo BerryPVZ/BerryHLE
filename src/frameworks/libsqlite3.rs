@@ -1,4 +1,5 @@
 use crate::dyld::{export_c_func, FunctionExports, HostDylib};
+use crate::fs::GuestPath;
 use crate::mem::{ConstPtr, MutPtr};
 use crate::Environment;
 use rusqlite::Connection;
@@ -93,34 +94,53 @@ fn set_error(db_handle: u32, msg: String) {
 }
 
 // ---------- sqlite3_open ----------
+/// Location for databases the guest filesystem cannot map to a host path
+/// (read-only bundle files, or the empty filename that means "temporary").
+fn private_sqlite_path(env: &Environment, filename: &str) -> String {
+    let safe_name = filename
+        .replace('/', "_")
+        .replace('\\', "_")
+        .replace(':', "_");
+
+    let app_ns = std::env::var("TOUCHHLE_SQLITE_NAMESPACE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| env.bundle.bundle_identifier().to_string())
+        .replace('/', "_")
+        .replace('\\', "_")
+        .replace(':', "_")
+        .replace(' ', "_");
+
+    let dir = crate::paths::user_data_base_path().join(crate::paths::SQLITE_DIR);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log!("libsqlite3: failed to create sqlite dir {:?}: {}", dir, e);
+    }
+
+    dir.join(format!("{}_{}", app_ns, safe_name))
+        .to_string_lossy()
+        .into_owned()
+}
 pub fn sqlite3_open(env: &mut Environment, filename_ptr: u32, pp_db: u32) -> u32 {
     let filename = read_cstring(env, filename_ptr);
 
+    // Darwin's SQLite sees the same filesystem as the app, so a database the
+    // app also opens with `open`/`mmap` must be the very file SQLite edits.
+    // Use the host path the guest filesystem resolves to, so both views agree.
     let path = if filename == ":memory:" {
         ":memory:".to_string()
-    } else {
-        let safe_name = filename
-            .replace('/', "_")
-            .replace('\\', "_")
-            .replace(':', "_");
-
-        let app_ns = std::env::var("TOUCHHLE_SQLITE_NAMESPACE")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| env.bundle.bundle_identifier().to_string())
-            .replace('/', "_")
-            .replace('\\', "_")
-            .replace(':', "_")
-            .replace(' ', "_");
-
-        let dir = crate::paths::user_data_base_path().join(crate::paths::SQLITE_DIR);
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            log!("libsqlite3: failed to create sqlite dir {:?}: {}", dir, e);
+    } else if !filename.is_empty() {
+        match env.fs.writable_host_path(GuestPath::new(&filename)) {
+            Ok(host_path) => host_path.to_string_lossy().into_owned(),
+            Err(()) => {
+                log!(
+                    "libsqlite3: {:?} has no writable guest path, using a private database",
+                    filename
+                );
+                private_sqlite_path(env, &filename)
+            }
         }
-
-        dir.join(format!("{}_{}", app_ns, safe_name))
-            .to_string_lossy()
-            .into_owned()
+    } else {
+        private_sqlite_path(env, &filename)
     };
 
     log!(
