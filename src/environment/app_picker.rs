@@ -3797,16 +3797,16 @@ log!("Warning: Couldn't inspect the last app's bundle; some app-specific options
         quick_options_force_composition_argument(picker_settings.force_composition).to_string(),
     );
 
-    // Always passed explicitly so the picker's renderer choice wins over
-    // options-file settings, including legacy --gles-native switches.
+    // Always passed explicitly so the picker's renderer choice is applied;
+    // this app's bundled defaults and options files still override it.
     option_args
         .push(quick_options_renderer_mode_argument(picker_settings.renderer_mode).to_string());
-option_args.extend(quick_options_ram_limiter_arguments(
+    option_args.extend(quick_options_ram_limiter_arguments(
         picker_settings.memory_limit_mb,
     ));
 
-    // The two compatibility fixes are only emitted when the Settings screen
-    // actually set them (see `quick_options_fix_arguments`).
+    // Compatibility fix switches are only emitted when the Settings screen
+    // actually set them.
     option_args.extend(quick_options_fix_arguments(
         picker_settings.rotation_fix,
         picker_settings.fix_movie_player,
@@ -6343,8 +6343,9 @@ fn setup_settings(
         ));
     }
     sections.push(("DISPLAY", display_rows));
-    // Compatibility fixes: off unless a switch is flipped or the bundled
-    // per-app defaults enable them. Each applies on the next launch.
+    // Compatibility fixes for the app about to launch. A flipped switch is
+    // applied first, so the app's bundled defaults still override it; each
+    // applies on the next launch.
     let fix_rows = vec![
         SettingsRow::Toggle(
             "Preserve DYLD stubs",
@@ -6355,7 +6356,7 @@ fn setup_settings(
         ),
         SettingsRow::Toggle(
             "Enable dladdr()",
-            "Answer dladdr() for real instead of returning failure. Some old games hang while resolving their own images; this helps only those games.",
+            "Answer dladdr() for real instead of returning failure. Some old games hang while resolving their own images, so this helps only those games; no app turns it on by default.",
             "dladdr:",
             picker_settings.dladdr.unwrap_or(false),
             true,
@@ -6368,8 +6369,8 @@ fn setup_settings(
             true,
         ),
         // Opt-in, and may be enabled per-app in the options files. Leaving the
-        // switch alone keeps those defaults; flipping it (either way) is an
-        // explicit override for every later launch.
+        // switch alone keeps those defaults; a flipped switch is applied first,
+        // so a bundled default for this app still wins.
         SettingsRow::Toggle(
             "Rotation fix",
             "Turns the game image to match the app's own autorotation instead of the old iPad guess. Turn it on if the image comes out upside down or a quarter turn off.",
@@ -8571,9 +8572,10 @@ fn quick_options_dladdr_argument(enabled: bool) -> &'static str {
     }
 }
 /// Launch arguments for the two compatibility fix switches. An untouched
-/// switch (`None`) emits nothing: `--no-rotation-fix` / `--no-fix-movie-player`
-/// are explicit overrides that would cancel the app-specific defaults in
-/// touchHLE_default_options.txt (GTA III needs both fixes).
+/// switch (`None`) emits nothing; a flipped switch emits an explicit
+/// `--rotation-fix` / `--no-rotation-fix` or `--fix-movie-player` /
+/// `--no-fix-movie-player`. The app's bundled defaults in
+/// touchHLE_default_options.txt are still applied afterwards and win.
 fn quick_options_fix_arguments(
     rotation_fix: Option<bool>,
     fix_movie_player: Option<bool>,
