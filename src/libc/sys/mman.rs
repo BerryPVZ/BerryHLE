@@ -88,9 +88,17 @@ struct FileBacking {
 /// memory-mapped database, say) diverge, and flushing at unmap time is too
 /// late for the reader. Warn when that happens.
 fn file_identity(file: &File) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = file.metadata().ok()?;
-    Some((metadata.dev(), metadata.ino()))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata().ok()?;
+        Some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        None
+    }
 }
 /// Warn when `file` already backs another live shared mapping.
 fn warn_about_second_mapping(
