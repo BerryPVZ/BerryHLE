@@ -13,6 +13,15 @@ buildscript {
         kotlin_version = '2.0.21'
     }
     repositories {
+        // Central answers through several front ends; a 404 storm on one of
+        // them (as GitHub's runners saw on repo.maven.apache.org) leaves the
+        // others serving the same artifacts, so list the alternatives.
+        maven {
+            url "https://maven-central.storage-download.googleapis.com/maven2/"
+        }
+        maven {
+            url "https://repo1.maven.org/maven2"
+        }
         mavenCentral()
         google()
         maven {
@@ -31,6 +40,12 @@ buildscript {
 
 allprojects {
     repositories {
+        maven {
+            url "https://maven-central.storage-download.googleapis.com/maven2/"
+        }
+        maven {
+            url "https://repo1.maven.org/maven2"
+        }
         mavenCentral()
         google()
     }
