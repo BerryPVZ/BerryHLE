@@ -963,7 +963,7 @@ fn quick_exit(env: &mut Environment, exit_code: i32) {
     immediate_exit(env, "quick_exit", exit_code);
 }
 
-fn abort(env: &mut Environment) {
+pub(crate) fn abort(env: &mut Environment) {
     let outcome = raise_signal(env, SIGABRT);
     if outcome == RaiseOutcome::DefaultActionPerformed
         || env.is_guest_termination_requested()

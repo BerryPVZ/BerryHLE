@@ -1446,64 +1446,53 @@ pub fn objc_getClass(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class 
     nil
 }
 
-pub fn objc_begin_catch(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class {
-    if name.is_null() {
-        return nil;
-    }
+/// `void objc_exception_throw(id exception)` — see Apple's `objc-exception.h`
+/// (`https://opensource.apple.com/source/objc4/objc4-532.2/runtime/objc-exception.mm`).
+///
+/// touchHLE has no Objective-C unwinder, so the exception is described in the
+/// log and control returns to the nearest app-level frame, the same bypass the
+/// C++ ABI entry points use. `objc_exception_rethrow` shares it.
+pub fn objc_exception_throw(env: &mut crate::Environment, exception: id) {
+    let description = exception_description(env, exception);
+    crate::libc::cxxabi::unwind_past_objc_exception(env, &description);
+}
 
-    let name_str = match env.mem.cstr_at_utf8(name) {
-        Ok(s) => s.to_string(),
-        Err(_) => return nil,
-    };
-    if let Some(class) = env.objc.get_class(&name_str, false, &env.mem) {
-        return class;
-    }
+/// `void objc_exception_rethrow(void)`.
+pub fn objc_exception_rethrow(env: &mut crate::Environment) {
+    crate::libc::cxxabi::unwind_past_objc_exception(env, "re-thrown with no exception in flight");
+}
 
-    if ObjC::find_template(&name_str).is_some() {
-        return env.objc.link_class(&name_str, false, &mut env.mem);
-    }
+/// `void objc_terminate(void)` — called when an exception reaches a frame that
+/// cannot handle it. iOS terminates the process; the guest requests that here
+/// so headless sessions and TestApp keep their strict termination behaviour.
+pub fn objc_terminate(env: &mut crate::Environment) {
+    log!(
+        "objc_terminate: an Objective-C exception reached a frame with no handler, \
+         terminating the guest as iOS does."
+    );
+    crate::libc::stdlib::abort(env);
+}
 
+/// `id objc_begin_catch(void *exception_buffer)`. The throw bypass above returns
+/// to an app frame instead of unwinding into a catch landing pad, so no
+/// exception is ever in flight when a catch block runs.
+pub fn objc_begin_catch(_env: &mut crate::Environment, _exception_buffer: MutVoidPtr) -> id {
     nil
 }
 
-pub fn objc_end_catch(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class {
-    if name.is_null() {
-        return nil;
+/// `void objc_end_catch(void)`. Nothing was retained by `objc_begin_catch`.
+pub fn objc_end_catch(_env: &mut crate::Environment) {}
+
+fn exception_description(env: &mut crate::Environment, exception: id) -> String {
+    if exception.is_null() {
+        return "nil".to_owned();
     }
-
-    let name_str = match env.mem.cstr_at_utf8(name) {
-        Ok(s) => s.to_string(),
-        Err(_) => return nil,
-    };
-    if let Some(class) = env.objc.get_class(&name_str, false, &env.mem) {
-        return class;
-    }
-
-    if ObjC::find_template(&name_str).is_some() {
-        return env.objc.link_class(&name_str, false, &mut env.mem);
-    }
-
-    nil
-}
-
-pub fn objc_exception_throw(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class {
-    if name.is_null() {
-        return nil;
-    }
-
-    let name_str = match env.mem.cstr_at_utf8(name) {
-        Ok(s) => s.to_string(),
-        Err(_) => return nil,
-    };
-    if let Some(class) = env.objc.get_class(&name_str, false, &env.mem) {
-        return class;
-    }
-
-    if ObjC::find_template(&name_str).is_some() {
-        return env.objc.link_class(&name_str, false, &mut env.mem);
-    }
-
-    nil
+    let class = object_getClass(env, exception);
+    format!(
+        "of class {} at {:?}",
+        env.objc.get_class_name(class),
+        exception
+    )
 }
 
 pub fn object_getClassName(env: &mut crate::Environment, obj: id) -> Class {
