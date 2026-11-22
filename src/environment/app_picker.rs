@@ -2612,7 +2612,6 @@ fn app_picker_inner(
     let mut quick_options_force_composition_override = Some(picker_settings.force_composition);
     let mut quick_options_cheat_engine = picker_settings.cheat_engine;
     let mut quick_options_quick_menu = picker_settings.quick_menu;
-    let mut quick_options_dladdr = picker_settings.dladdr;
     let mut device_state = DropdownState {
         selected: picker_settings.device_model_tag,
         ..Default::default()
@@ -3569,7 +3568,6 @@ log!("Warning: Couldn't inspect the last app's bundle; some app-specific options
             picker_settings.preserve_dyld_stubs = Some(preserve_dyld_stubs);
         } else if let Some(dladdr) = std::mem::take(&mut host_obj.dladdr) {
             picker_settings.dladdr = Some(dladdr);
-            quick_options_dladdr = Some(dladdr);
         } else if std::mem::take(&mut host_obj.corruption_mode_changed) {
             picker_settings.corruption_mode =
                 host_obj.corruption_mode.unwrap_or(CorruptionMode::Off);
@@ -3770,14 +3768,6 @@ log!("Warning: Couldn't inspect the last app's bundle; some app-specific options
         .push(quick_options_trace_gl_errors_argument(picker_settings.trace_gl_errors).to_string());
     option_args
         .push(quick_options_trace_gl_draws_argument(picker_settings.trace_gl_draws).to_string());
-    option_args.push(
-        if quick_options_dladdr.unwrap_or(false) {
-            "--dladdr"
-        } else {
-            "--no-dladdr"
-        }
-        .to_string(),
-    );
     option_args.push(
         if picker_settings.quick_menu {
             "--quick-menu"

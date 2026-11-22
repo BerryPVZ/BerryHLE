@@ -421,7 +421,6 @@ mod tests {
     }
 
     #[test]
-#[test]
 fn curl_keeps_its_hinge_edge_fixed() {
     let bounds = CGRect {
         origin: CGPoint { x: 10.0, y: 20.0 },
