@@ -649,14 +649,12 @@ fn pan_touches_moved(
     // UIKit reports velocity in points per second since the previous event.
     let velocity = match last_move {
         Some(last) => {
-            let seconds = now.duration_since(last).as_secs_f64() as CGFloat;
-            if seconds > 0.0 {
-                CGPoint {
-                    x: (location.x - previous.x) / seconds,
-                    y: (location.y - previous.y) / seconds,
-                }
-            } else {
-                CGPoint { x: 0.0, y: 0.0 }
+            // Clamp to a millisecond so a pair of events in the same tick
+            // cannot divide by zero or report an infinite velocity.
+            let seconds = now.duration_since(last).as_secs_f64().max(0.001) as CGFloat;
+            CGPoint {
+                x: (location.x - previous.x) / seconds,
+                y: (location.y - previous.y) / seconds,
             }
         }
         None => CGPoint { x: 0.0, y: 0.0 },
