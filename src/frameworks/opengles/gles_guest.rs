@@ -3340,11 +3340,17 @@ unsafe fn supply_min_filter_after_upload(
     target: GLenum,
     texture: Option<GLuint>,
 ) {
+    // TexParameter and the parameter queries take the cube target, not a face.
+    let parameter_target = crate::gles::util::tex_parameter_target(target);
     let mut current: GLint = 0;
-    gles.GetTexParameteriv(target, gles11::TEXTURE_MIN_FILTER, &mut current);
-    if let Some(texture) = texture {
-        shadow.forget_generated_mipmaps(target, texture);
-    }
+    gles.GetTexParameteriv(parameter_target, gles11::TEXTURE_MIN_FILTER, &mut current);
+    let pending = match texture {
+        Some(texture) => {
+            shadow.forget_generated_mipmaps(parameter_target, texture);
+            shadow.take_pending_min_filter(parameter_target, texture)
+        }
+        None => None,
+    };
     if !gles.is_es2() {
         use std::sync::atomic::{AtomicBool, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
@@ -3355,7 +3361,20 @@ unsafe fn supply_min_filter_after_upload(
                  [this log will only be shown once]"
             );
         }
-        gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+        gles.TexParameteri(parameter_target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+        return;
+    }
+    // A mipmap filter set before this upload could not build a chain then
+    // because there was no level 0 yet. Now there is, so apply what the guest
+    // asked for: keeping the substitute instead would lose minification for
+    // the life of the texture.
+    if let Some(requested) = pending {
+        let filter = if generate_mipmaps(gles, shadow, target) {
+            requested
+        } else {
+            demipmap_filter_value(gles11::TEXTURE_MIN_FILTER, requested)
+        };
+        gles.TexParameteri(parameter_target, gles11::TEXTURE_MIN_FILTER, filter);
         return;
     }
     if !is_mipmap_min_filter(current) {
@@ -3367,7 +3386,7 @@ unsafe fn supply_min_filter_after_upload(
     // The host kept the guest's compressed texels and cannot build a chain
     // for them; replace the filter instead of leaving the texture incomplete,
     // which samples black.
-    gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+    gles.TexParameteri(parameter_target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
 }
 
 /// Keep the guest's mipmap `GL_TEXTURE_MIN_FILTER` when a mip chain can be
@@ -3380,17 +3399,30 @@ fn adjust_min_filter(
     pname: GLenum,
     param: GLint,
 ) -> GLint {
-    if !fix_min_filter || pname != gles11::TEXTURE_MIN_FILTER || !is_mipmap_min_filter(param) {
+    if !fix_min_filter || pname != gles11::TEXTURE_MIN_FILTER {
+        return param;
+    }
+    let texture_target = crate::gles::util::tex_parameter_target(target);
+    let texture = unsafe { current_bound_texture(gles, texture_target) }.unwrap_or(0);
+    if !is_mipmap_min_filter(param) {
+        // The guest wants a plain filter, so drop any deferred request.
+        if texture != 0 {
+            shadow.forget_pending_min_filter(texture_target, texture);
+        }
         return param;
     }
     if !gles.is_es2() {
         return demipmap_filter_value(pname, param);
     }
     if unsafe { generate_mipmaps(gles, shadow, target) } {
-        param
-    } else {
-        demipmap_filter_value(pname, param)
+        return param;
     }
+    // The texture has no level 0 yet, which is the usual order: create it, set
+    // the filter, then upload. Keep the request for the upload to honour.
+    if texture != 0 {
+        shadow.record_pending_min_filter(texture_target, texture, param);
+    }
+    demipmap_filter_value(pname, param)
 }
 
 fn glTexParameteri(env: &mut Environment, target: GLenum, pname: GLenum, param: GLint) {

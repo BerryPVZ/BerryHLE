@@ -202,6 +202,11 @@ pub(super) struct GLShadowState {
     /// Textures whose mip chain the emulator generated for the level-0 contents
     /// they currently hold, keyed by `(parameter target, texture name)`.
     pub(super) generated_mipmaps: HashSet<(GLenum, GLuint)>,
+    /// Mipmap `GL_TEXTURE_MIN_FILTER` values a guest asked for before the
+    /// texture had a level 0. The chain can only be built after that upload,
+    /// so the request is kept here and applied then (see
+    /// `gles_guest::supply_min_filter_after_upload`).
+    pub(super) pending_min_filters: HashMap<(GLenum, GLuint), GLint>,
     pub(super) current_vertex_array: GLuint,
     pub(super) software_vertex_arrays: HashSet<GLuint>,
     pub(super) software_vao_element_array_buffers: HashMap<GLuint, GLuint>,
@@ -238,6 +243,7 @@ impl Default for GLShadowState {
             pvrtc_unallocated_levels: HashSet::new(),
             auto_depth_renderbuffers: HashSet::new(),
             generated_mipmaps: HashSet::new(),
+            pending_min_filters: HashMap::new(),
             current_vertex_array: 0,
             software_vertex_arrays: HashSet::new(),
             software_vao_element_array_buffers: HashMap::new(),
@@ -309,6 +315,7 @@ impl GLShadowState {
             .retain(|key, _| key.1 != texture);
         self.pvrtc_unallocated_levels.retain(|key| key.1 != texture);
         self.generated_mipmaps.retain(|key| key.1 != texture);
+        self.pending_min_filters.retain(|key, _| key.1 != texture);
     }
     /// Record that the emulator, not the guest, attached this depth renderbuffer.
     pub(super) fn record_auto_depth_renderbuffer(&mut self, renderbuffer: GLuint) {
@@ -328,6 +335,27 @@ impl GLShadowState {
     /// A new level-0 upload invalidates whatever chain was generated before.
     pub(super) fn forget_generated_mipmaps(&mut self, target: GLenum, texture: GLuint) {
         self.generated_mipmaps.remove(&(target, texture));
+    }
+    /// Remember a mipmap min filter the guest set before the texture had a
+    /// level 0, so the chain and the filter can be applied after the upload.
+    pub(super) fn record_pending_min_filter(
+        &mut self,
+        target: GLenum,
+        texture: GLuint,
+        filter: GLint,
+    ) {
+        self.pending_min_filters.insert((target, texture), filter);
+    }
+    /// Take the remembered filter for `texture`, if any.
+    pub(super) fn take_pending_min_filter(
+        &mut self,
+        target: GLenum,
+        texture: GLuint,
+    ) -> Option<GLint> {
+        self.pending_min_filters.remove(&(target, texture))
+    }
+    pub(super) fn forget_pending_min_filter(&mut self, target: GLenum, texture: GLuint) {
+        self.pending_min_filters.remove(&(target, texture));
     }
     /// Mark a PVRTC level as not yet materialized: its first upload must use
     /// `glTexImage2D` (which defines the level) instead of
