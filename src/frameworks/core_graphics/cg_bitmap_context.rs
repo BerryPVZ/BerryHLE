@@ -622,15 +622,47 @@ pub(super) fn draw_image(
     rect: CGRect,
     image: CGImageRef,
 ) {
+    draw_image_region(env, context, rect, image, None);
+}
+
+/// Blits `rect` of `image`, optionally restricted to the `source` region of
+/// the image (in image pixels). Used by nine-patch drawing, which needs to
+/// draw individual slices; there is no general clip support in the bitmap
+/// context, so the region is applied while sampling instead.
+pub(crate) fn draw_image_region(
+    env: &mut Environment,
+    context: CGContextRef,
+    rect: CGRect,
+    image: CGImageRef,
+    source: Option<CGRect>,
+) {
     let image = cg_image::borrow_image(&env.objc, image);
     let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
 
     let (image_width, image_height) = image.dimensions();
+    let (src_x, src_y, src_width, src_height) = match source {
+        Some(source) => (
+            source.origin.x,
+            source.origin.y,
+            source.size.width,
+            source.size.height,
+        ),
+        None => (0.0, 0.0, image_width as f32, image_height as f32),
+    };
     let mut visited = 0usize;
     let mut src_nonzero = 0usize;
     for ((x, y), (texel_x, texel_y)) in drawer.iter_transformed_pixels(rect) {
-        let texel_x = (image_width as f32 * texel_x) as i32;
-        let texel_y = (image_height as f32 * (1.0 - texel_y)) as i32;
+        let texel_x = src_x + src_width * texel_x;
+        let texel_y = src_y + src_height * (1.0 - texel_y);
+        if texel_x < src_x
+            || texel_x >= src_x + src_width
+            || texel_y < src_y
+            || texel_y >= src_y + src_height
+        {
+            continue;
+        }
+        let texel_x = texel_x as i32;
+        let texel_y = texel_y as i32;
         if texel_x >= 0 && texel_x < image_width as i32 && texel_y >= 0 && texel_y < image_height as i32 {
             let at = (texel_y as usize * image_width as usize + texel_x as usize) * 4;
             let rgba = &image.pixels()[at..at + 4];

@@ -937,6 +937,23 @@ pub fn CGContextDrawImage(
     cg_bitmap_context::draw_image(env, context, rect, image);
 }
 
+/// Same as `CGContextDrawImage`, but only samples the `source` rectangle of
+/// the image (in image pixels). Nine-patch drawing uses it to blit one slice
+/// per call without a real clip path.
+pub(crate) fn draw_image_region(
+    env: &mut Environment,
+    context: CGContextRef,
+    rect: CGRect,
+    image: CGImageRef,
+    source: CGRect,
+) {
+    if context.is_null() {
+        log!("Warning: draw_image_region called with null context, skipping");
+        return;
+    }
+    cg_bitmap_context::draw_image_region(env, context, rect, image, Some(source));
+}
+
 /// `void CGContextDrawTiledImage(CGContextRef c, CGRect rect, CGImageRef image)`
 ///
 /// Apple documentation: draws an image repeatedly, tiling it across the entire
