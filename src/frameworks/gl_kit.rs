@@ -693,4 +693,34 @@ mod tests {
             None
         );
     }
+
+    /// The model transform is applied before the projection, so the inverse
+    /// of `projection * model` is what unprojects; the opposite order gives a
+    /// different point once the two matrices do not commute.
+    #[test]
+    fn glk_math_unproject_inverts_projection_times_model() {
+        let mut projection = GLKMatrix4 { m: [0.0; 16] };
+        projection.m[0] = 2.0;
+        projection.m[5] = 2.0;
+        projection.m[10] = 2.0;
+        projection.m[15] = 1.0;
+        let mut model = matrix4_identity();
+        model.m[12] = 10.0;
+
+        let object = unproject_point(
+            GLKVector3 {
+                x: 100.0,
+                y: 50.0,
+                z: 0.5,
+            },
+            model,
+            projection,
+            [0, 0, 100, 100],
+        )
+        .unwrap();
+        // Inverse projection gives x = 1/2, then inverse translation subtracts 10.
+        assert!((object.x + 9.5).abs() < 1e-5);
+        assert_eq!(object.y, 0.0);
+        assert_eq!(object.z, 0.0);
+    }
 }
