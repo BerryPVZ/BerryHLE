@@ -90,23 +90,23 @@ never shell redirection or `sed`. Run `git diff --check` after editing.
 
 ## Build, test, lint
 
-- `cargo`/`rustc` may be off `PATH`:
-  `export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"`.
-- Submodules first: `git submodule update --init` (`vendor/SDL`, `dynarmic`,
-  `openal-soft`, `libxml2`, `stb`).
-- Fresh builds need `export CMAKE_POLICY_VERSION_MINIMUM=3.5`: CMake 4.4 rejects
-  `sdl2-sys`'s old `cmake_minimum_required`.
-- `cargo test` — 743 unit tests and 2 integration tests. TestApp needs
-  `tests/llvm` (LLVM 12; its `clang` is x86_64, so Rosetta on Apple Silicon) and
-  `tests/common-3.0.sdk`.
+- Initialize submodules: `git submodule update --init --recursive`.
+- With CMake 4, older bundled CMake projects may need
+  `export CMAKE_POLICY_VERSION_MINIMUM=3.5`.
+- `cargo test` runs Rust unit and integration tests. TestApp needs
+  `tests/llvm/bin/clang` (LLVM 12 is tested) and `tests/common-3.0.sdk`;
+  see `tests/README.md` for setup.
 - One test: `cargo test --lib <name>`. TestApp only:
   `cargo test --test integration test_app`.
 - Run an app: `cargo run --release -- path/to/app.app`, with the bundle in
-  `touchHLE_apps/`. That directory, `touchHLE_sandbox/` and the `touchHLE_*.txt`
-  runtime files are gitignored.
+  `touchHLE_apps/`.
 - Android: `android/` builds the core with `--no-default-features` and
   `sdl2/bundled` plus two static wrappers, not the default feature set (see
   `extraCargoBuildArguments` in `android/app/build.gradle`).
+- AppDB requires Python 3.11+: `cd appdb && pip install -e . && uvicorn app.main:app --reload`.
+  Its development SQLite database and uploads are local; production uses `/data`.
+- Telegram bot requires Python 3.10+: `cd telegram_bot && pip install -e '.[test]' && pytest`.
+  See `telegram_bot/README.md` for required environment variables.
 
 ## Formatting and lint
 
@@ -114,10 +114,9 @@ Never run `cargo fmt`: `cargo fmt --check` reports 986 files because the tree is
 hand-formatted (4-space indent, wrapped by hand), so it buries a real change in an
 unreviewable diff. Follow the surrounding style.
 
-`dev-scripts/lint.sh` cannot pass: 351 pre-existing comment lines over 80 columns
-and ~1000 pre-existing clippy warnings that `--deny warnings` turns into a failure.
-Use it as a delta check only: keep new comments within 80 columns, add no new
-warnings. `cargo clippy` needs the `PATH` above.
+`dev-scripts/lint.sh` checks line lengths, Clippy and documentation with warnings
+denied. Existing violations may prevent a clean run; report failures and avoid
+adding new ones.
 
 ## Commits and docs
 
