@@ -2685,7 +2685,7 @@ impl Environment {
     pub(crate) fn replace_direct_guest_call(&mut self, direct: bool) -> bool {
         self.threads
             .get_mut(self.current_thread)
-            .map_or(false, |thread| {
+            .is_some_and(|thread| {
                 std::mem::replace(&mut thread.direct_guest_call, direct)
             })
     }

@@ -91,7 +91,6 @@ use crate::objc::classes::imp_implementationWithBlock;
 use crate::objc::classes::{objc_msgForward, objc_msgForward_stret};
 use crate::Environment;
 use classes::{ClassHostObject, FakeClass, UnimplementedClass};
-use exceptions::__objc_personality_v0 as ___objc_personality_v0;
 use messages::{
     objc_enumerationMutation, objc_msgSendSuper, objc_msgSendSuper2, objc_msgSendSuper2_stret,
     objc_msgSendSuper_stret, objc_msgSend_stret, MsgSendSignature, MsgSendSuperSignature,
@@ -534,7 +533,7 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(class_getMethodImplementation(_, _)),
     export_c_func!(class_getMethodImplementation_stret(_, _)),
     export_c_func!(objc_storeStrong(_, _)),
-    export_c_func!(___objc_personality_v0(_, _, _, _, _)),
+    export_c_func!(__objc_personality_v0(_, _, _, _, _)),
     export_c_func_aliased!("_objc_msgForward", objc_msgForward(_, _)),
     export_c_func_aliased!("_objc_msgForward_stret", objc_msgForward_stret(_, _, _)),
     // Additional ObjC runtime helpers needed by iOS 5/6 binaries.
