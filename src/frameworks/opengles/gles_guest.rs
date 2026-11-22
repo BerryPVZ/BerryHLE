@@ -3861,7 +3861,8 @@ fn glTexSubImage2D(
     pixels: ConstVoidPtr,
 ) {
     super::draw_stats::record_texture_upload();
-    with_ctx_and_mem(env, |gles, mem| unsafe {
+    let fix_filter = env.options.fix_texture_min_filter && level == 0;
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         let pixel_count: GuestUSize = width.checked_mul(height).unwrap().try_into().unwrap();
         let size = image_size_estimate(pixel_count, format, type_);
         let pixels = if pixels.is_null() {
@@ -3871,7 +3872,30 @@ fn glTexSubImage2D(
         };
         gles.TexSubImage2D(
             target, level, xoffset, yoffset, width, height, format, type_, pixels,
-        )
+        );
+        if !fix_filter {
+            return;
+        }
+        // Level 0 changed, so any mip chain built from the old texels is stale.
+        // Rebuild it from the new texels; if the host refuses, drop the
+        // mipmap filter rather than leave an incomplete texture sampling black.
+        let Some(texture) = current_bound_texture(gles, target) else {
+            return;
+        };
+        let parameter_target = crate::gles::util::tex_parameter_target(target);
+        shadow.forget_generated_mipmaps(parameter_target, texture);
+        let mut current_filter: GLint = 0;
+        gles.GetTexParameteriv(parameter_target, gles11::TEXTURE_MIN_FILTER, &mut current_filter);
+        if !is_mipmap_min_filter(current_filter) {
+            return;
+        }
+        if !generate_mipmaps(gles, shadow, target) {
+            gles.TexParameteri(
+                parameter_target,
+                gles11::TEXTURE_MIN_FILTER,
+                gles11::LINEAR as GLint,
+            );
+        }
     })
 }
 fn glCompressedTexImage2D(
