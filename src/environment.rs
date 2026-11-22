@@ -3952,6 +3952,7 @@ impl Environment {
             // Interactive runs report null writes and carry on for
             // compatibility; headless runs preserve the first failure.
             let mut recovered_null_write = false;
+            let mut exhausted_null_write = None;
             if matches!(error, cpu::CpuError::MemoryError) {
                 if let Some((probe_number, address)) = crate::mem::null_write_probe_pending() {
                     crate::mem::null_write_probe_clear();
@@ -3984,11 +3985,30 @@ impl Environment {
                     // session must carry on; headless runs stay strict.
                     if !null_write_probe_is_fatal(self.window.is_some(), probe_number) {
                         recovered_null_write = true;
+                    } else {
+                        exhausted_null_write = Some((probe_number, address));
                     }
                 }
             }
             if recovered_null_write {
                 return;
+            }
+            if let Some((probe_number, address)) = exhausted_null_write {
+                // `MemoryError` is what dynarmic sees when the store is
+                // refused, not the reason the guest failed. Say what actually
+                // happened; the store address and guest PC are the evidence.
+                panic!(
+                    "Guest wrote through a NULL pointer {} time(s); the last store was to \
+                     {:#010x} at PC={:#x} LR={:#x}. HyperHLE discards such stores, and stops \
+                     once the budget runs out (headless: the first; interactive: {}). The \
+                     guest dereferenced a pointer that was never initialised, such as a \
+                     failed allocation or an API that returned NULL.",
+                    probe_number,
+                    address,
+                    self.cpu.regs()[cpu::Cpu::PC],
+                    self.cpu.regs()[cpu::Cpu::LR],
+                    crate::mem::NULL_WRITE_PROBE_LIMIT,
+                );
             }
 
             panic!("Error during CPU execution: {error:?}");
