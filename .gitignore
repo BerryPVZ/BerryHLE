@@ -5,6 +5,8 @@
 /HyperHLE_apps/*.ipa
 /HyperHLE_apps/*.app
 HyperHLE_log.txt
+# User-supplied picker wallpaper; the shipped default is touchHLE_wallpaper.png.
+/HyperHLE_wallpaper.*
 # Legacy names: copied forward on first launch and never deleted.
 /touchHLE_sandbox
 /touchHLE_apps/
