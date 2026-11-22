@@ -67,11 +67,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     let value = serialize_plist(env, plist);
     let mut buf = Vec::new();
     let wrote = if format == NSPropertyListXMLFormat_v1_0 {
-        value.to_writer_xml(&mut buf)
+        Some(value.to_writer_xml(&mut buf))
+    } else if format == NSPropertyListBinaryFormat_v1_0 {
+        Some(value.to_writer_binary(&mut buf))
     } else {
-        value.to_writer_binary(&mut buf)
+        None
     };
-    if wrote.is_err() {
+    if !matches!(wrote, Some(Ok(()))) {
         if !error.is_null() {
             let err = make_plist_write_error(env);
             env.mem.write(error, err);

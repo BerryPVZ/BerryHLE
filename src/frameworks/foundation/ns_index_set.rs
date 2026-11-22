@@ -200,6 +200,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             break;
         }
     }
+    env.mem.free(stop);
 }
 
 - (NSUInteger)count {
