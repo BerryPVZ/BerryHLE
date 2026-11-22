@@ -41,8 +41,8 @@ mod weak;
 pub(crate) use messages::{set_dispatch_depth, take_dispatch_depth};
 
 pub use classes::{
-    __objc_deallocOnMainThreadHelper, class_addIvar, class_addMethod, class_addProtocol,
-    class_conformsToProtocol,
+    __objc_deallocOnMainThreadHelper, class_addIvar, class_addMethod,
+    class_addProtocol, class_conformsToProtocol,
     class_copyIvarList, class_copyMethodList, class_copyPropertyList, class_copyProtocolList,
     class_createInstance,
     class_getClassMethod, class_getInstanceMethod, class_getInstanceSize,
@@ -78,8 +78,9 @@ pub use objects::{
     id, impl_HostObject_with_superclass, nil, AnyHostObject, HostObject, TrivialHostObject,
 };
 pub use properties::{
-    class_getInstanceVariable, ivar_getName, ivar_getOffset, object_getInstanceVariable,
-    object_getIvar, object_setInstanceVariable, object_setIvar, todo_objc_setter,
+    class_addProperty, class_getInstanceVariable, ivar_getName, ivar_getOffset,
+    object_getInstanceVariable, object_getIvar, object_setInstanceVariable, object_setIvar,
+    property_copyAttributeList, todo_objc_setter,
 };
 pub use selectors::{selector, SEL};
 
@@ -99,7 +100,6 @@ use properties::{ivar_list_t, objc_copyStruct, objc_getProperty, objc_setPropert
 use properties::{
     objc_setProperty_atomic_copy, objc_setProperty_nonatomic, objc_setProperty_nonatomic_copy,
 };
-use properties::{class_addProperty, property_copyAttributeList};
 use properties::{property_getAttributes, property_getName};
 use selectors::{sel_getName, sel_getUid, sel_isEqual, sel_registerName};
 use synchronization::{objc_sync_enter, objc_sync_exit};
@@ -464,18 +464,23 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(class_getClassMethod(_, _)),
     export_c_func!(class_respondsToSelector(_, _)),
     export_c_func!(class_addMethod(_, _, _, _)),
+    export_c_func!(class_addProtocol(_, _)),
+    export_c_func!(class_addProperty(_, _, _, _)),
+    export_c_func!(class_getIvarLayout(_)),
+    export_c_func!(property_copyAttributeList(_, _)),
+    export_c_func!(protocol_copyMethodDescriptionList(_, _, _, _)),
+    export_c_func!(protocol_copyProtocolList(_, _)),
+    export_c_func!(objc_constructInstance(_, _)),
+    export_c_func!(objc_initializeClassPair(_, _, _, _)),
     export_c_func!(class_addIvar(_, _, _, _, _)),
     export_c_func!(class_getProperty(_, _)),
     export_c_func!(property_getName(_)),
     export_c_func!(property_getAttributes(_)),
     export_c_func!(class_copyPropertyList(_, _)),
-    export_c_func!(class_addProperty(_, _, _, _)),
-    export_c_func!(property_copyAttributeList(_, _)),
     export_c_func!(class_copyMethodList(_, _)),
     export_c_func!(class_copyIvarList(_, _)),
     export_c_func!(class_copyProtocolList(_, _)),
     export_c_func!(class_conformsToProtocol(_, _)),
-    export_c_func!(class_addProtocol(_, _)),
     export_c_func!(class_replaceMethod(_, _, _, _)),
     export_c_func!(method_getImplementation(_)),
     export_c_func!(method_setImplementation(_, _)),
@@ -495,12 +500,9 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func_aliased!("_objc_msgForward_stret", objc_msgForward_stret(_, _, _)),
     // Additional ObjC runtime helpers needed by iOS 5/6 binaries.
     export_c_func!(class_getName(_)),
-    export_c_func!(class_getIvarLayout(_)),
     export_c_func!(objc_lookUpClass(_)),
     export_c_func!(objc_getRequiredClass(_)),
     export_c_func!(objc_allocateClassPair(_, _, _)),
-    export_c_func!(objc_initializeClassPair(_, _, _, _)),
-    export_c_func!(objc_constructInstance(_, _)),
     export_c_func!(objc_copyCppObjectAtomic(_, _, _)),
     export_c_func!(objc_readClassPair(_, _)),
     export_c_func!(objc_registerClassPair(_)),
@@ -509,8 +511,6 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(objc_getProtocol(_)),
     export_c_func!(protocol_getName(_)),
     export_c_func!(protocol_getMethodDescription(_, _, _, _)),
-    export_c_func!(protocol_copyProtocolList(_, _)),
-    export_c_func!(protocol_copyMethodDescriptionList(_, _, _, _)),
     export_c_func!(objc_getClassList(_, _)),
     export_c_func!(objc_copyClassList(_)),
     export_c_func!(protocol_conformsToProtocol(_, _)),

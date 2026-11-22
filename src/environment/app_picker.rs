@@ -554,6 +554,7 @@ struct AppPickerDelegateHostObject {
     overlay_corner: Option<PerformanceOverlayCorner>,
     cheat_engine: Option<bool>,
     quick_menu: Option<bool>,
+    dladdr: Option<bool>,
     /// `Some(..)` only when the user just flipped the switch: `None` means no
     /// change is pending. The saved state is tri-state (see `PickerSettings`).
     rotation_fix: Option<bool>,
@@ -562,7 +563,6 @@ struct AppPickerDelegateHostObject {
     /// `Some(..)` only when the user just flipped the switch.
     manual_ui_rotation: Option<bool>,
     preserve_dyld_stubs: Option<bool>,
-    dladdr: Option<bool>,
     corruption_mode: Option<CorruptionMode>,
     corruption_mode_changed: bool,
     corruption_startup_delay: Option<StartupDelayPreset>,
@@ -2601,6 +2601,18 @@ fn app_picker_inner(
         show_fullscreen_row,
     );
     let mut quick_options_show_fps = initial_quick_options_show_fps;
+    let mut quick_options_overlay_mode = picker_settings.overlay_mode;
+    let mut quick_options_overlay_corner = picker_settings.overlay_corner;
+    let mut quick_options_rotation_fix = picker_settings.rotation_fix;
+    let mut quick_options_fix_movie_player = picker_settings.fix_movie_player;
+    let mut quick_options_fps_limit = picker_settings.fps_limit;
+    let mut quick_options_memory_limit_mb = picker_settings.memory_limit_mb;
+    let mut quick_options_preserve_aspect_ratio = picker_settings.preserve_aspect_ratio;
+    let mut quick_options_show_lock_screen = picker_settings.show_lock_screen;
+    let mut quick_options_force_composition_override = Some(picker_settings.force_composition);
+    let mut quick_options_cheat_engine = picker_settings.cheat_engine;
+    let mut quick_options_quick_menu = picker_settings.quick_menu;
+    let mut quick_options_dladdr = picker_settings.dladdr;
     let mut device_state = DropdownState {
         selected: picker_settings.device_model_tag,
         ..Default::default()
@@ -3509,6 +3521,7 @@ log!("Warning: Couldn't inspect the last app's bundle; some app-specific options
             picker_settings.game_center_authenticated = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.quick_menu) {
             picker_settings.quick_menu = enabled;
+            quick_options_quick_menu = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.cheat_engine) {
             picker_settings.cheat_engine = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.show_fps) {
@@ -3556,6 +3569,7 @@ log!("Warning: Couldn't inspect the last app's bundle; some app-specific options
             picker_settings.preserve_dyld_stubs = Some(preserve_dyld_stubs);
         } else if let Some(dladdr) = std::mem::take(&mut host_obj.dladdr) {
             picker_settings.dladdr = Some(dladdr);
+            quick_options_dladdr = Some(dladdr);
         } else if std::mem::take(&mut host_obj.corruption_mode_changed) {
             picker_settings.corruption_mode =
                 host_obj.corruption_mode.unwrap_or(CorruptionMode::Off);
@@ -3756,6 +3770,14 @@ log!("Warning: Couldn't inspect the last app's bundle; some app-specific options
         .push(quick_options_trace_gl_errors_argument(picker_settings.trace_gl_errors).to_string());
     option_args
         .push(quick_options_trace_gl_draws_argument(picker_settings.trace_gl_draws).to_string());
+    option_args.push(
+        if quick_options_dladdr.unwrap_or(false) {
+            "--dladdr"
+        } else {
+            "--no-dladdr"
+        }
+        .to_string(),
+    );
     option_args.push(
         if picker_settings.quick_menu {
             "--quick-menu"

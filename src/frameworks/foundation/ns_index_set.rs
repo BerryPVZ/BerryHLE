@@ -86,6 +86,19 @@ fn remove_range(host: &mut NSIndexSetHostObject, location: NSUInteger, length: N
         .retain(|&index| (index as u64) < start || (index as u64) >= end);
 }
 
+/// Copies the sorted indexes of another index set, used by the set algebra
+/// methods. A nil argument contributes nothing.
+fn indexes_of(env: &mut crate::Environment, other: id) -> Vec<NSUInteger> {
+    if other == nil {
+        Vec::new()
+    } else {
+        env.objc
+            .borrow::<NSIndexSetHostObject>(other)
+            .indexes
+            .clone()
+    }
+}
+
 /// Moves every index at or above `index` by `delta`. A negative shift can
 /// push an index below zero (Apple drops those) or past an index that stayed
 /// put, so the result is sorted again.
@@ -406,16 +419,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())removeIndexes:(id)other { // NSIndexSet*
-    if other == nil {
-        return;
-    }
-    let indexes = {
-        let other = env.objc.borrow::<NSIndexSetHostObject>(other);
-        other.indexes.clone()
-    };
+    let indexes = indexes_of(env, other);
     let host = env.objc.borrow_mut::<NSIndexSetHostObject>(this);
     host.indexes
         .retain(|index| indexes.binary_search(index).is_err());
+}
+
+- (())intersectIndexes:(id)other { // NSIndexSet*
+    let keep = indexes_of(env, other);
+    let host = env.objc.borrow_mut::<NSIndexSetHostObject>(this);
+    host.indexes.retain(|index| keep.binary_search(index).is_ok());
 }
 
 - (())removeAllIndexes {

@@ -794,6 +794,14 @@ pub fn CGContextGetClipBoundingBox(env: &mut Environment, context: CGContextRef)
     }
 }
 
+/// `void CGContextClip(CGContextRef c)` — intersects the clip with the
+/// current path. HyperHLE's bitmap contexts do not maintain a path for
+/// clipping, so this is a no-op like `CGContextClipToRect`'s sub-rect case.
+/// <https://developer.apple.com/documentation/coregraphics/1456148-cgcontextclip>
+fn CGContextClip(_env: &mut Environment, _context: CGContextRef) {
+    log_dbg!("CGContextClip: arbitrary path clipping is not implemented; ignoring.");
+}
+
 fn CGContextResetClip(_env: &mut Environment, _context: CGContextRef) {
     log_dbg!("CGContextResetClip: stubbed");
 }
@@ -802,12 +810,6 @@ fn CGContextResetClip(_env: &mut Environment, _context: CGContextRef) {
 /// with the current path. The software rasteriser only implements the
 /// full-bounds clip (see [CGContextClipToRect]), so the path is ignored
 /// rather than losing the whole context.
-fn CGContextClip(_env: &mut Environment, context: CGContextRef) {
-    log_dbg!(
-        "CGContextClip({:?}): path clipping is not implemented, ignoring.",
-        context
-    );
-}
 /// `void CGContextEOClip(CGContextRef c)` — like [CGContextClip] but using the
 /// even-odd winding rule. Since path clipping is not implemented, the winding
 /// rule makes no difference:
@@ -1554,8 +1556,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGContextSetGrayFillColor(_, _, _)),
     export_c_func!(CGContextFillRect(_, _)),
     export_c_func!(CGContextClearRect(_, _)),
-    export_c_func!(CGContextClipToRect(_, _)),
     export_c_func!(CGContextClip(_)),
+    export_c_func!(CGContextClipToRect(_, _)),
     export_c_func!(CGContextEOClip(_)),
     export_c_func!(CGContextConcatCTM(_, _)),
     export_c_func!(CGContextGetCTM(_)),
