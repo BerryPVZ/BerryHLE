@@ -3280,16 +3280,40 @@ fn is_mipmap_min_filter(param: GLint) -> bool {
 ///
 /// Only ES 2.0 backends do this: ES 1.1 has no mipmaps for non-power-of-two
 /// textures, so generation there can fail on a texture the guest already uses.
-unsafe fn generate_mipmaps(gles: &mut dyn GLES, shadow: &mut GLShadowState, target: GLenum) {
+///
+/// Returns whether the bound texture has a complete mip chain afterwards: a
+/// host that rejects generation leaves the texture level-0-only, so the caller
+/// must fall back to a non-mipmap filter or the texture samples black.
+unsafe fn generate_mipmaps(gles: &mut dyn GLES, shadow: &mut GLShadowState, target: GLenum) -> bool {
     // Cube-map faces share one texture object and one mip chain.
     let target = crate::gles::util::tex_parameter_target(target);
     let Some(texture) = current_bound_texture(gles, target) else {
-        return;
+        return false;
     };
-    if texture == 0 || !shadow.record_generated_mipmaps(target, texture) {
-        return;
+    if texture == 0 {
+        return false;
+    }
+    if !shadow.record_generated_mipmaps(target, texture) {
+        return true;
     }
     gles.GenerateMipmap(target);
+    if gles.GetError() != 0 {
+        // Keep the record honest: a later filter change must retry rather than
+        // assume a chain this host refused to build.
+        shadow.forget_generated_mipmaps(target, texture);
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SEEN_FAILED: AtomicBool = AtomicBool::new(false);
+        if !SEEN_FAILED.swap(true, Ordering::Relaxed) {
+            log!(
+                "fix_texture_min_filter: the host cannot generate mipmaps for \
+                 texture {} (target 0x{:x}); using a non-mipmap filter \
+                 [this log will only be shown once]",
+                texture,
+                target
+            );
+        }
+        return false;
+    }
     use std::sync::atomic::{AtomicBool, Ordering};
     static SEEN: AtomicBool = AtomicBool::new(false);
     if !SEEN.swap(true, Ordering::Relaxed) {
@@ -3301,6 +3325,7 @@ unsafe fn generate_mipmaps(gles: &mut dyn GLES, shadow: &mut GLShadowState, targ
             target
         );
     }
+    true
 }
 
 /// Restore the guest's min filter after a level-0 upload.
@@ -3336,25 +3361,13 @@ unsafe fn supply_min_filter_after_upload(
     if !is_mipmap_min_filter(current) {
         return;
     }
-    if let Some(texture) = texture {
-        shadow.record_generated_mipmaps(target, texture);
+    if generate_mipmaps(gles, shadow, target) {
+        return;
     }
-    gles.GenerateMipmap(target);
-    if gles.GetError() != 0 {
-        // The host kept the guest's compressed texels and cannot build a
-        // chain for them; replace the filter instead of sampling black.
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static SEEN_FAILED: AtomicBool = AtomicBool::new(false);
-        if !SEEN_FAILED.swap(true, Ordering::Relaxed) {
-            log!(
-                "fix_texture_min_filter: the host cannot generate mipmaps for \
-                 texture target 0x{:x}; keeping GL_TEXTURE_MIN_FILTER=GL_LINEAR \
-                 [this log will only be shown once]",
-                target
-            );
-        }
-        gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
-    }
+    // The host kept the guest's compressed texels and cannot build a chain
+    // for them; replace the filter instead of leaving the texture incomplete,
+    // which samples black.
+    gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
 }
 
 /// Keep the guest's mipmap `GL_TEXTURE_MIN_FILTER` when a mip chain can be
@@ -3373,8 +3386,11 @@ fn adjust_min_filter(
     if !gles.is_es2() {
         return demipmap_filter_value(pname, param);
     }
-    unsafe { generate_mipmaps(gles, shadow, target) };
-    param
+    if unsafe { generate_mipmaps(gles, shadow, target) } {
+        param
+    } else {
+        demipmap_filter_value(pname, param)
+    }
 }
 
 fn glTexParameteri(env: &mut Environment, target: GLenum, pname: GLenum, param: GLint) {
