@@ -10,6 +10,7 @@ use crate::frameworks::core_graphics::cg_image::{
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::frameworks::foundation::{ns_data, ns_string, NSInteger};
+use crate::frameworks::uikit::ui_geometry::UIEdgeInsets;
 use crate::frameworks::uikit::ui_graphics::UIGraphicsGetCurrentContext;
 use crate::fs::GuestPath;
 use crate::image::Image;
@@ -362,6 +363,26 @@ pub const CLASSES: ClassExports = objc_classes! {
     host.left_cap_width = leftCapWidth;
     host.top_cap_height = topCapHeight;
 
+    autorelease(env, new_img)
+}
+
+- (id)resizableImageWithCapInsets:(UIEdgeInsets)capInsets {
+    let image: id = msg![env; this resizableImageWithCapInsets:capInsets resizingMode:0];
+    image
+}
+
+- (id)resizableImageWithCapInsets:(UIEdgeInsets)capInsets resizingMode:(NSInteger)_resizingMode {
+    let &UIImageHostObject {
+        cg_image,
+        scale,
+        orientation,
+        ..
+    } = env.objc.borrow::<UIImageHostObject>(this);
+    let new_img: id = msg_class![env; UIImage alloc];
+    let new_img: id = msg![env; new_img initWithCGImage:cg_image scale:scale orientation:orientation];
+    let host = env.objc.borrow_mut::<UIImageHostObject>(new_img);
+    host.left_cap_width = capInsets.left as NSInteger;
+    host.top_cap_height = capInsets.top as NSInteger;
     autorelease(env, new_img)
 }
 

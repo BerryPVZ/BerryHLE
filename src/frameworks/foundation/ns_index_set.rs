@@ -177,6 +177,31 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // MARK: - Count / membership
 
+- (())enumerateIndexesUsingBlock:(id)block {
+    if block == nil {
+        return;
+    }
+    let invoke_ptr: u32 = env.mem.read(block.cast::<u32>() + 3u32);
+    if invoke_ptr == 0 {
+        log!("Warning: NSIndexSet block {:?} has no invoke pointer; skipping.", block);
+        return;
+    }
+    let indexes = env.objc.borrow::<NSIndexSetHostObject>(this).indexes.clone();
+    // BOOL *stop: one byte, but allocate a word so the guest store stays aligned.
+    let stop = env.mem.alloc(4);
+    env.mem.write(stop.cast::<u32>(), 0);
+    use crate::abi::CallFromHost;
+    let invoke = crate::abi::GuestFunction::from_addr_with_thumb_bit(invoke_ptr);
+    let block_arg: crate::mem::ConstVoidPtr =
+        crate::mem::Ptr::from_bits(block.to_bits()).cast_const();
+    for index in indexes {
+        let _: () = invoke.call_from_host(env, (block_arg, index, stop));
+        if env.mem.read(stop.cast::<u32>()) != 0 {
+            break;
+        }
+    }
+}
+
 - (NSUInteger)count {
     env.objc.borrow::<NSIndexSetHostObject>(this).indexes.len() as NSUInteger
 }

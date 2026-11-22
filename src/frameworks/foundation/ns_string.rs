@@ -1817,6 +1817,35 @@ pub const CLASSES: ClassExports = objc_classes! {
     ui_font::size_with_font(env, font, &text, None)
 }
 
+- (CGRect)boundingRectWithSize:(CGSize)size
+                       options:(NSUInteger)options
+                    attributes:(id)attributes
+                       context:(id)_context {
+    let text = to_rust_string(env, this);
+    let font_key = get_static_str(env, "NSFont");
+    let font: id = msg![env; attributes objectForKey:font_key];
+    let font: id = if font == nil {
+        msg_class![env; UIFont systemFontOfSize:12.0]
+    } else {
+        font
+    };
+    // NSStringDrawingUsesLineFragmentOrigin == 1: the size is a wrapping box.
+    let measured = if options & 1 != 0 {
+        ui_font::size_with_font(
+            env,
+            font,
+            &text,
+            Some((size, UILineBreakModeWordWrap)),
+        )
+    } else {
+        ui_font::size_with_font(env, font, &text, None)
+    };
+    CGRect {
+        origin: CGPoint { x: 0.0, y: 0.0 },
+        size: measured,
+    }
+}
+
 - (CGSize)sizeWithFont:(id)font forWidth:(CGFloat)width lineBreakMode:(UILineBreakMode)line_break_mode {
     let text = to_rust_string(env, this);
     let size = CGSize { width, height: 99999.0 };

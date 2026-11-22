@@ -126,9 +126,8 @@ pub(crate) struct UIViewHostObject {
     is_uncontrolled: bool,
     /// Strong refs to attached `UIGestureRecognizer*` instances. Used by
     /// `addGestureRecognizer:` / `removeGestureRecognizer:` /
-    /// `gestureRecognizers`. We don't dispatch real gesture recognition;
-    /// keeping a list is enough to avoid `Unknown selector` panics in
-    /// games that wire pinch/pan/tap recognizers up at startup.
+    /// `gestureRecognizers`. Touches are delivered to these from
+    /// `touchesBegan/Moved/Ended` in `ui_gesture_recognizer`.
     gesture_recognizers: Vec<id>,
     // ----- UIAccessibility informal protocol (NSObject category in real
     // iOS, but in practice only meaningful for views). All properties

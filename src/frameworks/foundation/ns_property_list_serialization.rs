@@ -60,6 +60,30 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg_class![env; NSData dataWithBytesNoCopy:ptr length:len]
 }
 
++ (id)dataWithPropertyList:(id)plist
+                   format:(NSPropertyListFormat)format
+                  options:(NSUInteger)_options
+                    error:(MutPtr<id>)error { // NSError **
+    let value = serialize_plist(env, plist);
+    let mut buf = Vec::new();
+    let wrote = if format == NSPropertyListXMLFormat_v1_0 {
+        value.to_writer_xml(&mut buf)
+    } else {
+        value.to_writer_binary(&mut buf)
+    };
+    if wrote.is_err() {
+        if !error.is_null() {
+            let err = make_plist_write_error(env);
+            env.mem.write(error, err);
+        }
+        return nil;
+    }
+    let len: u32 = buf.len().try_into().unwrap();
+    let ptr = env.mem.alloc(len);
+    env.mem.bytes_at_mut(ptr.cast(), len).copy_from_slice(&buf[..]);
+    msg_class![env; NSData dataWithBytesNoCopy:ptr length:len]
+}
+
 + (id)propertyListFromData:(id)data // NSData *
           mutabilityOption:(NSPropertyListMutabilityOptions)opt
                     format:(MutPtr<NSPropertyListFormat>)format
@@ -173,6 +197,16 @@ fn make_plist_read_error(env: &mut Environment, message: &str) -> id {
     log_dbg!("NSPropertyListSerialization read error: {}", message);
     let domain = ns_string::from_rust_string(env, String::from("NSCocoaErrorDomain"));
     let code: NSInteger = 3840; // NSPropertyListReadCorruptError
+    let err: id = msg_class![env; NSError errorWithDomain:domain code:code userInfo:nil];
+    release(env, domain);
+    err
+}
+
+/// Build an autoreleased `NSError` for a failed property-list write. The code
+/// `3850` is `NSPropertyListWriteInvalidError`.
+fn make_plist_write_error(env: &mut Environment) -> id {
+    let domain = ns_string::from_rust_string(env, String::from("NSCocoaErrorDomain"));
+    let code: NSInteger = 3850; // NSPropertyListWriteInvalidError
     let err: id = msg_class![env; NSError errorWithDomain:domain code:code userInfo:nil];
     release(env, domain);
     err
