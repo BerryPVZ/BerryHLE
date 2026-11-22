@@ -694,6 +694,22 @@ fn basename(env: &mut Environment, path: MutPtr<u8>) -> MutPtr<u8> {
     path + start as GuestUSize
 }
 
+// The emulator currently models C-locale collation. The ordinary and xlocale
+// entry points must agree; guest libstdc++ imports both spellings.
+// https://github.com/apple-oss-distributions/Libc/blob/main/string/FreeBSD/strxfrm.c
+fn strcoll(env: &mut Environment, a: ConstPtr<u8>, b: ConstPtr<u8>) -> i32 {
+    strcoll_l(env, a, b, MutVoidPtr::null())
+}
+
+fn strxfrm(
+    env: &mut Environment,
+    dest: MutPtr<u8>,
+    src: ConstPtr<u8>,
+    n: GuestUSize,
+) -> GuestUSize {
+    strxfrm_l(env, dest, src, n, MutVoidPtr::null())
+}
+
 fn strcoll_l(
     env: &mut Environment,
     a: ConstPtr<u8>,
@@ -722,23 +738,6 @@ fn strxfrm_l(
         env.mem.write(dest + copy as GuestUSize, 0);
     }
     len
-}
-
-/// `int strcoll(const char *s1, const char *s2)` — the locale-free variant of
-/// `strcoll_l`. touchHLE has a single C/ASCII locale, so collation is byte
-/// order, which is what darwin returns for the C locale.
-fn strcoll(env: &mut Environment, a: ConstPtr<u8>, b: ConstPtr<u8>) -> i32 {
-    strcoll_l(env, a, b, MutVoidPtr::null())
-}
-
-/// `size_t strxfrm(char *dst, const char *src, size_t n)`.
-fn strxfrm(
-    env: &mut Environment,
-    dest: MutPtr<u8>,
-    src: ConstPtr<u8>,
-    n: GuestUSize,
-) -> GuestUSize {
-    strxfrm_l(env, dest, src, n, MutVoidPtr::null())
 }
 
 pub const FUNCTIONS: FunctionExports = &[

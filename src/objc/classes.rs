@@ -913,7 +913,6 @@ impl ObjC {
                 "Warning: register_bin_classes: {garbage_entries} of {total_entries} ObjC class entries were garbage (truncated/zero-filled binary — the .ipa is likely damaged); the app may fail to start or misbehave."
             );
         }
-
     }
 
     pub(crate) fn reconcile_bin_class_ivars(&mut self, mem: &mut Mem) {
@@ -1446,61 +1445,19 @@ pub fn objc_getClass(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class 
     nil
 }
 
-/// `void objc_exception_throw(id exception)` — see Apple's `objc-exception.h`
-/// (`https://opensource.apple.com/source/objc4/objc4-532.2/runtime/objc-exception.mm`).
-///
-/// touchHLE has no Objective-C unwinder, so the exception is described in the
-/// log and control returns to the nearest app-level frame, the same bypass the
-/// C++ ABI entry points use. `objc_exception_rethrow` shares it.
-pub fn objc_exception_throw(env: &mut crate::Environment, exception: id) {
-    let (key, description) = exception_description(env, exception);
-    crate::libc::cxxabi::unwind_past_objc_exception(env, &key, &description);
-}
-
-/// `void objc_exception_rethrow(void)`.
-pub fn objc_exception_rethrow(env: &mut crate::Environment) {
-    crate::libc::cxxabi::unwind_past_objc_exception(
-        env,
-        "re-thrown exception",
-        "re-thrown with no exception in flight",
-    );
-}
-
 /// `void objc_terminate(void)` — called when an exception reaches a frame that
 /// cannot handle it. iOS terminates the process; the guest requests that here
 /// so headless sessions and TestApp keep their strict termination behaviour.
+/// Termination must use the guest C++ handler and must never return normally.
+/// https://github.com/apple-oss-distributions/objc4/blob/main/runtime/objc-exception.mm
 pub fn objc_terminate(env: &mut crate::Environment) {
-    log!(
-        "objc_terminate: an Objective-C exception reached a frame with no handler, \
-         terminating the guest as iOS does."
-    );
-    crate::libc::stdlib::abort(env);
-}
-
-/// `id objc_begin_catch(void *exception_buffer)`. The throw bypass above returns
-/// to an app frame instead of unwinding into a catch landing pad, so no
-/// exception is ever in flight when a catch block runs.
-pub fn objc_begin_catch(_env: &mut crate::Environment, _exception_buffer: MutVoidPtr) -> id {
-    nil
-}
-
-/// `void objc_end_catch(void)`. Nothing was retained by `objc_begin_catch`.
-pub fn objc_end_catch(_env: &mut crate::Environment) {}
-
-/// The log text names the exception's address, but the re-throw loop guard keys
-/// on the class so a guest that allocates a fresh exception object each
-/// iteration is still counted.
-fn exception_description(
-    env: &mut crate::Environment,
-    exception: id,
-) -> (String, String) {
-    if exception.is_null() {
-        return ("nil".to_owned(), "nil".to_owned());
-    }
-    let class = object_getClass(env, exception);
-    let class_name = env.objc.get_class_name(class).to_owned();
-    let description = format!("of class {} at {:?}", class_name, exception);
-    (class_name, description)
+    let address = env
+        .dyld
+        .guest_cxxabi_export("__ZSt9terminatev")
+        .expect("objc_terminate requires the guest C++ termination handler");
+    env.cpu
+        .branch(crate::abi::GuestFunction::from_addr_with_thumb_bit(address));
+    env.note_guest_control_flow_redirect();
 }
 
 pub fn object_getClassName(env: &mut crate::Environment, obj: id) -> Class {
@@ -2336,27 +2293,6 @@ pub fn __objc_deallocOnMainThreadHelper(env: &mut crate::Environment, context: M
     if !obj.is_null() {
         crate::objc::release(env, obj);
     }
-}
-
-pub fn ___objc_personality_v0(
-    _env: &mut crate::Environment,
-    version: i32,
-    actions: i32,
-    exception_class: u64,
-    exception_object: MutVoidPtr,
-    context: MutVoidPtr,
-) -> i32 {
-    log!(
-        "___objc_personality_v0 called! Exception handling is not fully implemented in touchHLE.\n\
-        version: {}, actions: {}, class: {:x}, object: {:?}, context: {:?}",
-        version,
-        actions,
-        exception_class,
-        exception_object,
-        context
-    );
-    // _URC_FATAL_PHASE1_ERROR
-    3
 }
 
 /// `_objc_msgForward` — the ObjC runtime's message forwarding trampoline.

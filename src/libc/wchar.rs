@@ -22,24 +22,11 @@ const WEOF: wint_t = -1;
 // MARK: - Existing functions (unchanged)
 
 fn btowc(_env: &mut Environment, c: i32) -> wint_t {
-    let c = c as u8;
-    if c.is_ascii() {
-        c as wint_t
-    } else {
-        WEOF
-    }
+    u8::try_from(c).map_or(WEOF, |c| c as wint_t)
 }
 
 fn wctob(_env: &mut Environment, c: wint_t) -> i32 {
-    if u32::try_from(c)
-        .ok()
-        .and_then(char::from_u32)
-        .is_some_and(|c| c.is_ascii())
-    {
-        c
-    } else {
-        WEOF
-    }
+    u8::try_from(c).map_or(WEOF, |c| c as i32)
 }
 
 fn wmemset(
@@ -447,16 +434,12 @@ fn mbtowc(env: &mut Environment, pwc: MutPtr<wchar_t>, s: ConstPtr<u8>, n: Guest
     }
 }
 
-/// wctomb — convert wide char to multibyte (ASCII locale stub).
+/// wctomb — convert a wide character using Darwin's stateless C encoding.
 fn wctomb(env: &mut Environment, s: MutPtr<u8>, wc: wchar_t) -> i32 {
     if s.is_null() {
         return 0;
     }
-    if !(0..=0x7F).contains(&wc) {
-        return -1;
-    }
-    env.mem.write(s, wc as u8);
-    1
+    wcrtomb(env, s, wc, MutVoidPtr::null()) as i32
 }
 
 /// mbstowcs — convert multibyte string to wide string.
@@ -467,11 +450,9 @@ fn mbstowcs(
     n: GuestUSize,
 ) -> GuestUSize {
     let mut i: GuestUSize = 0;
-    loop {
+    let limit = if dest.is_null() { GuestUSize::MAX } else { n };
+    while i < limit {
         let byte = env.mem.read(src + i);
-        if i == n {
-            break;
-        }
         if !dest.is_null() {
             env.mem.write(dest + i, byte as wchar_t);
         }
@@ -491,16 +472,13 @@ fn wcstombs(
     n: GuestUSize,
 ) -> GuestUSize {
     let mut i: GuestUSize = 0;
-    loop {
+    let limit = if dest.is_null() { GuestUSize::MAX } else { n };
+    while i < limit {
         let wc = env.mem.read(src + i);
-        if i == n {
-            break;
-        }
-        if !(0..=0x7F).contains(&wc) {
+        let Ok(byte) = u8::try_from(wc) else {
+            super::errno::set_errno(env, super::errno::EILSEQ);
             return GuestUSize::MAX;
-            // encoding error
-        }
-        let byte = wc as u8;
+        };
         if !dest.is_null() {
             env.mem.write(dest + i, byte);
         }
@@ -746,7 +724,9 @@ fn wcstof(env: &mut Environment, s: ConstPtr<wchar_t>, endptr: MutPtr<MutPtr<wch
 }
 
 // MARK: - xlocale.h wide-character variants
-// touchHLE has a single C/ASCII locale, so the locale argument is ignored.
+// touchHLE models the C locale, so the locale argument is ignored.
+// Darwin's C locale maps every unsigned byte (not just ASCII) to a wchar.
+// https://github.com/apple-oss-distributions/Libc/blob/main/locale/FreeBSD/none.c
 
 fn wcrtomb_l(
     env: &mut Environment,
@@ -758,10 +738,11 @@ fn wcrtomb_l(
     if s.is_null() {
         return 1;
     }
-    if !(0..=0x7F).contains(&wc) {
-        return GuestUSize::MAX; // (size_t)-1
-    }
-    env.mem.write(s, wc as u8);
+    let Ok(byte) = u8::try_from(wc) else {
+        super::errno::set_errno(env, super::errno::EILSEQ);
+        return GuestUSize::MAX;
+    };
+    env.mem.write(s, byte);
     1
 }
 
@@ -774,28 +755,42 @@ fn mbrtowc_l(
     _loc: crate::libc::clocale::locale_t,
 ) -> GuestUSize {
     if s.is_null() {
-        if !pwc.is_null() {
-            env.mem.write(pwc, 0);
-        }
-        return 0;
+        return 0; // Reset the stateless C encoding; do not touch pwc.
     }
     if n == 0 {
-        return GuestUSize::MAX - 1; // (size_t)-2
+        return GuestUSize::MAX - 1; // (size_t)-2: incomplete input
     }
     let c = env.mem.read(s);
-    if c == 0 {
-        if !pwc.is_null() {
-            env.mem.write(pwc, 0);
-        }
-        return 0;
-    }
-    if c > 0x7F {
-        return GuestUSize::MAX;
-    }
     if !pwc.is_null() {
         env.mem.write(pwc, c as wchar_t);
     }
-    1
+    if c == 0 {
+        0
+    } else {
+        1
+    }
+}
+
+fn wcrtomb(env: &mut Environment, s: MutPtr<u8>, wc: wchar_t, ps: MutVoidPtr) -> GuestUSize {
+    wcrtomb_l(env, s, wc, ps, MutVoidPtr::null())
+}
+
+fn mbrtowc(
+    env: &mut Environment,
+    pwc: MutPtr<wchar_t>,
+    s: ConstPtr<u8>,
+    n: GuestUSize,
+    ps: MutVoidPtr,
+) -> GuestUSize {
+    mbrtowc_l(env, pwc, s, n, ps, MutVoidPtr::null())
+}
+
+fn mbrlen(env: &mut Environment, s: ConstPtr<u8>, n: GuestUSize, ps: MutVoidPtr) -> GuestUSize {
+    mbrtowc(env, MutPtr::null(), s, n, ps)
+}
+
+fn mbsinit(_env: &mut Environment, _ps: MutVoidPtr) -> i32 {
+    1 // Darwin's _none_mbsinit: the C encoding is always in its initial state.
 }
 
 fn mbrlen_l(
@@ -816,6 +811,9 @@ fn wctob_l(env: &mut Environment, c: wint_t, _loc: crate::libc::clocale::locale_
     wctob(env, c)
 }
 
+// Darwin's counting calls ignore the output limit and leave *src unchanged.
+// Conversion calls write NUL and clear *src only when they consume that NUL.
+// https://github.com/apple-oss-distributions/Libc/blob/main/locale/FreeBSD/none.c
 fn mbsnrtowcs_l(
     env: &mut Environment,
     dest: MutPtr<wchar_t>,
@@ -825,27 +823,24 @@ fn mbsnrtowcs_l(
     _ps: MutVoidPtr,
     _loc: crate::libc::clocale::locale_t,
 ) -> GuestUSize {
-    if src.is_null() || env.mem.read(src).is_null() {
-        return 0;
-    }
-    let mut input = env.mem.read(src);
-    let mut written = 0;
-    while written < len && (written as GuestUSize) < nms {
-        let c = env.mem.read(input);
-        input += 1;
+    let input = env.mem.read(src);
+    let limit = if dest.is_null() { nms } else { nms.min(len) };
+    for i in 0..limit {
+        let c = env.mem.read(input + i);
+        if !dest.is_null() {
+            env.mem.write(dest + i, c as wchar_t);
+        }
         if c == 0 {
-            env.mem.write(src, ConstPtr::null());
-            return written;
+            if !dest.is_null() {
+                env.mem.write(src, ConstPtr::null());
+            }
+            return i;
         }
-        if dest.is_null() {
-            written += 1;
-            continue;
-        }
-        env.mem.write(dest + written, c as wchar_t);
-        written += 1;
     }
-    env.mem.write(src, input);
-    written
+    if !dest.is_null() {
+        env.mem.write(src, input + limit);
+    }
+    limit
 }
 
 fn wcsnrtombs_l(
@@ -857,33 +852,31 @@ fn wcsnrtombs_l(
     _ps: MutVoidPtr,
     _loc: crate::libc::clocale::locale_t,
 ) -> GuestUSize {
-    if src.is_null() || env.mem.read(src).is_null() {
-        return 0;
-    }
-    let mut input = env.mem.read(src);
-    let mut written = 0;
-    while written < len && (written as GuestUSize) < nwc {
-        let c = env.mem.read(input);
-        input += 1;
-        if c == 0 {
+    let input = env.mem.read(src);
+    let limit = if dest.is_null() { nwc } else { nwc.min(len) };
+    for i in 0..limit {
+        let wc = env.mem.read(input + i);
+        let Ok(byte) = u8::try_from(wc) else {
             if !dest.is_null() {
-                env.mem.write(dest + written, 0);
+                env.mem.write(src, input + i);
             }
-            env.mem.write(src, ConstPtr::null());
-            return written;
-        }
-        if !(0..=0x7F).contains(&c) {
+            super::errno::set_errno(env, super::errno::EILSEQ);
             return GuestUSize::MAX;
+        };
+        if !dest.is_null() {
+            env.mem.write(dest + i, byte);
         }
-        if dest.is_null() {
-            written += 1;
-            continue;
+        if byte == 0 {
+            if !dest.is_null() {
+                env.mem.write(src, ConstPtr::null());
+            }
+            return i;
         }
-        env.mem.write(dest + written, c as u8);
-        written += 1;
     }
-    env.mem.write(src, input);
-    written
+    if !dest.is_null() {
+        env.mem.write(src, input + limit);
+    }
+    limit
 }
 
 fn wcscoll_l(
@@ -897,7 +890,7 @@ fn wcscoll_l(
         let ca = env.mem.read(a + i);
         let cb = env.mem.read(b + i);
         if ca != cb || ca == 0 {
-            return ca - cb;
+            return ca.cmp(&cb) as i32;
         }
         i += 1;
     }
@@ -937,26 +930,6 @@ fn wcsxfrm(
     n: GuestUSize,
 ) -> GuestUSize {
     wcsxfrm_l(env, dest, src, n, MutVoidPtr::null())
-}
-
-/// `size_t mbrtowc(wchar_t *pwc, const char *s, size_t n, mbstate_t *ps)`.
-fn mbrtowc(
-    env: &mut Environment,
-    pwc: MutPtr<wchar_t>,
-    s: ConstPtr<u8>,
-    n: GuestUSize,
-    ps: MutVoidPtr,
-) -> GuestUSize {
-    mbrtowc_l(env, pwc, s, n, ps, MutVoidPtr::null())
-}
-/// `size_t wcrtomb(char *s, wchar_t wc, mbstate_t *ps)`.
-fn wcrtomb(
-    env: &mut Environment,
-    s: MutPtr<u8>,
-    wc: wchar_t,
-    ps: MutVoidPtr,
-) -> GuestUSize {
-    wcrtomb_l(env, s, wc, ps, MutVoidPtr::null())
 }
 
 /// iswspace — test if wide char is whitespace.
@@ -1056,43 +1029,21 @@ fn ungetwc(_env: &mut Environment, c: wint_t, _stream: crate::mem::MutVoidPtr) -
 fn mbsrtowcs(
     env: &mut Environment,
     dest: MutPtr<wchar_t>,
-    src: MutPtr<ConstPtr<u8>>, // const char**
+    src: MutPtr<ConstPtr<u8>>,
     len: GuestUSize,
-    _ps: crate::mem::MutVoidPtr, // mbstate_t* — ignored (stateless ASCII)
+    ps: MutVoidPtr,
 ) -> GuestUSize {
-    if src.is_null() {
-        return 0;
-    }
+    mbsnrtowcs_l(env, dest, src, GuestUSize::MAX, len, ps, MutVoidPtr::null())
+}
 
-    let src_ptr: ConstPtr<u8> = env.mem.read(src);
-    if src_ptr.is_null() {
-        return 0;
-    }
-
-    // Count or convert up to `len` wide chars.
-    let mut i: GuestUSize = 0;
-    loop {
-        if i == len {
-            break;
-        }
-        let byte = env.mem.read(src_ptr + i);
-        if !dest.is_null() {
-            env.mem.write(dest + i, byte as wchar_t);
-        }
-        if byte == 0 {
-            // Null terminator consumed — set *src to NULL per POSIX.
-            env.mem.write(src, ConstPtr::null());
-            return i; // not counting the null terminator
-        }
-        i += 1;
-    }
-
-    // Reached `len` without hitting null — update *src to point past converted
-    // chars.
-    if !dest.is_null() {
-        env.mem.write(src, src_ptr + i);
-    }
-    i
+fn wcsrtombs(
+    env: &mut Environment,
+    dest: MutPtr<u8>,
+    src: MutPtr<ConstPtr<wchar_t>>,
+    len: GuestUSize,
+    ps: MutVoidPtr,
+) -> GuestUSize {
+    wcsnrtombs_l(env, dest, src, GuestUSize::MAX, len, ps, MutVoidPtr::null())
 }
 
 /// `size_t mbsrtowcs_l(wchar_t *restrict dst, const char **restrict src,
@@ -1160,11 +1111,14 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(wcstoull(_, _, _)),
     export_c_func!(wcstold(_, _)),
     export_c_func!(wcrtomb(_, _, _)),
-    export_c_func!(wcrtomb_l(_, _, _, _)),
     export_c_func!(mbrtowc(_, _, _, _)),
-    export_c_func!(mbrtowc_l(_, _, _, _, _)),
+    export_c_func!(mbrlen(_, _, _)),
+    export_c_func!(mbsinit(_)),
     export_c_func!(wcscoll(_, _)),
     export_c_func!(wcsxfrm(_, _, _)),
+    export_c_func!(wcsrtombs(_, _, _, _)),
+    export_c_func!(wcrtomb_l(_, _, _, _)),
+    export_c_func!(mbrtowc_l(_, _, _, _, _)),
     export_c_func!(mbrlen_l(_, _, _, _)),
     export_c_func!(btowc_l(_, _)),
     export_c_func!(wctob_l(_, _)),

@@ -72,6 +72,10 @@ pub struct Thread {
     pub blocked_by: ThreadBlock,
     /// Container for thread local state of various child modules
     pub thread_local_framework_state: frameworks::ThreadLocalState,
+    /// Whether the current API dispatch came directly from a guest SVC.
+    /// Host-initiated API calls must wait for a result; guest message sends
+    /// can tail-call their implementation and allow exceptions to unwind it.
+    direct_guest_call: bool,
     /// The thread's return value, including an explicit main-thread pthread_exit.
     return_value: Option<MutVoidPtr>,
     /// Context object containing the CPU state for this thread.
@@ -1251,6 +1255,7 @@ impl Environment {
             dispatch_depth: 0,
             host_stack_base: 0,
             thread_local_framework_state: Default::default(),
+            direct_guest_call: false,
         };
 
         let mut env = Environment {
@@ -1467,6 +1472,7 @@ impl Environment {
             dispatch_depth: 0,
             host_stack_base: 0,
             thread_local_framework_state: Default::default(),
+            direct_guest_call: false,
         };
 
         let mut env = Environment {
@@ -1952,6 +1958,7 @@ impl Environment {
             dispatch_depth: 0,
             host_stack_base: 0,
             thread_local_framework_state: Default::default(),
+            direct_guest_call: false,
         });
 
         let new_thread_id = self.threads.len() - 1;
@@ -2667,6 +2674,20 @@ impl Environment {
     /// Whether the active linked host function redirected guest control flow.
     pub(crate) fn is_guest_control_flow_redirected(&self) -> bool {
         self.guest_control_flow_redirected
+    }
+
+    pub(crate) fn is_direct_guest_call(&self) -> bool {
+        self.threads
+            .get(self.current_thread)
+            .is_some_and(|thread| thread.direct_guest_call)
+    }
+
+    pub(crate) fn replace_direct_guest_call(&mut self, direct: bool) -> bool {
+        self.threads
+            .get_mut(self.current_thread)
+            .map_or(false, |thread| {
+                std::mem::replace(&mut thread.direct_guest_call, direct)
+            })
     }
 
     /// Mark a synthetic frame installed for a host-to-guest call.
@@ -4103,7 +4124,9 @@ impl Environment {
                                     std::sync::atomic::Ordering::Relaxed,
                                 );
                             }
+                            let previous_origin = self.replace_direct_guest_call(true);
                             f.call_from_guest(self);
+                            self.replace_direct_guest_call(previous_origin);
 
                             let guest_control_flow_redirected =
                                 std::mem::take(&mut self.guest_control_flow_redirected);
@@ -4820,6 +4843,7 @@ pub(crate) fn touch_test_environment() -> Environment {
         dispatch_depth: 0,
         host_stack_base: 0,
         thread_local_framework_state: Default::default(),
+        direct_guest_call: false,
     });
     env.dyld.do_initial_linking_with_no_bins(&mut env.mem, &mut env.objc);
     stack::prep_stack_for_start(&mut env.mem, &mut env.cpu, &[], &[], &[], false);
