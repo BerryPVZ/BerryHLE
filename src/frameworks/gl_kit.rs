@@ -26,7 +26,7 @@ use crate::frameworks::core_graphics::{CGFloat, CGRect};
 use crate::frameworks::foundation::{NSInteger, NSTimeInterval};
 use crate::frameworks::uikit::ui_view::UIViewHostObject;
 use crate::frameworks::uikit::ui_view_controller::UIViewControllerHostObject;
-use crate::mem::{ConstVoidPtr, MutPtr, SafeRead};
+use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr, SafeRead};
 use crate::objc::{
     id, impl_HostObject_with_superclass, msg, nil, objc_classes, release, retain, ClassExports,
     NSZonePtr,
@@ -89,6 +89,8 @@ pub(super) struct GLKVector3 {
     pub(super) z: f32,
 }
 
+unsafe impl SafeRead for GLKVector3 {}
+impl_GuestRet_for_large_struct!(GLKVector3);
 impl GuestArg for GLKVector3 {
     const REG_COUNT: usize = 3;
 
@@ -202,6 +204,60 @@ fn invert_matrix4(matrix: GLKMatrix4) -> (GLKMatrix4, bool) {
     (inverse, true)
 }
 
+/// Matrix product in GLKit's column-major layout.
+fn multiply_matrix4(a: GLKMatrix4, b: GLKMatrix4) -> GLKMatrix4 {
+    GLKMatrix4 {
+        m: std::array::from_fn(|index| {
+            let (column, row) = (index / 4, index % 4);
+            (0..4)
+                .map(|k| a.m[k * 4 + row] * b.m[column * 4 + k])
+                .sum()
+        }),
+    }
+}
+
+fn multiply_matrix4_vector4(matrix: GLKMatrix4, vector: [f32; 4]) -> [f32; 4] {
+    std::array::from_fn(|row| {
+        (0..4)
+            .map(|k| matrix.m[k * 4 + row] * vector[k])
+            .sum()
+    })
+}
+
+/// `GLKMathUnproject` takes window coordinates in the viewport's `(x, y,
+/// width, height)` rectangle and returns object-space coordinates.
+/// <https://developer.apple.com/documentation/glkit/glkmathunproject(_:_:_:_:_:)>
+fn unproject_point(
+    window: GLKVector3,
+    model: GLKMatrix4,
+    projection: GLKMatrix4,
+    viewport: [i32; 4],
+) -> Option<GLKVector3> {
+    let (inverse, invertible) = invert_matrix4(multiply_matrix4(projection, model));
+    if !invertible {
+        return None;
+    }
+    let [x, y, width, height] = viewport;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let clip = [
+        (window.x - x as f32) / width as f32 * 2.0 - 1.0,
+        (window.y - y as f32) / height as f32 * 2.0 - 1.0,
+        window.z * 2.0 - 1.0,
+        1.0,
+    ];
+    let object = multiply_matrix4_vector4(inverse, clip);
+    if object[3] == 0.0 {
+        return None;
+    }
+    Some(GLKVector3 {
+        x: object[0] / object[3],
+        y: object[1] / object[3],
+        z: object[2] / object[3],
+    })
+}
+
 #[allow(non_snake_case)]
 pub fn GLKMatrix4Invert(
     env: &mut Environment,
@@ -226,12 +282,49 @@ pub fn GLKMatrix4Invert(
     inverse
 }
 
+/// Returns the object-space point, and reports through `success` whether the
+/// model/projection pair could be inverted. Coordinates outside the viewport
+/// are still unprojected, matching GLKit.
+/// <https://developer.apple.com/documentation/glkit/glkmathunproject(_:_:_:_:_:)>
+#[allow(non_snake_case)]
+pub(super) fn GLKMathUnproject(
+    env: &mut Environment,
+    window: GLKVector3,
+    model: GLKMatrix4,
+    projection: GLKMatrix4,
+    viewport: ConstPtr<i32>,
+    success: MutPtr<u8>,
+) -> GLKVector3 {
+    let object = if viewport.is_null() {
+        None
+    } else {
+        let viewport = [
+            env.mem.read(viewport),
+            env.mem.read(viewport + 1),
+            env.mem.read(viewport + 2),
+            env.mem.read(viewport + 3),
+        ];
+        unproject_point(window, model, projection, viewport)
+    };
+    if !success.is_null() {
+        env.mem.write(success, u8::from(object.is_some()));
+    }
+    object.unwrap_or(GLKVector3 {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+    })
+}
+
 pub const CONSTANTS: ConstantExports = &[(
     "_GLKMatrix4Identity",
     HostConstant::Custom(glk_matrix4_identity),
 )];
 
-pub const FUNCTIONS: FunctionExports = &[export_c_func!(GLKMatrix4Invert(_, _))];
+pub const FUNCTIONS: FunctionExports = &[
+    export_c_func!(GLKMatrix4Invert(_, _)),
+    export_c_func!(GLKMathUnproject(_, _, _, _, _)),
+];
 
 /// `GLKViewDrawableColorFormat` etc. are plain integer enums in GLKit's
 /// headers (`GLKView.h`); `GLKViewDrawableColorFormatRGBA8888` (the
@@ -528,7 +621,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
 
 #[cfg(test)]
 mod tests {
-    use super::{invert_matrix4, matrix4_identity, GLKMatrix4};
+    use super::{invert_matrix4, matrix4_identity, unproject_point, GLKMatrix4, GLKVector3};
 
     #[test]
     fn glk_matrix4_invert_handles_identity_and_translation() {
@@ -551,5 +644,53 @@ mod tests {
         let (inverse, invertible) = invert_matrix4(matrix);
         assert!(!invertible);
         assert_eq!(inverse, matrix4_identity());
+    }
+
+    /// With identity model and projection, window coordinates map linearly
+    /// onto normalised device coordinates, with y growing downwards.
+    #[test]
+    fn glk_math_unproject_maps_window_coordinates_to_object_space() {
+        let identity = matrix4_identity();
+        let viewport = [0, 0, 100, 100];
+
+        let centre = unproject_point(
+            GLKVector3 {
+                x: 50.0,
+                y: 50.0,
+                z: 0.5,
+            },
+            identity,
+            identity,
+            viewport,
+        )
+        .unwrap();
+        assert_eq!(centre, GLKVector3 { x: 0.0, y: 0.0, z: 0.0 });
+
+        let corner = unproject_point(
+            GLKVector3 {
+                x: 100.0,
+                y: 100.0,
+                z: 1.0,
+            },
+            identity,
+            identity,
+            viewport,
+        )
+        .unwrap();
+        assert_eq!(corner, GLKVector3 { x: 1.0, y: 1.0, z: 1.0 });
+
+        assert_eq!(
+            unproject_point(
+                GLKVector3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                identity,
+                GLKMatrix4 { m: [0.0; 16] },
+                viewport,
+            ),
+            None
+        );
     }
 }
