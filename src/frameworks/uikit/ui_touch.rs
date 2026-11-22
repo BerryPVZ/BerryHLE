@@ -827,6 +827,7 @@ pub(super) fn send_event_to_views(env: &mut Environment, window: id, event: id) 
             }
             UITouchPhaseCancelled => {
                 () = msg![env; view touchesCancelled:touches withEvent:event];
+                super::ui_gesture_recognizer::touches_cancelled(env, view);
             }
             _ => {}
         }

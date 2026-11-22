@@ -18,6 +18,9 @@ pub const UIGestureRecognizerStateBegan: UIGestureRecognizerState = 1;
 pub const UIGestureRecognizerStateChanged: UIGestureRecognizerState = 2;
 /// `UIGestureRecognizerStateRecognized` is `UIGestureRecognizerStateEnded`.
 pub const UIGestureRecognizerStateRecognized: UIGestureRecognizerState = 3;
+/// UIKit sends the action once more with this state when a system event
+/// (incoming call, touch cancellation) interrupts the gesture.
+pub const UIGestureRecognizerStateCancelled: UIGestureRecognizerState = 4;
 pub const UIGestureRecognizerStateFailed: UIGestureRecognizerState = 5;
 
 pub type UISwipeGestureRecognizerDirection = NSUInteger;
@@ -77,6 +80,9 @@ pub(super) struct UIGestureRecognizerHostObject {
     pub(super) pinch_scale: CGFloat,
     pub(super) pinch_velocity: CGFloat,
     pub(super) pinch_start_distance: CGFloat,
+    pub(super) two_finger_last_move: Option<Instant>,
+    pub(super) two_finger_last_distance: CGFloat,
+    pub(super) two_finger_last_angle: CGFloat,
     pub(super) rotation: CGFloat,
     pub(super) rotation_velocity: CGFloat,
     pub(super) rotation_start_angle: CGFloat,
@@ -118,6 +124,9 @@ impl UIGestureRecognizerHostObject {
             pinch_scale: if kind == GestureKind::Pinch { 1.0 } else { 0.0 },
             pinch_velocity: 0.0,
             pinch_start_distance: 0.0,
+            two_finger_last_move: None,
+            two_finger_last_distance: 0.0,
+            two_finger_last_angle: 0.0,
             rotation: 0.0,
             rotation_velocity: 0.0,
             rotation_start_angle: 0.0,
@@ -462,6 +471,7 @@ pub(super) fn touches_began(env: &mut Environment, view: id, touches: id) {
         host.state = UIGestureRecognizerStatePossible;
         host.tracking = true;
         if host.kind == GestureKind::Pan {
+            host.active_touches.insert(touch, (location, location));
             host.pan_translation = CGPoint { x: 0.0, y: 0.0 };
             host.pan_velocity = CGPoint { x: 0.0, y: 0.0 };
             host.pan_last_move = Some(Instant::now());
@@ -677,7 +687,7 @@ fn pan_touches_moved(
 ) {
     let location: CGPoint = msg![env; touch locationInView:view];
     let now = Instant::now();
-    let (enabled, start, state, last_move, previous) = {
+    let (enabled, start, state, last_move, previous, minimum, maximum) = {
         let host = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer);
         (
             host.enabled,
@@ -685,9 +695,30 @@ fn pan_touches_moved(
             host.state,
             host.pan_last_move,
             host.current_location,
+            host.minimum_number_of_touches as usize,
+            host.maximum_number_of_touches as usize,
         )
     };
     if !enabled {
+        return;
+    }
+    let touches = {
+        let host = env
+            .objc
+            .borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
+        // A touch whose Began event predates this recognizer's tracking still
+        // counts towards the touch limits.
+        host.active_touches.entry(touch).or_insert((location, location));
+        host.active_touches.len()
+    };
+    // More fingers than the recognizer accepts cancels it, as on iOS; fewer
+    // than its minimum keeps it Pending until enough have landed.
+    if touches > maximum {
+        let host = env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
+        host.state = UIGestureRecognizerStateFailed;
+        host.tracking = false;
+        host.active_touches.clear();
+        host.pan_last_move = None;
         return;
     }
     let translation = CGPoint {
@@ -695,19 +726,12 @@ fn pan_touches_moved(
         y: location.y - start.y,
     };
     // UIKit reports velocity in points per second since the previous event.
-    let velocity = match last_move {
-        Some(last) => {
-            // Clamp to a millisecond so a pair of events in the same tick
-            // cannot divide by zero or report an infinite velocity.
-            let seconds = now.duration_since(last).as_secs_f64().max(0.001) as CGFloat;
-            CGPoint {
-                x: (location.x - previous.x) / seconds,
-                y: (location.y - previous.y) / seconds,
-            }
-        }
-        None => CGPoint { x: 0.0, y: 0.0 },
+    let velocity = CGPoint {
+        x: velocity_per_second(now, last_move, previous.x, location.x),
+        y: velocity_per_second(now, last_move, previous.y, location.y),
     };
     let began = state == UIGestureRecognizerStatePossible
+        && touches >= minimum
         && (translation.x != 0.0 || translation.y != 0.0);
     {
         let host = env
@@ -733,6 +757,12 @@ fn pan_touches_ended(
     view: id,
 ) {
     let location: CGPoint = msg![env; touch locationInView:view];
+    {
+        let host = env
+            .objc
+            .borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
+        host.active_touches.remove(&touch);
+    }
     let active = {
         let host = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer);
         matches!(
@@ -768,6 +798,43 @@ fn movement_allowed(a: CGPoint, b: CGPoint, limit: CGFloat) -> bool {
     dx * dx + dy * dy <= limit * limit
 }
 
+/// Routes a touch cancellation to the recognizers on `view`. UIKit moves a
+/// gesture that was already under way to `Cancelled` and sends its action one
+/// last time; a gesture that had not started simply fails.
+pub(super) fn touches_cancelled(env: &mut Environment, view: id) {
+    if view == nil {
+        return;
+    }
+    let recognizers = recognizers_in_chain(env, view);
+    for &recognizer in &recognizers { retain(env, recognizer); }
+    for &recognizer in &recognizers {
+        let was_active = {
+            let host = env
+                .objc
+                .borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
+            let active = matches!(
+                host.state,
+                UIGestureRecognizerStateBegan | UIGestureRecognizerStateChanged
+            );
+            host.state = if active {
+                UIGestureRecognizerStateCancelled
+            } else {
+                UIGestureRecognizerStateFailed
+            };
+            host.tracking = false;
+            host.active_touches.clear();
+            host.press_started = None;
+            host.completed_taps = 0;
+            host.previous_tap = None;
+            active
+        };
+        stop_press_timer(env, recognizer);
+        if was_active {
+            send_action(env, recognizer);
+        }
+    }
+    for recognizer in recognizers { release(env, recognizer); }
+}
 fn long_press_timer(env: &mut Environment, recognizer: id, timer: id) {
     let h = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer);
     if h.press_timer != timer { return; }
@@ -794,6 +861,37 @@ fn pair_distance_and_angle(a: CGPoint, b: CGPoint) -> (CGFloat, CGFloat) {
     let dx = b.x - a.x;
     let dy = b.y - a.y;
     ((dx * dx + dy * dy).sqrt(), dy.atan2(dx))
+}
+
+/// Wraps an angle into (-pi, pi], so a rotation past half a turn keeps the
+/// sign a guest expects instead of jumping by a full turn.
+fn wrapped_angle(angle: CGFloat) -> CGFloat {
+    let full_turn = 2.0 * std::f32::consts::PI;
+    let mut angle = angle % full_turn;
+    if angle > std::f32::consts::PI {
+        angle -= full_turn;
+    }
+    if angle < -std::f32::consts::PI {
+        angle += full_turn;
+    }
+    angle
+}
+
+/// Change per second since the previous event, clamped to a millisecond so a
+/// pair of events in the same tick cannot divide by zero.
+fn velocity_per_second(
+    now: Instant,
+    last: Option<Instant>,
+    previous: CGFloat,
+    current: CGFloat,
+) -> CGFloat {
+    match last {
+        Some(last) => {
+            let seconds = now.duration_since(last).as_secs_f64().max(0.001) as CGFloat;
+            (current - previous) / seconds
+        }
+        None => 0.0,
+    }
 }
 
 fn two_finger_touches(env: &mut Environment, recognizer: id, touches: id, phase: u8) {
@@ -853,6 +951,7 @@ fn two_finger_touches_inner(env: &mut Environment, recognizer: id, touches: id, 
             .then(ay.partial_cmp(&by).unwrap_or(std::cmp::Ordering::Equal))
     });
     let (distance, angle) = pair_distance_and_angle(points[0], points[1]);
+    let now = Instant::now();
     if phase == 0 {
         h.pinch_scale = 1.0;
         h.pinch_velocity = 0.0;
@@ -860,16 +959,31 @@ fn two_finger_touches_inner(env: &mut Environment, recognizer: id, touches: id, 
         h.rotation = 0.0;
         h.rotation_velocity = 0.0;
         h.rotation_start_angle = angle;
+        h.two_finger_last_move = Some(Instant::now());
+        h.two_finger_last_distance = distance;
+        h.two_finger_last_angle = angle;
         h.state = UIGestureRecognizerStateBegan;
         h.tracking = true;
     } else if phase == 1 {
         if h.pinch_start_distance > 0.0 {
             h.pinch_scale = distance / h.pinch_start_distance;
         }
-        let mut delta = angle - h.rotation_start_angle;
-        while delta > std::f32::consts::PI { delta -= 2.0 * std::f32::consts::PI; }
-        while delta < -std::f32::consts::PI { delta += 2.0 * std::f32::consts::PI; }
-        h.rotation = delta;
+        h.rotation = wrapped_angle(angle - h.rotation_start_angle);
+        h.pinch_velocity = velocity_per_second(
+            now,
+            h.two_finger_last_move,
+            h.two_finger_last_distance,
+            distance,
+        );
+        h.rotation_velocity = velocity_per_second(
+            now,
+            h.two_finger_last_move,
+            h.two_finger_last_angle,
+            angle,
+        );
+        h.two_finger_last_move = Some(now);
+        h.two_finger_last_distance = distance;
+        h.two_finger_last_angle = angle;
         h.state = UIGestureRecognizerStateChanged;
     }
     let dispatch = phase != 2;
@@ -989,5 +1103,25 @@ mod two_finger_tests {
             CGPoint { x: 0.0, y: 0.0 },
         );
         assert!(flipped < 0.0);
+    }
+
+    #[test]
+    fn velocity_is_change_per_second_since_the_previous_event() {
+        let now = Instant::now();
+        let last = Some(now - Duration::from_secs(2));
+        assert_eq!(velocity_per_second(now, last, 10.0, 14.0), 2.0);
+        assert_eq!(velocity_per_second(now, last, 10.0, 6.0), -2.0);
+        // Two events in the same tick cannot produce an infinite velocity.
+        let last = Some(now);
+        assert!((velocity_per_second(now, last, 0.0, 1.0) - 1000.0).abs() < 0.01);
+        assert_eq!(velocity_per_second(now, None, 0.0, 1.0), 0.0);
+    }
+
+    #[test]
+    fn rotation_wraps_at_half_a_turn() {
+        let almost = std::f32::consts::PI - 0.1;
+        assert!((wrapped_angle(almost + 0.2) - (-(std::f32::consts::PI - 0.1))).abs() < 1e-5);
+        assert!((wrapped_angle(0.5) - 0.5).abs() < 1e-6);
+        assert!((wrapped_angle(-0.5) + 0.5).abs() < 1e-6);
     }
 }
