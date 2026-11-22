@@ -54,10 +54,13 @@ pub use classes::{
     method_getName, method_getNumberOfArguments, method_getReturnType, method_getTypeEncoding,
     method_setImplementation, objc_alloc, objc_allocWithZone, objc_allocateClassPair,
     objc_autorelease, objc_autoreleasePoolPop, objc_autoreleasePoolPush,
-    objc_autoreleaseReturnValue, objc_begin_catch, objc_classes, objc_copyClassList,
-    objc_copyClassNamesForImage, objc_copyImageNames, objc_disposeClassPair, objc_end_catch,
+    objc_autoreleaseReturnValue, objc_begin_catch, objc_classes, objc_constructInstance,
+    objc_copyClassList,
+    objc_copyClassNamesForImage, objc_copyCppObjectAtomic, objc_copyImageNames,
+    objc_disposeClassPair, objc_end_catch,
     objc_exception_throw, objc_getClass, objc_getClassList, objc_getMetaClass, objc_getProtocol,
-    objc_getRequiredClass, objc_lookUpClass, objc_readClassPair, objc_registerClassPair,
+    objc_getRequiredClass, objc_initializeClassPair, objc_lookUpClass, objc_readClassPair,
+    objc_registerClassPair,
     objc_release, objc_retain, objc_retainAutorelease, objc_retainAutoreleaseReturnValue,
     objc_retainAutoreleasedReturnValue, objc_retainBlock, objc_storeStrong,
     objc_unsafeClaimAutoreleasedReturnValue, object_getClass, object_getClassName,
@@ -95,6 +98,7 @@ use properties::{ivar_list_t, objc_copyStruct, objc_getProperty, objc_setPropert
 use properties::{
     objc_setProperty_atomic_copy, objc_setProperty_nonatomic, objc_setProperty_nonatomic_copy,
 };
+use properties::{class_addProperty, property_copyAttributeList};
 use properties::{property_getAttributes, property_getName};
 use selectors::{sel_getName, sel_getUid, sel_isEqual, sel_registerName};
 use synchronization::{objc_sync_enter, objc_sync_exit};
@@ -462,6 +466,8 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(property_getName(_)),
     export_c_func!(property_getAttributes(_)),
     export_c_func!(class_copyPropertyList(_, _)),
+    export_c_func!(class_addProperty(_, _, _, _)),
+    export_c_func!(property_copyAttributeList(_, _)),
     export_c_func!(class_copyMethodList(_, _)),
     export_c_func!(class_copyIvarList(_, _)),
     export_c_func!(class_copyProtocolList(_, _)),
@@ -490,6 +496,9 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(objc_lookUpClass(_)),
     export_c_func!(objc_getRequiredClass(_)),
     export_c_func!(objc_allocateClassPair(_, _, _)),
+    export_c_func!(objc_initializeClassPair(_, _, _, _)),
+    export_c_func!(objc_constructInstance(_, _)),
+    export_c_func!(objc_copyCppObjectAtomic(_, _, _)),
     export_c_func!(objc_readClassPair(_, _)),
     export_c_func!(objc_registerClassPair(_)),
     export_c_func!(objc_disposeClassPair(_)),

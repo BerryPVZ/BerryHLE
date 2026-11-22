@@ -15,6 +15,7 @@ use super::{
     id, ivar_list_t, method_list_t, nil, objc_object, AnyHostObject, HostIMP, HostObject, ObjC,
     IMP, SEL,
 };
+use crate::abi::{CallFromHost, GuestFunction};
 use crate::bundle;
 use crate::fastmap::FxHashMap;
 use crate::mach_o::MachO;
@@ -1592,6 +1593,40 @@ pub fn class_createInstance(
     crate::frameworks::foundation::ns_object::invoke_cxx_constructors(env, object)
 }
 
+/// `id objc_constructInstance(Class cls, void *bytes)` — makes an instance of
+/// `cls` in caller-provided storage, or allocates one when `bytes` is null.
+/// The memory stays the caller's to free, so it is registered rather than
+/// allocated here.
+/// https://developer.apple.com/documentation/objectivec/1418952-objc_constructinstance
+pub fn objc_constructInstance(env: &mut crate::Environment, cls: Class, bytes: MutVoidPtr) -> id {
+    if cls == nil {
+        return nil;
+    }
+    if bytes.is_null() {
+        return class_createInstance(env, cls, 0);
+    }
+    let object: id = bytes.cast();
+    env.mem.write(object, objc_object { isa: cls });
+    env.objc
+        .register_static_object(object, Box::new(super::TrivialHostObject));
+    crate::frameworks::foundation::ns_object::invoke_cxx_constructors(env, object)
+}
+
+/// `void objc_copyCppObjectAtomic(void *dest, const void *src, void
+/// (*copyHelper)(void *dest, const void *src))` — copies a C++ object whose
+/// copy constructor lives in the caller's helper.
+pub fn objc_copyCppObjectAtomic(
+    env: &mut crate::Environment,
+    dest: MutVoidPtr,
+    src: ConstVoidPtr,
+    copy_helper: GuestFunction,
+) {
+    if copy_helper == GuestFunction::null_ptr() {
+        return;
+    }
+    let _: () = copy_helper.call_from_host(env, (dest, src));
+}
+
 // ──────────────────────────────────────────────────────────────────
 // Opaque `Method` handles
 //
@@ -2649,6 +2684,109 @@ pub fn objc_getRequiredClass(env: &mut crate::Environment, name: ConstPtr<u8>) -
 /// Create an unpublished class/metaclass pair with the given superclass.
 /// Apple's objc4-532.2 creates real pairs before registering their names.
 /// https://github.com/apple-oss-distributions/objc4/blob/objc4-532.2/runtime/objc-runtime-new.mm
+/// Sizes and parents shared by `objc_allocateClassPair` and
+/// `objc_initializeClassPair`.
+struct ClassPairGeometry {
+    instance_start: GuestUSize,
+    instance_size: GuestUSize,
+    meta_superclass: Class,
+    meta_isa: Class,
+    meta_size: GuestUSize,
+}
+
+/// `None` matches the runtime's refusal to subclass a class that is still
+/// being constructed, or a metaclass.
+fn class_pair_geometry(
+    env: &mut crate::Environment,
+    superclass: Class,
+) -> Option<ClassPairGeometry> {
+    if superclass == nil {
+        return Some(ClassPairGeometry {
+            instance_start: 0,
+            instance_size: guest_size_of::<objc_object>(),
+            meta_superclass: nil,
+            meta_isa: nil,
+            meta_size: guest_size_of::<class_t>(),
+        });
+    }
+    let parent = env
+        .objc
+        .get_host_object(superclass)
+        .and_then(|object| object.as_any().downcast_ref::<ClassHostObject>())?;
+    if parent.is_constructing || parent.is_metaclass {
+        return None;
+    }
+    let instance_size = parent.instance_size;
+    let meta_superclass = ObjC::read_isa(superclass, &env.mem);
+    let meta_size = env
+        .objc
+        .class_instance_size(meta_superclass)
+        .max(guest_size_of::<class_t>());
+    Some(ClassPairGeometry {
+        instance_start: instance_size,
+        instance_size,
+        meta_superclass,
+        meta_isa: ObjC::read_isa(meta_superclass, &env.mem),
+        meta_size,
+    })
+}
+
+/// Fills in and registers a class/metaclass pair at the given addresses.
+fn write_class_pair(
+    env: &mut crate::Environment,
+    class: Class,
+    metaclass: Class,
+    superclass: Class,
+    name: String,
+    geometry: ClassPairGeometry,
+) {
+    env.mem.write(class, objc_object { isa: metaclass });
+    env.mem.write(class.cast::<Class>() + 1, superclass);
+    let meta_superclass = if superclass == nil {
+        class
+    } else {
+        geometry.meta_superclass
+    };
+    env.mem.write(
+        metaclass,
+        objc_object {
+            isa: if superclass == nil {
+                metaclass
+            } else {
+                geometry.meta_isa
+            },
+        },
+    );
+    env.mem.write(metaclass.cast::<Class>() + 1, meta_superclass);
+    env.objc.register_static_object(
+        class,
+        Box::new(ClassHostObject {
+            name: name.clone(),
+            superclass,
+            instance_start: geometry.instance_start,
+            instance_size: geometry.instance_size,
+            is_from_bin: true,
+            is_constructing: true,
+            is_dynamic: true,
+            ..Default::default()
+        }),
+    );
+    env.objc.register_static_object(
+        metaclass,
+        Box::new(ClassHostObject {
+            name,
+            is_metaclass: true,
+            superclass: meta_superclass,
+            instance_start: geometry.meta_size,
+            instance_size: geometry.meta_size,
+            is_from_bin: true,
+            is_constructing: true,
+            is_dynamic: true,
+            ..Default::default()
+        }),
+    );
+}
+
 pub fn objc_allocateClassPair(
     env: &mut crate::Environment,
     superclass: Class,
@@ -2666,41 +2804,10 @@ pub fn objc_allocateClassPair(
     {
         return nil;
     }
-    let (instance_start, instance_size, meta_superclass, meta_isa, meta_size) = if superclass == nil
-    {
-        (
-            0,
-            guest_size_of::<objc_object>(),
-            nil,
-            nil,
-            guest_size_of::<class_t>(),
-        )
-    } else {
-        let Some(parent) = env
-            .objc
-            .get_host_object(superclass)
-            .and_then(|object| object.as_any().downcast_ref::<ClassHostObject>())
-        else {
-            return nil;
-        };
-        if parent.is_constructing || parent.is_metaclass {
-            return nil;
-        }
-        let size = parent.instance_size;
-        let parent_meta = ObjC::read_isa(superclass, &env.mem);
-        let meta_size = env
-            .objc
-            .class_instance_size(parent_meta)
-            .max(guest_size_of::<class_t>());
-        (
-            size,
-            size,
-            parent_meta,
-            ObjC::read_isa(parent_meta, &env.mem),
-            meta_size,
-        )
+    let Some(geometry) = class_pair_geometry(env, superclass) else {
+        return nil;
     };
-    let Some(class_size) = meta_size.checked_add(extra_bytes) else {
+    let Some(class_size) = geometry.meta_size.checked_add(extra_bytes) else {
         return nil;
     };
     let Some(metaclass_size) = guest_size_of::<class_t>().checked_add(extra_bytes) else {
@@ -2715,52 +2822,37 @@ pub fn objc_allocateClassPair(
         env.mem.free(class.cast());
         return nil;
     }
-    env.mem.write(class, objc_object { isa: metaclass });
-    env.mem.write(class.cast::<Class>() + 1, superclass);
-    env.mem.write(
-        metaclass,
-        objc_object {
-            isa: if superclass == nil {
-                metaclass
-            } else {
-                meta_isa
-            },
-        },
-    );
-    let meta_superclass = if superclass == nil {
-        class
-    } else {
-        meta_superclass
+    write_class_pair(env, class, metaclass, superclass, name, geometry);
+    class
+}
+
+/// `Class objc_initializeClassPair(Class superclass, const char *name, Class
+/// cls, Class meta)` — the pre-`objc_allocateClassPair` entry point: the
+/// caller provides the class and metaclass storage, which the runtime then
+/// fills in and registers. Returns `Nil` if the name is already in use.
+/// https://opensource.apple.com/source/objc4/objc4-532.2/runtime/objc-runtime-old.mm
+pub fn objc_initializeClassPair(
+    env: &mut crate::Environment,
+    superclass: Class,
+    name: ConstPtr<u8>,
+    class: Class,
+    metaclass: Class,
+) -> Class {
+    if name.is_null() || class == nil || metaclass == nil {
+        return nil;
+    }
+    let Ok(name) = env.mem.cstr_at_utf8(name) else {
+        return nil;
     };
-    env.mem
-        .write(metaclass.cast::<Class>() + 1, meta_superclass);
-    env.objc.register_static_object(
-        class,
-        Box::new(ClassHostObject {
-            name: name.clone(),
-            superclass,
-            instance_start,
-            instance_size,
-            is_from_bin: true,
-            is_constructing: true,
-            is_dynamic: true,
-            ..Default::default()
-        }),
-    );
-    env.objc.register_static_object(
-        metaclass,
-        Box::new(ClassHostObject {
-            name,
-            is_metaclass: true,
-            superclass: meta_superclass,
-            instance_start: meta_size,
-            instance_size: meta_size,
-            is_from_bin: true,
-            is_constructing: true,
-            is_dynamic: true,
-            ..Default::default()
-        }),
-    );
+    let name = name.to_owned();
+    if env.objc.get_class(&name, false, &env.mem).is_some() || ObjC::find_template(&name).is_some()
+    {
+        return nil;
+    }
+    let Some(geometry) = class_pair_geometry(env, superclass) else {
+        return nil;
+    };
+    write_class_pair(env, class, metaclass, superclass, name, geometry);
     class
 }
 

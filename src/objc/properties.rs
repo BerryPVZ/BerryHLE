@@ -73,8 +73,8 @@ unsafe impl SafeRead for property_list_t {}
 /// opaque `objc_property_t`.
 #[repr(C, packed)]
 pub(super) struct property_t {
-    name: ConstPtr<u8>,
-    attributes: ConstPtr<u8>,
+    pub(super) name: ConstPtr<u8>,
+    pub(super) attributes: ConstPtr<u8>,
 }
 unsafe impl SafeRead for property_t {}
 
@@ -1009,6 +1009,172 @@ macro_rules! todo_objc_setter {
     };
 }
 pub use crate::todo_objc_setter;
+
+/// The layout of one declared property attribute, as passed to
+/// `class_addProperty` and returned by `property_copyAttributeList`.
+/// https://developer.apple.com/documentation/objectivec/objc_property_attribute_t
+#[repr(C)]
+pub(super) struct objc_property_attribute_t {
+    pub(super) name: ConstPtr<u8>,
+    pub(super) value: ConstPtr<u8>,
+}
+unsafe impl SafeRead for objc_property_attribute_t {}
+
+/// Splits an attribute string such as `T@"NSString",&,N,V_name` into
+/// `(code, value)` pairs. Commas inside a quoted type encoding do not
+/// separate entries.
+fn split_property_attributes(attributes: &[u8]) -> Vec<(u8, Vec<u8>)> {
+    let mut entries = Vec::new();
+    let mut current: Vec<u8> = Vec::new();
+    let mut quoted = false;
+    for &byte in attributes {
+        match byte {
+            b'"' => {
+                quoted = !quoted;
+                current.push(byte);
+            }
+            b',' if !quoted => {
+                if !current.is_empty() {
+                    entries.push(current.clone());
+                    current.clear();
+                }
+            }
+            _ => current.push(byte),
+        }
+    }
+    if !current.is_empty() {
+        entries.push(current);
+    }
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            let (&code, value) = entry.split_first()?;
+            Some((code, value.to_vec()))
+        })
+        .collect()
+}
+
+/// `objc_property_attribute_t *property_copyAttributeList(objc_property_t
+/// property, unsigned int *outCount)` — the caller owns the array and every
+/// string in it and frees them with `free()`.
+///
+/// Per Apple's Objective-C Runtime Reference
+/// (<https://developer.apple.com/documentation/objectivec/1418605-property_copyattributelist>):
+///
+/// > Returns the attribute descriptors of a property. [...] the caller must
+/// > free the returned array.
+///
+/// Our `property_t` entries store the attribute string from the app binary
+/// (or from `class_addProperty`), so this parses that string back into the
+/// descriptor array.
+pub fn property_copyAttributeList(
+    env: &mut Environment,
+    property: ConstVoidPtr,
+    out_count: MutPtr<u32>,
+) -> MutPtr<objc_property_attribute_t> {
+    if !out_count.is_null() {
+        env.mem.write(out_count, 0);
+    }
+    if property.is_null() {
+        return Ptr::null();
+    }
+    let prop_ptr: ConstPtr<property_t> = property.cast();
+    let property_t { attributes, .. } = env.mem.read(prop_ptr);
+    if attributes.is_null() {
+        return Ptr::null();
+    }
+    let Ok(raw) = env.mem.cstr_at_utf8(attributes) else {
+        return Ptr::null();
+    };
+    let entries = split_property_attributes(raw.as_bytes());
+    if entries.is_empty() {
+        return Ptr::null();
+    }
+    let entry_size = guest_size_of::<objc_property_attribute_t>();
+    let array: MutPtr<objc_property_attribute_t> =
+        env.mem.alloc(entry_size * entries.len() as GuestUSize).cast();
+    for (index, (code, value)) in entries.iter().enumerate() {
+        let name = env.mem.alloc_and_write_cstr(&[*code]).cast_const();
+        let value = if value.is_empty() {
+            Ptr::null()
+        } else {
+            env.mem.alloc_and_write_cstr(value).cast_const()
+        };
+        env.mem.write(
+            array + index as GuestUSize,
+            objc_property_attribute_t { name, value },
+        );
+    }
+    if !out_count.is_null() {
+        env.mem.write(out_count, entries.len() as u32);
+    }
+    array
+}
+
+/// `void class_addProperty(Class cls, const char *name, const
+/// objc_property_attribute_t *attributes, unsigned int attributeCount)`.
+///
+/// The runtime stores a single attribute string per property, so the
+/// descriptors are joined into one comma-separated string here, which
+/// `property_getAttributes`, `class_copyPropertyList` and
+/// `property_copyAttributeList` then report as Apple's runtime does.
+/// https://developer.apple.com/documentation/objectivec/1418638-class_addproperty
+pub fn class_addProperty(
+    env: &mut Environment,
+    cls: Class,
+    name: ConstPtr<u8>,
+    attributes: ConstPtr<objc_property_attribute_t>,
+    count: u32,
+) {
+    if cls.is_null() || name.is_null() {
+        return;
+    }
+    let is_metaclass = match env.objc.get_host_object(cls) {
+        Some(object) => match object.as_any().downcast_ref::<ClassHostObject>() {
+            Some(class_obj) => class_obj.is_metaclass,
+            None => return,
+        },
+        None => return,
+    };
+    if is_metaclass {
+        return;
+    }
+    let Ok(name_string) = env.mem.cstr_at_utf8(name) else {
+        return;
+    };
+    let name_string = name_string.to_owned();
+    let mut attribute_string = Vec::new();
+    for index in 0..count {
+        let entry = env.mem.read(attributes + index);
+        if entry.name.is_null() {
+            continue;
+        }
+        if !attribute_string.is_empty() {
+            attribute_string.push(b',');
+        }
+        if let Ok(code) = env.mem.cstr_at_utf8(entry.name) {
+            attribute_string.extend_from_slice(code.as_bytes());
+        }
+        if !entry.value.is_null() {
+            if let Ok(value) = env.mem.cstr_at_utf8(entry.value) {
+                attribute_string.extend_from_slice(value.as_bytes());
+            }
+        }
+    }
+    let attributes_ptr = env.mem.alloc_and_write_cstr(&attribute_string).cast_const();
+    let property_ptr: ConstVoidPtr = env
+        .mem
+        .alloc_and_write(property_t {
+            name,
+            attributes: attributes_ptr,
+        })
+        .cast_const()
+        .cast();
+    env.objc
+        .borrow_mut::<ClassHostObject>(cls)
+        .properties
+        .insert(name_string, property_ptr);
+}
 
 #[cfg(test)]
 mod trainer_metadata_tests {
