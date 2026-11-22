@@ -299,6 +299,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         for i in 0..count as u32 {
             indexes.push(env.mem.read(bytes_ptr.cast::<NSUInteger>() + i));
         }
+        indexes.sort_unstable();
+        indexes.dedup();
         env.objc.borrow_mut::<NSIndexSetHostObject>(this).indexes = indexes;
     }
     this
@@ -482,6 +484,14 @@ mod tests {
         assert!(equal);
         let count: NSUInteger = msg![env; restored count];
         assert_eq!(count, 4);
+
+        let empty: id = msg_class![env; NSMutableIndexSet indexSet];
+        let archived_empty: id = msg_class![env; NSKeyedArchiver archivedDataWithRootObject:empty];
+        let restored_empty: id =
+            msg_class![env; NSKeyedUnarchiver unarchiveObjectWithData:archived_empty];
+        assert_ne!(restored_empty, nil);
+        let empty_count: NSUInteger = msg![env; restored_empty count];
+        assert_eq!(empty_count, 0);
         () = msg![env; pool drain];
     }
 }
