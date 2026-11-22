@@ -396,7 +396,30 @@ fn release_shared_pages(env: &mut Environment, start: GuestUSize, end: GuestUSiz
         .collect();
     for (base, len) in overlapping {
         env.libc_state.mmap.shared_files.remove(&base);
-        restore_anonymous_pages(&env.mem, base, len);
+        let base = base.to_bits();
+        let mapping_end = base.saturating_add(len);
+        let released_start = base.max(start);
+        let released_end = mapping_end.min(end);
+        restore_anonymous_pages(
+            &env.mem,
+            MutVoidPtr::from_bits(released_start),
+            released_end.saturating_sub(released_start),
+        );
+        // A partial unmap or MAP_FIXED replacement only ends sharing for the
+        // pages it names. Keep an entry for each surviving side, or those pages
+        // would stay file-backed after the allocator takes them back.
+        if base < released_start {
+            env.libc_state
+                .mmap
+                .shared_files
+                .insert(MutVoidPtr::from_bits(base), released_start - base);
+        }
+        if released_end < mapping_end {
+            env.libc_state.mmap.shared_files.insert(
+                MutVoidPtr::from_bits(released_end),
+                mapping_end - released_end,
+            );
+        }
     }
 }
 
@@ -441,6 +464,8 @@ fn alias_shared_file(
         // Darwin lets a mapping extend past the end of the file; a store into
         // the extra pages lengthens the file. Our page cache is the file, so
         // make room first or the store would fault.
+        // shortcut: the whole mapping grows at once, Darwin grows on the first
+        // store; upgrade if an app checks the file size after mmap.
         if posix_io::ftruncate(env, fd, mapping_end) != 0 {
             log!(
                 "Warning: mmap: could not grow fd {} to {} bytes for a {} byte shared mapping",
@@ -549,6 +574,7 @@ fn mmap(
         return MAP_FAILED;
     }
 
+    let mut aliased = false;
     if (flags & MAP_ANON) != 0 {
         // Real mmap always returns page-aligned addresses and callers (e.g.
         // Boehm GC) rely on that. Fail gracefully instead of panicking the host.
@@ -596,7 +622,9 @@ fn mmap(
         }
         // A shared mapping is the only kind whose writes must reach the file
         // and every other mapping of it, so let the host's page cache do it.
-        if (flags & MAP_SHARED) != 0 && alias_shared_file(env, ptr, fd, offset, len) {
+        aliased = (flags & MAP_SHARED) != 0
+            && alias_shared_file(env, ptr, fd, offset, len);
+        if aliased {
             log_dbg!(
                 "mmap: fd {} shared mapping aliased the host page cache at {:?}, offset {}, {} bytes",
                 fd,
@@ -604,72 +632,72 @@ fn mmap(
                 offset,
                 len
             );
-            return ptr;
-        }
-        // Darwin's `mmap` reads the pages itself and leaves the descriptor's
-        // file offset where it was, so save it and put it back after reading:
-        // a guest that keeps writing through the same descriptor would
-        // otherwise restart at offset 0 and never extend the file.
-        let saved_offset = posix_io::lseek(env, fd, 0, SEEK_CUR);
-        let new_offset = posix_io::lseek(env, fd, offset, SEEK_SET);
-        if new_offset != offset {
-            log!(
-                "Warning: mmap: lseek to offset {} failed (returned {}); returning MAP_FAILED",
-                offset,
-                new_offset
-            );
-            env.mem.free(ptr);
-            set_errno(env, EIO);
-            return MAP_FAILED;
-        }
-        // Read the mapped range in full. A single read stops at the end of a
-        // short file, which is fine, but it can also stop short of the range
-        // for other reasons and leave a hole in the middle of the mapping;
-        // keep asking until the mapping is full or the file runs out. The
-        // remainder stays zeroed by the calloc above.
-        let mut read_total: GuestUSize = 0;
-        let mut read_error: GuestISize = 0;
-        while read_total < len {
-            let dest = MutVoidPtr::from_bits(ptr.to_bits() + read_total);
-            let read = posix_io::read(env, fd, dest, len - read_total);
-            if read <= 0 {
-                read_error = read;
-                break;
-            }
-            read_total = read_total.saturating_add(read as GuestUSize);
-        }
-        if saved_offset >= 0 {
-            posix_io::lseek(env, fd, saved_offset, SEEK_SET);
-        }
-        if read_error < 0 {
-            log!(
-                "Warning: mmap: read from fd {} at {:?}, offset {} failed ({}); \
-                 padding remainder with zeros",
-                fd,
-                ptr,
-                offset,
-                read_error,
-            );
-        } else if read_total < len {
-            log!(
-                "Warning: mmap: read only {} of {} bytes from fd {} at {:?}, \
-                 offset {}; padding remainder with zeros",
-                read_total,
-                len,
-                fd,
-                ptr,
-                offset
-            );
         } else {
-            log!(
-                "mmap: fd {} ({}) at {:?}, offset {}, {} bytes ({} read from file)",
-                fd,
-                env.libc_state.posix_io.path_for_fd(fd).unwrap_or("?"),
-                ptr,
-                offset,
-                len,
-                read_total
-            );
+            // Darwin's `mmap` reads the pages itself and leaves the descriptor's
+            // file offset where it was, so save it and put it back after reading:
+            // a guest that keeps writing through the same descriptor would
+            // otherwise restart at offset 0 and never extend the file.
+            let saved_offset = posix_io::lseek(env, fd, 0, SEEK_CUR);
+            let new_offset = posix_io::lseek(env, fd, offset, SEEK_SET);
+            if new_offset != offset {
+                log!(
+                    "Warning: mmap: lseek to offset {} failed (returned {}); returning MAP_FAILED",
+                    offset,
+                    new_offset
+                );
+                env.mem.free(ptr);
+                set_errno(env, EIO);
+                return MAP_FAILED;
+            }
+            // Read the mapped range in full. A single read stops at the end of a
+            // short file, which is fine, but it can also stop short of the range
+            // for other reasons and leave a hole in the middle of the mapping;
+            // keep asking until the mapping is full or the file runs out. The
+            // remainder stays zeroed by the calloc above.
+            let mut read_total: GuestUSize = 0;
+            let mut read_error: GuestISize = 0;
+            while read_total < len {
+                let dest = MutVoidPtr::from_bits(ptr.to_bits() + read_total);
+                let read = posix_io::read(env, fd, dest, len - read_total);
+                if read <= 0 {
+                    read_error = read;
+                    break;
+                }
+                read_total = read_total.saturating_add(read as GuestUSize);
+            }
+            if saved_offset >= 0 {
+                posix_io::lseek(env, fd, saved_offset, SEEK_SET);
+            }
+            if read_error < 0 {
+                log!(
+                    "Warning: mmap: read from fd {} at {:?}, offset {} failed ({}); \
+                     padding remainder with zeros",
+                    fd,
+                    ptr,
+                    offset,
+                    read_error,
+                );
+            } else if read_total < len {
+                log!(
+                    "Warning: mmap: read only {} of {} bytes from fd {} at {:?}, \
+                     offset {}; padding remainder with zeros",
+                    read_total,
+                    len,
+                    fd,
+                    ptr,
+                    offset
+                );
+            } else {
+                log!(
+                    "mmap: fd {} ({}) at {:?}, offset {}, {} bytes ({} read from file)",
+                    fd,
+                    env.libc_state.posix_io.path_for_fd(fd).unwrap_or("?"),
+                    ptr,
+                    offset,
+                    len,
+                    read_total
+                );
+            }
         }
     }
 
@@ -677,7 +705,7 @@ fn mmap(
     track_allocation(&mut env.libc_state.mmap.allocations, ptr, len);
     // A recycled address must not keep the previous mapping's file backing.
     env.libc_state.mmap.writebacks.remove(&ptr);
-    if flags & MAP_ANON == 0 && flags & MAP_SHARED != 0 {
+    if !aliased && flags & MAP_ANON == 0 && flags & MAP_SHARED != 0 {
         match env.libc_state.posix_io.guest_file(fd).and_then(|file| {
             file.try_clone_host_file().ok()
         }) {
@@ -740,8 +768,8 @@ fn mmap_fixed(
     fd: FileDescriptor,
     offset: off_t,
 ) -> MutVoidPtr {
-    // Flush old shared pages before replacing them. Preserve their metadata
-    // until the fixed allocation succeeds, in case replacement fails.
+    // Flush old shared pages while they are still mapped. Only the replaced
+    // range stops being file-backed; the rest of a larger mapping stays aliased.
     let replaced_range = page_range(addr, len);
     if let Some((start, end)) = replaced_range {
         flush_guest_range(env, start, end);
@@ -1599,6 +1627,44 @@ mod partial_munmap_tests {
             Ptr::from_bits(start + PAGE_SIZE),
             PAGE_SIZE
         ));
+    }
+}
+
+#[cfg(test)]
+mod shared_mapping_release_tests {
+    use super::*;
+    use crate::mem::Ptr;
+
+    /// Releasing the middle page of an aliased shared mapping must restore only
+    /// that page: the pages either side stay file-backed, with their contents
+    /// intact, or a partial munmap would zero a live mapping.
+    #[test]
+    fn partial_release_keeps_the_rest_of_a_shared_mapping() {
+        let _lock = crate::environment::ENVIRONMENT_TEST_LOCK.lock().unwrap();
+        let mut env = crate::environment::touch_test_environment();
+        let base: MutVoidPtr = Ptr::from_bits(0x2000_0000);
+        let mut allocations = HashMap::new();
+        assert_eq!(
+            map_fixed_zeroed(&mut env.mem, &mut allocations, base, PAGE_SIZE * 3),
+            Ok((PAGE_SIZE * 3, true))
+        );
+        env.mem
+            .bytes_at_mut(base.cast(), PAGE_SIZE * 3)
+            .fill(0xAB);
+        env.libc_state
+            .mmap
+            .shared_files
+            .insert(base, PAGE_SIZE * 3);
+
+        let hole = base.to_bits() + PAGE_SIZE;
+        release_shared_pages(&mut env, hole, hole + PAGE_SIZE);
+
+        let page = PAGE_SIZE as usize;
+        let bytes = env.mem.bytes_at(base.cast(), PAGE_SIZE * 3);
+        assert!(bytes[..page].iter().all(|&b| b == 0xAB));
+        assert!(bytes[page..page * 2].iter().all(|&b| b == 0));
+        assert!(bytes[page * 2..].iter().all(|&b| b == 0xAB));
+        assert_eq!(env.libc_state.mmap.shared_files.len(), 2);
     }
 }
 
