@@ -257,9 +257,9 @@ pub const LOCK_NB: FLockFlag = 4;
 pub const LOCK_UN: FLockFlag = 8;
 
 #[repr(C, packed)]
-struct iovec {
-    iov_base: ConstPtr<u8>,
-    iov_len: GuestUSize,
+pub(crate) struct iovec {
+    pub(crate) iov_base: ConstPtr<u8>,
+    pub(crate) iov_len: GuestUSize,
 }
 unsafe impl SafeRead for iovec {}
 
