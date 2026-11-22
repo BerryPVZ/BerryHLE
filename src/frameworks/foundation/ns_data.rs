@@ -360,6 +360,15 @@ pub const CLASSES: ClassExports = objc_classes! {
     decode_current_data(env, coder, true)
 }
 
+// `NSKeyedUnarchiver`'s `decode_current_data` reads the bytes back from
+// "NS.data", so the encoder must write the same key.
+- (())encodeWithCoder:(id)coder {
+    let bytes: ConstVoidPtr = msg![env; this bytes];
+    let length: NSUInteger = msg![env; this length];
+    let key = ns_string::get_static_str(env, "NS.data");
+    () = msg![env; coder encodeBytes:bytes length:length forKey:key];
+}
+
 // =========================================================================
 // MARK: - Dealloc / copy
 // =========================================================================

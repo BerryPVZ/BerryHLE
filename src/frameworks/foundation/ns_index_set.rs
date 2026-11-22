@@ -286,6 +286,36 @@ pub const CLASSES: ClassExports = objc_classes! {
     autorelease(env, new)
 }
 
+// MARK: - NSCoding
+
+- (id)initWithCoder:(id)coder {
+    let key = crate::frameworks::foundation::ns_string::get_static_str(env, "NSIndexSetData");
+    let data: id = msg![env; coder decodeObjectForKey:key];
+    if data != nil {
+        let len: NSUInteger = msg![env; data length];
+        let count = len as usize / std::mem::size_of::<NSUInteger>();
+        let bytes_ptr: crate::mem::ConstVoidPtr = msg![env; data bytes];
+        let mut indexes = Vec::with_capacity(count);
+        for i in 0..count as u32 {
+            indexes.push(env.mem.read(bytes_ptr.cast::<NSUInteger>() + i));
+        }
+        env.objc.borrow_mut::<NSIndexSetHostObject>(this).indexes = indexes;
+    }
+    this
+}
+
+- (())encodeWithCoder:(id)coder {
+    let host = env.objc.borrow::<NSIndexSetHostObject>(this);
+    let byte_len = (host.indexes.len() * std::mem::size_of::<NSUInteger>()) as NSUInteger;
+    let buf: crate::mem::MutVoidPtr = env.mem.alloc(byte_len as u32).cast();
+    for (i, &index) in host.indexes.iter().enumerate() {
+        env.mem.write(buf.cast::<NSUInteger>() + i as u32, index);
+    }
+    let data: id = msg_class![env; NSData dataWithBytesNoCopy:buf length:byte_len];
+    let key = crate::frameworks::foundation::ns_string::get_static_str(env, "NSIndexSetData");
+    () = msg![env; coder encodeObject:data forKey:key];
+}
+
 // MARK: - Description
 
 - (id)description {
@@ -431,5 +461,27 @@ mod tests {
         assert_eq!(set.indexes, vec![0, 4]);
         remove_range(&mut set, 0, 0);
         assert_eq!(set.indexes, vec![0, 4]);
+    }
+
+    #[test]
+    fn keyed_archive_round_trips_a_mutable_index_set() {
+        let _lock = crate::environment::ENVIRONMENT_TEST_LOCK.lock().unwrap();
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let set: id = msg_class![env; NSMutableIndexSet indexSet];
+        () = msg![env; set addIndex:1];
+        () = msg![env; set addIndex:7];
+        let range = NSRange { location: 3, length: 2 };
+        () = msg![env; set addIndexesInRange:range];
+        let archived: id = msg_class![env; NSKeyedArchiver archivedDataWithRootObject:set];
+        assert_ne!(archived, nil);
+        let restored: id = msg_class![env; NSKeyedUnarchiver unarchiveObjectWithData:archived];
+        assert_ne!(restored, nil);
+        let equal: bool = msg![env; restored isEqualToIndexSet:set];
+        assert!(equal);
+        let count: NSUInteger = msg![env; restored count];
+        assert_eq!(count, 4);
+        () = msg![env; pool drain];
     }
 }
