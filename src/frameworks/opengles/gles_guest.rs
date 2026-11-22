@@ -3297,7 +3297,8 @@ unsafe fn generate_mipmaps(gles: &mut dyn GLES, shadow: &mut GLShadowState, targ
         return true;
     }
     gles.GenerateMipmap(target);
-    if gles.GetError() != 0 {
+    let generate_error = gles.GetError();
+    if generate_error != 0 {
         // Keep the record honest: a later filter change must retry rather than
         // assume a chain this host refused to build.
         shadow.forget_generated_mipmaps(target, texture);
@@ -3306,10 +3307,11 @@ unsafe fn generate_mipmaps(gles: &mut dyn GLES, shadow: &mut GLShadowState, targ
         if !SEEN_FAILED.swap(true, Ordering::Relaxed) {
             log!(
                 "fix_texture_min_filter: the host cannot generate mipmaps for \
-                 texture {} (target 0x{:x}); using a non-mipmap filter \
-                 [this log will only be shown once]",
+                 texture {} (target 0x{:x}, GL error 0x{:x}); using a non-mipmap \
+                 filter [this log will only be shown once]",
                 texture,
-                target
+                target,
+                generate_error
             );
         }
         return false;
