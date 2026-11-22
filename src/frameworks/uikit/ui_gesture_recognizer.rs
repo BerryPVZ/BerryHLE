@@ -727,8 +727,8 @@ fn pan_touches_moved(
     };
     // UIKit reports velocity in points per second since the previous event.
     let velocity = CGPoint {
-        x: velocity_per_second(now, last_move, previous.x, location.x),
-        y: velocity_per_second(now, last_move, previous.y, location.y),
+        x: velocity_per_second(now, last_move, location.x - previous.x),
+        y: velocity_per_second(now, last_move, location.y - previous.y),
     };
     let began = state == UIGestureRecognizerStatePossible
         && touches >= minimum
@@ -757,19 +757,23 @@ fn pan_touches_ended(
     view: id,
 ) {
     let location: CGPoint = msg![env; touch locationInView:view];
-    {
+    let (active, remaining) = {
         let host = env
             .objc
             .borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
         host.active_touches.remove(&touch);
-    }
-    let active = {
-        let host = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer);
-        matches!(
-            host.state,
-            UIGestureRecognizerStateBegan | UIGestureRecognizerStateChanged
+        (
+            matches!(
+                host.state,
+                UIGestureRecognizerStateBegan | UIGestureRecognizerStateChanged
+            ),
+            host.active_touches.len(),
         )
     };
+    // Lifting one finger of a multi-touch pan keeps the gesture going.
+    if active && remaining > 0 {
+        return;
+    }
     {
         let host = env
             .objc
@@ -808,7 +812,7 @@ pub(super) fn touches_cancelled(env: &mut Environment, view: id) {
     let recognizers = recognizers_in_chain(env, view);
     for &recognizer in &recognizers { retain(env, recognizer); }
     for &recognizer in &recognizers {
-        let was_active = {
+        let (was_active, was_touched) = {
             let host = env
                 .objc
                 .borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
@@ -816,25 +820,32 @@ pub(super) fn touches_cancelled(env: &mut Environment, view: id) {
                 host.state,
                 UIGestureRecognizerStateBegan | UIGestureRecognizerStateChanged
             );
-            host.state = if active {
-                UIGestureRecognizerStateCancelled
-            } else {
-                UIGestureRecognizerStateFailed
-            };
-            host.tracking = false;
-            host.active_touches.clear();
-            host.press_started = None;
-            host.completed_taps = 0;
-            host.previous_tap = None;
-            active
+            // Recognizers that never saw these touches keep their state.
+            let touched = host.tracking || active;
+            if touched {
+                host.state = if active {
+                    UIGestureRecognizerStateCancelled
+                } else {
+                    UIGestureRecognizerStateFailed
+                };
+                host.tracking = false;
+                host.active_touches.clear();
+                host.press_started = None;
+                host.completed_taps = 0;
+                host.previous_tap = None;
+            }
+            (active, touched)
         };
-        stop_press_timer(env, recognizer);
+        if was_touched {
+            stop_press_timer(env, recognizer);
+        }
         if was_active {
             send_action(env, recognizer);
         }
     }
     for recognizer in recognizers { release(env, recognizer); }
 }
+
 fn long_press_timer(env: &mut Environment, recognizer: id, timer: id) {
     let h = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer);
     if h.press_timer != timer { return; }
@@ -879,16 +890,11 @@ fn wrapped_angle(angle: CGFloat) -> CGFloat {
 
 /// Change per second since the previous event, clamped to a millisecond so a
 /// pair of events in the same tick cannot divide by zero.
-fn velocity_per_second(
-    now: Instant,
-    last: Option<Instant>,
-    previous: CGFloat,
-    current: CGFloat,
-) -> CGFloat {
+fn velocity_per_second(now: Instant, last: Option<Instant>, delta: CGFloat) -> CGFloat {
     match last {
         Some(last) => {
             let seconds = now.duration_since(last).as_secs_f64().max(0.001) as CGFloat;
-            (current - previous) / seconds
+            delta / seconds
         }
         None => 0.0,
     }
@@ -959,7 +965,7 @@ fn two_finger_touches_inner(env: &mut Environment, recognizer: id, touches: id, 
         h.rotation = 0.0;
         h.rotation_velocity = 0.0;
         h.rotation_start_angle = angle;
-        h.two_finger_last_move = Some(Instant::now());
+        h.two_finger_last_move = Some(now);
         h.two_finger_last_distance = distance;
         h.two_finger_last_angle = angle;
         h.state = UIGestureRecognizerStateBegan;
@@ -972,14 +978,14 @@ fn two_finger_touches_inner(env: &mut Environment, recognizer: id, touches: id, 
         h.pinch_velocity = velocity_per_second(
             now,
             h.two_finger_last_move,
-            h.two_finger_last_distance,
-            distance,
+            distance - h.two_finger_last_distance,
         );
+        // The raw angles jump by a full turn at +-pi, so velocity uses the
+        // wrapped difference instead.
         h.rotation_velocity = velocity_per_second(
             now,
             h.two_finger_last_move,
-            h.two_finger_last_angle,
-            angle,
+            wrapped_angle(angle - h.two_finger_last_angle),
         );
         h.two_finger_last_move = Some(now);
         h.two_finger_last_distance = distance;
@@ -1109,12 +1115,16 @@ mod two_finger_tests {
     fn velocity_is_change_per_second_since_the_previous_event() {
         let now = Instant::now();
         let last = Some(now - Duration::from_secs(2));
-        assert_eq!(velocity_per_second(now, last, 10.0, 14.0), 2.0);
-        assert_eq!(velocity_per_second(now, last, 10.0, 6.0), -2.0);
+        assert_eq!(velocity_per_second(now, last, 4.0), 2.0);
+        assert_eq!(velocity_per_second(now, last, -4.0), -2.0);
         // Two events in the same tick cannot produce an infinite velocity.
         let last = Some(now);
-        assert!((velocity_per_second(now, last, 0.0, 1.0) - 1000.0).abs() < 0.01);
-        assert_eq!(velocity_per_second(now, None, 0.0, 1.0), 0.0);
+        assert!((velocity_per_second(now, last, 1.0) - 1000.0).abs() < 0.01);
+        assert_eq!(velocity_per_second(now, None, 1.0), 0.0);
+        // An angle crossing +-pi is a small step, not a whole turn.
+        let last = Some(now - Duration::from_secs(1));
+        let delta = wrapped_angle(-3.0 - 3.0);
+        assert!((velocity_per_second(now, last, delta) - (2.0 * std::f32::consts::PI - 6.0)).abs() < 1e-4);
     }
 
     #[test]
