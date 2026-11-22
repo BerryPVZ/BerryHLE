@@ -684,16 +684,18 @@ Other options:
         picker's Settings screen.
 
     --fix-texture-min-filter
-        Workaround for apps that rely on the default ES 1.1
-        GL_TEXTURE_MIN_FILTER (GL_NEAREST_MIPMAP_LINEAR) being usable
-        on a level-0-only texture. With this flag, after every
-        glTexImage2D(level=0) call HyperHLE issues an extra
-        glTexParameteri(GL_TEXTURE_MIN_FILTER, GL_LINEAR) so that
-        strict drivers (notably Qualcomm Adreno's native ES 1.1 path)
-        don't sample the texture as opaque black just because no
-        mipmaps were uploaded. The guest's own glTexParameteri calls
-        still override this. Apps that legitimately upload mipmaps
-        should NOT enable this flag.
+        Workaround for apps that ask for a mipmap GL_TEXTURE_MIN_FILTER
+        but upload only level 0. Strict drivers (notably Qualcomm
+        Adreno's native ES 1.1 path) sample such a texture as opaque
+        black, and Core Graphics atlases minified with GL_NEAREST show
+        stray texels as white blocks.
+        On an ES 2.0 context HyperHLE now generates the missing mip
+        chain after each level-0 upload and keeps the guest's filter,
+        so minification works as the app intended. On an ES 1.1
+        context (which cannot mipmap non-power-of-two textures) it
+        forces GL_TEXTURE_MIN_FILTER=GL_LINEAR after each level-0
+        upload instead. Apps that upload real mipmaps themselves are
+        unaffected either way.
 
         On Android builds this workaround is enabled by default, because
         Android hosts essentially always run Mali / Adreno / similar

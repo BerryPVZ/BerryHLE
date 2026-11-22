@@ -193,6 +193,15 @@ pub(super) struct GLShadowState {
     /// level is first allocated via `glTexImage2D`, so subsequent updates can
     /// use `glTexSubImage2D`.
     pub(super) pvrtc_unallocated_levels: HashSet<(GLenum, GLuint, GLint)>,
+    /// Depth renderbuffers this emulator created and attached itself, for a
+    /// framebuffer whose guest attached colour only (see
+    /// `gles_guest::glFramebufferRenderbufferOES`). They have to follow a later
+    /// re-specification of their colour renderbuffer, or the framebuffer goes
+    /// incomplete and every draw into it is discarded.
+    pub(super) auto_depth_renderbuffers: HashSet<GLuint>,
+    /// Textures whose mip chain the emulator generated for the level-0 contents
+    /// they currently hold, keyed by `(parameter target, texture name)`.
+    pub(super) generated_mipmaps: HashSet<(GLenum, GLuint)>,
     pub(super) current_vertex_array: GLuint,
     pub(super) software_vertex_arrays: HashSet<GLuint>,
     pub(super) software_vao_element_array_buffers: HashMap<GLuint, GLuint>,
@@ -227,6 +236,8 @@ impl Default for GLShadowState {
             guest_bound_attribs: HashMap::new(),
             pvrtc_texture_levels: HashMap::new(),
             pvrtc_unallocated_levels: HashSet::new(),
+            auto_depth_renderbuffers: HashSet::new(),
+            generated_mipmaps: HashSet::new(),
             current_vertex_array: 0,
             software_vertex_arrays: HashSet::new(),
             software_vao_element_array_buffers: HashMap::new(),
@@ -297,6 +308,26 @@ impl GLShadowState {
         self.pvrtc_texture_levels
             .retain(|key, _| key.1 != texture);
         self.pvrtc_unallocated_levels.retain(|key| key.1 != texture);
+        self.generated_mipmaps.retain(|key| key.1 != texture);
+    }
+    /// Record that the emulator, not the guest, attached this depth renderbuffer.
+    pub(super) fn record_auto_depth_renderbuffer(&mut self, renderbuffer: GLuint) {
+        self.auto_depth_renderbuffers.insert(renderbuffer);
+    }
+    pub(super) fn is_auto_depth_renderbuffer(&self, renderbuffer: GLuint) -> bool {
+        self.auto_depth_renderbuffers.contains(&renderbuffer)
+    }
+    pub(super) fn forget_auto_depth_renderbuffer(&mut self, renderbuffer: GLuint) {
+        self.auto_depth_renderbuffers.remove(&renderbuffer);
+    }
+    /// Note that a mip chain now exists for `texture`'s current level-0 contents.
+    /// Returns `true` only the first time, so callers generate it once.
+    pub(super) fn record_generated_mipmaps(&mut self, target: GLenum, texture: GLuint) -> bool {
+        self.generated_mipmaps.insert((target, texture))
+    }
+    /// A new level-0 upload invalidates whatever chain was generated before.
+    pub(super) fn forget_generated_mipmaps(&mut self, target: GLenum, texture: GLuint) {
+        self.generated_mipmaps.remove(&(target, texture));
     }
     /// Mark a PVRTC level as not yet materialized: its first upload must use
     /// `glTexImage2D` (which defines the level) instead of
@@ -572,12 +603,14 @@ fn log_fix_min_filter_status(enabled: bool) {
     }
     if enabled {
         log!(
-            "fix_texture_min_filter: ON (after every level-0 texture upload, \
-             GL_TEXTURE_MIN_FILTER will be forced to GL_LINEAR if the guest \
-             never set it). This avoids flat-black/white-textured geometry on \
-             strict drivers (Mali, Adreno) for iOS games that don't ship \
-             mipmaps. Disable with --no-fix-texture-min-filter if a game \
-             genuinely needs mipmap minification."
+            "fix_texture_min_filter: ON. ES 2.0 contexts keep the guest's \
+             mipmap GL_TEXTURE_MIN_FILTER and get a mip chain generated after \
+             each level-0 texture upload; ES 1.1 contexts replace a mipmap \
+             filter with GL_LINEAR after every level-0 upload. Both avoid \
+             flat-black or blocky-white textured geometry on strict drivers (Mali, Adreno) \
+             for iOS games that don't ship mipmaps. Disable with \
+             --no-fix-texture-min-filter if a game genuinely needs mipmap \
+             minification."
         );
     } else {
         log!(

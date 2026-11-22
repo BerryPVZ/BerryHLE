@@ -3256,11 +3256,71 @@ fn demipmap_filter_value(pname: GLenum, param: GLint) -> GLint {
     demipmapped as GLint
 }
 
-fn maybe_demipmap_min_filter(env: &Environment, pname: GLenum, param: GLint) -> GLint {
-    if !env.options.fix_texture_min_filter {
+/// Whether `param` is one of the four mipmap `GL_TEXTURE_MIN_FILTER` modes.
+fn is_mipmap_min_filter(param: GLint) -> bool {
+    matches!(
+        param as GLenum,
+        gles11::NEAREST_MIPMAP_NEAREST
+            | gles11::NEAREST_MIPMAP_LINEAR
+            | gles11::LINEAR_MIPMAP_NEAREST
+            | gles11::LINEAR_MIPMAP_LINEAR
+    )
+}
+
+/// Give the bound texture a mip chain so a mipmap min-filter can stay set.
+///
+/// iOS-era GPUs sample the mip chain when an app asks for mipmap minification.
+/// On a strict driver a level-0-only texture is incomplete and samples black,
+/// which is why the guest's filter used to be replaced with its non-mipmap
+/// equivalent. That keeps the texture usable but throws away all minification
+/// filtering, so an app that minifies a large atlas into a small viewport
+/// (Blockheads renders a 2048x2048 world atlas into a 320x320 camera) samples
+/// arbitrary single texels and shows blocks of white atlas gutter art.
+/// Generating the chain once per level-0 upload restores what iOS did.
+///
+/// Only ES 2.0 backends do this: ES 1.1 has no mipmaps for non-power-of-two
+/// textures, so generation there can fail on a texture the guest already uses.
+unsafe fn generate_mipmaps(gles: &mut dyn GLES, shadow: &mut GLShadowState, target: GLenum) {
+    // Cube-map faces share one texture object and one mip chain.
+    let target = crate::gles::util::tex_parameter_target(target);
+    let Some(texture) = current_bound_texture(gles, target) else {
+        return;
+    };
+    if texture == 0 || !shadow.record_generated_mipmaps(target, texture) {
+        return;
+    }
+    gles.GenerateMipmap(target);
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    if !SEEN.swap(true, Ordering::Relaxed) {
+        log!(
+            "fix_texture_min_filter: generating a mip chain for texture {} \
+             (target 0x{:x}) instead of replacing the guest's mipmap \
+             GL_TEXTURE_MIN_FILTER [this log will only be shown once]",
+            texture,
+            target
+        );
+    }
+}
+
+/// Keep the guest's mipmap `GL_TEXTURE_MIN_FILTER` when a mip chain can be
+/// supplied, otherwise fall back to the non-mipmap substitute.
+fn adjust_min_filter(
+    fix_min_filter: bool,
+    gles: &mut dyn GLES,
+    shadow: &mut GLShadowState,
+    target: GLenum,
+    pname: GLenum,
+    param: GLint,
+) -> GLint {
+    if !fix_min_filter || pname != gles11::TEXTURE_MIN_FILTER || !is_mipmap_min_filter(param) {
         return param;
     }
-    demipmap_filter_value(pname, param)
+    if !gles.is_es2() {
+        return demipmap_filter_value(pname, param);
+    }
+    unsafe { generate_mipmaps(gles, shadow, target) };
+    param
 }
 
 fn glTexParameteri(env: &mut Environment, target: GLenum, pname: GLenum, param: GLint) {
@@ -3277,8 +3337,9 @@ fn glTexParameteri(env: &mut Environment, target: GLenum, pname: GLenum, param: 
     if pname == gles11::TEXTURE_CROP_RECT_OES {
         return;
     }
-    let param = maybe_demipmap_min_filter(env, pname, param);
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
+    let fix_min_filter = env.options.fix_texture_min_filter && pname == gles11::TEXTURE_MIN_FILTER;
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        let param = adjust_min_filter(fix_min_filter, gles, shadow, target, pname, param);
         gles.TexParameteri(target, pname, param)
     })
 }
@@ -3288,9 +3349,10 @@ fn glTexParameterf(env: &mut Environment, target: GLenum, pname: GLenum, param: 
     }
     // Floats can also be used to pass enum-valued min-filter params (an
     // OpenGL quirk), so route them through the same substitution.
-    let param = maybe_demipmap_min_filter(env, pname, param as GLint) as GLfloat;
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.TexParameterf(target, pname, param)
+    let fix_min_filter = env.options.fix_texture_min_filter && pname == gles11::TEXTURE_MIN_FILTER;
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        let param = adjust_min_filter(fix_min_filter, gles, shadow, target, pname, param as GLint);
+        gles.TexParameterf(target, pname, param as GLfloat)
     })
 }
 fn glTexParameterx(env: &mut Environment, target: GLenum, pname: GLenum, param: GLfixed) {
@@ -3298,8 +3360,9 @@ fn glTexParameterx(env: &mut Environment, target: GLenum, pname: GLenum, param: 
         return;
     }
     // Fixed-point can also encode enum values; route through substitution.
-    let param = maybe_demipmap_min_filter(env, pname, param) as GLfixed;
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
+    let fix_min_filter = env.options.fix_texture_min_filter && pname == gles11::TEXTURE_MIN_FILTER;
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        let param = adjust_min_filter(fix_min_filter, gles, shadow, target, pname, param);
         gles.TexParameterx(target, pname, param)
     })
 }
@@ -3340,11 +3403,11 @@ fn glTexParameteriv(env: &mut Environment, target: GLenum, pname: GLenum, params
         return;
     }
     let fix_min_filter = env.options.fix_texture_min_filter && pname == gles11::TEXTURE_MIN_FILTER;
-    with_ctx_and_mem(env, |gles, mem| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         let params_ptr = mem.ptr_at(params, 1);
         if fix_min_filter {
             let original: GLint = *params_ptr;
-            let substituted = demipmap_filter_value(pname, original);
+            let substituted = adjust_min_filter(true, gles, shadow, target, pname, original);
             if substituted != original {
                 let v = [substituted];
                 gles.TexParameteriv(target, pname, v.as_ptr());
@@ -3367,11 +3430,12 @@ fn glTexParameterfv(
         return;
     }
     let fix_min_filter = env.options.fix_texture_min_filter && pname == gles11::TEXTURE_MIN_FILTER;
-    with_ctx_and_mem(env, |gles, mem| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         let params_ptr = mem.ptr_at(params, 1);
         if fix_min_filter {
             let original: GLfloat = *params_ptr;
-            let substituted = demipmap_filter_value(pname, original as GLint) as GLfloat;
+            let substituted = adjust_min_filter(true, gles, shadow, target, pname, original as GLint)
+                as GLfloat;
             if substituted != original {
                 let v = [substituted];
                 gles.TexParameterfv(target, pname, v.as_ptr());
@@ -3394,11 +3458,11 @@ fn glTexParameterxv(
         return;
     }
     let fix_min_filter = env.options.fix_texture_min_filter && pname == gles11::TEXTURE_MIN_FILTER;
-    with_ctx_and_mem(env, |gles, mem| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         let params_ptr = mem.ptr_at(params, 1);
         if fix_min_filter {
             let original: GLfixed = *params_ptr;
-            let substituted = demipmap_filter_value(pname, original) as GLfixed;
+            let substituted = adjust_min_filter(true, gles, shadow, target, pname, original);
             if substituted != original {
                 let v = [substituted];
                 gles.TexParameterxv(target, pname, v.as_ptr());
@@ -3595,6 +3659,19 @@ fn glTexImage2D(
             }
         }
     }
+    if env.options.verbose_gles {
+        log!(
+            "glTexImage2D: target=0x{:x} level={} size={}x{} internalformat=0x{:x} format=0x{:x} type=0x{:x} pixels_null={}",
+            target,
+            level,
+            width,
+            height,
+            internalformat as u32,
+            format,
+            type_,
+            pixels.is_null()
+        );
+    }
     let guest_pixels = pixels;
     let fix_filter = env.options.fix_texture_min_filter && level == 0;
     let parameter_target = crate::gles::util::tex_parameter_target(target);
@@ -3658,20 +3735,39 @@ fn glTexImage2D(
             }
         }
         if fix_filter {
-            // Set GL_TEXTURE_MIN_FILTER to GL_LINEAR for the bound
-            // texture so it isn't sampled as opaque black on strict
-            // ES 1.1 drivers (notably Qualcomm Adreno) just because
-            // the guest never bothered to override the default
-            // GL_NEAREST_MIPMAP_LINEAR. The guest's own
-            // glTexParameteri(GL_TEXTURE_MIN_FILTER, …) will override
-            // this on subsequent calls — see Options::fix_texture_min_filter.
-            static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                log!(
-                    "First fix_texture_min_filter override: forcing GL_TEXTURE_MIN_FILTER=GL_LINEAR after glTexImage2D(level=0) [this log will only be shown once]"
-                );
+            // A mipmap min-filter on a level-0-only texture is incomplete and
+            // samples black on a strict driver (notably Qualcomm Adreno),
+            // because the guest kept the default GL_NEAREST_MIPMAP_LINEAR
+            // instead of overriding it after upload. iOS sampled the whole
+            // chain, so generate one and keep the guest's filter: replacing
+            // it costs all minification filtering and an app that shrinks a
+            // large atlas samples single texels (Blockheads' white blocks).
+            // Only a backend that cannot build chains falls back to
+            // GL_LINEAR. See Options::fix_texture_min_filter.
+            let mut current: GLint = 0;
+            gles.GetTexParameteriv(parameter_target, gles11::TEXTURE_MIN_FILTER, &mut current);
+            if let Some(texture) = bound_texture {
+                shadow.forget_generated_mipmaps(parameter_target, texture);
             }
-            gles.TexParameteri(parameter_target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+            if !gles.is_es2() {
+                static SEEN: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    log!(
+                        "First fix_texture_min_filter override: forcing GL_TEXTURE_MIN_FILTER=GL_LINEAR after glTexImage2D(level=0) [this log will only be shown once]"
+                    );
+                }
+                gles.TexParameteri(
+                    parameter_target,
+                    gles11::TEXTURE_MIN_FILTER,
+                    gles11::LINEAR as GLint,
+                );
+            } else if is_mipmap_min_filter(current) {
+                if let Some(texture) = bound_texture {
+                    shadow.record_generated_mipmaps(parameter_target, texture);
+                }
+                gles.GenerateMipmap(parameter_target);
+            }
         }
     })
 }
@@ -4211,8 +4307,52 @@ fn glRenderbufferStorageOES(
 ) {
     let factor = env.options.scale_hack.get() as GLsizei;
     let (width, height) = (width * factor, height * factor);
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.RenderbufferStorageOES(target, internalformat, width, height)
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        gles.RenderbufferStorageOES(target, internalformat, width, height);
+        // An auto-attached depth renderbuffer was sized from the colour
+        // renderbuffer it was attached for. When the app re-specifies that
+        // colour buffer at a new size (Blockheads grows its drawable from
+        // 320x460 to 320x480), the depth attachment keeps the old size, the
+        // framebuffer goes incomplete and every draw into it is discarded.
+        // Follow the colour size, as the app would have if it had attached a
+        // depth buffer itself.
+        while gles.GetError() != 0 {}
+        let mut colour_rb: GLint = 0;
+        gles.GetIntegerv(gles11::RENDERBUFFER_BINDING_OES, &mut colour_rb);
+        let mut framebuffer: GLint = 0;
+        gles.GetIntegerv(gles11::FRAMEBUFFER_BINDING_OES, &mut framebuffer);
+        if colour_rb == 0 || framebuffer == 0 {
+            return;
+        }
+        let mut colour_attachment: GLint = 0;
+        gles.GetFramebufferAttachmentParameterivOES(
+            gles11::FRAMEBUFFER_OES,
+            gles11::COLOR_ATTACHMENT0_OES,
+            gles11::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME_OES,
+            &mut colour_attachment,
+        );
+        let mut depth_rb: GLint = 0;
+        gles.GetFramebufferAttachmentParameterivOES(
+            gles11::FRAMEBUFFER_OES,
+            gles11::DEPTH_ATTACHMENT_OES,
+            gles11::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME_OES,
+            &mut depth_rb,
+        );
+        while gles.GetError() != 0 {}
+        if colour_attachment != colour_rb
+            || depth_rb == 0
+            || !shadow.is_auto_depth_renderbuffer(depth_rb as GLuint)
+        {
+            return;
+        }
+        gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, depth_rb as GLuint);
+        gles.RenderbufferStorageOES(
+            gles11::RENDERBUFFER_OES,
+            gles11::DEPTH_COMPONENT16_OES,
+            width,
+            height,
+        );
+        gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, colour_rb as GLuint);
     })
 }
 
@@ -4257,7 +4397,7 @@ fn glFramebufferRenderbufferOES(
     // Whether this call made us synthesise a depth buffer for the target. The
     // framebuffer's new state is recorded after the GL closure because that
     // closure only has the GLES wrapper, not the framework state.
-    let auto_attached: bool = with_ctx_and_mem(env, |gles, _mem| unsafe {
+    let auto_attached: bool = with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
         let mut auto_attached = false;
         gles.FramebufferRenderbufferOES(target, attachment, renderbuffertarget, renderbuffer);
         // When an iOS app attaches its drawable color renderbuffer to an FBO,
@@ -4406,6 +4546,7 @@ fn glFramebufferRenderbufferOES(
                     // Don't claim success when the attachment was reverted.
                     if status == gles11::FRAMEBUFFER_COMPLETE_OES {
                         auto_attached = true;
+                        shadow.record_auto_depth_renderbuffer(depth_rb);
                         FIRST.call_once(|| log!("{message}"));
                     }
                     log_dbg!("{message} (framebuffer status {status:#x})");
@@ -4515,9 +4656,15 @@ fn glDeleteFramebuffersOES(env: &mut Environment, n: GLsizei, framebuffers: Cons
     }
 }
 fn glDeleteRenderbuffersOES(env: &mut Environment, n: GLsizei, renderbuffers: ConstPtr<GLuint>) {
-    with_ctx_and_mem(env, |gles, mem| {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| {
         let n_usize: GuestUSize = n.try_into().unwrap();
         let renderbuffers = mem.ptr_at(renderbuffers, n_usize);
+        if !renderbuffers.is_null() {
+            for i in 0..n_usize {
+                let name: GLuint = unsafe { *renderbuffers.offset(i as isize) };
+                shadow.forget_auto_depth_renderbuffer(name);
+            }
+        }
         unsafe { gles.DeleteRenderbuffersOES(n, renderbuffers) }
     })
 }
