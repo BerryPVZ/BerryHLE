@@ -3303,6 +3303,60 @@ unsafe fn generate_mipmaps(gles: &mut dyn GLES, shadow: &mut GLShadowState, targ
     }
 }
 
+/// Restore the guest's min filter after a level-0 upload.
+///
+/// A mipmap min-filter stays set and the chain is generated, because the
+/// upload supplied a full level 0. A backend or host format that cannot build
+/// the chain keeps the old `GL_LINEAR` substitute: an incomplete texture
+/// samples black, which is worse than losing minification.
+unsafe fn supply_min_filter_after_upload(
+    gles: &mut dyn GLES,
+    shadow: &mut GLShadowState,
+    target: GLenum,
+    texture: Option<GLuint>,
+) {
+    let mut current: GLint = 0;
+    gles.GetTexParameteriv(target, gles11::TEXTURE_MIN_FILTER, &mut current);
+    if let Some(texture) = texture {
+        shadow.forget_generated_mipmaps(target, texture);
+    }
+    if !gles.is_es2() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SEEN: AtomicBool = AtomicBool::new(false);
+        if !SEEN.swap(true, Ordering::Relaxed) {
+            log!(
+                "First fix_texture_min_filter override: forcing \
+                 GL_TEXTURE_MIN_FILTER=GL_LINEAR after a level-0 upload \
+                 [this log will only be shown once]"
+            );
+        }
+        gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+        return;
+    }
+    if !is_mipmap_min_filter(current) {
+        return;
+    }
+    if let Some(texture) = texture {
+        shadow.record_generated_mipmaps(target, texture);
+    }
+    gles.GenerateMipmap(target);
+    if gles.GetError() != 0 {
+        // The host kept the guest's compressed texels and cannot build a
+        // chain for them; replace the filter instead of sampling black.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SEEN_FAILED: AtomicBool = AtomicBool::new(false);
+        if !SEEN_FAILED.swap(true, Ordering::Relaxed) {
+            log!(
+                "fix_texture_min_filter: the host cannot generate mipmaps for \
+                 texture target 0x{:x}; keeping GL_TEXTURE_MIN_FILTER=GL_LINEAR \
+                 [this log will only be shown once]",
+                target
+            );
+        }
+        gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+    }
+}
+
 /// Keep the guest's mipmap `GL_TEXTURE_MIN_FILTER` when a mip chain can be
 /// supplied, otherwise fall back to the non-mipmap substitute.
 fn adjust_min_filter(
@@ -3735,39 +3789,12 @@ fn glTexImage2D(
             }
         }
         if fix_filter {
-            // A mipmap min-filter on a level-0-only texture is incomplete and
-            // samples black on a strict driver (notably Qualcomm Adreno),
-            // because the guest kept the default GL_NEAREST_MIPMAP_LINEAR
-            // instead of overriding it after upload. iOS sampled the whole
-            // chain, so generate one and keep the guest's filter: replacing
-            // it costs all minification filtering and an app that shrinks a
-            // large atlas samples single texels (Blockheads' white blocks).
-            // Only a backend that cannot build chains falls back to
-            // GL_LINEAR. See Options::fix_texture_min_filter.
-            let mut current: GLint = 0;
-            gles.GetTexParameteriv(parameter_target, gles11::TEXTURE_MIN_FILTER, &mut current);
-            if let Some(texture) = bound_texture {
-                shadow.forget_generated_mipmaps(parameter_target, texture);
-            }
-            if !gles.is_es2() {
-                static SEEN: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    log!(
-                        "First fix_texture_min_filter override: forcing GL_TEXTURE_MIN_FILTER=GL_LINEAR after glTexImage2D(level=0) [this log will only be shown once]"
-                    );
-                }
-                gles.TexParameteri(
-                    parameter_target,
-                    gles11::TEXTURE_MIN_FILTER,
-                    gles11::LINEAR as GLint,
-                );
-            } else if is_mipmap_min_filter(current) {
-                if let Some(texture) = bound_texture {
-                    shadow.record_generated_mipmaps(parameter_target, texture);
-                }
-                gles.GenerateMipmap(parameter_target);
-            }
+            // The guest asked for mipmap minification and iOS sampled the
+            // chain, so supply one instead of losing all minification
+            // filtering. Replacing the filter made a shrunken atlas sample
+            // single texels (Blockheads' white blocks).
+            // See Options::fix_texture_min_filter.
+            supply_min_filter_after_upload(gles, shadow, parameter_target, bound_texture);
         }
     })
 }
@@ -3934,7 +3961,9 @@ fn glCompressedTexImage2D(
                 }
             }
             if fix_filter {
-                gles.TexParameteri(parameter_target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+                // Storage came from glTexImage2D(RGBA), so the chain can be
+                // generated just like an uncompressed upload.
+                supply_min_filter_after_upload(gles, shadow, parameter_target, bound_texture);
             }
             return;
         }
@@ -3979,7 +4008,8 @@ fn glCompressedTexImage2D(
                     }
                 }
                 if fix_filter {
-                    gles.TexParameteri(parameter_target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+                    // PVRTC was decoded to RGBA, so the chain can exist.
+                    supply_min_filter_after_upload(gles, shadow, parameter_target, bound_texture);
                 }
                 return;
             }
@@ -4062,7 +4092,9 @@ fn glCompressedTexImage2D(
         }
 
         if fix_filter {
-            gles.TexParameteri(parameter_target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+            // Some hosts keep the guest's compressed texels and cannot build
+            // a chain for them; supply_min_filter_after_upload falls back.
+            supply_min_filter_after_upload(gles, shadow, parameter_target, bound_texture);
         }
     })
 }
