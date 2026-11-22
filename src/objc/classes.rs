@@ -1453,13 +1453,17 @@ pub fn objc_getClass(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class 
 /// log and control returns to the nearest app-level frame, the same bypass the
 /// C++ ABI entry points use. `objc_exception_rethrow` shares it.
 pub fn objc_exception_throw(env: &mut crate::Environment, exception: id) {
-    let description = exception_description(env, exception);
-    crate::libc::cxxabi::unwind_past_objc_exception(env, &description);
+    let (key, description) = exception_description(env, exception);
+    crate::libc::cxxabi::unwind_past_objc_exception(env, &key, &description);
 }
 
 /// `void objc_exception_rethrow(void)`.
 pub fn objc_exception_rethrow(env: &mut crate::Environment) {
-    crate::libc::cxxabi::unwind_past_objc_exception(env, "re-thrown with no exception in flight");
+    crate::libc::cxxabi::unwind_past_objc_exception(
+        env,
+        "re-thrown exception",
+        "re-thrown with no exception in flight",
+    );
 }
 
 /// `void objc_terminate(void)` — called when an exception reaches a frame that
@@ -1483,16 +1487,20 @@ pub fn objc_begin_catch(_env: &mut crate::Environment, _exception_buffer: MutVoi
 /// `void objc_end_catch(void)`. Nothing was retained by `objc_begin_catch`.
 pub fn objc_end_catch(_env: &mut crate::Environment) {}
 
-fn exception_description(env: &mut crate::Environment, exception: id) -> String {
+/// The log text names the exception's address, but the re-throw loop guard keys
+/// on the class so a guest that allocates a fresh exception object each
+/// iteration is still counted.
+fn exception_description(
+    env: &mut crate::Environment,
+    exception: id,
+) -> (String, String) {
     if exception.is_null() {
-        return "nil".to_owned();
+        return ("nil".to_owned(), "nil".to_owned());
     }
     let class = object_getClass(env, exception);
-    format!(
-        "of class {} at {:?}",
-        env.objc.get_class_name(class),
-        exception
-    )
+    let class_name = env.objc.get_class_name(class).to_owned();
+    let description = format!("of class {} at {:?}", class_name, exception);
+    (class_name, description)
 }
 
 pub fn object_getClassName(env: &mut crate::Environment, obj: id) -> Class {

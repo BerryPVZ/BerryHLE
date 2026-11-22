@@ -442,9 +442,14 @@ fn __cxa_throw(env: &mut Environment, exception: MutVoidPtr, tinfo: ConstVoidPtr
 
 /// Bypass shared by the Objective-C exception entry points: there is no
 /// unwinder, so return to the nearest app-level frame, and stop a guest that
-/// keeps re-throwing so the emulator cannot spin forever.
-pub(crate) fn unwind_past_objc_exception(env: &mut Environment, description: &str) {
-    let count = note_exception_throw(description);
+/// keeps re-throwing so the emulator cannot spin forever. `key` identifies the
+/// exception for the loop guard; `description` is only logged.
+pub(crate) fn unwind_past_objc_exception(
+    env: &mut Environment,
+    key: &str,
+    description: &str,
+) {
+    let count = note_exception_throw(key);
 
     if count <= 3 || count.is_multiple_of(64) {
         log!(
