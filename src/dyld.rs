@@ -1358,7 +1358,17 @@ impl Dyld {
                     .unresolved_symbols
                     .entry(name.to_string())
                     .or_default() += 1;
-                continue;
+                // Point the slot at a trap instead of leaving NULL (which is
+                // what a zero-initialised slot holds anyway). Guest code that
+                // calls the import then reports its name and call site; NULL
+                // only produced a jump to address 0, which Dynarmic reported
+                // as a bare "Error during CPU execution: MemoryError".
+                let symbol: &'static str =
+                    Box::leak(name.to_string().into_boxed_str());
+                let trap: HostFunction =
+                    Box::leak(Box::new(UnresolvedImportCalled { symbol }));
+                let stub = self.create_guest_function(mem, symbol, trap);
+                Ptr::from_bits(stub.to_ptr().to_bits())
             };
             // wrapping_add() is used in case the offset is negative. I haven't
             // seen it happen, but it would make sense if that is allowed.
@@ -2334,6 +2344,35 @@ fn local_code_symbol(bin: &MachO, symbol: &str) -> Option<u32> {
                 .is_some_and(|offset| offset < section.size)
         })
         .then_some(address)
+}
+
+/// Reports a call to an import no host library implements.
+///
+/// Unresolved imports used to be linked to NULL, so calling one jumped to
+/// address 0 and surfaced as a bare `MemoryError`. The trap names the symbol
+/// and the guest call site instead. It deliberately does not invent a return
+/// value: unknown imports have unknown side effects, and a fake success hides
+/// the real failure.
+struct UnresolvedImportCalled {
+    symbol: &'static str,
+}
+
+impl CallFromGuest for UnresolvedImportCalled {
+    fn call_from_guest(&self, env: &mut Environment) {
+        let lr = env.cpu.regs()[Cpu::LR];
+        log!(
+            "Error: the unimplemented import {} was called; LR={:#010x}",
+            self.symbol,
+            lr
+        );
+        panic!(
+            "Guest called the unimplemented import {} (caller LR={:#010x}). \
+             HyperHLE links imports it cannot implement to this trap, so the \
+             call is reported with its name and call site instead of failing as \
+             a jump to address 0.",
+            self.symbol, lr
+        );
+    }
 }
 
 fn unresolved_function_called(symbol: &str, stub_pc: u32, caller_lr: u32) -> ! {

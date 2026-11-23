@@ -364,6 +364,10 @@ static NULL_WRITE_PROBE_PENDING: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static NULL_WRITE_PROBE_ADDRESS: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
+/// First null-page access of this run, packed as
+/// `pc << 32 | lr << 1 | is_write`. Zero means none seen yet.
+static FIRST_NULL_ACCESS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Total size of the live guest heap allocations, in bytes, mirrored for the
 /// performance overlay's VMEM counter. The authoritative bookkeeping lives in
@@ -621,6 +625,35 @@ pub fn reset_null_write_probes() {
     use std::sync::atomic::Ordering;
     NULL_WRITE_PROBE_PENDING.store(0, Ordering::Relaxed);
     NULL_WRITE_PROBE_COUNT.store(0, Ordering::Relaxed);
+    FIRST_NULL_ACCESS.store(0, Ordering::Relaxed);
+}
+
+/// Record the first null-page fault site of this app run, so a later fatal
+/// report can name where the guest first used the bad pointer. Only the first
+/// site is kept: it is the one that explains the failure.
+pub fn note_null_fault_site(pc: u32, lr: u32, is_write: bool) {
+    use std::sync::atomic::Ordering;
+    let packed =
+        ((pc as u64) << 32) | ((lr as u64 & 0xffff_fffe) | is_write as u64);
+    let _ = FIRST_NULL_ACCESS.compare_exchange(
+        0,
+        packed,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+}
+
+/// The first null-page fault site of this app run: `(pc, lr, is_write)`.
+pub(crate) fn first_null_access() -> Option<(u32, u32, bool)> {
+    use std::sync::atomic::Ordering;
+    let packed = FIRST_NULL_ACCESS.load(Ordering::Relaxed);
+    (packed != 0).then(|| {
+        (
+            (packed >> 32) as u32,
+            (packed as u32) & 0xffff_fffe,
+            packed as u32 & 1 != 0,
+        )
+    })
 }
 
 #[cfg(test)]

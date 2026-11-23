@@ -3956,6 +3956,11 @@ impl Environment {
             if matches!(error, cpu::CpuError::MemoryError) {
                 if let Some((probe_number, address)) = crate::mem::null_write_probe_pending() {
                     crate::mem::null_write_probe_clear();
+                    crate::mem::note_null_fault_site(
+                        self.cpu.regs()[cpu::Cpu::PC],
+                        self.cpu.regs()[cpu::Cpu::LR],
+                        true,
+                    );
                     if probe_number == 1 {
                         log_no_panic!(
                             "NULL-WRITE PROBE #{}: guest stored to {:#010x}; PC={:#x} LR={:#x} (thread {}, thumb={}). Code at PC: [{}]",
@@ -3997,16 +4002,26 @@ impl Environment {
                 // `MemoryError` is what dynarmic sees when the store is
                 // refused, not the reason the guest failed. Say what actually
                 // happened; the store address and guest PC are the evidence.
+                // The first fault site matters more than the last: by now the
+                // guest may have walked a different structure.
+                let first_site = match crate::mem::first_null_access() {
+                    Some((pc, lr, _)) => {
+                        format!("The first one was at PC={pc:#x} LR={lr:#x}.")
+                    }
+                    None => String::new(),
+                };
                 panic!(
                     "Guest wrote through a NULL pointer {} time(s); the last store was to \
-                     {:#010x} at PC={:#x} LR={:#x}. HyperHLE discards such stores, and stops \
-                     once the budget runs out (headless: the first; interactive: {}). The \
-                     guest dereferenced a pointer that was never initialised, such as a \
-                     failed allocation or an API that returned NULL.",
+                     {:#010x} at PC={:#x} LR={:#x}. {}HyperHLE discards such stores, \
+                     and stops once the budget runs out (headless: the first; \
+                     interactive: {}). The guest dereferenced a pointer that was never \
+                     initialised, such as a failed allocation or an API that returned \
+                     NULL.",
                     probe_number,
                     address,
                     self.cpu.regs()[cpu::Cpu::PC],
                     self.cpu.regs()[cpu::Cpu::LR],
+                    first_site,
                     crate::mem::NULL_WRITE_PROBE_LIMIT,
                 );
             }
