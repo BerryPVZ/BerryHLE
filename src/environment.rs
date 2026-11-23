@@ -1787,11 +1787,13 @@ impl Environment {
         }
     }
 
-    /// Names the guest symbol containing `pc`, as `Image: symbol+0x12`.
+    /// Names the guest function containing `pc`, as `Image: symbol+0x12`.
     ///
     /// The image's own symbol table is already in [`Environment::bins`],
     /// including local symbols, so a fault inside the app can be named without
-    /// a separate disassembly step.
+    /// a separate disassembly step. Only symbols in the same code section as
+    /// `pc` are considered, so a nearer data symbol cannot be reported as if
+    /// it were the function.
     pub(crate) fn guest_symbol_for_pc(&self, pc: u32) -> Option<String> {
         let pc = pc & !1;
         let mut nearest: Option<(u32, &str, &str)> = None;
@@ -1799,14 +1801,31 @@ impl Environment {
             if !bin.mapped_segments.iter().any(|range| range.contains(&pc)) {
                 continue;
             }
+            let Some(section) = bin.sections.iter().find(|section| {
+                section.name == "__text"
+                    && section.addr <= pc
+                    && pc - section.addr < section.size
+            }) else {
+                continue;
+            };
+            let code = section.addr..section.addr + section.size;
             for (name, &addr) in &bin.exported_symbols {
                 let addr = addr & !1;
-                if addr <= pc && nearest.is_none_or(|(best, _, _)| pc - addr < best) {
-                    nearest = Some((pc - addr, name, &bin.name));
+                if addr <= pc && code.contains(&addr) {
+                    if nearest.is_none_or(|(best, _, _)| pc - addr < best) {
+                        nearest = Some((pc - addr, name, &bin.name));
+                    }
                 }
             }
         }
         nearest.map(|(offset, name, bin)| format!("{bin}: {name}+{offset:#x}"))
+    }
+
+    /// [`Self::guest_symbol_for_pc`] as a log suffix, parentheses included.
+    pub(crate) fn guest_symbol_suffix(&self, pc: u32) -> String {
+        self.guest_symbol_for_pc(pc)
+            .map(|symbol| format!(" ({symbol})"))
+            .unwrap_or_default()
     }
 
     pub(crate) fn stack_trace_current(&self) {
@@ -3987,13 +4006,13 @@ impl Environment {
                         let pc = self.cpu.regs()[cpu::Cpu::PC];
                         let lr = self.cpu.regs()[cpu::Cpu::LR];
                         log_no_panic!(
-                            "NULL-WRITE PROBE #{}: guest stored to {:#010x}; PC={:#x} ({}) LR={:#x} ({}) (thread {}, thumb={}). Code at PC: [{}]",
+                            "NULL-WRITE PROBE #{}: guest stored to {:#010x}; PC={:#x}{} LR={:#x}{} (thread {}, thumb={}). Code at PC: [{}]",
                             probe_number,
                             address,
                             pc,
-                            self.guest_symbol_for_pc(pc).unwrap_or_default(),
+                            self.guest_symbol_suffix(pc),
                             lr,
-                            self.guest_symbol_for_pc(lr).unwrap_or_default(),
+                            self.guest_symbol_suffix(lr),
                             self.current_thread,
                             is_thumb,
                             self.guest_code_words(pc)
@@ -4031,15 +4050,11 @@ impl Environment {
                 // The first fault site matters more than the last: by now the
                 // guest may have walked a different structure.
                 let first_site = match crate::mem::first_null_access() {
-                    Some((pc, lr, _)) => {
-                        let at = self.guest_symbol_for_pc(pc);
-                        let from = self.guest_symbol_for_pc(lr);
-                        format!(
-                            "The first one was at PC={pc:#x}{} LR={lr:#x}{}.",
-                            at.map(|s| format!(" ({s})")).unwrap_or_default(),
-                            from.map(|s| format!(" ({s})")).unwrap_or_default()
-                        )
-                    }
+                    Some((pc, lr, _)) => format!(
+                        "The first one was at PC={pc:#x}{} LR={lr:#x}{}.",
+                        self.guest_symbol_suffix(pc),
+                        self.guest_symbol_suffix(lr)
+                    ),
                     None => String::new(),
                 };
                 panic!(
@@ -5734,5 +5749,31 @@ mod guest_symbol_lookup_tests {
         );
         // Outside every mapped segment there is nothing to name.
         assert_eq!(env.guest_symbol_for_pc(0x9000), None);
+    }
+
+    #[test]
+    fn does_not_name_an_address_in_a_data_section() {
+        let mut env = touch_test_environment();
+        let mut app = image("App", 0x1000, &[("_helper", 0x1001)]);
+        app.sections[0].size = 0x100;
+        app.sections.push(mach_o::Section {
+            name: "__const".to_owned(),
+            segment_name: "__TEXT".to_owned(),
+            addr: 0x1200,
+            size: 0x100,
+            type_: mach_o::SectionType::Normal,
+            dyld_indirect_symbol_info: None,
+        });
+        app.exported_symbols.insert("_table".to_owned(), 0x1201);
+        env.bins = vec![app];
+
+        // `_table` is the nearest symbol below the address, but it holds data,
+        // so reporting it as the faulting function would mislead.
+        assert_eq!(env.guest_symbol_for_pc(0x1245), None);
+        // Code is still named normally.
+        assert_eq!(
+            env.guest_symbol_for_pc(0x1005),
+            Some("App: _helper+0x4".to_owned())
+        );
     }
 }
