@@ -2360,17 +2360,19 @@ struct UnresolvedImportCalled {
 impl CallFromGuest for UnresolvedImportCalled {
     fn call_from_guest(&self, env: &mut Environment) {
         let lr = env.cpu.regs()[Cpu::LR];
+        let site = env.guest_symbol_for_pc(lr).unwrap_or_default();
         log!(
-            "Error: the unimplemented import {} was called; LR={:#010x}",
+            "Error: the unimplemented import {} was called; LR={:#010x} ({})",
             self.symbol,
-            lr
+            lr,
+            site
         );
         panic!(
-            "Guest called the unimplemented import {} (caller LR={:#010x}). \
+            "Guest called the unimplemented import {} (caller LR={:#010x} ({})). \
              HyperHLE links imports it cannot implement to this trap, so the \
              call is reported with its name and call site instead of failing as \
              a jump to address 0.",
-            self.symbol, lr
+            self.symbol, lr, site
         );
     }
 }

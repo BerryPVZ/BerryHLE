@@ -1787,6 +1787,28 @@ impl Environment {
         }
     }
 
+    /// Names the guest symbol containing `pc`, as `Image: symbol+0x12`.
+    ///
+    /// The image's own symbol table is already in [`Environment::bins`],
+    /// including local symbols, so a fault inside the app can be named without
+    /// a separate disassembly step.
+    pub(crate) fn guest_symbol_for_pc(&self, pc: u32) -> Option<String> {
+        let pc = pc & !1;
+        let mut nearest: Option<(u32, &str, &str)> = None;
+        for bin in &self.bins {
+            if !bin.mapped_segments.iter().any(|range| range.contains(&pc)) {
+                continue;
+            }
+            for (name, &addr) in &bin.exported_symbols {
+                let addr = addr & !1;
+                if addr <= pc && nearest.is_none_or(|(best, _, _)| pc - addr < best) {
+                    nearest = Some((pc - addr, name, &bin.name));
+                }
+            }
+        }
+        nearest.map(|(offset, name, bin)| format!("{bin}: {name}+{offset:#x}"))
+    }
+
     pub(crate) fn stack_trace_current(&self) {
         if self.current_thread == 0 {
             echo_no_panic!("Attempting to produce stack trace for main thread:");
@@ -3962,15 +3984,19 @@ impl Environment {
                         true,
                     );
                     if probe_number == 1 {
+                        let pc = self.cpu.regs()[cpu::Cpu::PC];
+                        let lr = self.cpu.regs()[cpu::Cpu::LR];
                         log_no_panic!(
-                            "NULL-WRITE PROBE #{}: guest stored to {:#010x}; PC={:#x} LR={:#x} (thread {}, thumb={}). Code at PC: [{}]",
+                            "NULL-WRITE PROBE #{}: guest stored to {:#010x}; PC={:#x} ({}) LR={:#x} ({}) (thread {}, thumb={}). Code at PC: [{}]",
                             probe_number,
                             address,
-                            self.cpu.regs()[cpu::Cpu::PC],
-                            self.cpu.regs()[cpu::Cpu::LR],
+                            pc,
+                            self.guest_symbol_for_pc(pc).unwrap_or_default(),
+                            lr,
+                            self.guest_symbol_for_pc(lr).unwrap_or_default(),
                             self.current_thread,
                             is_thumb,
-                            self.guest_code_words(self.cpu.regs()[cpu::Cpu::PC])
+                            self.guest_code_words(pc)
                         );
                         self.dump_all_regs();
                         self.stack_trace_current();
@@ -4006,7 +4032,13 @@ impl Environment {
                 // guest may have walked a different structure.
                 let first_site = match crate::mem::first_null_access() {
                     Some((pc, lr, _)) => {
-                        format!("The first one was at PC={pc:#x} LR={lr:#x}.")
+                        let at = self.guest_symbol_for_pc(pc);
+                        let from = self.guest_symbol_for_pc(lr);
+                        format!(
+                            "The first one was at PC={pc:#x}{} LR={lr:#x}{}.",
+                            at.map(|s| format!(" ({s})")).unwrap_or_default(),
+                            from.map(|s| format!(" ({s})")).unwrap_or_default()
+                        )
                     }
                     None => String::new(),
                 };
@@ -5643,5 +5675,64 @@ mod dylib_sorting_tests {
                 "/usr/lib/libSystem.B.dylib".to_owned(),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod guest_symbol_lookup_tests {
+    use super::*;
+
+    fn image(name: &str, base: u32, symbols: &[(&str, u32)]) -> mach_o::MachO {
+        mach_o::MachO {
+            name: name.to_owned(),
+            loaded_path: format!("/{name}"),
+            dynamic_libraries: Vec::new(),
+            run_paths: Vec::new(),
+            slide: 0,
+            sections: vec![mach_o::Section {
+                name: "__text".to_owned(),
+                segment_name: "__TEXT".to_owned(),
+                addr: 0x1000,
+                size: 0x1000,
+                type_: mach_o::SectionType::Normal,
+                dyld_indirect_symbol_info: None,
+            }],
+            exported_symbols: symbols
+                .iter()
+                .map(|(symbol, addr)| ((*symbol).to_owned(), *addr))
+                .collect(),
+            symbol_locations: Default::default(),
+            external_symbols: Default::default(),
+            external_relocations: Vec::new(),
+            entry_point_pc: None,
+            entry_point_is_lc_main: false,
+            last_segment_end: base + 0x1000,
+            text_base: base,
+            mapped_segments: vec![base..base + 0x1000],
+        }
+    }
+
+    #[test]
+    fn names_the_containing_symbol_and_ignores_other_images() {
+        let mut env = touch_test_environment();
+        env.bins = vec![
+            image("App", 0x1000, &[("_main", 0x1101), ("_helper", 0x1201)]),
+            // Symbols of this image would be the nearest match if its mapped
+            // range were consulted, so the lookup must skip it instead.
+            image("Lib", 0x5000, &[("_libfunction", 0x1241)]),
+        ];
+
+        // Nearest symbol below the address wins, inside the image's own
+        // mapped range; the Thumb bit on the PC is ignored.
+        assert_eq!(
+            env.guest_symbol_for_pc(0x1245),
+            Some("App: _helper+0x44".to_owned())
+        );
+        assert_eq!(
+            env.guest_symbol_for_pc(0x1235),
+            Some("App: _helper+0x34".to_owned())
+        );
+        // Outside every mapped segment there is nothing to name.
+        assert_eq!(env.guest_symbol_for_pc(0x9000), None);
     }
 }
