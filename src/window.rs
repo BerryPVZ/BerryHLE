@@ -3879,7 +3879,7 @@ pub fn launch_wallpaper_picker(env: &mut Environment) -> Result<(), String> {
         let filename = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
         let bytes = std::fs::read(filename.trim()).map_err(|e| e.to_string())?;
         crate::image::Image::from_bytes(&bytes)?;
-        let destination = crate::paths::user_data_base_path().join("AppleJuiceHLE_wallpaper.custom");
+        let destination = crate::paths::user_data_base_path().join(crate::paths::CUSTOM_WALLPAPER_FILE);
         let temporary = destination.with_extension("pending");
         std::fs::write(&temporary, bytes).map_err(|e| e.to_string())?;
         // Windows rename cannot replace a file. Copy the fully written temp

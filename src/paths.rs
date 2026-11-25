@@ -129,6 +129,9 @@ pub const WALLPAPER_FILES: &[&str] = &[
     "touchHLE_wallpaper.jpeg",
 ];
 
+/// Stable filename for wallpaper chosen through the picker. Keep it across rebrands.
+pub const CUSTOM_WALLPAPER_FILE: &str = "BerryHLE_wallpaper.custom";
+
 /// Name of the bundled default wallpaper resource, copied into the user
 /// directory on first run. This is the file baked into the app bundle; it is
 /// intentionally not the same as [WALLPAPER_FILES].

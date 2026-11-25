@@ -707,7 +707,7 @@ public class MainActivity extends SDLActivity {
             if (resultCode != Activity.RESULT_OK || data == null || data.getData() == null) return;
             final Uri uri = data.getData();
             new Thread(() -> {
-                File pending = new File(getExternalFilesDir(null), "AppleJuiceHLE_wallpaper.pending");
+                File pending = new File(getExternalFilesDir(null), "BerryHLE_wallpaper.pending");
                 try (InputStream input = getContentResolver().openInputStream(uri)) {
                     android.graphics.Bitmap bitmap = android.graphics.BitmapFactory.decodeStream(input);
                     if (bitmap == null) throw new IOException("Unsupported image");
@@ -717,7 +717,7 @@ public class MainActivity extends SDLActivity {
                     } finally {
                         bitmap.recycle();
                     }
-                    File destination = new File(getExternalFilesDir(null), "AppleJuiceHLE_wallpaper.custom");
+                    File destination = new File(getExternalFilesDir(null), "BerryHLE_wallpaper.custom");
                     if (!pending.renameTo(destination)) throw new IOException("Couldn't save wallpaper");
                 } catch (Exception e) {
                     pending.delete();

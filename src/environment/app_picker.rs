@@ -2474,7 +2474,7 @@ fn app_picker_inner(
     let mut found_wallpaper = false;
     let mut wallpaper_view: Option<id> = None;
     for candidate in
-        std::iter::once(&"AppleJuiceHLE_wallpaper.custom").chain(paths::WALLPAPER_FILES.iter())
+        std::iter::once(&paths::CUSTOM_WALLPAPER_FILE).chain(paths::WALLPAPER_FILES.iter())
     {
         let candidate = paths::user_data_base_path().join(candidate);
         if !candidate.exists() {
@@ -2871,7 +2871,7 @@ fn app_picker_inner(
     }
     // If an app is picked, this loop returns. If the user quits touchHLE, the
     // process exits.
-    let custom_wallpaper = paths::user_data_base_path().join("AppleJuiceHLE_wallpaper.custom");
+    let custom_wallpaper = paths::user_data_base_path().join(paths::CUSTOM_WALLPAPER_FILE);
     let mut wallpaper_stamp = std::fs::metadata(&custom_wallpaper)
         .ok()
         .and_then(|m| m.modified().ok());
