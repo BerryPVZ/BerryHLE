@@ -1,0 +1,6 @@
+# rust-sdl2 touchHLE-3 expects Cargo's pre-1.100 build-directory layout.
+# https://doc.rust-lang.org/cargo/CHANGELOG.html#cargo-1100-2026-11-12
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

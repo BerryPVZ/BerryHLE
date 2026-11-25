@@ -106,6 +106,10 @@ The titles below have been tested with HyperHLE-Reborn and are known to run. Com
 
 ## Build and documentation
 
+Builds use Rust 1.97.1, selected by `rust-toolchain.toml`. The bundled SDL2
+build script expects Cargo's older artifact layout; Cargo 1.100 changed it.
+Rustup selects the pinned compiler automatically.
+
 Build and run a desktop version with Cargo:
 
 ```sh

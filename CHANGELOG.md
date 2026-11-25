@@ -15,6 +15,10 @@ Changes are categorised as follows:
 
 ## NEXT
 
+- Pin Rust/Cargo to 1.97.1: Cargo 1.100 removed the old artifact layout that
+  the bundled SDL2 build script needs when copying Android shared libraries.
+  Android CI logs the compiler version and separates its toolchain caches.
+
 - Renamed the emulator to AppleJuiceHLE, retaining existing apps, options and saves.
 - Integrated current KlugKlugTG and Zanuaimi experimental compatibility work.
 - Android releases extract the NDK with unzip and validate compiler/linker links,
