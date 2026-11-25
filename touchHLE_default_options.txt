@@ -6,7 +6,7 @@
 #
 # This file contains touchHLE's recommended default options for various apps.
 #
-# *** Don't edit this file yourself! Use touchHLE_options.txt instead. ***
+# *** Don't edit this file yourself! Use HyperHLE_options.txt instead. ***
 #
 # ---
 #
@@ -104,13 +104,6 @@ com.polarbit.waveblazer: --landscape-left
 
 # Command & Conquer: Red Alert
 com.ea.candcra.row: --landscape-left
-
-# Hill Climb Racing
-# (landscape-only; it takes its layout from the window bounds and declares no
-# interface orientation, so it must start in landscape. It also draws its
-# frames already rotated for a landscape interface, so the orientation-derived
-# presentation rotation must not be applied on top of them.)
-com.fingersoft.hillclimbracing: --landscape-left --present-rotate=0
 
 # Reiner Knizia's Ra
 # (landscape-only; the root view controller only autorotates once the device
@@ -256,7 +249,7 @@ com.chillingo.redball3hd: --landscape-left
 # override it later if it ever wants to.
 #
 # The earlier black-screen symptom on Adreno (before the texture-filter
-# fix) was caused by HyperHLE's internal present path trying to clear a
+# fix) was caused by AppleJuiceHLE's internal present path trying to clear a
 # non-zero GL_CURRENT_PROGRAM via glUseProgram(0), which was a no-op
 # stub on GLES1Native. That dance has been removed from the ES 1.1
 # present path, so this app no longer needs --prefer-gles2-context.
@@ -313,7 +306,12 @@ com.palmheroes.PalmHeroes: --landscape-right
 
 # Mutant Fridge Mayhem (issue #220)
 # App requests LandscapeRight; use landscape-right so the orientation matches.
-com.turner.mfm: --landscape-right
+# Landscape bounds keep its point and pixel axes aligned with the viewport.
+com.turner.mfm: --landscape-right --landscape-uiscreen-bounds
+
+# Gangstar Rio is landscape-only; portrait UIScreen axes leave its EAGL scene
+# occupying only a small part of the display.
+com.gameloft.gangstar3: --landscape-uiscreen-bounds
 
 # Minion Jump / Kingdom Prince
 com.apprisetec9.minionjump: --device-family=ipad --landscape-right --force-composition
@@ -346,7 +344,7 @@ com.gamehivecorp.superbattleracers: --landscape-right --gles1=gles1_on_gl2
 com.blackstoneaudio.enhancedaudioplayer.bsa-Animal-Farm: --device-family=ipad --landscape-right --force-composition
 
 # Minecraft: Story Mode
-com.telltalegames.MC100: --device-family=ipad --landscape-left --prefer-gles2-context --landscape-uiscreen-bounds --present-rotate=0 --mach-semaphore-spurious-wake=100
+com.telltalegames.MC100: --device-family=ipad --landscape-left --prefer-gles2-context --landscape-uiscreen-bounds --present-rotate=0 --audio-unit-render-thread
 
 # Deus Ex: The Fall (Unity 4.2 + Mono + Wwise). The spurious-wake breaker (now
 # main-thread-only) times the main thread out of the Wwise/FMOD audio calls that
@@ -389,10 +387,10 @@ com.anarchyent.mcwikipaid: --device-family=iphone-4
 # Break the Cookie: Sports (Kobold2D config.lua uses CCDirector rotation).
 # Its Info.plist advertises portrait too, despite landscape-only gameplay.
 # Read back the portrait drawable and apply device rotation once.
-hu.BV.BTC-Olympic: --landscape-left --present-mode=readback --no-root-autorotation --force-composition
+hu.BV.BTC-Olympic: --landscape-left --present-mode=readback --no-root-autorotation --force-composition --dladdr
 
 # Break the Cookie Free uses the same CCDirector drawable and startup checks.
-hu.BV.BreakTheCookieFree: --landscape-left --present-mode=readback --no-root-autorotation --force-composition
+hu.BV.BreakTheCookieFree: --landscape-left --present-mode=readback --no-root-autorotation --force-composition --dladdr
 
 # Food Fight mixes NIB-based UIKit menus with a MashEAGLView. Keep the
 # compositor active while the game's GL renderer is idle on menu screens.
@@ -437,3 +435,18 @@ com.gamevil.illusia: --landscape-left
 # not to autorotate the views, so the app's hit-testing stays in the same
 # 480x320 space it lays its controls out in.
 com.gameloft.asphaltmotorsports: --landscape-uiscreen-bounds --present-rotate=0
+
+# Exploration/Kiloblocks rotates its GL projection and framebuffer touch
+# coordinates itself. Keep its EAGL view in portrait space to avoid applying
+# the root-view rotation a second time.
+com.explorationbase.Exploration: --manual-ui-rotation --rotation-fix
+
+# Earn to Die's Marmalade loader hashes its code to decode its constructor
+# table. Keep linker stubs intact so HLE linking does not change that hash.
+# Readback presents its GL renderbuffer without the blank shared-texture path.
+com.notdoppler.EarntoDie: --preserve-dyld-stubs --present-mode=readback
+
+# BackStab's MoviePlayer sends movieSubtitles_reset after [super dealloc].
+# Preserve the freed isa and overlay ivar until reuse so that cleanup removes
+# substView, which otherwise remains above EAGLView and intercepts every tap.
+com.gameloft.BackStab: --zero-memory-on-alloc

@@ -9,22 +9,35 @@
 //! likely to use UIKit in very simple and limited ways, so this implementation
 //! will probably take a lot of shortcuts.
 
-use crate::{msg, Environment};
+use crate::{msg, msg_class, Environment};
 use std::time::Instant;
 
 use crate::dyld::{export_c_func, FunctionExports, HostConstant};
 use crate::frameworks::core_graphics::cg_geometry::CGSize;
 use crate::mem::{ConstVoidPtr, MutPtr};
 
-/// HyperHLE does not emulate an active iOS Guided Access session.
+/// AppleJuiceHLE does not emulate an active iOS Guided Access session.
+/// `BOOL UIAccessibilityIsVoiceOverRunning(void)`
+///
+/// touchHLE does not model accessibility services, so VoiceOver is never
+/// running. Apps use this to decide whether to speak menu items (RetroArch
+/// asks for it while building its menu); the unimplemented function was a
+/// return-0 stub, which is the same answer but without the warning.
+/// https://developer.apple.com/documentation/uikit/1615157-uiaccessibilityisvoiceoverru
+fn UIAccessibilityIsVoiceOverRunning(_env: &mut Environment) -> bool {
+    false
+}
+
 fn UIAccessibilityIsGuidedAccessEnabled(_env: &mut Environment) -> bool {
     false
 }
 
 const FUNCTIONS: FunctionExports = &[
     export_c_func!(UIAccessibilityIsGuidedAccessEnabled()),
+    export_c_func!(UIAccessibilityIsVoiceOverRunning()),
 ];
 
+mod globbert_debug;
 pub mod ns_paragraph_style;
 pub mod ui_accelerometer;
 pub mod ui_action_sheet;
@@ -32,16 +45,15 @@ pub mod ui_activity;
 pub mod ui_activity_indicator_view;
 pub mod ui_alert_controller;
 pub mod ui_application;
+pub mod ui_bezier_path;
 pub mod ui_color;
 pub mod ui_custom_object;
 pub mod ui_device;
 pub mod ui_document;
 pub mod ui_event;
-pub mod ui_bezier_path;
 pub mod ui_font;
 pub mod ui_geometry;
 pub mod ui_gesture_recognizer;
-mod globbert_debug;
 pub mod ui_graphics;
 pub mod ui_image;
 pub mod ui_image_picker_controller;
@@ -49,6 +61,7 @@ pub mod ui_keyboard;
 pub mod ui_launch_delegate;
 pub mod ui_layout_placeholders;
 pub mod ui_local_notification;
+pub mod ui_menu;
 pub mod ui_navigation_bar;
 pub mod ui_nib;
 pub mod ui_page_view_controller;
@@ -939,6 +952,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ui_keyboard::CLASSES,
         ui_launch_delegate::CLASSES,
         ui_local_notification::CLASSES,
+        ui_menu::CLASSES,
         ui_navigation_bar::CLASSES,
         ui_nib::CLASSES,
         ui_pasteboard::CLASSES,
@@ -981,6 +995,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ui_view_controller::CLASSES,
         ui_page_view_controller::CLASSES,
         ui_view_controller::ui_navigation_controller::CLASSES,
+        ui_view_controller::modal_transition::CLASSES,
     ],
     constant_exports: &[
         ui_application::CONSTANTS,
@@ -992,6 +1007,8 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ui_nib::CONSTANTS,
         ui_view::ui_control::ui_text_field::CONSTANTS,
         ui_view::ui_window::CONSTANTS,
+        ui_storyboard::CONSTANTS,
+        ui_view_controller::ui_navigation_controller::CONSTANTS,
         CONSTANTS,
     ],
     function_exports: &[
@@ -1019,10 +1036,14 @@ pub struct State {
     ui_image: ui_image::State,
     ui_keyboard: ui_keyboard::State,
     ui_launch_delegate: ui_launch_delegate::State,
+    ui_menu: ui_menu::State,
     ui_screen: ui_screen::State,
     ui_touch: ui_touch::State,
     pub ui_view: ui_view::State,
     ui_responder: ui_responder::State,
+    /// Set once UIKit has autorotated the root view. The presenter measures the
+    /// rotation from the layer tree instead, so this is only used to stop a
+    /// later portrait `setStatusBarOrientation:` from undoing the autorotation.
     pub autorotation_transform_applied: bool,
 }
 
@@ -1116,7 +1137,9 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                     if env.objc.class_is_subclass_of(class, ui_text_field_class) {
                         match text_event {
                             TextInputEvent::Text(text) => {
-                                ui_view::ui_control::ui_text_field::handle_text(env, responder, text)
+                                ui_view::ui_control::ui_text_field::handle_text(
+                                    env, responder, text,
+                                )
                             }
                             TextInputEvent::Backspace => {
                                 ui_view::ui_control::ui_text_field::handle_backspace(env, responder)
@@ -1126,17 +1149,24 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                             }
                         }
                     } else {
-                        let ui_text_view_class = env.objc.get_known_class("UITextView", &mut env.mem);
+                        let ui_text_view_class =
+                            env.objc.get_known_class("UITextView", &mut env.mem);
                         if env.objc.class_is_subclass_of(class, ui_text_view_class) {
                             match text_event {
                                 TextInputEvent::Text(text) => {
-                                    ui_view::ui_scroll_view::ui_text_view::handle_text(env, responder, text)
+                                    ui_view::ui_scroll_view::ui_text_view::handle_text(
+                                        env, responder, text,
+                                    )
                                 }
                                 TextInputEvent::Backspace => {
-                                    ui_view::ui_scroll_view::ui_text_view::handle_backspace(env, responder)
+                                    ui_view::ui_scroll_view::ui_text_view::handle_backspace(
+                                        env, responder,
+                                    )
                                 }
                                 TextInputEvent::Return => {
-                                    ui_view::ui_scroll_view::ui_text_view::handle_return(env, responder)
+                                    ui_view::ui_scroll_view::ui_text_view::handle_return(
+                                        env, responder,
+                                    )
                                 }
                             }
                         } else {
@@ -1164,14 +1194,23 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
         }
     }
 
-    ui_accelerometer::handle_accelerometer(env)
+    let (webview_deadline, _) = ui_view::ui_web_view::handle_native_load_events(env);
+    let accelerometer_deadline = ui_accelerometer::handle_accelerometer(env);
+    let next_deadline = match (accelerometer_deadline, webview_deadline) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
+    };
+    next_deadline
 }
 
 #[cfg(test)]
 mod accessibility_export_tests {
     #[test]
     fn guided_access_query_is_exported_as_a_function() {
-        let exports: Vec<_> = super::DYLIB.function_exports.iter()
+        let exports: Vec<_> = super::DYLIB
+            .function_exports
+            .iter()
             .flat_map(|table| table.iter())
             .filter(|(name, _)| *name == "_UIAccessibilityIsGuidedAccessEnabled")
             .collect();

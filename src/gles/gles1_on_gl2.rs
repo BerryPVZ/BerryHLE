@@ -28,14 +28,53 @@ const IMPLEMENTATION_COLOR_READ_FORMAT_OES: GLenum = 0x8B9B;
 const IMPLEMENTATION_COLOR_READ_TYPE_OES: GLenum = 0x8B98;
 use super::gles_generic::GLES;
 use super::util::{
-    fixed_to_float, float_to_fixed, matrix_fixed_to_float, try_decode_pvrtc, PalettedTextureFormat,
-    ParamTable, ParamType,
+    base_min_filter, fix_texture_min_filter_enabled, fixed_to_float, float_to_fixed,
+    matrix_fixed_to_float, npot_upload_workaround_enabled, tex_parameter_target, try_decode_pvrtc,
+    PalettedTextureFormat, ParamTable, ParamType,
 };
 use super::GLESContext;
 use crate::window::{GLContext, GLVersion, Window};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::sync::{Mutex, OnceLock};
+
+// GLES BGRA extensions accept BGRA storage; desktop GL accepts BGRA only
+// as the input channel order. Use RGBA storage without changing those bytes.
+// https://registry.khronos.org/OpenGL/extensions/EXT/EXT_texture_format_BGRA8888.txt
+// https://github.com/google/angle/blob/main/src/libANGLE/renderer/gl/formatutilsgl.cpp
+fn desktop_texture_formats(internal: GLint, external: GLenum) -> (GLint, GLenum) {
+    let internal = if internal as GLenum == gl21::BGRA {
+        gl21::RGBA as GLint
+    } else {
+        internal
+    };
+    (internal, external)
+}
+
+#[cfg(test)]
+#[test]
+fn bgra_texture_upload_preserves_input_channel_order() {
+    assert_eq!(
+        desktop_texture_formats(gl21::BGRA as GLint, gl21::BGRA),
+        (gl21::RGBA as GLint, gl21::BGRA),
+    );
+    assert_eq!(
+        desktop_texture_formats(gl21::RGBA as GLint, gl21::BGRA),
+        (gl21::RGBA as GLint, gl21::BGRA),
+    );
+    for format in [
+        gl21::RGB,
+        gl21::RGBA,
+        gl21::ALPHA,
+        gl21::LUMINANCE,
+        gl21::LUMINANCE_ALPHA,
+    ] {
+        assert_eq!(
+            desktop_texture_formats(format as GLint, format),
+            (format as GLint, format)
+        );
+    }
+}
 
 /// List of capabilities shared by OpenGL ES 1.1 and OpenGL 2.1.
 ///
@@ -114,6 +153,8 @@ pub struct ArrayInfo {
 }
 
 struct ArrayStateBackup {
+    array_index: usize,
+    client_texture: Option<GLenum>,
     size: Option<GLint>,
     stride: GLsizei,
     pointer: *const GLvoid,
@@ -501,13 +542,15 @@ impl Default for MatrixArrayPointerState {
 }
 
 pub struct GLES1OnGL2State {
-    pointer_is_fixed_point: [bool; ARRAYS.len()],
-    fixed_point_texture_units: HashSet<GLenum>,
-    fixed_point_translation_buffers: [Vec<GLfloat>; ARRAYS.len()],
-    /// `GL_ARRAY_BUFFER_BINDING` as it was before `translate_fixed_point_arrays`
-    /// started rebinding buffers, so `restore_fixed_point_arrays` can put it
+    pointer_needs_translation: [bool; ARRAYS.len()],
+    array_types: [GLenum; ARRAYS.len()],
+    texture_translation_types: HashMap<GLenum, GLenum>,
+    array_translation_buffers: [Vec<GLfloat>; ARRAYS.len()],
+    texture_translation_buffers: HashMap<GLenum, Vec<GLfloat>>,
+    /// `GL_ARRAY_BUFFER_BINDING` as it was before `translate_client_arrays`
+    /// started rebinding buffers, so `restore_client_arrays` can put it
     /// back. `None` when no translation is in progress.
-    fixed_point_saved_array_buffer: Option<GLuint>,
+    translation_saved_array_buffer: Option<GLuint>,
     matrix_mode: MatrixModeState,
     matrix_palette_enabled: bool,
     current_palette_matrix: GLuint,
@@ -527,10 +570,12 @@ pub struct GLES1OnGL2Context {
 /// stay in sync as fields are added.
 fn new_gles1_on_gl2_state() -> GLES1OnGL2State {
     GLES1OnGL2State {
-        pointer_is_fixed_point: [false; ARRAYS.len()],
-        fixed_point_texture_units: HashSet::new(),
-        fixed_point_translation_buffers: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
-        fixed_point_saved_array_buffer: None,
+        pointer_needs_translation: [false; ARRAYS.len()],
+        array_types: [gl21::FLOAT; ARRAYS.len()],
+        texture_translation_types: HashMap::new(),
+        array_translation_buffers: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+        texture_translation_buffers: HashMap::new(),
+        translation_saved_array_buffer: None,
         matrix_mode: MatrixModeState::ModelView,
         matrix_palette_enabled: false,
         current_palette_matrix: 0,
@@ -562,9 +607,9 @@ impl GLESContext for GLES1OnGL2Context {
     fn make_current<'gl_ctx, 'win: 'gl_ctx>(
         &'gl_ctx mut self,
         window: &'win mut Window,
-    ) -> Box<dyn GLES + 'gl_ctx> {
+    ) -> crate::gles::CurrentGLES<'gl_ctx> {
         if self.gl_ctx.is_current() && self.is_loaded {
-            return Box::new(GLES1OnGL2 {
+            return crate::gles::CurrentGLES::ES1OnGL2(GLES1OnGL2 {
                 state: &mut self.state,
             });
         }
@@ -575,7 +620,7 @@ impl GLESContext for GLES1OnGL2Context {
         gl21::load_with(|s| window.gl_get_proc_address(s));
         self.is_loaded = true;
 
-        Box::new(GLES1OnGL2 {
+        crate::gles::CurrentGLES::ES1OnGL2(GLES1OnGL2 {
             state: &mut self.state,
         })
     }
@@ -584,9 +629,9 @@ impl GLESContext for GLES1OnGL2Context {
         &'gl_ctx mut self,
         make_current_fn: &mut dyn FnMut(&GLContext),
         loader_fn: &mut dyn FnMut(&'static str) -> *const std::ffi::c_void,
-    ) -> Box<dyn GLES + 'gl_ctx> {
+    ) -> crate::gles::CurrentGLES<'gl_ctx> {
         if self.gl_ctx.is_current() && self.is_loaded {
-            return Box::new(GLES1OnGL2 {
+            return crate::gles::CurrentGLES::ES1OnGL2(GLES1OnGL2 {
                 state: &mut self.state,
             });
         }
@@ -595,7 +640,7 @@ impl GLESContext for GLES1OnGL2Context {
         gl21::load_with(loader_fn);
         self.is_loaded = true;
 
-        Box::new(GLES1OnGL2 {
+        crate::gles::CurrentGLES::ES1OnGL2(GLES1OnGL2 {
             state: &mut self.state,
         })
     }
@@ -665,186 +710,174 @@ impl GLES1OnGL2<'_> {
         gl21::PointSize(saved_size);
     }
 
-    /// If any arrays with fixed-point data are in use at the time of a draw
-    /// call, this function will convert the data to floating-point and
-    /// replace the pointers. [Self::restore_fixed_point_arrays] can be called
+    /// If any fixed-point or signed-byte arrays are in use at the time of a
+    /// draw call, this function converts the data to floating-point and
+    /// replace the pointers. [Self::restore_client_arrays] can be called
     /// after to restore the original state.
-    unsafe fn translate_fixed_point_arrays(
+    unsafe fn translate_client_arrays(
         &mut self,
         first: GLint,
         count: GLsizei,
-    ) -> [Option<ArrayStateBackup>; ARRAYS.len()] {
-        let mut backups: [Option<ArrayStateBackup>; ARRAYS.len()] = Default::default();
+    ) -> Vec<ArrayStateBackup> {
+        let mut backups = Vec::new();
+        if count == 0 {
+            return backups;
+        }
+        let mut old_client_active_texture = 0;
+        gl21::GetIntegerv(gl21::CLIENT_ACTIVE_TEXTURE, &mut old_client_active_texture);
         for (i, array_info) in ARRAYS.iter().enumerate() {
             // Decide whether we need to do anything for this array
 
-            if !self.state.pointer_is_fixed_point[i] {
+            if !self.state.pointer_needs_translation[i] {
                 continue;
             }
 
-            // There is one texture co-ordinates pointer per texture unit.
-            let old_client_active_texture = if array_info.name == gl21::TEXTURE_COORD_ARRAY {
-                // Is the texture unit involved in this draw call fixed-point?
-                // If not, we don't need to do anything.
-                let mut active_texture: GLenum = 0;
-                gl21::GetIntegerv(
-                    gl21::ACTIVE_TEXTURE,
-                    &mut active_texture as *mut _ as *mut _,
-                );
-                if !self
-                    .state
-                    .fixed_point_texture_units
-                    .contains(&active_texture)
-                {
+            // Every enabled client texture unit needs its own conversion and
+            // backing storage, including units other than GL_ACTIVE_TEXTURE.
+            let texture_units: Vec<_> = if array_info.name == gl21::TEXTURE_COORD_ARRAY {
+                self.state
+                    .texture_translation_types
+                    .keys()
+                    .copied()
+                    .map(Some)
+                    .collect()
+            } else {
+                vec![None]
+            };
+            for client_texture in texture_units {
+                let source_type = if let Some(unit) = client_texture {
+                    gl21::ClientActiveTexture(unit);
+                    self.state.texture_translation_types[&unit]
+                } else {
+                    self.state.array_types[i]
+                };
+
+                let mut is_active = gl21::FALSE;
+                gl21::GetBooleanv(array_info.name, &mut is_active);
+                if is_active != gl21::TRUE {
                     continue;
                 }
 
-                // Make sure our glTexCoordPointer call will affect that unit.
-                let mut old_client_active_texture: GLenum = 0;
-                gl21::GetIntegerv(
-                    gl21::CLIENT_ACTIVE_TEXTURE,
-                    &mut old_client_active_texture as *mut _ as *mut _,
+                let mut buffer_binding = 0;
+                gl21::GetIntegerv(array_info.buffer_binding, &mut buffer_binding);
+
+                // Remember the guest's GL_ARRAY_BUFFER binding before the
+                // map/unbind below and the restore_client_arrays rebinds.
+                // Leaving it changed desynchronizes the guest's binding from
+                // the driver's, turning the next gl*Pointer offset into a
+                // bogus client pointer.
+                if self.state.translation_saved_array_buffer.is_none() {
+                    let mut current_array_buffer: GLint = 0;
+                    gl21::GetIntegerv(gl21::ARRAY_BUFFER_BINDING, &mut current_array_buffer);
+                    self.state.translation_saved_array_buffer =
+                        Some(current_array_buffer as GLuint);
+                }
+
+                // Get and back up data
+
+                let size = array_info.size.map(|size_enum| {
+                    let mut size: GLint = 0;
+                    gl21::GetIntegerv(size_enum, &mut size);
+                    size
+                });
+                let mut stride: GLsizei = 0;
+                gl21::GetIntegerv(array_info.stride, &mut stride);
+                let old_pointer = {
+                    let mut pointer: *mut GLvoid = std::ptr::null_mut();
+                    // The second argument to glGetPointerv must be a mutable
+                    // pointer, but gl_generator generates the wrong signature
+                    // by mistake, see https://github.com/brendanzab/gl-rs/issues/541
+                    #[allow(clippy::unnecessary_mut_passed)]
+                    gl21::GetPointerv(array_info.pointer, &mut pointer);
+                    pointer.cast_const()
+                };
+
+                backups.push(ArrayStateBackup {
+                    array_index: i,
+                    client_texture,
+                    size,
+                    stride,
+                    pointer: old_pointer,
+                    buffer_binding: buffer_binding.try_into().unwrap(),
+                });
+
+                let pointer = if buffer_binding != 0 {
+                    // Map the buffer *this* array sources from; it isn't
+                    // necessarily the one currently bound to GL_ARRAY_BUFFER
+                    // A previous iteration may have unbound it, or the guest
+                    // may have bound another buffer since setting the array.
+                    gl21::BindBuffer(gl21::ARRAY_BUFFER, buffer_binding as GLuint);
+                    let mapped_buffer = gl21::MapBuffer(gl21::ARRAY_BUFFER, gl21::READ_ONLY);
+                    assert!(!mapped_buffer.is_null());
+                    // in this case the old_pointer is actually an offest!
+                    mapped_buffer.add(old_pointer as usize)
+                } else {
+                    old_pointer
+                };
+
+                // Create translated array and substitute pointer
+
+                let size = size.unwrap_or_else(|| {
+                    assert!(array_info.name == gl21::NORMAL_ARRAY);
+                    3
+                });
+                let buffer = if let Some(unit) = client_texture {
+                    self.state
+                        .texture_translation_buffers
+                        .entry(unit)
+                        .or_default()
+                } else {
+                    &mut self.state.array_translation_buffers[i]
+                };
+                Self::translate_array_elements(
+                    buffer,
+                    pointer.cast(),
+                    source_type,
+                    size,
+                    stride,
+                    first,
+                    count,
                 );
-                gl21::ClientActiveTexture(active_texture);
-                Some(old_client_active_texture)
-            } else {
-                None
-            };
 
-            let mut is_active = gl21::FALSE;
-            gl21::GetBooleanv(array_info.name, &mut is_active);
-            if is_active != gl21::TRUE {
-                continue;
-            }
-
-            let mut buffer_binding = 0;
-            gl21::GetIntegerv(array_info.buffer_binding, &mut buffer_binding);
-
-            // Remember the guest's GL_ARRAY_BUFFER binding the first time we
-            // are about to disturb it (the map/unbind below and the rebinds
-            // in restore_fixed_point_arrays), so it can be put back
-            // afterwards. Leaving it changed used to desynchronise the
-            // guest's idea of the binding from the driver's, which turns the
-            // next gl*Pointer offset into a bogus client pointer.
-            if self.state.fixed_point_saved_array_buffer.is_none() {
-                let mut current_array_buffer: GLint = 0;
-                gl21::GetIntegerv(gl21::ARRAY_BUFFER_BINDING, &mut current_array_buffer);
-                self.state.fixed_point_saved_array_buffer = Some(current_array_buffer as GLuint);
-            }
-
-            // Get and back up data
-
-            let size = array_info.size.map(|size_enum| {
-                let mut size: GLint = 0;
-                gl21::GetIntegerv(size_enum, &mut size);
-                size
-            });
-            let mut stride: GLsizei = 0;
-            gl21::GetIntegerv(array_info.stride, &mut stride);
-            let old_pointer = {
-                let mut pointer: *mut GLvoid = std::ptr::null_mut();
-                // The second argument to glGetPointerv must be a mutable
-                // pointer, but gl_generator generates the wrong signature
-                // by mistake, see https://github.com/brendanzab/gl-rs/issues/541
-                #[allow(clippy::unnecessary_mut_passed)]
-                gl21::GetPointerv(array_info.pointer, &mut pointer);
-                pointer.cast_const()
-            };
-
-            backups[i] = Some(ArrayStateBackup {
-                size,
-                stride,
-                pointer: old_pointer,
-                buffer_binding: buffer_binding.try_into().unwrap(),
-            });
-
-            let pointer = if buffer_binding != 0 {
-                // Map the buffer *this* array sources from; it isn't
-                // necessarily the one currently bound to GL_ARRAY_BUFFER
-                // (a previous iteration may have unbound it, or the guest may
-                // have bound a different buffer since specifying the array).
-                gl21::BindBuffer(gl21::ARRAY_BUFFER, buffer_binding as GLuint);
-                let mapped_buffer = gl21::MapBuffer(gl21::ARRAY_BUFFER, gl21::READ_ONLY);
-                assert!(!mapped_buffer.is_null());
-                // in this case the old_pointer is actually an offest!
-                mapped_buffer.add(old_pointer as usize)
-            } else {
-                old_pointer
-            };
-
-            // Create translated array and substitute pointer
-
-            let size = size.unwrap_or_else(|| {
-                assert!(array_info.name == gl21::NORMAL_ARRAY);
-                3
-            });
-            let stride = if stride == 0 {
-                // tightly packed mode
-                size * 4 // sizeof(gl::FLOAT)
-            } else {
-                stride
-            };
-
-            let buffer = &mut self.state.fixed_point_translation_buffers[i];
-            buffer.clear();
-            buffer.resize(((first + count) * size).try_into().unwrap(), 0.0);
-
-            {
-                assert!(first >= 0 && count >= 0 && size >= 0 && stride >= 0);
-                let first = first as usize;
-                let count = count as usize;
-                let size = size as usize;
-                let stride = stride as usize;
-                for j in first..(first + count) {
-                    let vector_ptr: *const GLvoid = pointer.add(j * stride);
-                    let vector_ptr: *const GLfixed = vector_ptr.cast();
-                    for k in 0..size {
-                        buffer[j * size + k] = fixed_to_float(vector_ptr.add(k).read_unaligned());
-                    }
+                if buffer_binding != 0 {
+                    gl21::UnmapBuffer(gl21::ARRAY_BUFFER);
                 }
-            }
-
-            if buffer_binding != 0 {
-                gl21::UnmapBuffer(gl21::ARRAY_BUFFER);
+                // The temporary data is always a client pointer, even when the
+                // guest bound another VBO after setting its source pointer.
                 gl21::BindBuffer(gl21::ARRAY_BUFFER, 0);
-            }
 
-            let buffer_ptr: *const GLfloat = buffer.as_ptr();
-            let buffer_ptr: *const GLvoid = buffer_ptr.cast();
-            match array_info.name {
-                gl21::COLOR_ARRAY => gl21::ColorPointer(size, gl21::FLOAT, 0, buffer_ptr),
-                gl21::NORMAL_ARRAY => {
-                    assert!(size == 3);
-                    gl21::NormalPointer(gl21::FLOAT, 0, buffer_ptr)
+                let buffer_ptr: *const GLfloat = buffer.as_ptr();
+                let buffer_ptr: *const GLvoid = buffer_ptr.cast();
+                match array_info.name {
+                    gl21::COLOR_ARRAY => gl21::ColorPointer(size, gl21::FLOAT, 0, buffer_ptr),
+                    gl21::NORMAL_ARRAY => {
+                        assert!(size == 3);
+                        gl21::NormalPointer(gl21::FLOAT, 0, buffer_ptr)
+                    }
+                    gl21::TEXTURE_COORD_ARRAY => {
+                        gl21::TexCoordPointer(size, gl21::FLOAT, 0, buffer_ptr)
+                    }
+                    gl21::VERTEX_ARRAY => gl21::VertexPointer(size, gl21::FLOAT, 0, buffer_ptr),
+                    _ => unreachable!(),
                 }
-                gl21::TEXTURE_COORD_ARRAY => {
-                    gl21::TexCoordPointer(size, gl21::FLOAT, 0, buffer_ptr)
-                }
-                gl21::VERTEX_ARRAY => gl21::VertexPointer(size, gl21::FLOAT, 0, buffer_ptr),
-                _ => unreachable!(),
-            }
-
-            if let Some(old_client_active_texture) = old_client_active_texture {
-                gl21::ClientActiveTexture(old_client_active_texture);
             }
         }
+        gl21::ClientActiveTexture(old_client_active_texture as GLenum);
         backups
     }
-    unsafe fn restore_fixed_point_arrays(
-        &mut self,
-        from_backup: [Option<ArrayStateBackup>; ARRAYS.len()],
-    ) {
-        for (i, backup) in from_backup.into_iter().enumerate() {
-            let array_info = &ARRAYS[i];
-            let Some(ArrayStateBackup {
+    unsafe fn restore_client_arrays(&mut self, from_backup: Vec<ArrayStateBackup>) {
+        let mut old_client_active_texture = 0;
+        gl21::GetIntegerv(gl21::CLIENT_ACTIVE_TEXTURE, &mut old_client_active_texture);
+        for backup in from_backup {
+            let ArrayStateBackup {
+                array_index,
+                client_texture,
                 size,
                 stride,
                 pointer,
                 buffer_binding,
-            }) = backup
-            else {
-                continue;
-            };
+            } = backup;
+            let array_info = &ARRAYS[array_index];
 
             // The pointer is an offset into `buffer_binding` if that is
             // non-zero, and a client pointer otherwise — in which case
@@ -862,23 +895,8 @@ impl GLES1OnGL2<'_> {
                     gl21::NormalPointer(gl21::FLOAT, stride, pointer)
                 }
                 gl21::TEXTURE_COORD_ARRAY => {
-                    let mut active_texture: GLenum = 0;
-                    gl21::GetIntegerv(
-                        gl21::ACTIVE_TEXTURE,
-                        &mut active_texture as *mut _ as *mut _,
-                    );
-                    assert!(self
-                        .state
-                        .fixed_point_texture_units
-                        .contains(&active_texture));
-                    let mut old_client_active_texture: GLenum = 0;
-                    gl21::GetIntegerv(
-                        gl21::CLIENT_ACTIVE_TEXTURE,
-                        &mut old_client_active_texture as *mut _ as *mut _,
-                    );
-                    gl21::ClientActiveTexture(active_texture);
+                    gl21::ClientActiveTexture(client_texture.unwrap());
                     gl21::TexCoordPointer(size.unwrap(), gl21::FLOAT, stride, pointer);
-                    gl21::ClientActiveTexture(old_client_active_texture)
                 }
                 gl21::VERTEX_ARRAY => {
                     gl21::VertexPointer(size.unwrap(), gl21::FLOAT, stride, pointer)
@@ -886,10 +904,41 @@ impl GLES1OnGL2<'_> {
                 _ => unreachable!(),
             }
         }
+        gl21::ClientActiveTexture(old_client_active_texture as GLenum);
         // Put the guest's GL_ARRAY_BUFFER binding back (see
-        // translate_fixed_point_arrays).
-        if let Some(saved) = self.state.fixed_point_saved_array_buffer.take() {
+        // translate_client_arrays).
+        if let Some(saved) = self.state.translation_saved_array_buffer.take() {
             gl21::BindBuffer(gl21::ARRAY_BUFFER, saved);
+        }
+    }
+
+    /// Keep vertex indices unchanged so indexed draws and nonzero `first`
+    /// still address the same elements after expanding bytes or fixed point.
+    unsafe fn translate_array_elements(
+        buffer: &mut Vec<GLfloat>,
+        pointer: *const u8,
+        type_: GLenum,
+        size: GLint,
+        stride: GLsizei,
+        first: GLint,
+        count: GLsizei,
+    ) {
+        assert!(first >= 0 && count >= 0 && (1..=4).contains(&size) && stride >= 0);
+        let (first, count, size, stride) = (
+            first as usize,
+            count as usize,
+            size as usize,
+            stride as usize,
+        );
+        buffer.clear();
+        if count == 0 {
+            return;
+        }
+        buffer.resize((first + count) * size, 0.0);
+        for index in first..first + count {
+            let mut vector = [0.0; 4];
+            Self::read_array_element_f32(pointer, index, size, type_, stride, &mut vector);
+            buffer[index * size..(index + 1) * size].copy_from_slice(&vector[..size]);
         }
     }
 
@@ -1120,7 +1169,7 @@ impl GLES1OnGL2<'_> {
 
     /// Scan an index buffer to find the `[min, max]` vertex range referenced,
     /// returning `(first, count)` so the caller can skin exactly that range.
-    /// Mirrors the range scan already used for fixed-point translation.
+    /// Mirrors the range scan already used for array translation.
     unsafe fn indexed_draw_vertex_range(
         &mut self,
         count: GLsizei,
@@ -2253,24 +2302,26 @@ impl GLES for GLES1OnGL2<'_> {
         pointer: *const GLvoid,
     ) {
         assert!(size == 4);
+        self.state.array_types[0] = type_;
         if type_ == gles11::FIXED {
             // Translation deferred until draw call
-            self.state.pointer_is_fixed_point[0] = true;
+            self.state.pointer_needs_translation[0] = true;
             gl21::ColorPointer(size, gl21::FLOAT, stride, pointer)
         } else {
             assert!(type_ == gl21::UNSIGNED_BYTE || type_ == gl21::FLOAT);
-            self.state.pointer_is_fixed_point[0] = false;
+            self.state.pointer_needs_translation[0] = false;
             gl21::ColorPointer(size, type_, stride, pointer)
         }
     }
     unsafe fn NormalPointer(&mut self, type_: GLenum, stride: GLsizei, pointer: *const GLvoid) {
+        self.state.array_types[1] = type_;
         if type_ == gles11::FIXED {
             // Translation deferred until draw call
-            self.state.pointer_is_fixed_point[1] = true;
+            self.state.pointer_needs_translation[1] = true;
             gl21::NormalPointer(gl21::FLOAT, stride, pointer)
         } else {
             assert!(type_ == gl21::BYTE || type_ == gl21::SHORT || type_ == gl21::FLOAT);
-            self.state.pointer_is_fixed_point[1] = false;
+            self.state.pointer_needs_translation[1] = false;
             gl21::NormalPointer(type_, stride, pointer)
         }
     }
@@ -2287,20 +2338,23 @@ impl GLES for GLES1OnGL2<'_> {
             gl21::CLIENT_ACTIVE_TEXTURE,
             &mut active_texture as *mut _ as *mut _,
         );
-        if type_ == gles11::FIXED {
+        // ES 1.1 permits signed-byte coordinates, unlike desktop GL 2.1.
+        // Convert them without normalization, just like integer vertices.
+        // https://registry.khronos.org/OpenGL-Refpages/es1.1/xhtml/glTexCoordPointer.xml
+        // https://registry.khronos.org/OpenGL-Refpages/gl2.1/xhtml/glTexCoordPointer.xml
+        if type_ == gles11::FIXED || type_ == gl21::BYTE {
             // Translation deferred until draw call.
             // There is one texture co-ordinates pointer per texture unit.
-            self.state.fixed_point_texture_units.insert(active_texture);
-            self.state.pointer_is_fixed_point[2] = true;
+            self.state
+                .texture_translation_types
+                .insert(active_texture, type_);
+            self.state.pointer_needs_translation[2] = true;
             gl21::TexCoordPointer(size, gl21::FLOAT, stride, pointer)
         } else {
-            // GL_BYTE is a valid ES 1.1 pointer type and GL 2.1 accepts it
-            // directly (e.g. Exploration Lite / Kiloblocks passes GL_BYTE
-            // texture coordinates), so forward it instead of asserting.
-            assert!(type_ == gl21::BYTE || type_ == gl21::SHORT || type_ == gl21::FLOAT);
-            self.state.fixed_point_texture_units.remove(&active_texture);
-            if self.state.fixed_point_texture_units.is_empty() {
-                self.state.pointer_is_fixed_point[2] = false;
+            assert!(type_ == gl21::SHORT || type_ == gl21::FLOAT);
+            self.state.texture_translation_types.remove(&active_texture);
+            if self.state.texture_translation_types.is_empty() {
+                self.state.pointer_needs_translation[2] = false;
             }
             gl21::TexCoordPointer(size, type_, stride, pointer)
         }
@@ -2313,16 +2367,14 @@ impl GLES for GLES1OnGL2<'_> {
         pointer: *const GLvoid,
     ) {
         assert!(size == 2 || size == 3 || size == 4);
-        if type_ == gles11::FIXED {
+        self.state.array_types[3] = type_;
+        if type_ == gles11::FIXED || type_ == gl21::BYTE {
             // Translation deferred until draw call
-            self.state.pointer_is_fixed_point[3] = true;
+            self.state.pointer_needs_translation[3] = true;
             gl21::VertexPointer(size, gl21::FLOAT, stride, pointer)
         } else {
-            // GL_BYTE is a valid ES 1.1 pointer type and GL 2.1 accepts it
-            // directly (e.g. Exploration Lite / Kiloblocks passes GL_BYTE
-            // texture coordinates), so forward it instead of asserting.
-            assert!(type_ == gl21::BYTE || type_ == gl21::SHORT || type_ == gl21::FLOAT);
-            self.state.pointer_is_fixed_point[3] = false;
+            assert!(type_ == gl21::SHORT || type_ == gl21::FLOAT);
+            self.state.pointer_needs_translation[3] = false;
             gl21::VertexPointer(size, type_, stride, pointer)
         }
     }
@@ -2405,11 +2457,11 @@ impl GLES for GLES1OnGL2<'_> {
             }
         }
 
-        let fixed_point_arrays_state_backup = self.translate_fixed_point_arrays(first, count);
+        let translated_arrays_state_backup = self.translate_client_arrays(first, count);
 
         gl21::DrawArrays(mode, first, count);
 
-        self.restore_fixed_point_arrays(fixed_point_arrays_state_backup);
+        self.restore_client_arrays(translated_arrays_state_backup);
     }
     unsafe fn DrawElements(
         &mut self,
@@ -2473,14 +2525,14 @@ impl GLES for GLES1OnGL2<'_> {
             }
         }
 
-        let fixed_point_arrays_state_backup = if self
+        let translated_arrays_state_backup = if self
             .state
-            .pointer_is_fixed_point
+            .pointer_needs_translation
             .iter()
-            .any(|&is_fixed| is_fixed)
+            .any(|&needs_translation| needs_translation)
         {
             // Scan the index buffer to find the range of data that may need
-            // fixed-point translation.
+            // array translation.
             // TODO: Would it be more efficient to turn this into a
             // non-indexed draw-call instead?
 
@@ -2535,15 +2587,15 @@ impl GLES for GLES1OnGL2<'_> {
                 gl21::UnmapBuffer(gl21::ELEMENT_ARRAY_BUFFER);
             }
 
-            Some(self.translate_fixed_point_arrays(first, count))
+            Some(self.translate_client_arrays(first, count))
         } else {
             None
         };
 
         gl21::DrawElements(mode, count, type_, indices);
 
-        if let Some(fixed_point_arrays_state_backup) = fixed_point_arrays_state_backup {
-            self.restore_fixed_point_arrays(fixed_point_arrays_state_backup);
+        if let Some(translated_arrays_state_backup) = translated_arrays_state_backup {
+            self.restore_client_arrays(translated_arrays_state_backup);
         }
     }
 
@@ -2682,7 +2734,7 @@ impl GLES for GLES1OnGL2<'_> {
     ) {
         assert!(target == gl21::TEXTURE_2D);
         assert!(level >= 0);
-        let internalformat = super::util::desktop_texture_internal_format(internalformat);
+        let (internalformat, format) = desktop_texture_formats(internalformat, format);
         assert!(
             internalformat as GLenum == gl21::ALPHA
                 || internalformat as GLenum == gl21::RGB
@@ -2715,7 +2767,8 @@ impl GLES for GLES1OnGL2<'_> {
             format,
             type_,
             pixels,
-        )
+        );
+        degrade_mipmap_min_filter(target, level, width, height);
     }
     unsafe fn TexSubImage2D(
         &mut self,
@@ -2845,6 +2898,7 @@ impl GLES for GLES1OnGL2<'_> {
                 internalformat
             );
         }
+        degrade_mipmap_min_filter(target, level, width, height);
     }
     unsafe fn CompressedTexSubImage2D(
         &mut self,
@@ -2927,7 +2981,12 @@ impl GLES for GLES1OnGL2<'_> {
                 || internalformat as GLenum == gl21::LUMINANCE_ALPHA
         );
         assert!(border == 0);
-        gl21::CopyTexImage2D(target, level, internalformat, x, y, width, height, border)
+        gl21::CopyTexImage2D(target, level, internalformat, x, y, width, height, border);
+        // `glCopyTexImage2D` allocates level-0 storage like `glTexImage2D`, so
+        // an NPOT copy has the same "mipmapped filter with no mip levels"
+        // problem. Desktop GL supports NPOT mip chains, so only the filter
+        // fix-up applies here — the wrap mode is left alone.
+        degrade_mipmap_min_filter(target, level, width, height);
     }
     unsafe fn CopyTexSubImage2D(
         &mut self,
@@ -3734,6 +3793,7 @@ impl GLES for GLES1OnGL2<'_> {
         stride: GLsizei,
         pointer: *const GLvoid,
     ) {
+        let type_ = super::util::core_vertex_attrib_type(type_);
         gl21::VertexAttribPointer(index, size, type_, normalized, stride, pointer);
     }
     unsafe fn VertexAttrib1f(&mut self, index: GLuint, x: GLfloat) {
@@ -3976,6 +4036,41 @@ impl GLES for GLES1OnGL2<'_> {
     }
 }
 
+/// Degrade a mipmapped `TEXTURE_MIN_FILTER` on the currently-bound texture
+/// after a non-power-of-two level-0 upload.
+///
+/// A mipmapped filter with no levels supplied makes the texture incomplete;
+/// whichever way the driver reports that, sampling it does not give the base
+/// level, so a guest that never sets `GL_TEXTURE_MIN_FILTER` (and therefore
+/// keeps the `GL_NEAREST_MIPMAP_LINEAR` default) renders black. The guest-level
+/// `demipmap_filter_value` in `gles_guest` only fires when the guest *sets*
+/// the filter, so this post-upload check is still needed for the default case.
+///
+/// Unlike `gles1_on_gles2` there is no wrap-mode forcing here: desktop OpenGL
+/// supports non-power-of-two textures with `GL_REPEAT` and real NPOT mip
+/// chains, so forcing `GL_CLAMP_TO_EDGE` would only take fidelity away. That
+/// is also why the workaround defaults to off outside Android
+/// (`fix_texture_min_filter_enabled`).
+unsafe fn degrade_mipmap_min_filter(target: GLenum, level: GLint, width: GLsizei, height: GLsizei) {
+    if !npot_upload_workaround_enabled(level, width, height, fix_texture_min_filter_enabled()) {
+        return;
+    }
+    // A cube-map face upload binds `GL_TEXTURE_CUBE_MAP`, so asking for
+    // `TEXTURE_2D` state here would read and write the wrong texture object.
+    let p_target = tex_parameter_target(target);
+    let mut min_filter: GLint = 0;
+    gl21::GetTexParameteriv(p_target, gl21::TEXTURE_MIN_FILTER, &mut min_filter);
+    let Some(replacement) = base_min_filter(min_filter) else {
+        return;
+    };
+    gl21::TexParameteri(p_target, gl21::TEXTURE_MIN_FILTER, replacement);
+    log_dbg!(
+        "GLES1OnGL2: mipmapped TEXTURE_MIN_FILTER {min_filter:#x} on a \
+         non-power-of-two level-0 texture replaced with {replacement:#x} \
+         [incomplete-texture workaround]"
+    );
+}
+
 #[cfg(test)]
 mod matrix_palette_tests {
     use super::{mat4_multiply, mat4_transform, MATRIX_IDENTITY};
@@ -4050,5 +4145,103 @@ mod matrix_palette_tests {
             blended[c] = 0.5 * ta[c] + 0.5 * tb[c];
         }
         assert_eq!(blended, [5.0, 0.0, 0.0, 1.0]);
+    }
+}
+
+#[cfg(test)]
+mod client_array_tests {
+    use super::{gl21, gles11, GLES1OnGL2};
+
+    // ES 1.1 integer coordinates are converted directly, without color or
+    // normal normalization. Desktop GL 2.1 cannot consume GL_BYTE coordinates.
+    // https://registry.khronos.org/OpenGL-Refpages/es1.1/xhtml/glTexCoordPointer.xml
+    #[test]
+    fn signed_byte_coordinates_preserve_values_and_vertex_indices() {
+        let coordinates: [i8; 6] = [-128, 127, -1, 2, 3, 0];
+        let mut converted = Vec::new();
+        unsafe {
+            GLES1OnGL2::translate_array_elements(
+                &mut converted,
+                coordinates.as_ptr().cast(),
+                gl21::BYTE,
+                2,
+                0,
+                1,
+                2,
+            );
+        }
+        assert_eq!(converted, [0.0, 0.0, -1.0, 2.0, 3.0, 0.0]);
+        unsafe {
+            GLES1OnGL2::translate_array_elements(
+                &mut converted,
+                coordinates.as_ptr().cast(),
+                gl21::BYTE,
+                2,
+                0,
+                0,
+                1,
+            );
+        }
+        assert_eq!(converted, [-128.0, 127.0]);
+    }
+
+    #[test]
+    fn interleaved_byte_vertices_respect_byte_stride() {
+        let vertices: [i8; 15] = [0, 0, 0, 99, 99, -5, 7, 12, 99, 99, 127, -128, 1, 99, 99];
+        let mut converted = Vec::new();
+        unsafe {
+            GLES1OnGL2::translate_array_elements(
+                &mut converted,
+                vertices.as_ptr().cast(),
+                gl21::BYTE,
+                3,
+                5,
+                1,
+                2,
+            );
+        }
+        assert_eq!(
+            converted,
+            [0.0, 0.0, 0.0, -5.0, 7.0, 12.0, 127.0, -128.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn fixed_point_arrays_preserve_unaligned_interleaved_values() {
+        let values: [i32; 12] = [0, 0, 0, 99, 32768, -65536, 98304, 99, 131072, 0, -32768, 99];
+        let mut bytes = vec![0xff];
+        for value in values {
+            bytes.extend_from_slice(&value.to_ne_bytes());
+        }
+        let mut converted = Vec::new();
+        unsafe {
+            GLES1OnGL2::translate_array_elements(
+                &mut converted,
+                bytes.as_ptr().add(1),
+                gles11::FIXED,
+                3,
+                16,
+                1,
+                2,
+            );
+        }
+        assert_eq!(converted, [0.0, 0.0, 0.0, 0.5, -1.0, 1.5, 2.0, 0.0, -0.5]);
+    }
+
+    #[test]
+    fn empty_draw_does_not_read_client_memory() {
+        let mut converted = vec![1.0];
+        unsafe {
+            GLES1OnGL2::translate_array_elements(
+                &mut converted,
+                std::ptr::null(),
+                gl21::BYTE,
+                3,
+                0,
+                200,
+                0,
+            );
+        }
+        assert!(converted.is_empty());
     }
 }

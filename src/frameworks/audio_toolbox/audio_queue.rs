@@ -12,16 +12,16 @@ use crate::abi::{CallFromHost, GuestFunction};
 use crate::audio::decode_ima4;
 use crate::audio::encode_ima4;
 use crate::audio::mic;
+use crate::audio::openal as al;
+use crate::audio::openal::al_types::*;
+use crate::audio::openal::{OpenAL, OpenALManager};
+use crate::audio::parse_mp3_frame_header;
+use crate::audio::symphonia_formats::FrameDecoder;
+use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::audio_toolbox::audio_converter::{
     convert_pcm, pcm_shape_from_asbd, AudioStreamPacketDescription, PcmShape,
 };
 use crate::frameworks::audio_toolbox::audio_unit::alloc_render_timestamp;
-use crate::audio::openal as al;
-use crate::audio::parse_mp3_frame_header;
-use crate::audio::symphonia_formats::FrameDecoder;
-use crate::audio::openal::al_types::*;
-use crate::audio::openal::{OpenAL, OpenALManager};
-use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::carbon_core::OSStatus;
 use crate::frameworks::core_audio_types::{
     debug_fourcc, fourcc, kAudioFormatAppleIMA4, kAudioFormatFlagIsBigEndian,
@@ -235,7 +235,6 @@ const kAudioQueueProperty_DeviceNumberChannels: AudioQueuePropertyID = fourcc(b"
 /// stored as a hint and the codec choice never changes.
 const kAudioQueueProperty_HardwareCodecPolicy: AudioQueuePropertyID = fourcc(b"aqcp");
 type AudioQueuePropertyListenerProc = GuestFunction;
-
 
 /// `AudioQueueHardwareCodecPolicy` from Apple's `AudioQueue.h`.
 #[allow(dead_code)]
@@ -649,18 +648,17 @@ pub fn AudioQueueEnqueueBuffer(
     // Capture the caller-supplied packet boundaries (compressed formats only)
     // before borrowing the host object, since reading guest memory and the
     // mutable host-object borrow can't overlap.
-    let packet_descs: Vec<(u32, u32)> =
-        if in_num_packet_descs > 0 && !in_packet_descs.is_null() {
-            let descs: ConstPtr<AudioStreamPacketDescription> = in_packet_descs.cast_const().cast();
-            (0..in_num_packet_descs)
-                .map(|i| {
-                    let d = env.mem.read(descs + i);
-                    (d.mStartOffset as u32, d.mDataByteSize)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+    let packet_descs: Vec<(u32, u32)> = if in_num_packet_descs > 0 && !in_packet_descs.is_null() {
+        let descs: ConstPtr<AudioStreamPacketDescription> = in_packet_descs.cast_const().cast();
+        (0..in_num_packet_descs)
+            .map(|i| {
+                let d = env.mem.read(descs + i);
+                (d.mStartOffset as u32, d.mDataByteSize)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let host_object = match State::get(&mut env.framework_state)
         .audio_queues
@@ -1563,7 +1561,11 @@ fn split_aac_access_units<'a>(data: &'a [u8], packet_descs: &[(u32, u32)]) -> Ve
             .collect();
     }
     if parse_adts_header(data).is_none() {
-        return if data.is_empty() { Vec::new() } else { vec![data] };
+        return if data.is_empty() {
+            Vec::new()
+        } else {
+            vec![data]
+        };
     }
     let mut units = Vec::new();
     let mut pos = 0;
@@ -1664,10 +1666,7 @@ fn decode_queue_buffer(
             pcm.extend_from_slice(frame_pcm);
         }
     }
-    let (rate, channels) = spec.unwrap_or((
-        format.sample_rate as u32,
-        format.channels_per_frame,
-    ));
+    let (rate, channels) = spec.unwrap_or((format.sample_rate as u32, format.channels_per_frame));
     let al_format = if channels == 2 {
         al::AL_FORMAT_STEREO16
     } else {
@@ -1940,9 +1939,8 @@ pub fn decode_buffer_from_bytes(
             // access unit in a 7-byte ADTS header so symphonia's ADTS reader
             // can parse the stream. MP3 is self-framing, so it's fed as-is.
             let is_aac = format.format_id == kAudioFormatMPEG4AAC;
-            let already_adts = data_slice.len() >= 2
-                && data_slice[0] == 0xFF
-                && (data_slice[1] & 0xF6) == 0xF0;
+            let already_adts =
+                data_slice.len() >= 2 && data_slice[0] == 0xFF && (data_slice[1] & 0xF6) == 0xF0;
             let feed_bytes: Vec<u8> = if is_aac && !already_adts {
                 wrap_raw_aac_as_adts(
                     data_slice,
@@ -2255,13 +2253,21 @@ fn pcm_to_i16(format: ALenum, data: &[u8]) -> (Vec<i16>, usize) {
         al::AL_FORMAT_MONO8 | al::AL_FORMAT_STEREO8 => (
             // 8-bit OpenAL samples are unsigned.
             data.iter().map(|&b| (i16::from(b) - 128) << 8).collect(),
-            if format == al::AL_FORMAT_STEREO8 { 2 } else { 1 },
+            if format == al::AL_FORMAT_STEREO8 {
+                2
+            } else {
+                1
+            },
         ),
         _ => (
             data.chunks_exact(2)
                 .map(|b| i16::from_le_bytes([b[0], b[1]]))
                 .collect(),
-            if format == al::AL_FORMAT_STEREO16 { 2 } else { 1 },
+            if format == al::AL_FORMAT_STEREO16 {
+                2
+            } else {
+                1
+            },
         ),
     }
 }
@@ -2316,7 +2322,19 @@ fn unqueue_buffers<F: FnMut(ALuint)>(al_source: ALuint, context: &OpenAL<'_>, mu
                 al::AL_BUFFERS_PROCESSED,
                 &mut al_buffers_processed,
             );
-            assert!(context.GetError() == 0);
+            let err = context.GetError();
+            if err != 0 {
+                // The source can go away while a queue is being torn down
+                // (or the host audio device closes). OpenAL reports that as a
+                // regular error; there is nothing left to unqueue, and a
+                // panic here would take the whole emulator down.
+                log_dbg!(
+                    "unqueue_buffers: GetSourcei({}) failed with AL error {:#x}; stopping",
+                    al_source,
+                    err
+                );
+                break;
+            }
         }
         if al_buffers_processed == 0 {
             break;
@@ -2326,7 +2344,14 @@ fn unqueue_buffers<F: FnMut(ALuint)>(al_source: ALuint, context: &OpenAL<'_>, mu
 
         unsafe {
             context.SourceUnqueueBuffers(al_source, 1, &mut al_buffer);
-            assert!(context.GetError() == 0);
+            let err = context.GetError();
+            if err != 0 {
+                log_dbg!(
+                    "unqueue_buffers: SourceUnqueueBuffers({}) failed with AL error {:#x}; stopping",
+                    al_source, err
+                );
+                break;
+            }
         }
 
         callback(al_buffer);
@@ -2385,20 +2410,14 @@ fn input_bytes_per_packet(format: &AudioStreamBasicDescription) -> u32 {
 }
 
 /// Capacity of an input buffer in whole packets (the queue's currency).
-fn input_packet_capacity(
-    buffer: &AudioQueueBuffer,
-    format: &AudioStreamBasicDescription,
-) -> u32 {
+fn input_packet_capacity(buffer: &AudioQueueBuffer, format: &AudioStreamBasicDescription) -> u32 {
     // Trailing partial packets are unusable.
     buffer.audio_data_bytes_capacity / input_bytes_per_packet(format)
 }
 
 /// Converts mono 16-bit host-microphone samples at [mic::MIC_SAMPLE_RATE]
 /// into interleaved 16-bit PCM in the queue's channel count and sample rate.
-fn convert_mic_to_pcm(
-    format: &AudioStreamBasicDescription,
-    host_samples: &[i16],
-) -> Vec<u8> {
+fn convert_mic_to_pcm(format: &AudioStreamBasicDescription, host_samples: &[i16]) -> Vec<u8> {
     let src_shape = PcmShape {
         sample_rate: f64::from(mic::MIC_SAMPLE_RATE),
         channels: 1,
@@ -2452,8 +2471,7 @@ fn fill_input_buffer(
                     let mut block = [0i16; 64];
                     for (frame, slot) in block.iter_mut().enumerate() {
                         let sample = (period * 64 + frame) * channels + channel;
-                        let bytes: [u8; 2] =
-                            [pcm[sample * 2], pcm[sample * 2 + 1]];
+                        let bytes: [u8; 2] = [pcm[sample * 2], pcm[sample * 2 + 1]];
                         *slot = i16::from_le_bytes(bytes);
                     }
                     out.extend_from_slice(&encode_ima4(&block));
@@ -2485,7 +2503,10 @@ fn fill_input_buffer(
                 None => src,
             };
             // Truncate to whole frames within the buffer's capacity.
-            let bytes_per_frame = shape.map(|s| s.bytes_per_frame as usize).unwrap_or(2).max(1);
+            let bytes_per_frame = shape
+                .map(|s| s.bytes_per_frame as usize)
+                .unwrap_or(2)
+                .max(1);
             let usable = (capacity / bytes_per_frame) * bytes_per_frame;
             out.truncate(usable);
             out
@@ -2567,10 +2588,8 @@ fn handle_input_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
 
         while let Some(&buffer_ref) = host_object.buffer_queue.front() {
             let buffer = env.mem.read(buffer_ref);
-            let packet_capacity =
-                input_packet_capacity(&buffer, &format);
-            let frames_capacity =
-                (packet_capacity as f64) * frames_per_packet;
+            let packet_capacity = input_packet_capacity(&buffer, &format);
+            let frames_capacity = (packet_capacity as f64) * frames_per_packet;
             let needed = frames_capacity * host_per_frame;
 
             if is_stopping {
@@ -2619,10 +2638,8 @@ fn handle_input_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
     // Phase 2: fill buffers and call the guest callback. No state borrows may
     // be live here: the callback can call any AudioQueue API.
     for delivery in deliveries {
-        let host_samples =
-            mic::take_samples(delivery.from_host, delivery.host_sample_count);
-        let num_packets =
-            fill_input_buffer(env, delivery.buffer_ref, &format, &host_samples);
+        let host_samples = mic::take_samples(delivery.from_host, delivery.host_sample_count);
+        let num_packets = fill_input_buffer(env, delivery.buffer_ref, &format, &host_samples);
         let timestamp = alloc_render_timestamp(env, delivery.sample_time);
         let () = callback_proc.call_from_host(
             env,
@@ -2781,14 +2798,24 @@ pub fn handle_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
             let mut al_source_state = 0;
 
             context.GetSourcei(al_source, al::AL_SOURCE_STATE, &mut al_source_state);
-            assert!(context.GetError() == 0);
+            let err = context.GetError();
+            if err != 0 {
+                log_dbg!(
+                    "audio queue source {} is no longer valid ({:#x}); skipping restart",
+                    al_source,
+                    err
+                );
+            }
             let mut queued = 0;
             let mut processed = 0;
             context.GetSourcei(al_source, al::AL_BUFFERS_QUEUED, &mut queued);
             context.GetSourcei(al_source, al::AL_BUFFERS_PROCESSED, &mut processed);
             // Restart only an underrun with fresh audio. Replaying processed
             // buffers repeats the tail when a track is draining.
-            if matches!(al_source_state, al::AL_STOPPED | al::AL_INITIAL) && queued > processed {
+            if err == 0
+                && matches!(al_source_state, al::AL_STOPPED | al::AL_INITIAL)
+                && queued > processed
+            {
                 context.SourcePlay(al_source);
                 log_dbg!("Restarted OpenAL source for queue {:?}", in_aq);
             }
@@ -2800,7 +2827,16 @@ pub fn handle_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
 
         unsafe {
             context.GetSourcei(al_source, al::AL_SOURCE_STATE, &mut al_source_state);
-            assert!(context.GetError() == 0);
+            let err = context.GetError();
+            if err != 0 {
+                log_dbg!(
+                    "audio queue source {} is no longer valid ({:#x}); completing stop",
+                    al_source,
+                    err
+                );
+                finish_stopping_audio_queue(env, in_aq);
+                return;
+            }
         }
 
         if al_source_state == al::AL_STOPPED {
@@ -2954,7 +2990,14 @@ pub fn AudioQueueStart(
         };
         host_object.is_running = AudioQueueIsRunning::Running;
         start_source_if_needed(&context, al_source);
-        assert!(unsafe { context.GetError() } == 0);
+        let err = unsafe { context.GetError() };
+        if err != 0 {
+            log_dbg!(
+                "AudioQueueStart: SourcePlay({}) failed with AL error {:#x}; audio stays silent",
+                al_source,
+                err
+            );
+        }
     } else {
         log!(
             "AudioQueueStart: Unsupported format {:?}, not starting",
@@ -2984,7 +3027,14 @@ pub fn AudioQueuePause(env: &mut Environment, in_aq: AudioQueueRef) -> OSStatus 
 
     if let Some(al_source) = host_object.al_source {
         unsafe { context.SourcePause(al_source) };
-        assert!(unsafe { context.GetError() } == 0);
+        let err = unsafe { context.GetError() };
+        if err != 0 {
+            log_dbg!(
+                "AudioQueuePause: SourcePause({}) failed with AL error {:#x}",
+                al_source,
+                err
+            );
+        }
     }
 
     0 // success
@@ -3004,6 +3054,10 @@ fn finish_stopping_audio_queue(env: &mut Environment, in_aq: AudioQueueRef) {
             mic::stop();
         }
         host_object.is_running = AudioQueueIsRunning::Stopped;
+        // A caller can reach here from inside handle_audio_queue, whose early
+        // return then skips its own guard reset. Stopped means no handler is
+        // active, so clear it here to keep a later Start from staying silent.
+        host_object.is_running_handler = false;
     }
 
     notify_aq_is_running(env, in_aq);
@@ -3069,7 +3123,14 @@ pub fn AudioQueueStop(env: &mut Environment, in_aq: AudioQueueRef, in_immediate:
         };
         if let Some(al_source) = host_object.al_source {
             unsafe { context.SourceStop(al_source) };
-            assert!(unsafe { context.GetError() } == 0);
+            let err = unsafe { context.GetError() };
+            if err != 0 {
+                log_dbg!(
+                    "AudioQueueStop: SourceStop({}) failed with AL error {:#x}",
+                    al_source,
+                    err
+                );
+            }
         };
 
         finish_stopping_audio_queue(env, in_aq);
@@ -3111,10 +3172,10 @@ fn AudioQueueReset(env: &mut Environment, in_aq: AudioQueueRef) -> OSStatus {
             let mut al_source_state = 0;
 
             context.GetSourcei(al_source, al::AL_SOURCE_STATE, &mut al_source_state);
-            assert!(context.GetError() == 0);
-            if al_source_state != al::AL_STOPPED {
+            let err = context.GetError();
+            if err == 0 && al_source_state != al::AL_STOPPED {
                 context.SourceStop(al_source);
-                assert!(context.GetError() == 0);
+                let _ = context.GetError();
             }
         }
 
@@ -3219,7 +3280,7 @@ pub fn AudioQueueDispose(
     if let Some(al_source) = host_object.al_source {
         unsafe {
             context.SourceStop(al_source);
-            assert!(context.GetError() == 0);
+            let _ = context.GetError();
         }
 
         unqueue_buffers(al_source, &context, |al_buffer| {
@@ -3231,7 +3292,7 @@ pub fn AudioQueueDispose(
                 host_object.al_unused_buffers.len().try_into().unwrap(),
                 host_object.al_unused_buffers.as_ptr(),
             );
-            assert!(context.GetError() == 0);
+            let _ = context.GetError();
         }
 
         // Free the OpenAL source back to the (finite) source pool. OpenAL Soft
@@ -3250,7 +3311,7 @@ pub fn AudioQueueDispose(
         // so releasing the source here matches the documented behaviour.
         unsafe {
             context.DeleteSources(1, &al_source);
-            assert!(context.GetError() == 0);
+            let _ = context.GetError();
         }
         host_object.al_source = None;
     }

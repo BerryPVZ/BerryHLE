@@ -15,11 +15,12 @@ use super::{
     id, ivar_list_t, method_list_t, nil, objc_object, AnyHostObject, HostIMP, HostObject, ObjC,
     IMP, SEL,
 };
+use crate::abi::{CallFromHost, GuestFunction};
 use crate::bundle;
 use crate::fastmap::FxHashMap;
 use crate::mach_o::MachO;
 use crate::mem::{
-    guest_size_of, ConstPtr, ConstVoidPtr, GuestUSize, Mem, MutVoidPtr, Ptr, SafeRead,
+    guest_size_of, ConstPtr, ConstVoidPtr, GuestUSize, Mem, MutPtr, MutVoidPtr, Ptr, SafeRead,
 };
 use std::collections::{HashMap, VecDeque};
 
@@ -70,6 +71,11 @@ pub(super) struct ClassHostObject {
     /// Size of the allocated memory for instances of this class or metaclass.
     /// This is always >= the value in the superclass.
     pub(super) instance_size: GuestUSize,
+    /// Dynamic pairs are unpublished while their ivars are being constructed.
+    pub(super) is_constructing: bool,
+    pub(super) is_dynamic: bool,
+    /// Runtime-owned ivar metadata and strings, freed with a dynamic class.
+    pub(super) dynamic_allocations: Vec<MutVoidPtr>,
 }
 impl HostObject for ClassHostObject {}
 
@@ -104,9 +110,18 @@ struct class_t {
     superclass: Class,
     _cache: ConstVoidPtr,
     _vtable: ConstVoidPtr,
-    data: ConstPtr<class_rw_t>,
+    data_bits: u32,
 }
 unsafe impl SafeRead for class_t {}
+
+impl class_t {
+    /// The low two bits describe Swift ABI variants on 32-bit iOS.
+    /// Apple's class_data_bits_t::data() masks them with FAST_DATA_MASK.
+    /// https://github.com/apple-oss-distributions/objc4/blob/objc4-779.1/runtime/objc-runtime-new.h
+    fn data(&self) -> ConstPtr<class_rw_t> {
+        Ptr::from_bits(self.data_bits & 0xffff_fffc)
+    }
+}
 
 /// The layout of the main class data in an app binary.
 ///
@@ -339,13 +354,15 @@ impl ClassHostObject {
             properties: HashMap::default(),
             protocols: Vec::new(),
             is_from_bin: false,
+            is_constructing: false,
+            is_dynamic: false,
+            dynamic_allocations: Vec::new(),
         }
     }
 
     fn from_bin(class: Class, is_metaclass: bool, mem: &Mem, objc: &mut ObjC) -> Self {
-        let class_t {
-            superclass, data, ..
-        } = mem.read(class.cast());
+        let class_struct: class_t = mem.read(class.cast());
+        let superclass = class_struct.superclass;
         let class_rw_t {
             instance_start,
             instance_size,
@@ -355,7 +372,7 @@ impl ClassHostObject {
             ivars,
             _base_properties,
             ..
-        } = mem.read(data);
+        } = mem.read(class_struct.data());
         // Apple's Objective-C 2.0 runtime stores `class_rw_t.name` as a
         // pointer to a NUL-terminated UTF-8 C string in `__objc_classname`
         // (see <objc/runtime.h> and `class_getName`). Some real-world
@@ -391,6 +408,9 @@ impl ClassHostObject {
             properties: HashMap::new(),
             protocols: protocol_list_entries(mem, base_protocols),
             is_from_bin: true,
+            is_constructing: false,
+            is_dynamic: false,
+            dynamic_allocations: Vec::new(),
         };
         if !base_methods.is_null() {
             host_object.add_methods_from_bin(base_methods, mem, objc);
@@ -410,6 +430,71 @@ impl ClassHostObject {
     // See methods.rs for binary method parsing
 }
 
+/// Where a faked SDK namespace applies.
+enum FakeScope {
+    /// Classes the app ships in its own binary and classes it only looks up by
+    /// name.
+    Everywhere,
+    /// Only classes the app looks up by name, never ones it ships.
+    LookedUp,
+}
+
+/// Third-party SDK class namespaces that are faked, so messages sent to their
+/// classes behave as if sent to nil. Both `substitute_classes` (classes from
+/// the app's own binary) and `link_class` (classes the app only looks up)
+/// consult this table, so the two paths cannot drift apart.
+const FAKED_SDKS: &[(&str, FakeScope)] = &[
+    // Advertising and analytics SDKs.
+    ("AdMob", FakeScope::Everywhere),
+    ("AltAds", FakeScope::Everywhere),
+    ("Mobclix", FakeScope::Everywhere),
+    ("Flurry", FakeScope::Everywhere),
+    ("OpenFeint", FakeScope::Everywhere),
+    ("Tapjoy", FakeScope::Everywhere),
+    ("UA", FakeScope::Everywhere),
+    ("GAD", FakeScope::Everywhere),
+    ("RevMob", FakeScope::Everywhere),
+    ("iSimulate", FakeScope::Everywhere),
+    ("ALSdk", FakeScope::Everywhere), // AppLovin SDK
+    ("ALAd", FakeScope::Everywhere), // AppLovin ads
+    ("ALEvent", FakeScope::Everywhere), // AppLovin events
+    ("ALIncentivized", FakeScope::Everywhere), // AppLovin incentivized ads
+    ("ALTargeting", FakeScope::Everywhere), // AppLovin targeting
+    ("ALPrivacy", FakeScope::Everywhere), // AppLovin privacy settings
+    // Everyplay gameplay video-recording SDK. Its capture proxy hooks the GL
+    // context and installs a CCGLView frame-completion handler that re-renders
+    // every frame through APPLE fence sync objects. Under touchHLE that
+    // handler spins forever inside -[CCGLView presentFrame], so the game never
+    // gets past its first frame. Recording is optional, so faking the whole
+    // Everyplay class namespace disables capture and lets the game run.
+    ("Everyplay", FakeScope::Everywhere),
+    // The Facebook SDK is different: a bundled Facebook SDK (e.g. the 3.x SDK
+    // inside Subway Surfers 1.11.0) has real, working code. Faking it turns
+    // `+[FBSession activeSession]` into nil, the app's `FacebookSession`
+    // wrapper then dereferences it, Unity throws, and mono ends up in its
+    // internal `g_assert_not_reached` trap.
+    ("FB", FakeScope::LookedUp),
+    // SpringBoard private classes (e.g. "SBSceneFor%@" → "SBSceneFor(null)").
+    // Apps probing for jailbroken-device features look these up via
+    // NSClassFromString and only act if they exist; returning a fake class
+    // lets the probe fail gracefully instead of panicking. Restricted to the
+    // known prefixes to avoid accidentally swallowing real third-party
+    // SB-prefixed libs.
+    ("SBScene", FakeScope::LookedUp),
+    ("SBSystem", FakeScope::LookedUp),
+];
+
+/// Would a class with this name from this origin be faked?
+fn is_faked_sdk(name: &str, from_app_binary: bool) -> bool {
+    FAKED_SDKS.iter().any(|(prefix, scope)| {
+        let applies = match scope {
+            FakeScope::Everywhere => true,
+            FakeScope::LookedUp => !from_app_binary,
+        };
+        applies && name.starts_with(prefix)
+    })
+}
+
 /// Decide whether a certain class/metaclass pair from the guest app should use
 /// fake class host objects and return the substitutions if so.
 fn substitute_classes(
@@ -418,8 +503,8 @@ fn substitute_classes(
     class: Class,
     metaclass: Class,
 ) -> Option<(Box<FakeClass>, Box<FakeClass>)> {
-    let class_t { data, .. } = mem.read(class.cast());
-    let class_rw_t { name, .. } = mem.read(data);
+    let class_struct: class_t = mem.read(class.cast());
+    let class_rw_t { name, .. } = mem.read(class_struct.data());
     // If the class name bytes aren't valid UTF-8 the metadata is almost
     // certainly corrupt / still-encrypted (see comment in
     // `ClassHostObject::from_bin`). Don't try to fake-substitute such a
@@ -430,43 +515,7 @@ fn substitute_classes(
     };
     // Substitute classes that seem to be from various third-party advertising
     // or social network SDKs.
-    if !(
-        name.starts_with("AdMob")
-        || name.starts_with("AltAds")
-        || name.starts_with("Mobclix")
-        // Note: the Facebook SDK namespace ("FB…") is deliberately *not*
-        // substituted here. Classes handled by this function come from the
-        // app's own binary, so a bundled Facebook SDK (e.g. the 3.x SDK inside
-        // Subway Surfers 1.11.0) has real, working code. Faking it turns
-        // `+[FBSession activeSession]` into nil, the app's `FacebookSession`
-        // wrapper then dereferences it, Unity throws, and mono ends up in its
-        // internal `g_assert_not_reached` trap. Classes that are only *looked
-        // up* and never shipped with the app are still faked by `link_class`.
-        || name.starts_with("Flurry")
-        || name.starts_with("OpenFeint")
-        || name.starts_with("Tapjoy")
-        || name.starts_with("UA")
-        || name.starts_with("GAD")
-        || name.starts_with("RevMob")
-        || name.starts_with("iSimulate")
-        || name.starts_with("ALSdk") // AppLovin SDK
-        || name.starts_with("ALAd")  // AppLovin ads
-        || name.starts_with("ALEvent") // AppLovin events
-        || name.starts_with("ALIncentivized") // AppLovin incentivized ads
-        || name.starts_with("ALTargeting") // AppLovin targeting
-        || name.starts_with("ALPrivacy")
-        // AppLovin privacy settings
-        || name.starts_with("Everyplay")
-        // Everyplay gameplay video-recording SDK. Its capture proxy hooks the
-        // GL context and installs a CCGLView frame-completion handler that
-        // re-renders every frame through APPLE fence sync objects. Under
-        // touchHLE that handler spins forever inside -[CCGLView presentFrame],
-        // so the game never gets past its first frame. Recording is optional,
-        // so faking the whole Everyplay class namespace (messages behave as if
-        // sent to nil) disables capture and lets the game run.
-    )
-    // <-- ДОБАВЛЕНО ЗДЕСЬ
-    {
+    if !is_faked_sdk(name, /* from_app_binary: */ true) {
         // TODO : try to remove when sqlite3 is supported.
         if (bundle.bundle_identifier() == "com.chillingo.defenderchronicles")
             && (name == "OFHighScoreService")
@@ -478,11 +527,11 @@ fn substitute_classes(
     }
 
     {
-        let class_t { data, .. } = mem.read(metaclass.cast());
+        let class_struct: class_t = mem.read(metaclass.cast());
         let class_rw_t {
             name: metaclass_name,
             ..
-        } = mem.read(data);
+        } = mem.read(class_struct.data());
         // Same defensive handling as the class-name read above. In Apple's
         // runtime, `class_getName(cls) == class_getName(object_getClass(cls))`,
         // but a corrupt binary can violate that invariant; an `assert!`
@@ -696,25 +745,8 @@ impl ObjC {
                 self,
             ));
         } else {
-            // ЗДЕСЬ ДОБАВЛЕНА ЛОГИКА ДЛЯ ДИНАМИЧЕСКИХ КЛАССОВ (GAD и др.)
-            let is_fake = name.starts_with("AdMob")
-                || name.starts_with("AltAds")
-                || name.starts_with("Mobclix")
-                || name.starts_with("FB")
-                || name.starts_with("Flurry")
-                || name.starts_with("OpenFeint")
-                || name.starts_with("Tapjoy")
-                || name.starts_with("UA")
-                || name.starts_with("GAD")
-                || name.starts_with("iSimulate")
-                // SpringBoard private classes (e.g. "SBSceneFor%@" → "SBSceneFor(null)").
-                // Apps probing for jailbroken-device features look these up
-                // via NSClassFromString and only act if they exist; returning
-                // a fake class lets the probe fail gracefully instead of
-                // panicking. Restricted to the known SBScene prefix to avoid
-                // accidentally swallowing real third-party SB-prefixed libs.
-                || name.starts_with("SBScene")
-                || name.starts_with("SBSystem"); // <-- ДОБАВЛЕНО ЗДЕСЬ
+            // Classes the app only looks up by name, never ships.
+            let is_fake = is_faked_sdk(name, /* from_app_binary: */ false);
 
             // Note: empty/garbage class names are rejected earlier in this
             // function (they return nil), so by this point `name` is a
@@ -881,11 +913,9 @@ impl ObjC {
                 "Warning: register_bin_classes: {garbage_entries} of {total_entries} ObjC class entries were garbage (truncated/zero-filled binary — the .ipa is likely damaged); the app may fail to start or misbehave."
             );
         }
-
-        self.reconcile_bin_class_ivars(mem);
     }
 
-    fn reconcile_bin_class_ivars(&mut self, mem: &mut Mem) {
+    pub(crate) fn reconcile_bin_class_ivars(&mut self, mem: &mut Mem) {
         // Host classes are linked lazily. A class list can be empty, contain
         // only independent roots, or have every entry skipped above. In those
         // cases non-lazy symbol binding need not have loaded NSObject at all.
@@ -1226,6 +1256,9 @@ impl ObjC {
                         properties: Default::default(),
                         protocols: Default::default(),
                         is_from_bin: Default::default(),
+                        is_constructing: false,
+                        is_dynamic: false,
+                        dynamic_allocations: Vec::new(),
                     },
                 );
                 log_dbg!(
@@ -1271,7 +1304,7 @@ impl ObjC {
         }
     }
 
-    /// Check whether `class` is a placeholder for a class touchHLE/HyperHLE
+    /// Check whether `class` is a placeholder for a class touchHLE/AppleJuiceHLE
     /// does not implement (an `UnimplementedClass` host object).
     pub fn is_unimplemented_class(&self, class: Class) -> bool {
         if class == nil {
@@ -1412,64 +1445,19 @@ pub fn objc_getClass(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class 
     nil
 }
 
-pub fn objc_begin_catch(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class {
-    if name.is_null() {
-        return nil;
-    }
-
-    let name_str = match env.mem.cstr_at_utf8(name) {
-        Ok(s) => s.to_string(),
-        Err(_) => return nil,
-    };
-    if let Some(class) = env.objc.get_class(&name_str, false, &env.mem) {
-        return class;
-    }
-
-    if ObjC::find_template(&name_str).is_some() {
-        return env.objc.link_class(&name_str, false, &mut env.mem);
-    }
-
-    nil
-}
-
-pub fn objc_end_catch(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class {
-    if name.is_null() {
-        return nil;
-    }
-
-    let name_str = match env.mem.cstr_at_utf8(name) {
-        Ok(s) => s.to_string(),
-        Err(_) => return nil,
-    };
-    if let Some(class) = env.objc.get_class(&name_str, false, &env.mem) {
-        return class;
-    }
-
-    if ObjC::find_template(&name_str).is_some() {
-        return env.objc.link_class(&name_str, false, &mut env.mem);
-    }
-
-    nil
-}
-
-pub fn objc_exception_throw(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class {
-    if name.is_null() {
-        return nil;
-    }
-
-    let name_str = match env.mem.cstr_at_utf8(name) {
-        Ok(s) => s.to_string(),
-        Err(_) => return nil,
-    };
-    if let Some(class) = env.objc.get_class(&name_str, false, &env.mem) {
-        return class;
-    }
-
-    if ObjC::find_template(&name_str).is_some() {
-        return env.objc.link_class(&name_str, false, &mut env.mem);
-    }
-
-    nil
+/// `void objc_terminate(void)` — called when an exception reaches a frame that
+/// cannot handle it. iOS terminates the process; the guest requests that here
+/// so headless sessions and TestApp keep their strict termination behaviour.
+/// Termination must use the guest C++ handler and must never return normally.
+/// https://github.com/apple-oss-distributions/objc4/blob/main/runtime/objc-exception.mm
+pub fn objc_terminate(env: &mut crate::Environment) {
+    let address = env
+        .dyld
+        .guest_cxxabi_export("__ZSt9terminatev")
+        .expect("objc_terminate requires the guest C++ termination handler");
+    env.cpu
+        .branch(crate::abi::GuestFunction::from_addr_with_thumb_bit(address));
+    env.note_guest_control_flow_redirect();
 }
 
 pub fn object_getClassName(env: &mut crate::Environment, obj: id) -> Class {
@@ -1479,6 +1467,16 @@ pub fn object_getClassName(env: &mut crate::Environment, obj: id) -> Class {
 
     let objc_obj: objc_object = env.mem.read(obj.cast());
     objc_obj.isa
+}
+
+/// https://developer.apple.com/documentation/objectivec/object_setclass(_:_:)
+pub fn object_setClass(env: &mut crate::Environment, object: id, class: Class) -> Class {
+    if object == nil {
+        return nil;
+    }
+    let previous = super::ObjC::read_isa(object, &env.mem);
+    env.mem.write(object.cast::<Class>(), class);
+    previous
 }
 
 pub fn object_getClass(env: &mut crate::Environment, obj: id) -> Class {
@@ -1526,27 +1524,71 @@ pub fn class_getSuperclass(env: &mut crate::Environment, cls: Class) -> Class {
     env.objc.get_superclass(cls)
 }
 
-pub fn class_getInstanceSize(env: &mut crate::Environment, cls: Class, name: SEL) -> ConstVoidPtr {
+/// The instance's ivar storage rounded to a guest pointer boundary.
+/// https://github.com/apple-oss-distributions/objc4/blob/objc4-779.1/runtime/objc-class.mm
+pub fn class_getInstanceSize(env: &mut crate::Environment, cls: Class) -> GuestUSize {
     if cls.is_null() {
-        return ConstVoidPtr::null();
+        return 0;
     }
+    let size = env.objc.class_instance_size(cls);
+    size.checked_add(3).expect("Class instance size overflows") & !3
+}
 
-    let mut curr = cls;
-    while !curr.is_null() {
-        if let Some(host_obj) = env.objc.get_host_object(curr) {
-            if let Some(class_obj) = host_obj.as_any().downcast_ref::<ClassHostObject>() {
-                if class_obj.methods.contains_key(&name) {
-                    return curr.cast_const().cast();
-                }
-            }
-        }
-        let next = env.objc.get_superclass(curr);
-        if next == curr {
-            break;
-        }
-        curr = next;
+/// Allocate zeroed instance storage without sending +alloc or -init.
+/// Apple's runtime reserves at least 16 bytes and runs C++ constructors.
+/// https://github.com/apple-oss-distributions/objc4/blob/objc4-779.1/runtime/objc-runtime-new.mm
+pub fn class_createInstance(
+    env: &mut crate::Environment,
+    cls: Class,
+    extra_bytes: GuestUSize,
+) -> id {
+    if cls == nil {
+        return nil;
     }
-    ConstVoidPtr::null()
+    let Some(size) = class_getInstanceSize(env, cls).checked_add(extra_bytes) else {
+        return nil;
+    };
+    let object = env.objc.alloc_object_sized(
+        cls,
+        size.max(16),
+        Box::new(super::TrivialHostObject),
+        &mut env.mem,
+    );
+    crate::frameworks::foundation::ns_object::invoke_cxx_constructors(env, object)
+}
+
+/// `id objc_constructInstance(Class cls, void *bytes)` — makes an instance of
+/// `cls` in caller-provided storage, or allocates one when `bytes` is null.
+/// The memory stays the caller's to free, so it is registered rather than
+/// allocated here.
+/// https://developer.apple.com/documentation/objectivec/1418952-objc_constructinstance
+pub fn objc_constructInstance(env: &mut crate::Environment, cls: Class, bytes: MutVoidPtr) -> id {
+    if cls == nil {
+        return nil;
+    }
+    if bytes.is_null() {
+        return class_createInstance(env, cls, 0);
+    }
+    let object: id = bytes.cast();
+    env.mem.write(object, objc_object { isa: cls });
+    env.objc
+        .register_static_object(object, Box::new(super::TrivialHostObject));
+    crate::frameworks::foundation::ns_object::invoke_cxx_constructors(env, object)
+}
+
+/// `void objc_copyCppObjectAtomic(void *dest, const void *src, void
+/// (*copyHelper)(void *dest, const void *src))` — copies a C++ object whose
+/// copy constructor lives in the caller's helper.
+pub fn objc_copyCppObjectAtomic(
+    env: &mut crate::Environment,
+    dest: MutVoidPtr,
+    src: ConstVoidPtr,
+    copy_helper: GuestFunction,
+) {
+    if copy_helper == GuestFunction::null_ptr() {
+        return;
+    }
+    let _: () = copy_helper.call_from_host(env, (dest, src));
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -1676,24 +1718,6 @@ fn imp_to_guest_ptr(
             };
             env.objc.imp_tokens.insert(token.to_bits(), imp);
             token.cast_const()
-        }
-    }
-}
-
-fn imp_to_callable_guest_ptr(
-    env: &mut crate::Environment,
-    imp: IMP,
-    message_send_symbol: &str,
-) -> ConstVoidPtr {
-    match imp {
-        IMP::Guest(guest_function) => guest_function.to_ptr(),
-        IMP::Host(_) => {
-            let dyld = &mut env.dyld;
-            let mem = &mut env.mem;
-            let cpu = &mut env.cpu;
-            dyld.create_proc_address(mem, cpu, message_send_symbol)
-                .map(|guest_function| ConstVoidPtr::from_bits(guest_function.addr_with_thumb_bit()))
-                .unwrap_or_else(|_| ConstVoidPtr::null())
         }
     }
 }
@@ -2037,42 +2061,26 @@ pub fn class_isMetaClass(env: &mut crate::Environment, cls: Class) -> bool {
         return false;
     }
     let class_struct: class_t = env.mem.read(cls.cast());
-    if class_struct.data.is_null() {
+    if class_struct.data().is_null() {
         return false;
     }
     let rw_size = std::mem::size_of::<class_rw_t>() as GuestUSize;
     if env
         .mem
-        .get_bytes_fallible(class_struct.data.cast(), rw_size)
+        .get_bytes_fallible(class_struct.data().cast(), rw_size)
         .is_none()
     {
         return false;
     }
-    let rw: class_rw_t = env.mem.read(class_struct.data.cast());
+    let rw: class_rw_t = env.mem.read(class_struct.data());
     (rw._flags & 0x2) != 0
 }
 
-pub fn objc_getMetaClass(env: &mut crate::Environment, cls: Class, name: SEL) -> ConstVoidPtr {
-    if cls.is_null() {
-        return ConstVoidPtr::null();
-    }
-
-    let mut curr = cls;
-    while !curr.is_null() {
-        if let Some(host_obj) = env.objc.get_host_object(curr) {
-            if let Some(class_obj) = host_obj.as_any().downcast_ref::<ClassHostObject>() {
-                if class_obj.methods.contains_key(&name) {
-                    return curr.cast_const().cast();
-                }
-            }
-        }
-        let next = env.objc.get_superclass(curr);
-        if next == curr {
-            break;
-        }
-        curr = next;
-    }
-    ConstVoidPtr::null()
+/// Look up the metaclass by the class's name.
+/// https://github.com/apple-oss-distributions/objc4/blob/objc4-779.1/runtime/objc-runtime.mm
+pub fn objc_getMetaClass(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class {
+    let class = objc_getClass(env, name);
+    ObjC::read_isa(class, &env.mem)
 }
 
 /// `IMP class_replaceMethod(Class cls, SEL name, IMP imp, const char *types)`
@@ -2297,27 +2305,6 @@ pub fn __objc_deallocOnMainThreadHelper(env: &mut crate::Environment, context: M
     }
 }
 
-pub fn ___objc_personality_v0(
-    _env: &mut crate::Environment,
-    version: i32,
-    actions: i32,
-    exception_class: u64,
-    exception_object: MutVoidPtr,
-    context: MutVoidPtr,
-) -> i32 {
-    log!(
-        "___objc_personality_v0 called! Exception handling is not fully implemented in touchHLE.\n\
-        version: {}, actions: {}, class: {:x}, object: {:?}, context: {:?}",
-        version,
-        actions,
-        exception_class,
-        exception_object,
-        context
-    );
-    // _URC_FATAL_PHASE1_ERROR
-    3
-}
-
 /// `_objc_msgForward` — the ObjC runtime's message forwarding trampoline.
 ///
 /// On a real device, when `objc_msgSend` cannot find an IMP for a given
@@ -2425,35 +2412,41 @@ pub fn class_getMethodImplementation(
     }
     // Unlike `method_getImplementation` (which takes an opaque `Method`),
     // this call resolves the selector through the inheritance chain.
+    // Apple's lookup uses LOOKUP_INITIALIZE, including when querying a
+    // metaclass. Initialization can replace the method before lookup.
+    // https://github.com/apple-oss-distributions/objc4/blob/objc4-779.1/runtime/objc-class.mm
+    let class_to_initialize = env.objc.get_host_object(cls).and_then(|object| {
+        let class = object.as_any().downcast_ref::<ClassHostObject>()?;
+        if class.is_metaclass {
+            env.objc.get_class(&class.name, false, &env.mem)
+        } else {
+            Some(cls)
+        }
+    });
+    if let Some(class) = class_to_initialize {
+        super::messages::ensure_class_initialized(env, class);
+    }
     let defining = find_defining_class(env, cls, name);
     if defining.is_null() {
         return ConstVoidPtr::null();
     }
     match imp_at(env, defining, name) {
-        Some(imp) => imp_to_callable_guest_ptr(env, imp, "_objc_msgSend"),
+        Some(imp) => imp_to_guest_ptr(env, defining, name, imp),
         None => ConstVoidPtr::null(),
     }
 }
 
 /// `IMP class_getMethodImplementation_stret(Class cls, SEL name)` — same
-/// as above but for selectors whose return type uses `objc_msgSend_stret`
-/// (large struct returns). The IMP slot is the same in touchHLE.
+/// as above, using struct-return forwarding if the method is missing.
+/// For an implemented method, both variants return its actual IMP, whose
+/// calling convention already includes any hidden result pointer.
+/// https://github.com/apple-oss-distributions/objc4/blob/objc4-779.1/runtime/objc-class.mm
 pub fn class_getMethodImplementation_stret(
     env: &mut crate::Environment,
     cls: Class,
     name: crate::objc::SEL,
 ) -> ConstVoidPtr {
-    if cls.is_null() || name.is_null() {
-        return ConstVoidPtr::null();
-    }
-    let defining = find_defining_class(env, cls, name);
-    if defining.is_null() {
-        return ConstVoidPtr::null();
-    }
-    match imp_at(env, defining, name) {
-        Some(imp) => imp_to_callable_guest_ptr(env, imp, "_objc_msgSend_stret"),
-        None => ConstVoidPtr::null(),
-    }
+    class_getMethodImplementation(env, cls, name)
 }
 
 pub fn objc_retainAutorelease(env: &mut crate::Environment, obj: id) -> id {
@@ -2551,7 +2544,35 @@ pub fn imp_implementationWithBlock(
         env.mem.write(tramp + 2, 0xe590_f00c); // ldr pc, [r0, #12]
     }
     env.mem.write(tramp + 3, block.to_bits()); // literal: block literal
+    env.objc.block_imps.insert(tramp.to_bits(), block);
     tramp.cast().cast_const()
+}
+
+/// Return the block owned by an IMP, or nil for a non-block IMP.
+/// https://developer.apple.com/documentation/objectivec/imp_getblock(_:)
+pub fn imp_getBlock(env: &mut crate::Environment, implementation: crate::mem::ConstVoidPtr) -> id {
+    env.objc
+        .block_imps
+        .get(&implementation.to_bits())
+        .copied()
+        .unwrap_or(crate::mem::ConstVoidPtr::null())
+        .cast_mut()
+        .cast()
+}
+
+/// Removing a block IMP releases the runtime's copy and its executable thunk.
+/// https://developer.apple.com/documentation/objectivec/imp_removeblock(_:)
+pub fn imp_removeBlock(
+    env: &mut crate::Environment,
+    implementation: crate::mem::ConstVoidPtr,
+) -> bool {
+    let Some(block) = env.objc.block_imps.remove(&implementation.to_bits()) else {
+        return false;
+    };
+    crate::libc::blocks::_Block_release(env, block);
+    env.cpu.invalidate_cache_range(implementation.to_bits(), 16);
+    env.mem.free(implementation.cast_mut());
+    true
 }
 
 /// `id objc_unsafeClaimAutoreleasedReturnValue(id obj)` — ARC runtime
@@ -2631,30 +2652,260 @@ pub fn objc_getRequiredClass(env: &mut crate::Environment, name: ConstPtr<u8>) -
     class
 }
 
-/// `Class objc_allocateClassPair(Class superclass, const char *name,
-/// size_t extraBytes)` — used to dynamically create a new class.
-/// Implementing this properly requires wiring into our `ClassHostObject`
-/// machinery; until that's done, we install a placeholder
-/// (UnimplementedClass) so the symbol resolves and the guest can decide
-/// to fall back. Calls to `+[NewClass alloc]` etc. will go through the
-/// usual UnimplementedClass path.
+/// Create an unpublished class/metaclass pair with the given superclass.
+/// Apple's objc4-532.2 creates real pairs before registering their names.
+/// https://github.com/apple-oss-distributions/objc4/blob/objc4-532.2/runtime/objc-runtime-new.mm
+/// Sizes and parents shared by `objc_allocateClassPair` and
+/// `objc_initializeClassPair`.
+struct ClassPairGeometry {
+    instance_start: GuestUSize,
+    instance_size: GuestUSize,
+    meta_superclass: Class,
+    meta_isa: Class,
+    meta_size: GuestUSize,
+}
+
+/// `None` matches the runtime's refusal to subclass a class that is still
+/// being constructed, or a metaclass.
+fn class_pair_geometry(
+    env: &mut crate::Environment,
+    superclass: Class,
+) -> Option<ClassPairGeometry> {
+    if superclass == nil {
+        return Some(ClassPairGeometry {
+            instance_start: 0,
+            instance_size: guest_size_of::<objc_object>(),
+            meta_superclass: nil,
+            meta_isa: nil,
+            meta_size: guest_size_of::<class_t>(),
+        });
+    }
+    let parent = env
+        .objc
+        .get_host_object(superclass)
+        .and_then(|object| object.as_any().downcast_ref::<ClassHostObject>())?;
+    if parent.is_constructing || parent.is_metaclass {
+        return None;
+    }
+    let instance_size = parent.instance_size;
+    let meta_superclass = ObjC::read_isa(superclass, &env.mem);
+    let meta_size = env
+        .objc
+        .class_instance_size(meta_superclass)
+        .max(guest_size_of::<class_t>());
+    Some(ClassPairGeometry {
+        instance_start: instance_size,
+        instance_size,
+        meta_superclass,
+        meta_isa: ObjC::read_isa(meta_superclass, &env.mem),
+        meta_size,
+    })
+}
+
+/// Fills in and registers a class/metaclass pair at the given addresses.
+fn write_class_pair(
+    env: &mut crate::Environment,
+    class: Class,
+    metaclass: Class,
+    superclass: Class,
+    name: String,
+    geometry: ClassPairGeometry,
+) {
+    env.mem.write(class, objc_object { isa: metaclass });
+    env.mem.write(class.cast::<Class>() + 1, superclass);
+    let meta_superclass = if superclass == nil {
+        class
+    } else {
+        geometry.meta_superclass
+    };
+    env.mem.write(
+        metaclass,
+        objc_object {
+            isa: if superclass == nil {
+                metaclass
+            } else {
+                geometry.meta_isa
+            },
+        },
+    );
+    env.mem.write(metaclass.cast::<Class>() + 1, meta_superclass);
+    env.objc.register_static_object(
+        class,
+        Box::new(ClassHostObject {
+            name: name.clone(),
+            superclass,
+            instance_start: geometry.instance_start,
+            instance_size: geometry.instance_size,
+            is_from_bin: true,
+            is_constructing: true,
+            is_dynamic: true,
+            ..Default::default()
+        }),
+    );
+    env.objc.register_static_object(
+        metaclass,
+        Box::new(ClassHostObject {
+            name,
+            is_metaclass: true,
+            superclass: meta_superclass,
+            instance_start: geometry.meta_size,
+            instance_size: geometry.meta_size,
+            is_from_bin: true,
+            is_constructing: true,
+            is_dynamic: true,
+            ..Default::default()
+        }),
+    );
+}
+
 pub fn objc_allocateClassPair(
     env: &mut crate::Environment,
-    _superclass: Class,
+    superclass: Class,
     name: ConstPtr<u8>,
-    _extra_bytes: u32,
+    extra_bytes: GuestUSize,
 ) -> Class {
-    let Ok(s) = env.mem.cstr_at_utf8(name) else {
+    if name.is_null() {
+        return nil;
+    }
+    let Ok(name) = env.mem.cstr_at_utf8(name) else {
         return nil;
     };
-    let name_str = s.to_string();
-    log!(
-        "Warning: objc_allocateClassPair({:?}, …): dynamic class registration is \
-         not fully supported; installing an UnimplementedClass placeholder.",
-        name_str
-    );
-    env.objc
-        .link_class(&name_str, /* is_metaclass: */ false, &mut env.mem)
+    let name = name.to_owned();
+    if env.objc.get_class(&name, false, &env.mem).is_some() || ObjC::find_template(&name).is_some()
+    {
+        return nil;
+    }
+    let Some(geometry) = class_pair_geometry(env, superclass) else {
+        return nil;
+    };
+    let Some(class_size) = geometry.meta_size.checked_add(extra_bytes) else {
+        return nil;
+    };
+    let Some(metaclass_size) = guest_size_of::<class_t>().checked_add(extra_bytes) else {
+        return nil;
+    };
+    let class: Class = env.mem.calloc(class_size).cast();
+    if class == nil {
+        return nil;
+    }
+    let metaclass: Class = env.mem.calloc(metaclass_size).cast();
+    if metaclass == nil {
+        env.mem.free(class.cast());
+        return nil;
+    }
+    write_class_pair(env, class, metaclass, superclass, name, geometry);
+    class
+}
+
+/// `Class objc_initializeClassPair(Class superclass, const char *name, Class
+/// cls, Class meta)` — the pre-`objc_allocateClassPair` entry point: the
+/// caller provides the class and metaclass storage, which the runtime then
+/// fills in and registers. Returns `Nil` if the name is already in use.
+/// https://opensource.apple.com/source/objc4/objc4-532.2/runtime/objc-runtime-old.mm
+pub fn objc_initializeClassPair(
+    env: &mut crate::Environment,
+    superclass: Class,
+    name: ConstPtr<u8>,
+    class: Class,
+    metaclass: Class,
+) -> Class {
+    if name.is_null() || class == nil || metaclass == nil {
+        return nil;
+    }
+    let Ok(name) = env.mem.cstr_at_utf8(name) else {
+        return nil;
+    };
+    let name = name.to_owned();
+    if env.objc.get_class(&name, false, &env.mem).is_some() || ObjC::find_template(&name).is_some()
+    {
+        return nil;
+    }
+    let Some(geometry) = class_pair_geometry(env, superclass) else {
+        return nil;
+    };
+    write_class_pair(env, class, metaclass, superclass, name, geometry);
+    class
+}
+
+/// Add an ivar only while a non-metaclass is under construction.
+/// Alignment is log2(bytes); offsets follow the superclass's unaligned size.
+/// https://developer.apple.com/documentation/objectivec/class_addivar(_:_:_:_:_:)
+/// https://github.com/apple-oss-distributions/objc4/blob/objc4-532.2/runtime/objc-runtime-new.mm
+pub fn class_addIvar(
+    env: &mut crate::Environment,
+    class: Class,
+    name: ConstPtr<u8>,
+    size: GuestUSize,
+    alignment: u8,
+    types: ConstPtr<u8>,
+) -> bool {
+    let Some(host) = env
+        .objc
+        .get_host_object(class)
+        .and_then(|object| object.as_any().downcast_ref::<ClassHostObject>())
+    else {
+        return false;
+    };
+    if host.is_metaclass || !host.is_constructing {
+        return false;
+    }
+    let current_size = host.instance_size;
+    let name = if name.is_null() {
+        String::new()
+    } else {
+        let Ok(name) = env.mem.cstr_at_utf8(name) else {
+            return false;
+        };
+        name.to_owned()
+    };
+    if !name.is_empty() && env.objc.class_lookup_ivar(class, &name).is_some() {
+        return false;
+    }
+    let Some(alignment_bytes) = 1u32.checked_shl(alignment.into()) else {
+        return false;
+    };
+    let mask = alignment_bytes - 1;
+    let Some(offset) = current_size.checked_add(mask).map(|size| size & !mask) else {
+        return false;
+    };
+    let Some(instance_size) = offset.checked_add(size) else {
+        return false;
+    };
+    let types = if types.is_null() {
+        Vec::new()
+    } else {
+        env.mem.cstr_at(types).to_vec()
+    };
+    let name_ptr = if name.is_empty() {
+        Ptr::null()
+    } else {
+        env.mem.alloc_and_write_cstr(name.as_bytes())
+    };
+    let type_ptr = env.mem.alloc_and_write_cstr(&types);
+    let offset_ptr = env.mem.alloc_and_write(offset);
+    let metadata = env.mem.alloc_and_write(super::properties::ivar_t {
+        name: name_ptr.cast_const(),
+        type_: type_ptr.cast_const(),
+        offset: offset_ptr.cast_const(),
+        alignment: alignment.into(),
+        size,
+    });
+    let host = env.objc.borrow_mut::<ClassHostObject>(class);
+    host.instance_size = instance_size;
+    if !name_ptr.is_null() {
+        host.dynamic_allocations.push(name_ptr.cast());
+        host.ivars.insert(
+            name,
+            IvarInfo {
+                offset: offset_ptr.cast_const(),
+                alignment: alignment.into(),
+                metadata: metadata.cast().cast_const(),
+            },
+        );
+    }
+    host.dynamic_allocations
+        .extend([type_ptr.cast(), offset_ptr.cast(), metadata.cast()]);
+    true
 }
 
 /// `Class objc_readClassPair(Class cls, const struct objc_image_info *info)` —
@@ -2690,20 +2941,73 @@ pub fn objc_allocWithZone(
     crate::objc::msg![env; cls allocWithZone:zone]
 }
 
-/// `void objc_registerClassPair(Class cls)` — finalise the registration
-/// of a dynamically created class. touchHLE's [`objc_allocateClassPair`]
-/// already inserts the class into the runtime tables; the matching
-/// `register` call is therefore a no-op that just publishes the class.
-/// <https://developer.apple.com/documentation/objectivec/1418414-objc_registerclasspair>
-pub fn objc_registerClassPair(_env: &mut crate::Environment, _cls: Class) {}
+/// Publish a dynamically allocated class after its methods and ivars are set.
+/// https://developer.apple.com/documentation/objectivec/objc_registerclasspair(_:)
+pub fn objc_registerClassPair(env: &mut crate::Environment, class: Class) {
+    let Some(host) = env
+        .objc
+        .get_host_object(class)
+        .and_then(|object| object.as_any().downcast_ref::<ClassHostObject>())
+    else {
+        return;
+    };
+    if !host.is_dynamic || !host.is_constructing || host.is_metaclass {
+        return;
+    }
+    let name = host.name.clone();
+    let metaclass = ObjC::read_isa(class, &env.mem);
+    env.objc
+        .borrow_mut::<ClassHostObject>(class)
+        .is_constructing = false;
+    env.objc
+        .borrow_mut::<ClassHostObject>(metaclass)
+        .is_constructing = false;
+    env.objc.classes.insert(name, class);
+}
 
-/// `void objc_disposeClassPair(Class cls)` — destroys a class created
-/// with [`objc_allocateClassPair`] that has not yet been registered.
-/// touchHLE doesn't reclaim class storage, so we just drop the reference
-/// on the floor (Apple's runtime is also lazy about this for very small
-/// allocations).
-/// <https://developer.apple.com/documentation/objectivec/1418912-objc_disposeclasspair>
-pub fn objc_disposeClassPair(_env: &mut crate::Environment, _cls: Class) {}
+/// Dispose a dynamic class after all its instances and subclasses are gone.
+/// https://developer.apple.com/documentation/objectivec/objc_disposeclasspair(_:)
+pub fn objc_disposeClassPair(env: &mut crate::Environment, class: Class) {
+    let Some(host) = env
+        .objc
+        .get_host_object(class)
+        .and_then(|object| object.as_any().downcast_ref::<ClassHostObject>())
+    else {
+        return;
+    };
+    if !host.is_dynamic || host.is_metaclass {
+        return;
+    }
+    let name = host.name.clone();
+    let metaclass = ObjC::read_isa(class, &env.mem);
+    if env.objc.classes.get(&name) == Some(&class) {
+        env.objc.classes.remove(&name);
+    }
+    for object in [class, metaclass] {
+        env.objc.initialized_classes.remove(&object);
+        let metadata = std::mem::take(
+            &mut env
+                .objc
+                .borrow_mut::<ClassHostObject>(object)
+                .dynamic_allocations,
+        );
+        for allocation in metadata {
+            env.mem.free(allocation);
+        }
+        let method_handles: Vec<_> = env
+            .objc
+            .method_handles
+            .iter()
+            .filter(|((owner, _), _)| *owner == object)
+            .map(|(key, pointer)| (*key, *pointer))
+            .collect();
+        for (key, pointer) in method_handles {
+            env.objc.method_handles.remove(&key);
+            env.mem.free(pointer);
+        }
+        env.objc.dealloc_object(object, &mut env.mem);
+    }
+}
 
 /// `Class class_setSuperclass(Class cls, Class newSuper)` — deprecated
 /// since OS X 10.5 but still exported by libobjc and used by older
@@ -2806,6 +3110,41 @@ fn class_conforms_to_protocol(objc: &ObjC, mem: &Mem, cls: Class, protocol: id) 
 /// Checks protocols adopted by the class, its categories, and its superclasses.
 pub fn class_conformsToProtocol(env: &mut crate::Environment, cls: Class, protocol: id) -> bool {
     class_conforms_to_protocol(&env.objc, &env.mem, cls, protocol)
+}
+
+/// `BOOL class_addProtocol(Class cls, Protocol *protocol)`.
+///
+/// Records that the class adopts the protocol, so later
+/// [class_conformsToProtocol] and `conformsToProtocol:` calls see it. Apple's
+/// contract is to return `NO` when the class already conforms:
+/// <https://developer.apple.com/documentation/objectivec/1418952-class_addprotocol>
+pub fn class_addProtocol(env: &mut crate::Environment, cls: Class, protocol: id) -> bool {
+    if cls.is_null() || protocol.is_null() {
+        return false;
+    }
+    if class_conforms_to_protocol(&env.objc, &env.mem, cls, protocol) {
+        return false;
+    }
+    let is_class = env
+        .objc
+        .get_host_object(cls)
+        .is_some_and(|host_obj| host_obj.as_any().downcast_ref::<ClassHostObject>().is_some());
+    if !is_class {
+        return false;
+    }
+    env.objc.borrow_mut::<ClassHostObject>(cls).protocols.push(protocol);
+    true
+}
+
+/// `const uint8_t *class_getIvarLayout(Class cls)`.
+///
+/// Apple returns the description of strong/weak ivar references the class
+/// carries in its own metadata. This runtime tracks ivars by name/offset and
+/// has no layout string to hand back, so this returns `NULL`, which Apple
+/// documents for a class with no layout information:
+/// <https://developer.apple.com/documentation/objectivec/1418688-class_getivarlayout>
+pub fn class_getIvarLayout(_env: &mut crate::Environment, _cls: Class) -> ConstPtr<u8> {
+    ConstPtr::null()
 }
 
 /// `struct objc_method_description`, as returned by
@@ -2913,6 +3252,146 @@ fn find_protocol_method_types(
         }
     }
     Ptr::null()
+}
+
+/// Collects the methods of one of a protocol's four method lists, following
+/// the protocols it adopts. `protocol_copyMethodDescriptionList` returns all
+/// of them at once, unlike `find_protocol_method_types` which stops at one.
+fn collect_protocol_method_descriptions(
+    mem: &Mem,
+    proto: id,
+    is_required: bool,
+    is_instance: bool,
+    depth: u32,
+    out: &mut Vec<(ConstPtr<u8>, ConstPtr<u8>)>,
+) {
+    // Layout of the 32-bit `protocol_t`, in words: isa, name, protocols,
+    // instanceMethods, classMethods, optionalInstanceMethods,
+    // optionalClassMethods, ...
+    if proto.is_null() || depth > 16 {
+        return;
+    }
+    let words: ConstPtr<u32> = Ptr::from_bits(proto.to_bits());
+    let list_index = match (is_required, is_instance) {
+        (true, true) => 3,
+        (true, false) => 4,
+        (false, true) => 5,
+        (false, false) => 6,
+    };
+    let list: ConstPtr<u32> = Ptr::from_bits(mem.read(words + list_index));
+    if !list.is_null() {
+        let entsize = (mem.read(list) & !3).max(8);
+        let count: u32 = mem.read(list + 1);
+        for i in 0..count.min(4096) {
+            let entry: ConstPtr<ConstPtr<u8>> = Ptr::from_bits(list.to_bits() + 8 + i * entsize);
+            let name = mem.read(entry);
+            let types = mem.read(entry + 1);
+            if name.is_null() || out.iter().any(|(known, _)| *known == name) {
+                continue;
+            }
+            out.push((name, types));
+        }
+    }
+    let adopted: ConstPtr<u32> = Ptr::from_bits(mem.read(words + 2));
+    if !adopted.is_null() {
+        let count: u32 = mem.read(adopted);
+        for i in 0..count.min(256) {
+            let other: id = Ptr::from_bits(mem.read(adopted + 1 + i));
+            collect_protocol_method_descriptions(
+                mem,
+                other,
+                is_required,
+                is_instance,
+                depth + 1,
+                out,
+            );
+        }
+    }
+}
+
+/// `Protocol * __unsafe_unretained *protocol_copyProtocolList(Protocol *proto,
+/// unsigned int *outCount)` per Apple's Objective-C Runtime Reference
+/// (<https://developer.apple.com/documentation/objectivec/1418855-protocol_copyprotocollist>).
+/// The returned protocols are the ones `proto` adopts, not the ones that
+/// adopt it.
+pub fn protocol_copyProtocolList(
+    env: &mut crate::Environment,
+    proto: id,
+    out_count: crate::mem::MutPtr<u32>,
+) -> crate::mem::MutPtr<ConstVoidPtr> {
+    if !out_count.is_null() {
+        env.mem.write(out_count, 0);
+    }
+    if proto.is_null() {
+        return Ptr::null();
+    }
+    let words: ConstPtr<u32> = Ptr::from_bits(proto.to_bits());
+    let adopted: ConstVoidPtr = Ptr::from_bits(env.mem.read(words + 2));
+    let protocols = protocol_list_entries(&env.mem, adopted);
+    let Ok(count) = u32::try_from(protocols.len()) else {
+        return Ptr::null();
+    };
+    if count == 0 {
+        return Ptr::null();
+    }
+    let Some(size) = count.checked_mul(guest_size_of::<ConstVoidPtr>()) else {
+        return Ptr::null();
+    };
+    let buffer: crate::mem::MutPtr<ConstVoidPtr> = env.mem.alloc(size).cast();
+    for (index, protocol) in protocols.iter().enumerate() {
+        env.mem.write(buffer + index as u32, protocol.cast_const().cast());
+    }
+    if !out_count.is_null() {
+        env.mem.write(out_count, count);
+    }
+    buffer
+}
+
+/// `struct objc_method_description *protocol_copyMethodDescriptionList(
+/// Protocol *p, BOOL isRequiredMethod, BOOL isInstanceMethod,
+/// unsigned int *outCount)` per Apple's Objective-C Runtime Reference
+/// (<https://developer.apple.com/documentation/objectivec/1418813-protocol_copymethoddescriptionl>).
+/// The caller owns the returned array (`free()`-able) and the entries are
+/// written as two 32-bit words, matching the packed guest struct.
+pub fn protocol_copyMethodDescriptionList(
+    env: &mut crate::Environment,
+    proto: id,
+    is_required: bool,
+    is_instance: bool,
+    out_count: crate::mem::MutPtr<u32>,
+) -> crate::mem::MutPtr<objc_method_description> {
+    if !out_count.is_null() {
+        env.mem.write(out_count, 0);
+    }
+    let mut descriptions = Vec::new();
+    collect_protocol_method_descriptions(
+        &env.mem,
+        proto,
+        is_required,
+        is_instance,
+        0,
+        &mut descriptions,
+    );
+    let Ok(count) = u32::try_from(descriptions.len()) else {
+        return Ptr::null();
+    };
+    if count == 0 {
+        return Ptr::null();
+    }
+    let Some(size) = count.checked_mul(guest_size_of::<objc_method_description>()) else {
+        return Ptr::null();
+    };
+    let buffer: crate::mem::MutPtr<objc_method_description> = env.mem.alloc(size).cast();
+    for (index, (name, types)) in descriptions.iter().enumerate() {
+        let entry: crate::mem::MutPtr<u32> =
+            Ptr::from_bits(buffer.to_bits() + index as u32 * 8);
+        env.mem.write(entry, name.to_bits());
+        env.mem.write(entry + 1, types.to_bits());
+    }
+    if !out_count.is_null() {
+        env.mem.write(out_count, count);
+    }
+    buffer
 }
 
 /// `int objc_getClassList(Class *buffer, int bufferLen)` per Apple's
@@ -3024,14 +3503,29 @@ pub fn objc_copyImageNames(
     result
 }
 
-/// `void *object_getIndexedIvars(id obj)` — returns a pointer to the
-/// extra bytes allocated for a class created with
-/// `objc_allocateClassPair(super, name, extraBytes)`. We don't allocate
-/// extra bytes (see [objc_allocateClassPair]), so just return the
-/// object pointer itself; callers that try to use it as scratch space
-/// will get a no-op buffer rather than crashing on NULL.
-pub fn object_getIndexedIvars(_env: &mut crate::Environment, obj: id) -> ConstVoidPtr {
-    obj.cast().cast_const()
+/// Return the extra storage following the object's ordinary instance bytes.
+/// For dynamic class objects this follows the class header, preserving isa.
+/// https://github.com/apple-oss-distributions/objc4/blob/objc4-532.2/runtime/objc-runtime-new.mm
+pub fn object_getIndexedIvars(env: &mut crate::Environment, object: id) -> ConstVoidPtr {
+    if object == nil {
+        return Ptr::null();
+    }
+    let class = ObjC::read_isa(object, &env.mem);
+    let mut size = class_getInstanceSize(env, class);
+    if env
+        .objc
+        .get_host_object(object)
+        .and_then(|host| host.as_any().downcast_ref::<ClassHostObject>())
+        .is_some_and(|class| class.is_dynamic)
+    {
+        size = size.max(guest_size_of::<class_t>());
+    }
+    Ptr::from_bits(
+        object
+            .to_bits()
+            .checked_add(size)
+            .expect("Indexed ivar offset overflows"),
+    )
 }
 
 /// `void method_exchangeImplementations(Method m1, Method m2)`
@@ -3337,6 +3831,64 @@ mod class_registration_tests {
         let mut objc = ObjC::new();
         objc.register_host_selectors(&mut mem);
         (objc, mem)
+    }
+
+    // Swift legacy/stable classes carry flags in class_data_bits_t. The
+    // loader must still find their real name, instance size, and methods.
+    // https://github.com/apple-oss-distributions/objc4/blob/objc4-779.1/runtime/objc-runtime-new.h
+    #[test]
+    fn binary_class_registration_reads_swift_tagged_metadata() {
+        for flags in [0, 1, 2] {
+            let (mut objc, mut mem) = runtime();
+            let name = mem.alloc_and_write_cstr(b"TaggedMetadataClass");
+            let selector_name = mem.alloc_and_write_cstr(b"fixtureMethod");
+            let types = mem.alloc_and_write_cstr(b"v8@0:4");
+            let method_list: crate::mem::MutPtr<u32> = mem.alloc(20).cast();
+            mem.write(method_list, 12);
+            mem.write(method_list + 1, 1);
+            mem.write(method_list + 2, selector_name.to_bits());
+            mem.write(method_list + 3, types.to_bits());
+            mem.write(method_list + 4, 0x2001);
+            let metadata: crate::mem::MutPtr<u32> = mem.calloc(40).cast();
+            mem.write(metadata + 1, 4);
+            mem.write(metadata + 2, 16);
+            mem.write(metadata + 4, name.to_bits());
+            mem.write(metadata + 5, method_list.to_bits());
+            let class: crate::mem::MutPtr<u32> = mem.calloc(20).cast();
+            mem.write(class + 4, metadata.to_bits() | flags);
+
+            let host = ClassHostObject::from_bin(class.cast(), false, &mem, &mut objc);
+
+            assert_eq!(host.name, "TaggedMetadataClass", "data flags {flags}");
+            assert_eq!(host.instance_start, 4);
+            assert_eq!(host.instance_size, 16);
+            let selector = objc.lookup_selector("fixtureMethod").unwrap();
+            assert_eq!(host.methods.len(), 1);
+            assert_eq!(host.guest_method_signatures[&selector], types.cast_const());
+            assert!(matches!(
+                host.methods[&selector],
+                IMP::Guest(function)
+                    if function.addr_with_thumb_bit() == 0x2001
+            ));
+        }
+    }
+
+    #[test]
+    fn faked_sdk_table_covers_both_lookup_paths() {
+        // Ad SDKs are faked whether the app ships them or only looks them up.
+        assert!(is_faked_sdk("GADBannerView", true));
+        assert!(is_faked_sdk("GADBannerView", false));
+        assert!(is_faked_sdk("ALSdk", true));
+        assert!(is_faked_sdk("ALSdk", false));
+        // A bundled Facebook SDK has real code, so only lookups are faked.
+        assert!(!is_faked_sdk("FBSession", true));
+        assert!(is_faked_sdk("FBSession", false));
+        // SpringBoard probes are lookups only.
+        assert!(!is_faked_sdk("SBSceneFor", true));
+        assert!(is_faked_sdk("SBSceneFor", false));
+        // Unrelated classes are never faked.
+        assert!(!is_faked_sdk("NSObject", true));
+        assert!(!is_faked_sdk("NSObject", false));
     }
 
     #[test]

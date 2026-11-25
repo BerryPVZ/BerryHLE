@@ -35,10 +35,10 @@ pub const UIKeyboardCenterEndUserInfoKey: &str = "UIKeyboardCenterEndUserInfoKey
 
 // MARK: - Keyboard type / appearance / return key
 
-type UIKeyboardType = NSInteger;
-const UIKeyboardTypeDefault: UIKeyboardType = 0;
+pub type UIKeyboardType = NSInteger;
+pub const UIKeyboardTypeDefault: UIKeyboardType = 0;
 const UIKeyboardTypeASCIICapable: UIKeyboardType = 1;
-const UIKeyboardTypeNumbersAndPunctuation: UIKeyboardType = 2;
+pub const UIKeyboardTypeNumbersAndPunctuation: UIKeyboardType = 2;
 const UIKeyboardTypeURL: UIKeyboardType = 3;
 const UIKeyboardTypeNumberPad: UIKeyboardType = 4;
 const UIKeyboardTypePhonePad: UIKeyboardType = 5;
@@ -54,7 +54,7 @@ const UIKeyboardAppearanceDark: UIKeyboardAppearance = 1;
 const UIKeyboardAppearanceLight: UIKeyboardAppearance = 2;
 const UIKeyboardAppearanceAlert: UIKeyboardAppearance = UIKeyboardAppearanceDark;
 
-type UIReturnKeyType = NSInteger;
+pub type UIReturnKeyType = NSInteger;
 const UIReturnKeyDefault: UIReturnKeyType = 0;
 const UIReturnKeyGo: UIReturnKeyType = 1;
 const UIReturnKeyGoogle: UIReturnKeyType = 2;
@@ -64,7 +64,7 @@ const UIReturnKeyRoute: UIReturnKeyType = 5;
 const UIReturnKeySearch: UIReturnKeyType = 6;
 const UIReturnKeySend: UIReturnKeyType = 7;
 const UIReturnKeyYahoo: UIReturnKeyType = 8;
-const UIReturnKeyDone: UIReturnKeyType = 9;
+pub const UIReturnKeyDone: UIReturnKeyType = 9;
 const UIReturnKeyEmergencyCall: UIReturnKeyType = 10;
 const UIReturnKeyContinue: UIReturnKeyType = 11;
 
@@ -392,6 +392,69 @@ pub fn post_keyboard_notifications(env: &mut crate::Environment, will_show: bool
     let center: crate::objc::id = msg_class![env; NSNotificationCenter defaultCenter];
 
     let user_info: crate::objc::id = msg_class![env; NSMutableDictionary new];
+
+    // iOS puts the keyboard's geometry in the notification's userInfo, and
+    // apps use it to move their own content out of the way:
+    //
+    //   UIKeyboardFrameBeginUserInfoKey  — NSValue(CGRect), starting frame
+    //   UIKeyboardFrameEndUserInfoKey    — NSValue(CGRect), final frame
+    //   UIKeyboardAnimationDurationUserInfoKey — NSNumber, seconds
+    //   UIKeyboardAnimationCurveUserInfoKey    — NSNumber, UIViewAnimationCurve
+    //
+    // Both frames are in *screen* coordinates and describe the keyboard's
+    // rectangle at the bottom of the display. Posting an empty dictionary, as
+    // this used to do, leaves apps reading a nil frame: Minecraft PE 0.16.2
+    // asks for `UIKeyboardFrameBeginUserInfoKey` and, with no frame, never
+    // considers the keyboard visible — so every typed character it receives is
+    // discarded (issue reported for 0.16.2).
+    //
+    // https://developer.apple.com/documentation/uikit/uikeyboardframeenduserinfokey
+    let screen: crate::objc::id = msg_class![env; UIScreen mainScreen];
+    let bounds: crate::frameworks::core_graphics::CGRect = msg![env; screen bounds];
+    let (screen_width, screen_height) = (bounds.size.width, bounds.size.height);
+    // The simulated keyboard is the iPhone one: it takes the bottom of the
+    // display. Apple's on-screen keyboard is ~216 points tall in portrait and
+    // ~162 in landscape on this device class.
+    let keyboard_height = if screen_width > screen_height {
+        162.0
+    } else {
+        216.0
+    };
+    let visible_frame = crate::frameworks::core_graphics::CGRect {
+        origin: crate::frameworks::core_graphics::CGPoint {
+            x: 0.0,
+            y: screen_height - keyboard_height,
+        },
+        size: crate::frameworks::core_graphics::CGSize {
+            width: screen_width,
+            height: keyboard_height,
+        },
+    };
+    // Hidden: same size, pushed just below the display.
+    let hidden_frame = crate::frameworks::core_graphics::CGRect {
+        origin: crate::frameworks::core_graphics::CGPoint {
+            x: 0.0,
+            y: screen_height,
+        },
+        size: visible_frame.size,
+    };
+    let (begin_frame, end_frame) = if will_show {
+        (hidden_frame, visible_frame)
+    } else {
+        (visible_frame, hidden_frame)
+    };
+    let begin_value: crate::objc::id = msg_class![env; NSValue valueWithCGRect:begin_frame];
+    let end_value: crate::objc::id = msg_class![env; NSValue valueWithCGRect:end_frame];
+    let duration_value: crate::objc::id = msg_class![env; NSNumber numberWithDouble:0.25];
+    let curve_value: crate::objc::id = msg_class![env; NSNumber numberWithInteger:7];
+    let begin_key = get_static_str(env, UIKeyboardFrameBeginUserInfoKey);
+    let end_key = get_static_str(env, UIKeyboardFrameEndUserInfoKey);
+    let duration_key = get_static_str(env, UIKeyboardAnimationDurationUserInfoKey);
+    let curve_key = get_static_str(env, UIKeyboardAnimationCurveUserInfoKey);
+    let _: () = msg![env; user_info setObject:begin_value forKey:begin_key];
+    let _: () = msg![env; user_info setObject:end_value forKey:end_key];
+    let _: () = msg![env; user_info setObject:duration_value forKey:duration_key];
+    let _: () = msg![env; user_info setObject:curve_value forKey:curve_key];
 
     for name in [will_name, did_name] {
         let ns_name = get_static_str(env, name);

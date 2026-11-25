@@ -57,7 +57,7 @@ pub fn thread_id_for_ns_thread(env: &mut Environment, thread: id) -> Option<Thre
     let thread_id = crate::libc::pthread::thread::thread_id_for_pthread(env, pthread)?;
     env.threads
         .get(thread_id)
-        .is_some_and(|thread| thread.active)
+        .is_some_and(|thread| thread.is_alive())
         .then_some(thread_id)
 }
 

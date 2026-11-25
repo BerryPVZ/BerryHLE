@@ -1,5 +1,5 @@
 #!/bin/sh
-# Decide whether to publish a HyperHLE release and which vMAJOR.MINOR.PATCH tag
+# Decide whether to publish a AppleJuiceHLE release and which vMAJOR.MINOR.PATCH tag
 # to use. A release is due every 6 commits on HEAD since the latest release
 # tag, or since the commit that introduced hyperhle release automation when no
 # tag exists yet.
@@ -52,7 +52,7 @@ version="v${major}.${minor}.${patch}"
 if [ "${FORCE_HYPERHLE_RELEASE:-}" = "true" ]; then
     should_release=true
 elif [ "${GITHUB_EVENT_NAME:-}" = "workflow_dispatch" ]; then
-    # Manual "Build HyperHLE" runs must never publish files to Releases;
+    # Manual "Build AppleJuiceHLE" runs must never publish files to Releases;
     # they only produce build artifacts.
     should_release=false
 elif [ "$commits_since" -lt "$RELEASE_EVERY" ]; then

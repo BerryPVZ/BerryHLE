@@ -72,6 +72,17 @@ fn isupper(_env: &mut Environment, c: i32) -> i32 {
 fn isxdigit(_env: &mut Environment, c: i32) -> i32 {
     ctype_mask(c, 0x10000)
 }
+// Darwin digittoint returns zero for a character outside 0-9/A-F/a-f.
+// https://github.com/apple-oss-distributions/Libc/blob/main/include/_ctype.h
+fn digittoint(_env: &mut Environment, c: i32) -> i32 {
+    match c {
+        48..=57 => c - 48,
+        65..=70 => c - 65 + 10,
+        97..=102 => c - 97 + 10,
+        _ => 0,
+    }
+}
+
 fn isblank(_env: &mut Environment, c: i32) -> i32 {
     ctype_mask(c, 0x20000)
 }
@@ -219,11 +230,28 @@ pub const CONSTANTS: ConstantExports = &[(
     HostConstant::Custom(get_default_rune_locale),
 )];
 
+// `xlocale.h` variants used by libc++. touchHLE only supports the C locale,
+// so the `locale_t` argument is ignored.
+fn __maskrune_l(env: &mut Environment, rune: i32, mask: u32, _loc: MutVoidPtr) -> i32 {
+    __maskrune(env, rune, mask)
+}
+fn ___mb_cur_max_l(_env: &mut Environment, _loc: MutVoidPtr) -> i32 {
+    // The guest locale is ASCII/C, so one byte per character.
+    1
+}
+fn ___toupper_l(env: &mut Environment, c: i32, _loc: MutVoidPtr) -> i32 {
+    __toupper(env, c)
+}
+fn ___tolower_l(env: &mut Environment, c: i32, _loc: MutVoidPtr) -> i32 {
+    __tolower(env, c)
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(isalnum(_)),
     export_c_func!(isalpha(_)),
     export_c_func!(iscntrl(_)),
     export_c_func!(isdigit(_)),
+    export_c_func!(digittoint(_)),
     export_c_func!(isgraph(_)),
     export_c_func!(islower(_)),
     export_c_func!(ispunct(_)),
@@ -236,6 +264,10 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(toupper(_)),
     export_c_func!(__tolower(_)),
     export_c_func!(__toupper(_)),
+    export_c_func!(__maskrune_l(_, _, _)),
+    export_c_func!(___mb_cur_max_l(_)),
+    export_c_func!(___toupper_l(_, _)),
+    export_c_func!(___tolower_l(_, _)),
     export_c_func!(__maskrune(_, _)),
 ];
 

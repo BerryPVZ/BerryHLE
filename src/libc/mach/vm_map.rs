@@ -9,7 +9,8 @@ use crate::dyld::{export_c_func, FunctionExports};
 use crate::libc::mach::init::MACH_TASK_SELF;
 use crate::libc::mach::port::mach_port_t;
 use crate::libc::mach::thread_info::{
-    kern_return_t, KERN_INVALID_ADDRESS, KERN_INVALID_ARGUMENT, KERN_INVALID_TASK, KERN_SUCCESS,
+    kern_return_t, KERN_INVALID_ADDRESS, KERN_INVALID_ARGUMENT, KERN_INVALID_TASK, KERN_NO_SPACE,
+    KERN_SUCCESS,
 };
 use crate::mem::{
     ConstPtr, Mem, MutPtr, Ptr, SafeRead, SafeWrite, PAGE_SIZE, PAGE_SIZE_ALIGN_MASK,
@@ -27,6 +28,7 @@ type vm_inherit_t = u32;
 const VM_PROT_READ: vm_prot_t = 1;
 const VM_PROT_WRITE: vm_prot_t = 2;
 const VM_PROT_EXECUTE: vm_prot_t = 4;
+const VM_FLAGS_ANYWHERE: i32 = 1;
 
 #[derive(Default)]
 pub struct State {
@@ -65,6 +67,26 @@ struct VmRegion {
 }
 
 impl VmRegion {
+    /// Reuse a virtual hole without releasing the backing heap allocation.
+    fn reclaim(&mut self, start: mach_vm_address_t, end: mach_vm_address_t) -> bool {
+        let Some(index) = self
+            .released
+            .iter()
+            .position(|&(s, e)| s <= start && end <= e)
+        else {
+            return false;
+        };
+        let (s, e) = self.released.remove(index);
+        if s < start {
+            self.released.insert(index, (s, start));
+        }
+        if end < e {
+            self.released.push((end, e));
+            self.released.sort_unstable();
+        }
+        true
+    }
+
     /// Record that `[start, end)` has been deallocated and report whether that
     /// completes the region.
     fn release(
@@ -122,7 +144,15 @@ pub fn vm_allocate(
     log_dbg!("vm_allocate() implemented atop standard allocator");
     let allocated = env.mem.alloc(new_size);
     let address = allocated.to_bits();
+    if address == 0 {
+        // Out of guest memory (including the RAM limiter's cap). Reporting
+        // success with address 0 would hand the guest a null "mapping" it
+        // believes it owns, so fail like the kernel does instead.
+        crate::mem::log_out_of_memory("vm_allocate", new_size);
+        return KERN_NO_SPACE;
+    }
     assert!(address & PAGE_SIZE_ALIGN_MASK == 0);
+    crate::mem::note_allocation_site(env.cpu.regs()[crate::cpu::Cpu::LR], new_size);
     env.mem.write(address_ptr, address);
 
     assert!(!env.libc_state.mach_vm.allocations.contains_key(&address));
@@ -133,6 +163,54 @@ pub fn vm_allocate(
         VmRegion { size, rounded_size: new_size, released: Vec::new() },
     );
 
+    KERN_SUCCESS
+}
+
+/// `kern_return_t vm_map(vm_map_t target_task, vm_address_t *address,
+///     vm_size_t size, vm_address_t mask, int flags, vm_map_t src_task,
+///     vm_address_t src_address, boolean_t copy, vm_prot_t cur_protection,
+///     vm_prot_t max_protection, vm_inherit_t inheritance)` — legacy
+///     `vm_map` maps anonymous (or copied) memory. AppleJuiceHLE backs it with the
+///     guest heap and records the region for `vm_deallocate`.
+/// <https://web.mit.edu/darwin/src/modules/xnu/osfmk/man/vm_map.html>
+fn vm_map(
+    env: &mut Environment,
+    target_task: vm_map_t,
+    address_ptr: MutPtr<mach_vm_address_t>,
+    size: mach_vm_size_t,
+    _mask: mach_vm_address_t,
+    _flags: i32,
+    _src_task: vm_map_t,
+    src_address: mach_vm_address_t,
+    copy: bool,
+    _cur_protection: vm_prot_t,
+    _max_protection: vm_prot_t,
+    _inheritance: vm_inherit_t,
+) -> kern_return_t {
+    if target_task != MACH_TASK_SELF || address_ptr.is_null() {
+        return KERN_INVALID_ARGUMENT;
+    }
+    let rounded_size = round_up_to_page(size);
+    let allocated = env.mem.alloc(rounded_size);
+    if allocated.is_null() {
+        crate::mem::log_out_of_memory("vm_map", rounded_size);
+        return KERN_NO_SPACE;
+    }
+    let address = allocated.to_bits();
+    if copy && src_address != 0 {
+        let source = env
+            .mem
+            .bytes_at(ConstPtr::from_bits(src_address), size)
+            .to_vec();
+        env.mem
+            .bytes_at_mut(allocated.cast(), size)
+            .copy_from_slice(&source);
+    }
+    env.mem.write(address_ptr, address);
+    env.libc_state
+        .mach_vm
+        .allocations
+        .insert(address, VmRegion { size, rounded_size, released: Vec::new() });
     KERN_SUCCESS
 }
 
@@ -319,59 +397,68 @@ fn vm_read_overwrite(
 ///
 /// Real Mach `vm_remap` maps the physical pages backing a region of one task's
 /// address space into another (or the same) task, optionally sharing them.
-/// touchHLE has a single flat guest address space and no notion of shared
-/// physical pages, so we approximate it: allocate a fresh page-aligned region
-/// and copy the source bytes into it. This is what callers like the Mono/Boehm
-/// GC actually need to keep running — a valid, readable mapping of the same
-/// contents — even though writes won't be reflected back into the source.
+/// Fixed mappings must occupy the requested address, including holes released
+/// inside an allocation. Mono places a template code page immediately after
+/// its data page and uses PC-relative loads to access that data.
+/// Page contents are copied; writes shared between mappings remain unsupported.
+/// https://github.com/apple-oss-distributions/xnu/blob/xnu-2050.18.24/osfmk/vm/vm_user.c
+/// https://github.com/mono/mono/blob/mono-3.4.0/mono/mini/aot-runtime.c
 #[allow(clippy::too_many_arguments)]
 fn vm_remap(
     env: &mut Environment,
     target_task: vm_map_t,
     target_address: MutPtr<mach_vm_address_t>,
     size: mach_vm_size_t,
-    _mask: mach_vm_address_t,
-    _flags: i32,
-    _src_task: vm_map_t,
+    mask: mach_vm_address_t,
+    flags: i32,
+    src_task: vm_map_t,
     src_address: mach_vm_address_t,
     copy: i32,
     cur_protection: MutPtr<vm_prot_t>,
     max_protection: MutPtr<vm_prot_t>,
-    _inheritance: vm_inherit_t,
+    inheritance: vm_inherit_t,
 ) -> kern_return_t {
-    assert_eq!(target_task, MACH_TASK_SELF);
-
-    if size == 0 || src_address == 0 {
-        log!(
-            "Warning: vm_remap(src={:#x}, size={:#x}): invalid argument; returning KERN_INVALID_ADDRESS.",
-            src_address,
-            size
-        );
+    if target_task != MACH_TASK_SELF || src_task != MACH_TASK_SELF {
+        return KERN_INVALID_TASK;
+    }
+    if target_address.is_null() || flags & !VM_FLAGS_ANYWHERE != 0 || inheritance > 2 {
+        return KERN_INVALID_ARGUMENT;
+    }
+    let Some(new_size) = size
+        .checked_next_multiple_of(PAGE_SIZE)
+        .filter(|&size| size != 0)
+    else {
+        return KERN_INVALID_ARGUMENT;
+    };
+    let source = src_address & !PAGE_SIZE_ALIGN_MASK;
+    if !guest_range_is_valid(&env.mem, source, new_size) {
         return KERN_INVALID_ADDRESS;
     }
+    let requested = env.mem.read(target_address) & !PAGE_SIZE_ALIGN_MASK;
+    let address = match remap_destination(
+        &mut env.mem,
+        &mut env.libc_state.mach_vm,
+        requested,
+        new_size,
+        mask,
+        flags,
+    ) {
+        Ok(address) => address,
+        Err(error) => return error,
+    };
 
-    // `size` is always rounded up to an integral number of pages.
-    let new_size = round_up_to_page(size);
-
-    log_dbg!(
-        "vm_remap(src={:#x}, size={:#x}, copy={}) approximated by allocate + copy",
-        src_address,
-        size,
-        copy
-    );
-
-    let allocated = env.mem.alloc(new_size);
-    let address = allocated.to_bits();
+    log_dbg!("vm_remap(src={source:#x}, size={new_size:#x}, copy={copy}) => {address:#x}");
     assert!(address & PAGE_SIZE_ALIGN_MASK == 0);
 
     // Copy the source region's bytes so the new mapping reads back the same
     // data. We copy the page-rounded length so the trailing partial page is
     // also valid.
-    let copy_len = new_size.min(u32::MAX);
-    let src: ConstPtr<u8> = Ptr::from_bits(src_address);
+    let copy_len = new_size;
+    let src: ConstPtr<u8> = Ptr::from_bits(source);
     let dst: MutPtr<u8> = Ptr::from_bits(address);
     let bytes: Vec<u8> = env.mem.bytes_at(src, copy_len).to_vec();
     env.mem.bytes_at_mut(dst, copy_len).copy_from_slice(&bytes);
+    env.cpu.invalidate_cache_range(address, copy_len);
 
     env.mem.write(target_address, address);
     if !cur_protection.is_null() {
@@ -387,13 +474,61 @@ fn vm_remap(
         );
     }
 
-    assert!(!env.libc_state.mach_vm.allocations.contains_key(&address));
-    env.libc_state.mach_vm.allocations.insert(
-        address,
-        VmRegion { size, rounded_size: new_size, released: Vec::new() },
-    );
-
     KERN_SUCCESS
+}
+
+/// Claim the target pages, refusing a collision instead of moving a fixed map.
+fn remap_destination(
+    mem: &mut Mem,
+    state: &mut State,
+    requested: mach_vm_address_t,
+    size: mach_vm_size_t,
+    mask: mach_vm_address_t,
+    flags: i32,
+) -> Result<mach_vm_address_t, kern_return_t> {
+    if flags & VM_FLAGS_ANYWHERE == 0 {
+        let end = requested.checked_add(size).ok_or(KERN_INVALID_ADDRESS)?;
+        if !guest_range_is_valid(mem, requested, size) {
+            return Err(KERN_INVALID_ADDRESS);
+        }
+        if requested & mask != 0 {
+            return Err(KERN_NO_SPACE);
+        }
+        for (&base, region) in &mut state.allocations {
+            if base <= requested
+                && u64::from(end) <= u64::from(base) + u64::from(region.rounded_size)
+                && region.reclaim(requested, end)
+            {
+                return Ok(requested);
+            }
+        }
+        if !mem.alloc_fixed(requested, size) {
+            return Err(KERN_NO_SPACE);
+        }
+        state.allocations.insert(
+            requested,
+            VmRegion {
+                size,
+                rounded_size: size,
+                released: Vec::new(),
+            },
+        );
+        return Ok(requested);
+    }
+    let allocated = mem.alloc_aligned(size, mask, requested);
+    let address = allocated.to_bits();
+    if address == 0 {
+        return Err(KERN_NO_SPACE);
+    }
+    state.allocations.insert(
+        address,
+        VmRegion {
+            size,
+            rounded_size: size,
+            released: Vec::new(),
+        },
+    );
+    Ok(address)
 }
 
 fn vm_purgable_control(
@@ -500,6 +635,7 @@ fn vm_region_recurse(
 
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(vm_allocate(_, _, _, _)),
+    export_c_func!(vm_map(_, _, _, _, _, _, _, _, _, _, _)),
     export_c_func!(vm_deallocate(_, _, _)),
     export_c_func!(vm_read_overwrite(_, _, _, _, _)),
     export_c_func!(vm_remap(_, _, _, _, _, _, _, _, _, _, _)),

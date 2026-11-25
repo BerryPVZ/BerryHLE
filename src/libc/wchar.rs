@@ -6,7 +6,7 @@
 //! `wchar.h`
 
 use crate::dyld::{export_c_func, FunctionExports};
-use crate::mem::{ConstPtr, GuestUSize, MutPtr};
+use crate::mem::{ConstPtr, GuestUSize, MutPtr, MutVoidPtr};
 use crate::Environment;
 
 use super::generic_char::GenericChar;
@@ -22,24 +22,11 @@ const WEOF: wint_t = -1;
 // MARK: - Existing functions (unchanged)
 
 fn btowc(_env: &mut Environment, c: i32) -> wint_t {
-    let c = c as u8;
-    if c.is_ascii() {
-        c as wint_t
-    } else {
-        WEOF
-    }
+    u8::try_from(c).map_or(WEOF, |c| c as wint_t)
 }
 
 fn wctob(_env: &mut Environment, c: wint_t) -> i32 {
-    if u32::try_from(c)
-        .ok()
-        .and_then(char::from_u32)
-        .is_some_and(|c| c.is_ascii())
-    {
-        c
-    } else {
-        WEOF
-    }
+    u8::try_from(c).map_or(WEOF, |c| c as i32)
 }
 
 fn wmemset(
@@ -236,6 +223,31 @@ fn wcspbrk(
     }
 }
 
+/// wcsftime — `strftime()` into a wide-character buffer.
+fn wcsftime(
+    env: &mut Environment,
+    wcs: MutPtr<wchar_t>,
+    max_size: GuestUSize,
+    format: ConstPtr<wchar_t>,
+    time_ptr: ConstPtr<crate::libc::time::tm>,
+) -> GuestUSize {
+    // TODO: support other locales
+    let format_string = env.mem.wcstr_at(format);
+
+    let c_string: MutPtr<u8> = env.mem.alloc(max_size).cast();
+    let c_format_string: ConstPtr<u8> = env
+        .mem
+        .alloc_and_write_cstr(format_string.as_bytes())
+        .cast_const();
+    let res = crate::libc::time::strftime(env, c_string, max_size, c_format_string, time_ptr);
+    env.mem.free(c_format_string.cast().cast_mut());
+    let written = crate::libc::stdlib::mbstowcs(env, wcs, c_string.cast_const(), max_size);
+    env.mem.free(c_string.cast());
+    // strftime returns 0 when the buffer was too small; wcsftime reports the
+    // same failure, otherwise the number of wide characters written.
+    if res == 0 { 0 } else { written }
+}
+
 /// wcstok — tokenise a wide string (stateful via saveptr).
 fn wcstok(
     env: &mut Environment,
@@ -422,16 +434,12 @@ fn mbtowc(env: &mut Environment, pwc: MutPtr<wchar_t>, s: ConstPtr<u8>, n: Guest
     }
 }
 
-/// wctomb — convert wide char to multibyte (ASCII locale stub).
+/// wctomb — convert a wide character using Darwin's stateless C encoding.
 fn wctomb(env: &mut Environment, s: MutPtr<u8>, wc: wchar_t) -> i32 {
     if s.is_null() {
         return 0;
     }
-    if !(0..=0x7F).contains(&wc) {
-        return -1;
-    }
-    env.mem.write(s, wc as u8);
-    1
+    wcrtomb(env, s, wc, MutVoidPtr::null()) as i32
 }
 
 /// mbstowcs — convert multibyte string to wide string.
@@ -442,11 +450,9 @@ fn mbstowcs(
     n: GuestUSize,
 ) -> GuestUSize {
     let mut i: GuestUSize = 0;
-    loop {
+    let limit = if dest.is_null() { GuestUSize::MAX } else { n };
+    while i < limit {
         let byte = env.mem.read(src + i);
-        if i == n {
-            break;
-        }
         if !dest.is_null() {
             env.mem.write(dest + i, byte as wchar_t);
         }
@@ -466,16 +472,13 @@ fn wcstombs(
     n: GuestUSize,
 ) -> GuestUSize {
     let mut i: GuestUSize = 0;
-    loop {
+    let limit = if dest.is_null() { GuestUSize::MAX } else { n };
+    while i < limit {
         let wc = env.mem.read(src + i);
-        if i == n {
-            break;
-        }
-        if !(0..=0x7F).contains(&wc) {
+        let Ok(byte) = u8::try_from(wc) else {
+            super::errno::set_errno(env, super::errno::EILSEQ);
             return GuestUSize::MAX;
-            // encoding error
-        }
-        let byte = wc as u8;
+        };
         if !dest.is_null() {
             env.mem.write(dest + i, byte);
         }
@@ -487,69 +490,446 @@ fn wcstombs(
     i
 }
 
-/// wcstol — wide string to long.
+/// The emulated C locale uses ASCII numeric syntax. Keeping one byte per
+/// wide character also makes an unconsumed delimiter map back to `wchar_t*`.
+fn wide_numeric_ascii(env: &Environment, s: ConstPtr<wchar_t>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut offset = 0;
+    loop {
+        let value = env.mem.read(s + offset);
+        if value == 0 || !(0..=0x7f).contains(&value) {
+            return bytes;
+        }
+        bytes.push(value as u8);
+        offset += 1;
+    }
+}
+
+/// The magnitude limit for a conversion of `bits` bits: the type's minimum
+/// for a negative signed value, its maximum otherwise. C returns this on
+/// overflow.
+fn integer_limit(signed: bool, negative: bool, bits: u32) -> u64 {
+    if signed {
+        if negative {
+            1 << (bits - 1)
+        } else {
+            (1 << (bits - 1)) - 1
+        }
+    } else if bits == 64 {
+        u64::MAX
+    } else {
+        (1 << bits) - 1
+    }
+}
+
+/// A C integer prefix scanned out of ASCII bytes.
+struct ScannedInteger {
+    /// Magnitude of the digits, before applying the sign.
+    magnitude: u64,
+    /// Byte offset just past the last digit.
+    consumed: usize,
+    /// Whether at least one digit was consumed.
+    any_digits: bool,
+    /// Whether the magnitude exceeded the type's range.
+    overflow: bool,
+    negative: bool,
+}
+
+/// Unlike Rust's whole-string `parse`, C conversions consume a numeric
+/// prefix and leave the next configuration field untouched.
+fn scan_integer(bytes: &[u8], mut base: i32, signed: bool, bits: u32) -> ScannedInteger {
+    let mut at = 0;
+    while bytes.get(at).is_some_and(|b| matches!(*b, 9..=13 | 32)) {
+        at += 1;
+    }
+    let negative = bytes.get(at) == Some(&b'-');
+    if matches!(bytes.get(at), Some(b'+' | b'-')) {
+        at += 1;
+    }
+    let digit = |byte: u8| (byte as char).to_digit(36);
+    if (base == 0 || base == 16)
+        && bytes.get(at) == Some(&b'0')
+        && matches!(bytes.get(at + 1), Some(b'x' | b'X'))
+        && bytes.get(at + 2).and_then(|b| digit(*b)).is_some_and(|d| d < 16)
+    {
+        base = 16;
+        at += 2;
+    } else if base == 0 {
+        base = if bytes.get(at) == Some(&b'0') { 8 } else { 10 };
+    }
+    let first_digit = at;
+    let limit = integer_limit(signed, negative, bits);
+    let mut magnitude = 0u64;
+    let mut overflow = false;
+    while let Some(value) = bytes.get(at).and_then(|b| digit(*b)) {
+        if value >= base as u32 {
+            break;
+        }
+        if magnitude > (limit - value as u64) / base as u64 {
+            overflow = true;
+        } else if !overflow {
+            magnitude = magnitude * base as u64 + value as u64;
+        }
+        at += 1;
+    }
+    ScannedInteger {
+        magnitude,
+        consumed: at,
+        any_digits: at != first_digit,
+        overflow,
+        negative,
+    }
+}
+
+/// Darwin long is 32 bits even when the host's long is 64 bits, so the
+/// caller picks the width.
+/// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/wcstol.3.html
+fn wide_integer_prefix(
+    env: &mut Environment,
+    s: ConstPtr<wchar_t>,
+    endptr: MutPtr<MutPtr<wchar_t>>,
+    base: i32,
+    signed: bool,
+    bits: u32,
+) -> u64 {
+    use super::errno::{set_errno, EINVAL, ERANGE};
+    if !endptr.is_null() {
+        env.mem.write(endptr, s.cast_mut());
+    }
+    if base != 0 && !(2..=36).contains(&base) {
+        set_errno(env, EINVAL);
+        return 0;
+    }
+    let bytes = wide_numeric_ascii(env, s);
+    let scanned = scan_integer(&bytes, base, signed, bits);
+    if !scanned.any_digits {
+        return 0;
+    }
+    if !endptr.is_null() {
+        env.mem.write(endptr, (s + scanned.consumed as GuestUSize).cast_mut());
+    }
+    if scanned.overflow {
+        set_errno(env, ERANGE);
+        return integer_limit(signed, scanned.negative, bits);
+    }
+    if scanned.negative {
+        scanned.magnitude.wrapping_neg()
+    } else {
+        scanned.magnitude
+    }
+}
+
+/// wcstol — wide string to Darwin's 32-bit long.
 fn wcstol(
     env: &mut Environment,
     s: ConstPtr<wchar_t>,
     endptr: MutPtr<MutPtr<wchar_t>>,
     base: i32,
 ) -> i32 {
-    // Convert to a narrow string then parse.
-    let mut buf = String::new();
-    let mut i: GuestUSize = 0;
-    loop {
-        let wc = env.mem.read(s + i);
-        if wc == 0 || wc > 0x7F {
-            break;
-        }
-        buf.push(wc as u8 as char);
-        i += 1;
-    }
-    let buf = buf.trim();
-    let result = if base == 0 || base == 10 {
-        buf.parse::<i32>().unwrap_or(0)
-    } else if base == 16 {
-        i32::from_str_radix(buf.trim_start_matches("0x"), 16).unwrap_or(0)
-    } else {
-        i32::from_str_radix(buf, base as u32).unwrap_or(0)
-    };
-    if !endptr.is_null() {
-        env.mem.write(endptr, (s + i).cast_mut());
-    }
-    result
+    wide_integer_prefix(env, s, endptr, base, true, 32) as i32
 }
 
-/// wcstoul — wide string to unsigned long.
+/// wcstoul — wide string to unsigned 32-bit long.
 fn wcstoul(
     env: &mut Environment,
     s: ConstPtr<wchar_t>,
     endptr: MutPtr<MutPtr<wchar_t>>,
     base: i32,
 ) -> u32 {
-    wcstol(env, s, endptr, base) as u32
+    wide_integer_prefix(env, s, endptr, base, false, 32) as u32
 }
 
-/// wcstod — wide string to double.
-fn wcstod(env: &mut Environment, s: ConstPtr<wchar_t>, endptr: MutPtr<MutPtr<wchar_t>>) -> f64 {
-    let mut buf = String::new();
-    let mut i: GuestUSize = 0;
-    loop {
-        let wc = env.mem.read(s + i);
-        if wc == 0 || wc > 0x7F {
-            break;
+/// wcstoll — wide string to long long.
+fn wcstoll(
+    env: &mut Environment,
+    s: ConstPtr<wchar_t>,
+    endptr: MutPtr<MutPtr<wchar_t>>,
+    base: i32,
+) -> i64 {
+    wide_integer_prefix(env, s, endptr, base, true, 64) as i64
+}
+
+/// wcstoull — wide string to unsigned long long.
+fn wcstoull(
+    env: &mut Environment,
+    s: ConstPtr<wchar_t>,
+    endptr: MutPtr<MutPtr<wchar_t>>,
+    base: i32,
+) -> u64 {
+    wide_integer_prefix(env, s, endptr, base, false, 64)
+}
+
+/// Use the host C99 converter for decimal/hex floats, infinity and NaN, and
+/// translate its byte offset back into a guest wide-character offset.
+/// The guest only supports the C numeric locale (see clocale.rs).
+/// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/wcstod.3.html
+fn wide_float_prefix(
+    env: &mut Environment,
+    s: ConstPtr<wchar_t>,
+    endptr: MutPtr<MutPtr<wchar_t>>,
+    single: bool,
+) -> f64 {
+    let bytes = wide_numeric_ascii(env, s);
+    let number = std::ffi::CString::new(bytes).unwrap();
+    let mut host_end = std::ptr::null_mut();
+    let value = unsafe {
+        if single {
+            libc::strtof(number.as_ptr(), &mut host_end) as f64
+        } else {
+            libc::strtod(number.as_ptr(), &mut host_end)
         }
-        buf.push(wc as u8 as char);
-        i += 1;
-    }
+    };
+    let consumed = unsafe { host_end.offset_from(number.as_ptr()) } as usize;
     if !endptr.is_null() {
-        env.mem.write(endptr, (s + i).cast_mut());
+        env.mem.write(endptr, (s + consumed as GuestUSize).cast_mut());
     }
-    buf.trim().parse::<f64>().unwrap_or(0.0)
+    let token = std::str::from_utf8(&number.as_bytes()[..consumed])
+        .unwrap()
+        .trim_start()
+        .trim_start_matches(['+', '-'])
+        .to_ascii_lowercase();
+    // An explicit infinity/NaN isn't an overflow. For finite syntax, a
+    // nonzero significand rounded to zero is an underflow.
+    if consumed != 0 && !token.starts_with("inf") && !token.starts_with("nan") {
+        let hexadecimal = token.starts_with("0x");
+        let significand = token.split(if hexadecimal { 'p' } else { 'e' }).next().unwrap();
+        let nonzero = significand
+            .bytes()
+            .any(|b| matches!(b, b'1'..=b'9') || (hexadecimal && matches!(b, b'a'..=b'f')));
+        let min_normal = if single {
+            f32::MIN_POSITIVE as f64
+        } else {
+            f64::MIN_POSITIVE
+        };
+        if value.is_infinite() || (nonzero && value.abs() < min_normal) {
+            super::errno::set_errno(env, super::errno::ERANGE);
+        }
+    }
+    value
+}
+
+/// wcstold — wide string to long double (represented as f64).
+fn wcstold(env: &mut Environment, s: ConstPtr<wchar_t>, endptr: MutPtr<MutPtr<wchar_t>>) -> f64 {
+    wcstod(env, s, endptr)
+}
+
+/// wcstod — use the same numeric-prefix scanner as narrow strtod.
+fn wcstod(env: &mut Environment, s: ConstPtr<wchar_t>, endptr: MutPtr<MutPtr<wchar_t>>) -> f64 {
+    wide_float_prefix(env, s, endptr, false)
 }
 
 /// wcstof — wide string to float.
 fn wcstof(env: &mut Environment, s: ConstPtr<wchar_t>, endptr: MutPtr<MutPtr<wchar_t>>) -> f32 {
-    wcstod(env, s, endptr) as f32
+    wide_float_prefix(env, s, endptr, true) as f32
+}
+
+// MARK: - xlocale.h wide-character variants
+// touchHLE models the C locale, so the locale argument is ignored.
+// Darwin's C locale maps every unsigned byte (not just ASCII) to a wchar.
+// https://github.com/apple-oss-distributions/Libc/blob/main/locale/FreeBSD/none.c
+
+fn wcrtomb_l(
+    env: &mut Environment,
+    s: MutPtr<u8>,
+    wc: wchar_t,
+    _ps: MutVoidPtr,
+    _loc: crate::libc::clocale::locale_t,
+) -> GuestUSize {
+    if s.is_null() {
+        return 1;
+    }
+    let Ok(byte) = u8::try_from(wc) else {
+        super::errno::set_errno(env, super::errno::EILSEQ);
+        return GuestUSize::MAX;
+    };
+    env.mem.write(s, byte);
+    1
+}
+
+fn mbrtowc_l(
+    env: &mut Environment,
+    pwc: MutPtr<wchar_t>,
+    s: ConstPtr<u8>,
+    n: GuestUSize,
+    _ps: MutVoidPtr,
+    _loc: crate::libc::clocale::locale_t,
+) -> GuestUSize {
+    if s.is_null() {
+        return 0; // Reset the stateless C encoding; do not touch pwc.
+    }
+    if n == 0 {
+        return GuestUSize::MAX - 1; // (size_t)-2: incomplete input
+    }
+    let c = env.mem.read(s);
+    if !pwc.is_null() {
+        env.mem.write(pwc, c as wchar_t);
+    }
+    if c == 0 {
+        0
+    } else {
+        1
+    }
+}
+
+fn wcrtomb(env: &mut Environment, s: MutPtr<u8>, wc: wchar_t, ps: MutVoidPtr) -> GuestUSize {
+    wcrtomb_l(env, s, wc, ps, MutVoidPtr::null())
+}
+
+fn mbrtowc(
+    env: &mut Environment,
+    pwc: MutPtr<wchar_t>,
+    s: ConstPtr<u8>,
+    n: GuestUSize,
+    ps: MutVoidPtr,
+) -> GuestUSize {
+    mbrtowc_l(env, pwc, s, n, ps, MutVoidPtr::null())
+}
+
+fn mbrlen(env: &mut Environment, s: ConstPtr<u8>, n: GuestUSize, ps: MutVoidPtr) -> GuestUSize {
+    mbrtowc(env, MutPtr::null(), s, n, ps)
+}
+
+fn mbsinit(_env: &mut Environment, _ps: MutVoidPtr) -> i32 {
+    1 // Darwin's _none_mbsinit: the C encoding is always in its initial state.
+}
+
+fn mbrlen_l(
+    env: &mut Environment,
+    s: ConstPtr<u8>,
+    n: GuestUSize,
+    ps: MutVoidPtr,
+    loc: crate::libc::clocale::locale_t,
+) -> GuestUSize {
+    mbrtowc_l(env, MutPtr::null(), s, n, ps, loc)
+}
+
+fn btowc_l(env: &mut Environment, c: i32, _loc: crate::libc::clocale::locale_t) -> wint_t {
+    btowc(env, c)
+}
+
+fn wctob_l(env: &mut Environment, c: wint_t, _loc: crate::libc::clocale::locale_t) -> i32 {
+    wctob(env, c)
+}
+
+// Darwin's counting calls ignore the output limit and leave *src unchanged.
+// Conversion calls write NUL and clear *src only when they consume that NUL.
+// https://github.com/apple-oss-distributions/Libc/blob/main/locale/FreeBSD/none.c
+fn mbsnrtowcs_l(
+    env: &mut Environment,
+    dest: MutPtr<wchar_t>,
+    src: MutPtr<ConstPtr<u8>>,
+    nms: GuestUSize,
+    len: GuestUSize,
+    _ps: MutVoidPtr,
+    _loc: crate::libc::clocale::locale_t,
+) -> GuestUSize {
+    let input = env.mem.read(src);
+    let limit = if dest.is_null() { nms } else { nms.min(len) };
+    for i in 0..limit {
+        let c = env.mem.read(input + i);
+        if !dest.is_null() {
+            env.mem.write(dest + i, c as wchar_t);
+        }
+        if c == 0 {
+            if !dest.is_null() {
+                env.mem.write(src, ConstPtr::null());
+            }
+            return i;
+        }
+    }
+    if !dest.is_null() {
+        env.mem.write(src, input + limit);
+    }
+    limit
+}
+
+fn wcsnrtombs_l(
+    env: &mut Environment,
+    dest: MutPtr<u8>,
+    src: MutPtr<ConstPtr<wchar_t>>,
+    nwc: GuestUSize,
+    len: GuestUSize,
+    _ps: MutVoidPtr,
+    _loc: crate::libc::clocale::locale_t,
+) -> GuestUSize {
+    let input = env.mem.read(src);
+    let limit = if dest.is_null() { nwc } else { nwc.min(len) };
+    for i in 0..limit {
+        let wc = env.mem.read(input + i);
+        let Ok(byte) = u8::try_from(wc) else {
+            if !dest.is_null() {
+                env.mem.write(src, input + i);
+            }
+            super::errno::set_errno(env, super::errno::EILSEQ);
+            return GuestUSize::MAX;
+        };
+        if !dest.is_null() {
+            env.mem.write(dest + i, byte);
+        }
+        if byte == 0 {
+            if !dest.is_null() {
+                env.mem.write(src, ConstPtr::null());
+            }
+            return i;
+        }
+    }
+    if !dest.is_null() {
+        env.mem.write(src, input + limit);
+    }
+    limit
+}
+
+fn wcscoll_l(
+    env: &mut Environment,
+    a: ConstPtr<wchar_t>,
+    b: ConstPtr<wchar_t>,
+    _loc: crate::libc::clocale::locale_t,
+) -> i32 {
+    let mut i: GuestUSize = 0;
+    loop {
+        let ca = env.mem.read(a + i);
+        let cb = env.mem.read(b + i);
+        if ca != cb || ca == 0 {
+            return ca.cmp(&cb) as i32;
+        }
+        i += 1;
+    }
+}
+
+fn wcsxfrm_l(
+    env: &mut Environment,
+    dest: MutPtr<wchar_t>,
+    src: ConstPtr<wchar_t>,
+    n: GuestUSize,
+    _loc: crate::libc::clocale::locale_t,
+) -> GuestUSize {
+    let mut i: GuestUSize = 0;
+    loop {
+        let c = env.mem.read(src + i);
+        if !dest.is_null() && i + 1 < n {
+            env.mem.write(dest + i, c);
+        }
+        if c == 0 {
+            return i;
+        }
+        i += 1;
+    }
+}
+
+/// `int wcscoll(const wchar_t *s1, const wchar_t *s2)` — the locale-free
+/// variant of `wcscoll_l`; code-point order, as darwin's C locale returns.
+fn wcscoll(env: &mut Environment, a: ConstPtr<wchar_t>, b: ConstPtr<wchar_t>) -> i32 {
+    wcscoll_l(env, a, b, MutVoidPtr::null())
+}
+
+/// `size_t wcsxfrm(wchar_t *dst, const wchar_t *src, size_t n)`.
+fn wcsxfrm(
+    env: &mut Environment,
+    dest: MutPtr<wchar_t>,
+    src: ConstPtr<wchar_t>,
+    n: GuestUSize,
+) -> GuestUSize {
+    wcsxfrm_l(env, dest, src, n, MutVoidPtr::null())
 }
 
 /// iswspace — test if wide char is whitespace.
@@ -649,43 +1029,21 @@ fn ungetwc(_env: &mut Environment, c: wint_t, _stream: crate::mem::MutVoidPtr) -
 fn mbsrtowcs(
     env: &mut Environment,
     dest: MutPtr<wchar_t>,
-    src: MutPtr<ConstPtr<u8>>, // const char**
+    src: MutPtr<ConstPtr<u8>>,
     len: GuestUSize,
-    _ps: crate::mem::MutVoidPtr, // mbstate_t* — ignored (stateless ASCII)
+    ps: MutVoidPtr,
 ) -> GuestUSize {
-    if src.is_null() {
-        return 0;
-    }
+    mbsnrtowcs_l(env, dest, src, GuestUSize::MAX, len, ps, MutVoidPtr::null())
+}
 
-    let src_ptr: ConstPtr<u8> = env.mem.read(src);
-    if src_ptr.is_null() {
-        return 0;
-    }
-
-    // Count or convert up to `len` wide chars.
-    let mut i: GuestUSize = 0;
-    loop {
-        if i == len {
-            break;
-        }
-        let byte = env.mem.read(src_ptr + i);
-        if !dest.is_null() {
-            env.mem.write(dest + i, byte as wchar_t);
-        }
-        if byte == 0 {
-            // Null terminator consumed — set *src to NULL per POSIX.
-            env.mem.write(src, ConstPtr::null());
-            return i; // not counting the null terminator
-        }
-        i += 1;
-    }
-
-    // Reached `len` without hitting null — update *src to point past converted
-    // chars.
-    if !dest.is_null() {
-        env.mem.write(src, src_ptr + i);
-    }
-    i
+fn wcsrtombs(
+    env: &mut Environment,
+    dest: MutPtr<u8>,
+    src: MutPtr<ConstPtr<wchar_t>>,
+    len: GuestUSize,
+    ps: MutVoidPtr,
+) -> GuestUSize {
+    wcsnrtombs_l(env, dest, src, GuestUSize::MAX, len, ps, MutVoidPtr::null())
 }
 
 /// `size_t mbsrtowcs_l(wchar_t *restrict dst, const char **restrict src,
@@ -726,6 +1084,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(wcsspn(_, _)),
     export_c_func!(wcspbrk(_, _)),
     export_c_func!(wcstok(_, _, _)),
+    export_c_func!(wcsftime(_, _, _, _)),
     export_c_func!(wcsncpy(_, _, _)),
     export_c_func!(__wcsncpy_chk(_, _, _, _)),
     export_c_func!(wcsdup(_)),
@@ -748,6 +1107,25 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(wcstombs(_, _, _)),
     export_c_func!(wcstol(_, _, _)),
     export_c_func!(wcstoul(_, _, _)),
+    export_c_func!(wcstoll(_, _, _)),
+    export_c_func!(wcstoull(_, _, _)),
+    export_c_func!(wcstold(_, _)),
+    export_c_func!(wcrtomb(_, _, _)),
+    export_c_func!(mbrtowc(_, _, _, _)),
+    export_c_func!(mbrlen(_, _, _)),
+    export_c_func!(mbsinit(_)),
+    export_c_func!(wcscoll(_, _)),
+    export_c_func!(wcsxfrm(_, _, _)),
+    export_c_func!(wcsrtombs(_, _, _, _)),
+    export_c_func!(wcrtomb_l(_, _, _, _)),
+    export_c_func!(mbrtowc_l(_, _, _, _, _)),
+    export_c_func!(mbrlen_l(_, _, _, _)),
+    export_c_func!(btowc_l(_, _)),
+    export_c_func!(wctob_l(_, _)),
+    export_c_func!(mbsnrtowcs_l(_, _, _, _, _, _)),
+    export_c_func!(wcsnrtombs_l(_, _, _, _, _, _)),
+    export_c_func!(wcscoll_l(_, _, _)),
+    export_c_func!(wcsxfrm_l(_, _, _, _)),
     export_c_func!(wcstod(_, _)),
     export_c_func!(wcstof(_, _)),
     // Classification
@@ -772,3 +1150,46 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(mbsrtowcs(_, _, _, _)),
     export_c_func!(mbsrtowcs_l(_, _, _, _, _)),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::{integer_limit, scan_integer};
+
+    #[test]
+    fn scans_64_bit_integers_past_the_32_bit_range() {
+        let scanned = scan_integer(b"9223372036854775807", 10, true, 64);
+        assert_eq!(scanned.magnitude, i64::MAX as u64);
+        assert!(!scanned.overflow);
+        assert_eq!(scanned.consumed, 19);
+
+        let scanned = scan_integer(b"9223372036854775808", 10, true, 64);
+        assert!(scanned.overflow);
+
+        let scanned = scan_integer(b"18446744073709551615", 10, false, 64);
+        assert_eq!(scanned.magnitude, u64::MAX);
+        assert!(!scanned.overflow);
+
+        // LLONG_MIN is a legal value, only one digit beyond it overflows.
+        let scanned = scan_integer(b"-9223372036854775808", 10, true, 64);
+        assert!(!scanned.overflow);
+        assert_eq!(scanned.magnitude.wrapping_neg() as i64, i64::MIN);
+    }
+
+    #[test]
+    fn keeps_32_bit_limits_for_long() {
+        let scanned = scan_integer(b"2147483648", 10, true, 32);
+        assert!(scanned.overflow);
+        assert_eq!(integer_limit(true, false, 32), i32::MAX as u64);
+        assert_eq!(integer_limit(true, true, 32), 0x8000_0000);
+        assert_eq!(integer_limit(false, false, 32), u32::MAX as u64);
+    }
+
+    #[test]
+    fn stops_at_the_first_non_digit() {
+        let scanned = scan_integer(b"  -0x1fzz", 0, true, 64);
+        assert_eq!(scanned.magnitude, 0x1f);
+        assert_eq!(scanned.consumed, 7);
+        assert!(scanned.negative);
+        assert!(scanned.any_digits);
+    }
+}

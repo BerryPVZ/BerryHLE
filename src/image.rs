@@ -18,7 +18,10 @@
 //! References:
 //! - "Supported Image Formats" in [Loading Images](https://developer.apple.com/library/archive/documentation/2DDrawing/Conceptual/DrawingPrintingiOS/LoadingImages/LoadingImages.html)
 
+use std::collections::hash_map::DefaultHasher;
 use std::ffi::{c_int, c_uchar, CStr};
+use std::hash::{Hash, Hasher};
+use std::io::{Read, Write};
 
 use touchHLE_pvrt_decompress_wrapper::*;
 use touchHLE_stb_image_wrapper::*;
@@ -274,30 +277,58 @@ impl Image {
         rgba: &[u8],
         stride: i32,
     ) -> i32 {
-        unsafe extern "C" fn write_cb(
-            context: *mut std::ffi::c_void,
-            data: *mut std::ffi::c_void,
-            size: std::ffi::c_int,
-        ) {
-            if context.is_null() || data.is_null() || size <= 0 {
-                return;
-            }
-            let out: &mut Vec<u8> = &mut *(context as *mut Vec<u8>);
-            let bytes = std::slice::from_raw_parts(data as *const u8, size as usize);
-            out.extend_from_slice(bytes);
+        let Some(png) = encode_png_rgba(w, h, rgba, stride) else {
+            return 0;
+        };
+        if ctx_ptr.is_null() {
+            return 0;
         }
+        let out: &mut Vec<u8> = unsafe { &mut *(ctx_ptr as *mut Vec<u8>) };
+        out.extend_from_slice(&png);
+        png.len() as i32
+    }
+}
 
-        unsafe {
-            stbi_write_png_to_func(
-                Some(write_cb),
-                ctx_ptr,
-                w,
-                h,
-                4,
-                rgba.as_ptr().cast(),
-                stride,
-            )
+/// PNG-encode an RGBA8888 buffer with stb_image_write.
+///
+/// `stride` is the number of bytes per row (normally `width * 4`). Returns
+/// `None` if the encoder fails, which in practice only happens when it runs out
+/// of memory.
+///
+/// This is free-standing rather than a method on `Image` so that diagnostics
+/// that already hold a raw pixel buffer — such as the presented-frame dump in
+/// `frameworks::opengles::eagl` — can write a viewable file without building a
+/// whole `Image` around data they do not own.
+pub fn encode_png_rgba(w: i32, h: i32, rgba: &[u8], stride: i32) -> Option<Vec<u8>> {
+    unsafe extern "C" fn write_cb(
+        context: *mut std::ffi::c_void,
+        data: *mut std::ffi::c_void,
+        size: c_int,
+    ) {
+        if context.is_null() || data.is_null() || size <= 0 {
+            return;
         }
+        let out: &mut Vec<u8> = &mut *(context as *mut Vec<u8>);
+        let bytes = std::slice::from_raw_parts(data as *const u8, size as usize);
+        out.extend_from_slice(bytes);
+    }
+
+    let mut out: Vec<u8> = Vec::new();
+    let ok = unsafe {
+        stbi_write_png_to_func(
+            Some(write_cb),
+            &mut out as *mut Vec<u8> as *mut std::ffi::c_void,
+            w,
+            h,
+            4,
+            rgba.as_ptr().cast(),
+            stride,
+        )
+    };
+    if ok == 0 {
+        None
+    } else {
+        Some(out)
     }
 }
 
@@ -453,4 +484,61 @@ mod tests {
         assert_eq!(decode_checksum(512, 512, true), 0xd44a_a11d_f63a_0446);
         assert_eq!(decode_checksum(1024, 512, true), 0x99ac_697d_389a_6a2a);
     }
+}
+
+/// Directory for cached decoded images, inside the user data directory.
+/// Avoids re-decoding PNGs and re-running the premultiply pass on every
+/// launch: once an image has been decoded, its raw RGBA is stored here and
+/// loaded directly next time.
+fn image_cache_dir() -> std::path::PathBuf {
+    crate::paths::user_data_base_path().join("image_cache")
+}
+
+/// Hash image bytes into a cache-file name. Different images get different
+/// files; the same image always maps to the same file (within one Rust
+/// toolchain release — a hash change just means a cache miss, not an error).
+fn image_cache_key(bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Try to load a decoded image from the disk cache. Returns `None` when the
+/// cache file is missing, truncated, or unreadable.
+fn read_cached_image(key: u64) -> Option<Image> {
+    let path = image_cache_dir().join(format!("{key}.rgba"));
+    let mut file = std::fs::File::open(&path).ok()?;
+    let mut header = [0u8; 8];
+    file.read_exact(&mut header).ok()?;
+    let width = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    let height = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+    let expected_len = width.checked_mul(height)? as usize * 4;
+    let mut pixels = vec![0u8; expected_len];
+    file.read_exact(&mut pixels).ok()?;
+    Some(Image::from_pixels(width, height, pixels))
+}
+
+/// Write a decoded image to the disk cache. Errors are ignored: the cache is
+/// purely an optimization, and a failed write just means decoding next time.
+fn write_cached_image(key: u64, image: &Image) {
+    let _ = std::fs::create_dir_all(&image_cache_dir());
+    let path = image_cache_dir().join(format!("{key}.rgba"));
+    let Ok(mut file) = std::fs::File::create(&path) else { return };
+    let (width, height) = image.dimensions();
+    let _ = file.write_all(&width.to_le_bytes());
+    let _ = file.write_all(&height.to_le_bytes());
+    let _ = file.write_all(image.pixels());
+}
+
+/// Decode an image, using the disk cache when possible.
+/// The first launch pays the full PNG decode + premultiply cost; every later
+/// launch loads the raw RGBA from disk instead.
+pub fn load_image_cached(bytes: &[u8]) -> Result<Image, String> {
+    let key = image_cache_key(bytes);
+    if let Some(cached) = read_cached_image(key) {
+        return Ok(cached);
+    }
+    let image = Image::from_bytes(bytes)?;
+    write_cached_image(key, &image);
+    Ok(image)
 }

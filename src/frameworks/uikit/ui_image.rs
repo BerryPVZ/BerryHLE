@@ -4,8 +4,8 @@
 
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::core_graphics::cg_context::{
-    CGContextDrawImage, CGContextRef, CGContextRestoreGState, CGContextSaveGState,
-    CGContextScaleCTM, CGContextTranslateCTM,
+    draw_image_region, CGContextDrawImage, CGContextRef, CGContextRestoreGState,
+    CGContextSaveGState, CGContextScaleCTM, CGContextTranslateCTM,
 };
 use crate::frameworks::core_graphics::cg_image::{
     self, CGImageGetHeight, CGImageGetWidth, CGImageRef, CGImageRelease, CGImageRetain,
@@ -13,6 +13,7 @@ use crate::frameworks::core_graphics::cg_image::{
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::frameworks::foundation::{ns_data, ns_string, NSInteger};
+use crate::frameworks::uikit::ui_geometry::UIEdgeInsets;
 use crate::frameworks::uikit::ui_graphics::UIGraphicsGetCurrentContext;
 use crate::fs::GuestPath;
 use crate::image::Image;
@@ -61,13 +62,27 @@ fn image_resource_candidates_for_device(name: &str, is_ipad: bool) -> (Vec<Strin
         None => (name, "png"),
     };
     let candidates = if is_ipad {
-        vec![stem.to_owned(), format!("{stem}~ipad"), format!("{stem}@2x~ipad"),
-             format!("{stem}@2x"), format!("{stem}~iphone"), format!("{stem}@2x~iphone"),
-             format!("{stem}@3x~iphone"), format!("{stem}@3x")]
+        vec![
+            stem.to_owned(),
+            format!("{stem}~ipad"),
+            format!("{stem}@2x~ipad"),
+            format!("{stem}@2x"),
+            format!("{stem}~iphone"),
+            format!("{stem}@2x~iphone"),
+            format!("{stem}@3x~iphone"),
+            format!("{stem}@3x"),
+        ]
     } else {
-        vec![stem.to_owned(), format!("{stem}~iphone"), format!("{stem}@2x~iphone"),
-             format!("{stem}@3x~iphone"), format!("{stem}@2x"), format!("{stem}@3x"),
-             format!("{stem}~ipad"), format!("{stem}@2x~ipad")]
+        vec![
+            stem.to_owned(),
+            format!("{stem}~iphone"),
+            format!("{stem}@2x~iphone"),
+            format!("{stem}@3x~iphone"),
+            format!("{stem}@2x"),
+            format!("{stem}@3x"),
+            format!("{stem}~ipad"),
+            format!("{stem}@2x~ipad"),
+        ]
     };
     (candidates, extension.to_owned())
 }
@@ -96,6 +111,10 @@ struct UIImageHostObject {
     orientation: NSInteger, // UIImageOrientation
     left_cap_width: NSInteger,
     top_cap_height: NSInteger,
+    /// Right/bottom insets from `-resizableImageWithCapInsets:`. The legacy
+    /// `-stretchableImageWithLeftCapWidth:topCapHeight:` API never sets them.
+    right_cap_width: NSInteger,
+    bottom_cap_height: NSInteger,
     /// Image scale factor (`1.0` for standard, `2.0` for @2x, `3.0` for @3x).
     /// UIKit reports `-[UIImage size]` in points (pixels / scale); honouring
     /// this keeps layout and hit-testing correct when a Retina-only app's
@@ -114,6 +133,144 @@ fn get_dummy_cg_image(env: &mut Environment) -> CGImageRef {
     cg_image::from_image(env, image)
 }
 
+/// Draws one cell of a nine-patch image: the `src` rectangle of `image` (in
+/// image pixels) into `dest` (in points). The bitmap context has no clip
+/// path, so the slice is selected while sampling rather than clipped after.
+fn draw_image_cell(
+    env: &mut Environment,
+    context: CGContextRef,
+    image: CGImageRef,
+    dest: CGRect,
+    src: CGRect,
+) {
+    if !(dest.size.width > 0.0)
+        || !(dest.size.height > 0.0)
+        || !(src.size.width > 0.0)
+        || !(src.size.height > 0.0)
+    {
+        return;
+    }
+    draw_image_region(env, context, dest, image, src);
+}
+
+/// Draws a resizable (nine-patch) image into `rect`: the cap regions keep
+/// their size and only the middle stretches. This is what
+/// `-resizableImageWithCapInsets:resizingMode:` promises for `-drawInRect:`.
+/// Returns false when the image has no caps or the caps do not fit in `rect`,
+/// so the caller falls back to a plain stretched draw.
+#[allow(clippy::too_many_arguments)]
+fn draw_nine_patch(
+    env: &mut Environment,
+    context: CGContextRef,
+    image: CGImageRef,
+    rect: CGRect,
+    scale: CGFloat,
+    left: NSInteger,
+    top: NSInteger,
+    right: NSInteger,
+    bottom: NSInteger,
+) -> bool {
+    let image_width = CGImageGetWidth(env, image) as CGFloat;
+    let image_height = CGImageGetHeight(env, image) as CGFloat;
+    let Some((dest, src)) = nine_patch_cells(
+        rect,
+        image_width,
+        image_height,
+        scale,
+        (left, top, right, bottom),
+    ) else {
+        return false;
+    };
+    for cell in 0..9 {
+        draw_image_cell(env, context, image, dest[cell], src[cell]);
+    }
+    true
+}
+
+/// Splits a resizable image into its nine cells. Destination cells are in
+/// points, source cells in image pixels. Returns `None` when the image has no
+/// caps or the caps do not fit in `rect`; the caller then draws it plain.
+fn nine_patch_cells(
+    rect: CGRect,
+    image_width: CGFloat,
+    image_height: CGFloat,
+    scale: CGFloat,
+    insets: (NSInteger, NSInteger, NSInteger, NSInteger),
+) -> Option<([CGRect; 9], [CGRect; 9])> {
+    let (left, top, right, bottom) = insets;
+    if left <= 0 && top <= 0 && right <= 0 && bottom <= 0 {
+        return None;
+    }
+    if !(image_width > 0.0) || !(image_height > 0.0) || !(scale > 0.0) {
+        return None;
+    }
+    let width = image_width / scale;
+    let height = image_height / scale;
+    let left = (left as CGFloat).clamp(0.0, width);
+    let right = (right as CGFloat).clamp(0.0, width - left);
+    let top = (top as CGFloat).clamp(0.0, height);
+    let bottom = (bottom as CGFloat).clamp(0.0, height - top);
+    let mid_width = rect.size.width - left - right;
+    let mid_height = rect.size.height - top - bottom;
+    if mid_width < 0.0 || mid_height < 0.0 {
+        // Apple scales the caps down when the rect is too small; a plain
+        // stretch is closer to that than dropping the image entirely.
+        return None;
+    }
+
+    let left_px = left * scale;
+    let right_px = right * scale;
+    let top_px = top * scale;
+    let bottom_px = bottom * scale;
+    let mid_px_width = image_width - left_px - right_px;
+    let mid_px_height = image_height - top_px - bottom_px;
+
+    let dest_x = [
+        rect.origin.x,
+        rect.origin.x + left,
+        rect.origin.x + left + mid_width,
+    ];
+    let dest_y = [
+        rect.origin.y,
+        rect.origin.y + top,
+        rect.origin.y + top + mid_height,
+    ];
+    let dest_w = [left, mid_width, right];
+    let dest_h = [top, mid_height, bottom];
+    let src_x = [0.0, left_px, image_width - right_px];
+    let src_y = [0.0, top_px, image_height - bottom_px];
+    let src_w = [left_px, mid_px_width, right_px];
+    let src_h = [top_px, mid_px_height, bottom_px];
+
+    let mut dest = [CGRect::default(); 9];
+    let mut src = [CGRect::default(); 9];
+    for cell in 0..9 {
+        let col = cell % 3;
+        let row = cell / 3;
+        dest[cell] = CGRect {
+            origin: CGPoint {
+                x: dest_x[col],
+                y: dest_y[row],
+            },
+            size: CGSize {
+                width: dest_w[col],
+                height: dest_h[row],
+            },
+        };
+        src[cell] = CGRect {
+            origin: CGPoint {
+                x: src_x[col],
+                y: src_y[row],
+            },
+            size: CGSize {
+                width: src_w[col],
+                height: src_h[row],
+            },
+        };
+    }
+    Some((dest, src))
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -126,6 +283,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         orientation: 0, // UIImageOrientationUp
         left_cap_width: 0,
         top_cap_height: 0,
+        right_cap_width: 0,
+        bottom_cap_height: 0,
         scale: 1.0,
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
@@ -245,6 +404,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     host.orientation = orientation;
     host.left_cap_width = 0;
     host.top_cap_height = 0;
+    host.right_cap_width = 0;
+    host.bottom_cap_height = 0;
     this
 }
 
@@ -378,10 +539,39 @@ pub const CLASSES: ClassExports = objc_classes! {
     let new_img: id = msg_class![env; UIImage alloc];
     let new_img: id = msg![env; new_img initWithCGImage:cg_image scale:scale orientation:orientation];
 
+    let scale = scale.max(1.0);
+    let width = CGImageGetWidth(env, cg_image) as CGFloat / scale;
+    let height = CGImageGetHeight(env, cg_image) as CGFloat / scale;
     let host = env.objc.borrow_mut::<UIImageHostObject>(new_img);
     host.left_cap_width = leftCapWidth;
     host.top_cap_height = topCapHeight;
+    // The legacy API only names the left/top caps; Apple stretches the middle
+    // one-pixel strip between them, so derive the opposite caps from it.
+    host.right_cap_width = (width - leftCapWidth as CGFloat - 1.0).max(0.0) as NSInteger;
+    host.bottom_cap_height = (height - topCapHeight as CGFloat - 1.0).max(0.0) as NSInteger;
 
+    autorelease(env, new_img)
+}
+
+- (id)resizableImageWithCapInsets:(UIEdgeInsets)capInsets {
+    let image: id = msg![env; this resizableImageWithCapInsets:capInsets resizingMode:0];
+    image
+}
+
+- (id)resizableImageWithCapInsets:(UIEdgeInsets)capInsets resizingMode:(NSInteger)_resizingMode {
+    let &UIImageHostObject {
+        cg_image,
+        scale,
+        orientation,
+        ..
+    } = env.objc.borrow::<UIImageHostObject>(this);
+    let new_img: id = msg_class![env; UIImage alloc];
+    let new_img: id = msg![env; new_img initWithCGImage:cg_image scale:scale orientation:orientation];
+    let host = env.objc.borrow_mut::<UIImageHostObject>(new_img);
+    host.left_cap_width = capInsets.left as NSInteger;
+    host.top_cap_height = capInsets.top as NSInteger;
+    host.right_cap_width = capInsets.right as NSInteger;
+    host.bottom_cap_height = capInsets.bottom as NSInteger;
     autorelease(env, new_img)
 }
 
@@ -417,14 +607,22 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())drawInRect:(CGRect)rect {
     let context = UIGraphicsGetCurrentContext(env);
     if context == nil { return; }
-    // TODO: Здесь должна быть логика отрисовки с учетом leftCapWidth и
-    // topCapHeight
-    // Если left_cap_width > 0 || top_cap_height > 0, нужно делить картинку на 9
-    // частей (nine-patch)
-    // и отрисовывать через CGContextDrawImage кусками. Пока рисуем целиком.
-    let image = env.objc.borrow::<UIImageHostObject>(this).cg_image;
+    let (image, scale, left, top, right, bottom) = {
+        let host = env.objc.borrow::<UIImageHostObject>(this);
+        (
+            host.cg_image,
+            host.scale.max(1.0),
+            host.left_cap_width,
+            host.top_cap_height,
+            host.right_cap_width,
+            host.bottom_cap_height,
+        )
+    };
     // Drawing a nil image is a no-op, not a crash.
     if image == nil { return; }
+    if draw_nine_patch(env, context, image, rect, scale, left, top, right, bottom) {
+        return;
+    }
     draw_ui_image(env, context, rect, image);
 }
 
@@ -436,9 +634,22 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())drawInRect:(CGRect)rect blendMode:(i32)_blend_mode alpha:(CGFloat)_alpha {
     let context = UIGraphicsGetCurrentContext(env);
     if context == nil { return; }
-    let image = env.objc.borrow::<UIImageHostObject>(this).cg_image;
+    let (image, scale, left, top, right, bottom) = {
+        let host = env.objc.borrow::<UIImageHostObject>(this);
+        (
+            host.cg_image,
+            host.scale.max(1.0),
+            host.left_cap_width,
+            host.top_cap_height,
+            host.right_cap_width,
+            host.bottom_cap_height,
+        )
+    };
     // Drawing a nil image is a no-op, not a crash.
     if image == nil { return; }
+    if draw_nine_patch(env, context, image, rect, scale, left, top, right, bottom) {
+        return;
+    }
     draw_ui_image(env, context, rect, image);
 }
 
@@ -502,6 +713,40 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 @implementation UIImageNibPlaceholder: NSObject
+
+// `UIImageNibPlaceholder` is UIKit's private stand-in for an image stored in
+// a nib. Real nibs usually decode the resource name through `-initWithCoder:`,
+// but storyboards and hand-written archives may instead invoke the regular
+// `UIImage` data/file initializers on the placeholder. Forward those to a
+// real `UIImage` and transfer ownership, exactly like `-initWithCoder:` below.
+// <https://developer.apple.com/documentation/uikit/uiimage>
+
+- (id)initWithData:(id)data { // NSData*
+    () = msg![env; this dealloc];
+    let image: id = msg_class![env; UIImage imageWithData:data];
+    if image != nil {
+        retain(env, image);
+    }
+    image
+}
+
+- (id)initWithData:(id)data scale:(CGFloat)scale { // NSData*
+    () = msg![env; this dealloc];
+    let image: id = msg_class![env; UIImage imageWithData:data scale:scale];
+    if image != nil {
+        retain(env, image);
+    }
+    image
+}
+
+- (id)initWithContentsOfFile:(id)path { // NSString*
+    () = msg![env; this dealloc];
+    let image: id = msg_class![env; UIImage imageWithContentsOfFile:path];
+    if image != nil {
+        retain(env, image);
+    }
+    image
+}
 
 - (id)initWithCoder:(id)coder {
     // В NIB-файлах плейсхолдеры картинок хранят имя ресурса под ключом
@@ -730,15 +975,68 @@ mod resource_tests {
 
     #[test]
     fn globbert_plain_png_names_precede_retina_fallbacks() {
-        for name in ["R&S_00015", "R&S_Ident_00023", "4_HEADPHONES_H37)225_389-216"] {
+        for name in [
+            "R&S_00015",
+            "R&S_Ident_00023",
+            "4_HEADPHONES_H37)225_389-216",
+        ] {
             let (candidates, extension) = image_resource_candidates(name);
-            assert_eq!(format!("{}.{}", candidates[0], extension), format!("{name}.png"));
+            assert_eq!(
+                format!("{}.{}", candidates[0], extension),
+                format!("{name}.png")
+            );
             assert!(candidates.contains(&format!("{name}@2x")));
             assert!(candidates.contains(&format!("{name}@3x")));
         }
     }
+}
+
+#[cfg(test)]
+mod nine_patch_tests {
+    use super::image_resource_candidates;
+    use super::nine_patch_cells;
+    use crate::frameworks::core_graphics::cg_geometry::{CGPoint, CGRect, CGSize};
+
+    fn rect(x: f32, y: f32, width: f32, height: f32) -> CGRect {
+        CGRect {
+            origin: CGPoint { x, y },
+            size: CGSize { width, height },
+        }
+    }
 
     #[test]
+    fn caps_keep_their_size_and_only_the_middle_stretches() {
+        let (dest, src) =
+            nine_patch_cells(rect(10.0, 20.0, 100.0, 50.0), 20.0, 20.0, 1.0, (4, 4, 4, 4)).unwrap();
+        // Top-left cap is 4x4, the middle absorbs the extra 92x42 points.
+        assert_eq!(dest[0], rect(10.0, 20.0, 4.0, 4.0));
+        assert_eq!(dest[4], rect(14.0, 24.0, 92.0, 42.0));
+        assert_eq!(dest[8], rect(106.0, 66.0, 4.0, 4.0));
+        // The source middle is the 12x12 centre of the 20x20 image.
+        assert_eq!(src[0], rect(0.0, 0.0, 4.0, 4.0));
+        assert_eq!(src[4], rect(4.0, 4.0, 12.0, 12.0));
+        assert_eq!(src[8], rect(16.0, 16.0, 4.0, 4.0));
+    }
+
+    #[test]
+    fn caps_scale_with_the_image_scale() {
+        // A @2x image is twice the pixels for the same points.
+        let (_, src) =
+            nine_patch_cells(rect(0.0, 0.0, 100.0, 50.0), 40.0, 40.0, 2.0, (4, 4, 4, 4)).unwrap();
+        assert_eq!(src[0], rect(0.0, 0.0, 8.0, 8.0));
+        assert_eq!(src[4], rect(8.0, 8.0, 24.0, 24.0));
+    }
+
+    #[test]
+    fn no_caps_or_no_room_falls_back_to_a_plain_draw() {
+        assert!(
+            nine_patch_cells(rect(0.0, 0.0, 10.0, 10.0), 20.0, 20.0, 1.0, (0, 0, 0, 0)).is_none()
+        );
+        assert!(
+            nine_patch_cells(rect(0.0, 0.0, 5.0, 50.0), 20.0, 20.0, 1.0, (4, 4, 4, 4)).is_none()
+        );
+    }
+
     fn suffixes_precede_extensions_and_directory_dots_are_preserved() {
         let (candidates, extension) = image_resource_candidates("news-close.png");
         assert_eq!(extension, "png");
@@ -749,7 +1047,11 @@ mod resource_tests {
     }
 }
 
-fn decoded_file_image(env: &mut Environment, path_str: &str, bytes: Vec<u8>) -> Result<CGImageRef, String> {
+fn decoded_file_image(
+    env: &mut Environment,
+    path_str: &str,
+    bytes: Vec<u8>,
+) -> Result<CGImageRef, String> {
     // File-backed UIImage objects remain distinct, and the file is read on
     // every call so writable files never return stale pixels. Only immutable
     // decoded CGImage backing is shared when the bytes still match exactly.
@@ -758,15 +1060,19 @@ fn decoded_file_image(env: &mut Environment, path_str: &str, bytes: Vec<u8>) -> 
     let budget = env.options.image_cache_mb as usize * 1024 * 1024;
     let cached = if budget > 0 {
         let state = State::get_mut(env);
-        let index = state.file_images.iter().position(|(path, data, _, _)|
-            path == path_str && data == &bytes);
+        let index = state
+            .file_images
+            .iter()
+            .position(|(path, data, _, _)| path == path_str && data == &bytes);
         index.map(|index| {
             let entry = state.file_images.remove(index).unwrap();
             let cg = entry.2;
             state.file_images.push_back(entry);
             cg
         })
-    } else { None };
+    } else {
+        None
+    };
     let cg = if let Some(cg) = cached {
         CGImageRetain(env, cg)
     } else {
@@ -780,7 +1086,9 @@ fn decoded_file_image(env: &mut Environment, path_str: &str, bytes: Vec<u8>) -> 
                 CGImageRelease(env, entry.2);
             }
             CGImageRetain(env, cg);
-            State::get_mut(env).file_images.push_back((path_str.to_string(), bytes, cg, size));
+            State::get_mut(env)
+                .file_images
+                .push_back((path_str.to_string(), bytes, cg, size));
             State::get_mut(env).file_image_bytes += size;
         }
         cg
@@ -795,8 +1103,10 @@ mod file_image_cache_tests {
     fn png(pixel: [u8; 4]) -> Vec<u8> {
         let image = Image::from_pixels(1, 1, pixel.to_vec());
         let mut bytes = Vec::<u8>::new();
-        assert_ne!(image.write_png_image((&mut bytes as *mut Vec<u8>).cast(),
-            1, 1, &pixel, 4), 0);
+        assert_ne!(
+            image.write_png_image((&mut bytes as *mut Vec<u8>).cast(), 1, 1, &pixel, 4),
+            0
+        );
         bytes
     }
 
@@ -812,12 +1122,17 @@ mod file_image_cache_tests {
         assert_eq!(a, b);
         let c = decoded_file_image(&mut env, "/frame.png", changed).unwrap();
         assert_ne!(a, c);
-        assert_eq!(cg_image::borrow_image(&env.objc, c).pixels(), &[0, 255, 0, 255]);
+        assert_eq!(
+            cg_image::borrow_image(&env.objc, c).pixels(),
+            &[0, 255, 0, 255]
+        );
         assert!(decoded_file_image(&mut env, "/frame.png", vec![0; 12]).is_err());
         env.options.image_cache_mb = 0;
         let uncached = decoded_file_image(&mut env, "/frame.png", first).unwrap();
         assert_ne!(a, uncached);
-        for image in [a, b, c, uncached] { CGImageRelease(&mut env, image); }
+        for image in [a, b, c, uncached] {
+            CGImageRelease(&mut env, image);
+        }
         // Two 400x400 decoded images exceed the one-MiB budget. Eviction
         // must release the cache's ownership without invalidating a caller.
         env.options.image_cache_mb = 1;
@@ -826,13 +1141,20 @@ mod file_image_cache_tests {
             let pixels = vec![color; 400 * 400 * 4];
             let image = Image::from_pixels(400, 400, pixels.clone());
             let mut bytes = Vec::<u8>::new();
-            assert_ne!(image.write_png_image((&mut bytes as *mut Vec<u8>).cast(),
-                400, 400, &pixels, 1600), 0);
+            assert_ne!(
+                image.write_png_image((&mut bytes as *mut Vec<u8>).cast(), 400, 400, &pixels, 1600),
+                0
+            );
             held.push(decoded_file_image(&mut env, &format!("/{color}.png"), bytes).unwrap());
         }
         assert!(State::get(&env).file_image_bytes <= 1024 * 1024);
         assert_eq!(State::get(&env).file_images.len(), 1);
-        assert_eq!(cg_image::borrow_image(&env.objc, held[0]).dimensions(), (400, 400));
-        for image in held { CGImageRelease(&mut env, image); }
+        assert_eq!(
+            cg_image::borrow_image(&env.objc, held[0]).dimensions(),
+            (400, 400)
+        );
+        for image in held {
+            CGImageRelease(&mut env, image);
+        }
     }
 }

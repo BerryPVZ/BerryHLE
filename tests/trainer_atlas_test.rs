@@ -113,7 +113,9 @@ fn atlas_orientation_ascii_art() {
     let mut canvas = vec![0u8; 40 * 220];
     let mut cursor = 2.0f32;
     for (idx, ch) in sample.chars().enumerate() {
-        let Some(Some(cell)) = cells.get(idx) else { continue };
+        let Some(Some(cell)) = cells.get(idx) else {
+            continue;
+        };
         let sc = scale_px / FONT_PX;
         let gx = cursor + cell.4 * sc;
         let gy = 2.0 + cell.5 * sc;
@@ -168,10 +170,7 @@ fn atlas_orientation_ascii_art() {
         if *ch == 'L' && dims.0 > 4 && dims.1 > 4 {
             let bl = pixels[(dims.1 as usize - 1) * dims.0 as usize];
             let tr = pixels[dims.0 as usize - 1];
-            assert!(
-                bl > 0.5,
-                "'L' bottom-left should have ink (stem); got {bl}"
-            );
+            assert!(bl > 0.5, "'L' bottom-left should have ink (stem); got {bl}");
             assert!(
                 tr < 0.5,
                 "'L' top-right should be empty; got {tr} — glyph bitmaps are mirrored!"

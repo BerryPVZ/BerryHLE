@@ -16,7 +16,7 @@
 //! `/System/Library/Frameworks/AddressBookUI.framework/AddressBookUI`,
 //! touchHLE prints a `Warning: app binary depends on unimplemented or
 //! missing dylib …` at startup, which can spook users into reporting
-//! otherwise-fine apps as broken (e.g. HyperHLE appdb report #64,
+//! otherwise-fine apps as broken (e.g. AppleJuiceHLE appdb report #64,
 //! Super Yum Yum Fruit Snatch).
 //!
 //! This stub exists so the dependency is recognized and the warning is

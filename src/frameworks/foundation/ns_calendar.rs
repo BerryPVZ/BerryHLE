@@ -11,7 +11,7 @@ use crate::frameworks::core_foundation::time::{
 };
 use crate::frameworks::foundation::ns_date_components::NSDateComponentsHostObject;
 use crate::frameworks::foundation::ns_string::get_static_str;
-use crate::frameworks::foundation::{NSInteger, NSTimeInterval, NSUInteger};
+use crate::frameworks::foundation::{NSInteger, NSNotFound, NSTimeInterval, NSUInteger};
 use crate::mem::Ptr;
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, ClassExports, HostObject, NSZonePtr,
@@ -328,6 +328,42 @@ pub const CLASSES: ClassExports = objc_classes! {
         comp.weekday = weekday;
     }
     autorelease(env, components)
+}
+
+// `- (NSUInteger)ordinalityOfUnit:(NSCalendarUnit)smaller
+//                          inUnit:(NSCalendarUnit)larger
+//                         forDate:(NSDate *)date;`
+//
+// Per Apple's
+// [NSCalendar Reference](https://developer.apple.com/documentation/foundation/nscalendar/1415804-ordinalityofunit):
+// "Returns the ordinal number of the smaller unit within the larger one, such
+// as the day of the year or the hour of the day." Counting starts at 1 and
+// returns NSNotFound when the two units are not nested. Blockheads calls this
+// while generating a world; a missing selector previously gave it 0.
+- (NSUInteger)ordinalityOfUnit:(NSCalendarUnit)smaller_unit
+                        inUnit:(NSCalendarUnit)larger_unit
+                       forDate:(id)date {
+    if date == nil {
+        return NSNotFound as NSUInteger;
+    }
+    let time_interval: NSTimeInterval = msg![env; date timeIntervalSinceReferenceDate];
+    let greg_date = CFAbsoluteTimeGetGregorianDate(env, time_interval, nil);
+    let mut day_of_year = greg_date.day as NSUInteger;
+    for month in 1..greg_date.month as i32 {
+        day_of_year += days_in_month(greg_date.year, month) as NSUInteger;
+    }
+    match (smaller_unit, larger_unit) {
+        (NSDayCalendarUnit, NSYearCalendarUnit) => day_of_year,
+        (NSMonthCalendarUnit, NSYearCalendarUnit) => greg_date.month as NSUInteger,
+        (NSDayCalendarUnit, NSMonthCalendarUnit) => greg_date.day as NSUInteger,
+        (NSHourCalendarUnit, NSDayCalendarUnit) => (greg_date.hours as NSUInteger) + 1,
+        (NSMinuteCalendarUnit, NSHourCalendarUnit) => (greg_date.minutes as NSUInteger) + 1,
+        (NSSecondCalendarUnit, NSMinuteCalendarUnit) => (greg_date.seconds as NSUInteger) + 1,
+        (NSWeekdayCalendarUnit, NSMonthCalendarUnit) => (greg_date.day as NSUInteger - 1) / 7 + 1,
+        (NSWeekdayCalendarUnit, NSYearCalendarUnit) => (day_of_year - 1) / 7 + 1,
+        (NSWeekCalendarUnit, NSYearCalendarUnit) => (day_of_year - 1) / 7 + 1,
+        _ => NSNotFound as NSUInteger,
+    }
 }
 
 // `- (NSDateComponents *)components:(NSCalendarUnit)unitFlags

@@ -12,6 +12,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::time::Duration;
 
 pub const OPTIONS_HELP: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/OPTIONS_HELP.txt"));
@@ -155,6 +156,56 @@ impl VsyncMode {
     }
 }
 
+/// Host renderer used for OpenGL ES apps on Android.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RendererMode {
+    /// Use the bundled ANGLE libraries.
+    Angle,
+    /// Use the Android device's native OpenGL ES driver.
+    NativeGles,
+}
+
+/// Parameters for the opt-in RTCV-style memory corruption engine.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CorruptionOptions {
+    pub enabled: bool,
+    pub startup_delay: Duration,
+    pub cooldown: Duration,
+    pub bytes_per_burst: u32,
+    pub max_offset: Option<u32>,
+    pub seed: u64,
+}
+
+impl Default for CorruptionOptions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            startup_delay: Duration::ZERO,
+            cooldown: Duration::from_millis(500),
+            bytes_per_burst: 8,
+            max_offset: None,
+            seed: 0,
+        }
+    }
+}
+
+impl RendererMode {
+    pub fn from_short_name(name: &str) -> Result<Self, ()> {
+        match name {
+            "angle" => Ok(Self::Angle),
+            "native-gles" => Ok(Self::NativeGles),
+            _ => Err(()),
+        }
+    }
+
+    pub fn short_name(self) -> &'static str {
+        match self {
+            Self::Angle => "angle",
+            Self::NativeGles => "native-gles",
+        }
+    }
+}
+
 /// Struct containing all user-configurable options.
 #[derive(Clone)]
 pub struct Options {
@@ -175,6 +226,12 @@ pub struct Options {
     pub globbert_debug: bool,
     /// Enable app-specific Objective-C return overrides from Quick Options.
     pub runtime_hooks_enabled: bool,
+    /// `--quick-menu`: show a pause button in the top-left corner of the
+    /// emulated screen while an app runs. It opens a menu with the settings
+    /// that are worth changing mid-game (performance display, FPS limiter,
+    /// RAM limiter, Cheat Engine) and an "Exit emulator" button that goes
+    /// back to the app picker.
+    pub quick_menu: bool,
     pub initial_orientation: DeviceOrientation,
     /// iOS version reported to guest applications. `None` uses the latest compatibility version.
     pub ios_version: Option<(i32, i32, i32)>,
@@ -207,7 +264,14 @@ pub struct Options {
     /// Allow selected early OpenGL ES 2.0 apps to use the GLES2 subset exposed
     /// through touchHLE's desktop OpenGL 2.1 compatibility backend.
     pub gles2_compat: bool,
+    pub corruption: CorruptionOptions,
     pub direct_memory_access: bool,
+    /// Bind through lazy-symbol data pointers without changing instructions.
+    /// Needed by engines that hash their executable code during startup.
+    pub preserve_dyld_stubs: bool,
+    /// `--dladdr`: enable the real `dladdr()` implementation. Off by default;
+    /// the failure stub is safer for legacy games that hang during startup.
+    pub dladdr: bool,
     /// CPU affinity policy for the emulator thread on Android
     /// (`--affinity=`): `None` = default (big cores), or one of
     /// `all` / `off` / `big` / an explicit CPU list like `4-7`.
@@ -215,11 +279,35 @@ pub struct Options {
     pub gdb_listen_addrs: Option<Vec<SocketAddr>>,
     pub preferred_languages: Option<Vec<String>>,
     pub headless: bool,
+    /// `--strict-symbols`: abort when the app links a symbol the emulator
+    /// does not implement. Off by default, because most apps tolerate a few
+    /// missing symbols; useful for tests and for finding out what an app
+    /// needs before it can run.
+    pub strict_symbols: bool,
+    /// `--trace-cxx-exceptions`: log every guest C++ throw (type and `what()`)
+    /// by routing the throw symbols through the host stub instead of straight
+    /// to the app's bundled C++ runtime. Off by default, because changing which
+    /// definition wins affects every C++ app.
+    pub trace_cxx_exceptions: bool,
+    /// Skip decoding and showing the game's launch image (splash screen) on
+    /// startup. Makes game launch noticeably faster, at the cost of not
+    /// seeing the app's launch artwork.
+    pub skip_launch_image: bool,
     pub print_fps: bool,
     pub performance_overlay_enabled: bool,
     pub performance_overlay_mode: PerformanceOverlayMode,
     pub performance_overlay_corner: PerformanceOverlayCorner,
     pub fps_limit: Option<f64>,
+    /// `--memory-limit=...`: cap on the emulated app's heap (its `malloc`
+    /// pool), in MiB. `None` is the default and means "let the Device model
+    /// decide": half of its RAM, like iOS's jetsam limit (see
+    /// `crate::environment::default_guest_heap_cap`). See
+    /// `crate::mem::Mem::set_memory_limit`.
+    pub memory_limit_mb: Option<u32>,
+    /// Preserve freed heap bytes until reuse, zeroing on allocation instead.
+    /// Opt in for legacy apps that read freed objects during their cleanup.
+    /// This does not retain objects or prevent their storage from being reused.
+    pub zero_memory_on_alloc: bool,
     pub force_composition: bool,
     /// See [PresentMode]. Can also be set with the `TOUCHHLE_PRESENT_MODE`
     /// environment variable (the option takes precedence).
@@ -258,6 +346,13 @@ pub struct Options {
     /// command line. Apps that legitimately rely on the ES 1.1 fixed-function
     /// pipeline should NOT enable this flag.
     pub prefer_gles2_context: bool,
+    /// Override the host/global landscape UIScreen-bounds setting for this app.
+    /// `None` keeps the `TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS` environment
+    /// setting; `Some(false)` lets a later profile or CLI argument undo it.
+    pub landscape_uiscreen_bounds: Option<bool>,
+    /// Drive Audio Unit rendering on a guest worker thread, independently of
+    /// the main run loop. Opt in for apps that block that loop during startup.
+    pub audio_unit_render_thread: bool,
     /// Break an otherwise-infinite `semaphore_wait()` by returning
     /// KERN_SUCCESS spuriously after this many milliseconds.
     ///
@@ -271,7 +366,8 @@ pub struct Options {
     /// It exists for FMOD's worker threads in Minecraft: Story Mode
     /// (com.telltalegames.MC100), which deadlock under our cooperative
     /// scheduler and are written to tolerate a spurious wake. Enable it only
-    /// per-app, via the default options file.
+    /// per-app, via the default options file. That app now uses
+    /// `--audio-unit-render-thread` instead, so no default profile needs it.
     pub mach_semaphore_spurious_wake_ms: Option<u64>,
     /// Override the EAGL and compositor presentation rotation with a fixed clockwise angle in
     /// degrees (0, 90, 180 or 270), replacing the orientation-derived rotation
@@ -281,12 +377,13 @@ pub struct Options {
     /// rotation turns the picture sideways; `--present-rotate=0` presents it
     /// as-is. `None` keeps the automatic behaviour.
     pub present_rotate: Option<u32>,
-    /// Report landscape UIScreen geometry for apps that draw in display coordinates.
-    pub landscape_uiscreen_bounds: bool,
-    /// Use UIKit's actual autorotation transform when deciding whether to add
-    /// EAGL's 180-degree presentation compensation. Off by default to retain
-    /// the legacy iPad/non-portrait heuristic; opt in with `--rotation-fix`.
+    /// Trust the layer tree's measured autorotation instead of adding EAGL's
+    /// legacy 180-degree presentation compensation. Off by default to retain
+    /// the iPad/non-portrait heuristic; opt in with `--rotation-fix`.
     pub rotation_fix: bool,
+    /// Leave the root view in portrait coordinates for engines that rotate
+    /// their OpenGL drawing and touch coordinates themselves.
+    pub manual_ui_rotation: bool,
     /// Force EAGL `initWithAPI:` to create an OpenGL ES 1.1 (fixed-function)
     /// context even when the app requested an OpenGL ES 2.0/3.x context.
     ///
@@ -299,6 +396,21 @@ pub struct Options {
     /// (per-app via the options file) or `TOUCHHLE_FORCE_GLES1_CONTEXT=1`.
     /// Apps that are ES 2.0-only will fail to create a context with this set.
     pub force_gles1_context: bool,
+    /// Pretend the GPU has no OpenGL ES 3.0 support, so apps that feature-test
+    /// for it fall back to their older GLES renderer.
+    ///
+    /// Apple only exposes ES 3.0 on A7-class GPUs and later (iPhone 5s,
+    /// iPad Air); on every earlier device
+    /// `-[EAGLContext initWithAPI:kEAGLRenderingAPIOpenGLES3]` returns `nil`
+    /// and `glGetString(GL_VERSION)` reports `"OpenGL ES 2.0 …"`.
+    /// With this option EAGL reproduces exactly that: an ES 3.0 context
+    /// request fails, and the ES 2.0 context reports a 2.0 version string.
+    /// Engines that ship both a 3.0 and an older renderer then take the older
+    /// path instead of the 3.0 one.
+    ///
+    /// Enable with `--no-gles3` (the "No GLES 3" switch in the app picker's
+    /// Settings > Graphics screen) or per-app via the options files.
+    pub no_gles3: bool,
     pub network_access: bool,
     /// Report a local Game Center player as signed in, without providing
     /// online Game Center services. Some games require this at startup.
@@ -318,19 +430,16 @@ pub struct Options {
     /// `glGetError()` clears the error queue, so guest `glGetError()` calls
     /// will see 0 instead of the real error. Diagnostic only.
     pub trace_gl_errors: bool,
+    /// Log state for the first 12 draws and up to 128 larger draws of each
+    /// kind per GL context. Diagnostic only; useful for tracing geometry.
+    pub trace_gl_draws: bool,
     /// Log every GLES call made by the guest (via the LoggingGLES wrapper).
     /// Much noisier than `trace_gl_errors`. Diagnostic only.
     pub verbose_gles: bool,
-    /// Prefer the vendor's native OpenGL ES driver over the bundled ANGLE
-    /// libraries on Android. Defaults to `false` ("GLES Native" quick option
-    /// OFF): the bundled ANGLE backend is the predictable default, since
-    /// vendor drivers differ a lot between devices. Enable (`--gles-native`,
-    /// quick option ON) to use the vendor driver instead: it behaves closest
-    /// to real iPhone-era hardware (lenient GLSL ES linking etc.) and avoids
-    /// ANGLE's stricter validation, which breaks some apps' shaders (e.g.
-    /// Gangstar's fragment-only varyings). Only meaningful on Android;
-    /// ignored elsewhere.
-    pub gles_native: bool,
+    /// Select the host OpenGL ES renderer on Android. ANGLE is the default;
+    /// native GLES can be selected for compatibility with vendor-driver quirks.
+    /// Ignored on other platforms.
+    pub renderer_mode: RendererMode,
     /// After a `glTexImage2D(level=0, …)` upload, if the bound texture's
     /// `GL_TEXTURE_MIN_FILTER` is still the ES 1.1 default
     /// `GL_NEAREST_MIPMAP_LINEAR` (which makes the texture incomplete
@@ -378,10 +487,11 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             fullscreen: false,
-            preserve_aspect_ratio: false,
+            preserve_aspect_ratio: true,
             trainer_disabled: true,
             globbert_debug: false,
             runtime_hooks_enabled: false,
+            quick_menu: false,
             device_family: None,
             auto_device_family: false,
             host_screen_size: None,
@@ -402,13 +512,19 @@ impl Default for Options {
             stabilize_virtual_cursor: None,
             gles1_implementation: None,
             gles2_compat: false,
+            corruption: CorruptionOptions::default(),
             direct_memory_access: true,
+            preserve_dyld_stubs: false,
+            dladdr: false,
             affinity: None,
             gdb_listen_addrs: None,
             preferred_languages: None,
             headless: false,
+            strict_symbols: false,
+            trace_cxx_exceptions: false,
+            skip_launch_image: false,
             print_fps: false,
-            performance_overlay_enabled: true,
+            performance_overlay_enabled: false,
             performance_overlay_mode: if cfg!(any(target_os = "android", target_os = "ios")) {
                 PerformanceOverlayMode::Minimal
             } else {
@@ -416,6 +532,8 @@ impl Default for Options {
             },
             performance_overlay_corner: PerformanceOverlayCorner::TopRight,
             fps_limit: Some(60.0),
+            memory_limit_mb: None,
+            zero_memory_on_alloc: false,
             force_composition: false,
             present_mode: std::env::var("TOUCHHLE_PRESENT_MODE")
                 .ok()
@@ -432,20 +550,23 @@ impl Default for Options {
                 .map(|value| value != "0")
                 .unwrap_or(true),
             prefer_gles2_context: false,
+            landscape_uiscreen_bounds: None,
+            audio_unit_render_thread: false,
             mach_semaphore_spurious_wake_ms: None,
             present_rotate: None,
-            landscape_uiscreen_bounds: false,
             rotation_fix: false,
             image_cache_mb: 0,
             sort_bundle_resources: false,
             present_default_framebuffer: false,
             root_autorotation: true,
+            manual_ui_rotation: false,
             force_gles1_context: std::env::var("TOUCHHLE_FORCE_GLES1_CONTEXT")
                 .map(|value| {
                     let value = value.trim();
                     value != "0" && !value.is_empty()
                 })
                 .unwrap_or(false),
+            no_gles3: false,
             network_access: false,
             game_center_authenticated: false,
             popup_errors: true,
@@ -453,8 +574,9 @@ impl Default for Options {
             dumping_file: crate::paths::user_data_base_path().join("DUMP.txt"),
             ignore_gl_errors: false,
             trace_gl_errors: false,
+            trace_gl_draws: false,
             verbose_gles: false,
-            gles_native: false,
+            renderer_mode: RendererMode::Angle,
             // On Android the host GLES driver is essentially always
             // ARM Mali / Qualcomm Adreno / something equally strict,
             // and apps shipped for iOS overwhelmingly upload PVRTC and
@@ -466,8 +588,8 @@ impl Default for Options {
             // black/white shapes (Temple Run on Mali-G57 is a textbook
             // case). Default the fix-up to ON so games work out of the
             // box on Android — users can still disable it via
-            // `--fix-texture-min-filter=false` in
-            // `touchHLE_options.txt` if they hit a game that genuinely
+            // `--no-fix-texture-min-filter` in
+            // `HyperHLE_options.txt` if they hit a game that genuinely
             // depends on mipmap minification (rare among iOS 2.x/3.x
             // titles). On desktop hosts (where the user is likely
             // running Mesa / Apple PowerVR / NVIDIA / AMD, all
@@ -485,6 +607,12 @@ impl Default for Options {
 }
 
 impl Options {
+    /// Resolve the per-app override against the host/global environment flag.
+    pub fn landscape_uiscreen_bounds_enabled(&self) -> bool {
+        self.landscape_uiscreen_bounds
+            .unwrap_or_else(|| crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS"))
+    }
+
     /// Parse the command-line argument syntax for an option. Returns `Ok(true)`
     /// if the option was valid and has been applied, or `Ok(false)` if the
     /// option was not recognized.
@@ -526,7 +654,10 @@ impl Options {
         } else if arg == "--root-autorotation" {
             self.root_autorotation = true;
         } else if let Some(value) = arg.strip_prefix("--image-cache-mb=") {
-            self.image_cache_mb = value.parse::<u32>().ok().filter(|n| *n <= 1024)
+            self.image_cache_mb = value
+                .parse::<u32>()
+                .ok()
+                .filter(|n| *n <= 1024)
                 .ok_or("Image cache budget must be between 0 and 1024 MiB")?;
         } else if arg == "--reverse-attrib-locations" {
             self.reverse_attrib_locations = true;
@@ -611,6 +742,10 @@ impl Options {
             self.x_tilt_offset = parse_degrees(value, "X tilt offset")?;
         } else if let Some(value) = arg.strip_prefix("--y-tilt-offset=") {
             self.y_tilt_offset = parse_degrees(value, "Y tilt offset")?;
+        } else if arg == "--no-controller-to-touch" {
+            self.button_to_touch.clear();
+            self.dpad_to_touch = None;
+            self.stick_to_touch = None;
         } else if let Some(values) = arg.strip_prefix("--button-to-touch=") {
             let (button, coords) = values
                 .split_once(',')
@@ -684,10 +819,53 @@ impl Options {
             );
         } else if arg == "--gles2-compat" {
             self.gles2_compat = true;
+        } else if arg == "--corrupt-game" {
+            self.corruption.enabled = true;
+        } else if arg == "--no-corrupt-game" {
+            self.corruption.enabled = false;
+        } else if arg == "--no-corrupt-max-offset" {
+            self.corruption.max_offset = None;
+        } else if let Some(value) = arg.strip_prefix("--corrupt-start-delay=") {
+            self.corruption.startup_delay =
+                parse_corruption_duration(value, "--corrupt-start-delay=")?;
+        } else if let Some(value) = arg.strip_prefix("--corrupt-cooldown=") {
+            self.corruption.cooldown = parse_corruption_duration(value, "--corrupt-cooldown=")?;
+        } else if let Some(value) = arg.strip_prefix("--corrupt-intensity=") {
+            let bytes: u32 = value
+                .parse()
+                .ok()
+                .filter(|&value| value > 0)
+                .ok_or_else(|| {
+                    "Invalid value for --corrupt-intensity= (must be > 0)".to_string()
+                })?;
+            self.corruption.enabled = true;
+            self.corruption.bytes_per_burst = bytes;
+        } else if let Some(value) = arg.strip_prefix("--corrupt-seed=") {
+            self.corruption.seed = value
+                .parse()
+                .map_err(|_| "Invalid value for --corrupt-seed=".to_string())?;
+            self.corruption.enabled = true;
+        } else if let Some(value) = arg.strip_prefix("--corrupt-max-offset=") {
+            let max_offset: u32 = value
+                .parse()
+                .map_err(|_| "Invalid value for --corrupt-max-offset=".to_string())?;
+            if max_offset == 0 {
+                return Err("--corrupt-max-offset= must be > 0".to_string());
+            }
+            self.corruption.max_offset = Some(max_offset);
+            self.corruption.enabled = true;
         } else if let Some(value) = arg.strip_prefix("--affinity=") {
             self.affinity = Some(value.to_string());
         } else if arg == "--disable-direct-memory-access" {
             self.direct_memory_access = false;
+        } else if arg == "--preserve-dyld-stubs" {
+            self.preserve_dyld_stubs = true;
+        } else if arg == "--no-preserve-dyld-stubs" {
+            self.preserve_dyld_stubs = false;
+        } else if arg == "--dladdr" {
+            self.dladdr = true;
+        } else if arg == "--no-dladdr" {
+            self.dladdr = false;
         } else if let Some(address) = arg.strip_prefix("--gdb=") {
             let addrs = address
                 .to_socket_addrs()
@@ -700,6 +878,14 @@ impl Options {
             self.headless = true;
             // Can't show the dialog box when headless!
             self.popup_errors = false;
+        } else if arg == "--strict-symbols" {
+            self.strict_symbols = true;
+        } else if arg == "--trace-cxx-exceptions" {
+            self.trace_cxx_exceptions = true;
+        } else if arg == "--skip-launch-image" {
+            self.skip_launch_image = true;
+        } else if arg == "--no-skip-launch-image" {
+            self.skip_launch_image = false;
         } else if arg == "--print-fps" {
             self.print_fps = true;
         } else if arg == "--no-print-fps" {
@@ -721,54 +907,61 @@ impl Options {
                 self.fps_limit = None;
             } else {
                 let limit: f64 = value
-                    .parse()
+                    .parse::<f64>()
                     .ok()
-                    .and_then(|v| if v <= 0.0 { None } else { Some(v) })
+                    .and_then(|v| (v.is_finite() && v > 0.0).then_some(v))
                     .ok_or_else(|| "Invalid value for --fps-limit=".to_string())?;
                 self.fps_limit = Some(limit);
             }
+        } else if arg == "--zero-memory-on-alloc" {
+            self.zero_memory_on_alloc = true;
+        } else if arg == "--zero-memory-on-free" {
+            self.zero_memory_on_alloc = false;
+        } else if let Some(value) = arg.strip_prefix("--memory-limit=") {
+            self.memory_limit_mb = parse_memory_limit_mb(value)?;
         } else if arg == "--force-composition" {
             self.force_composition = true;
         } else if arg == "--no-force-composition" {
             self.force_composition = false;
         } else if let Some(value) = arg.strip_prefix("--present-mode=") {
             self.present_mode = PresentMode::from_short_name(value).map_err(|_| {
-                "Invalid value for --present-mode= (expected auto, direct or readback)"
-                    .to_string()
+                "Invalid value for --present-mode= (expected auto, direct or readback)".to_string()
             })?;
         } else if arg == "--present-finish" {
             self.present_finish = true;
         } else if arg == "--no-present-finish" {
             self.present_finish = false;
         } else if let Some(value) = arg.strip_prefix("--vsync=") {
-            self.vsync = VsyncMode::from_short_name(value).map_err(|_| {
-                "Invalid value for --vsync= (expected auto, on or off)".to_string()
-            })?;
+            self.vsync = VsyncMode::from_short_name(value)
+                .map_err(|_| "Invalid value for --vsync= (expected auto, on or off)".to_string())?;
         } else if arg == "--vsync" {
             self.vsync = VsyncMode::On;
         } else if arg == "--no-vsync" {
             self.vsync = VsyncMode::Off;
         } else if arg == "--landscape-uiscreen-bounds" {
-            // Report UIScreen.bounds (and therefore the EAGL layer / renderbuffer
-            // size) as landscape instead of the iOS-accurate portrait-native
-            // bounds. Apps that lay their render target out directly from
-            // UIScreen.bounds without applying the interface-orientation
-            // rotation (e.g. Minecraft: Story Mode) otherwise render a portrait
-            // frame that gets stretched into the landscape window. Keep this
-            // in app options: the picker may have already queried UIScreen.
-            self.landscape_uiscreen_bounds = true;
+            self.landscape_uiscreen_bounds = Some(true);
+        } else if arg == "--no-landscape-uiscreen-bounds" {
+            self.landscape_uiscreen_bounds = Some(false);
         } else if let Some(value) = arg.strip_prefix("--present-rotate=") {
-            let deg: u32 = value
-                .parse()
-                .map_err(|_| "Invalid value for --present-rotate= (expected 0, 90, 180 or 270)".to_string())?;
+            let deg: u32 = value.parse().map_err(|_| {
+                "Invalid value for --present-rotate= (expected 0, 90, 180 or 270)".to_string()
+            })?;
             if !matches!(deg, 0 | 90 | 180 | 270) {
-                return Err("Invalid value for --present-rotate= (expected 0, 90, 180 or 270)".to_string());
+                return Err(
+                    "Invalid value for --present-rotate= (expected 0, 90, 180 or 270)".to_string(),
+                );
             }
             self.present_rotate = Some(deg);
         } else if arg == "--rotation-fix" {
             self.rotation_fix = true;
         } else if arg == "--no-rotation-fix" {
             self.rotation_fix = false;
+        } else if arg == "--no-present-rotate" {
+            self.present_rotate = None;
+        } else if arg == "--manual-ui-rotation" {
+            self.manual_ui_rotation = true;
+        } else if arg == "--no-manual-ui-rotation" {
+            self.manual_ui_rotation = false;
         } else if arg == "--perf-hints" {
             self.perf_hints = true;
         } else if arg == "--no-perf-hints" {
@@ -782,11 +975,21 @@ impl Options {
             self.mach_semaphore_spurious_wake_ms = (ms != 0).then_some(ms);
         } else if arg == "--prefer-gles2-context" {
             self.prefer_gles2_context = true;
+        } else if arg == "--no-prefer-gles2-context" {
+            self.prefer_gles2_context = false;
+        } else if arg == "--audio-unit-render-thread" {
+            self.audio_unit_render_thread = true;
+        } else if arg == "--no-audio-unit-render-thread" {
+            self.audio_unit_render_thread = false;
         } else if arg == "--force-gles1-context" {
             self.force_gles1_context = true;
             // GLES-native backend selection and EAGL both read this env var
             // (the GLES backend layer has no `Options` access).
             std::env::set_var("TOUCHHLE_FORCE_GLES1_CONTEXT", "1");
+        } else if arg == "--no-gles3" {
+            self.no_gles3 = true;
+        } else if arg == "--gles3" {
+            self.no_gles3 = false;
         } else if arg == "--allow-network-access" {
             self.network_access = true;
         } else if arg == "--no-network-access" {
@@ -797,22 +1000,34 @@ impl Options {
             self.game_center_authenticated = false;
         } else if arg == "--no-error-popup" {
             self.popup_errors = false;
+        } else if arg == "--error-popup" {
+            self.popup_errors = !self.headless;
         } else if let Some(values) = arg.strip_prefix("--dump=") {
             self.dumping_options = parse_dump_options(values)?;
         } else if let Some(path) = arg.strip_prefix("--dump-file=") {
             self.dumping_file = crate::paths::user_data_base_path().join(path);
         } else if arg == "--ignore-gl-errors" {
             self.ignore_gl_errors = true;
+        } else if arg == "--no-ignore-gl-errors" {
+            self.ignore_gl_errors = false;
         } else if arg == "--trace-gl-errors" {
             self.trace_gl_errors = true;
         } else if arg == "--no-trace-gl-errors" {
             self.trace_gl_errors = false;
+        } else if arg == "--trace-gl-draws" {
+            self.trace_gl_draws = true;
+        } else if arg == "--no-trace-gl-draws" {
+            self.trace_gl_draws = false;
         } else if arg == "--verbose-gles" {
             self.verbose_gles = true;
+        } else if let Some(value) = arg.strip_prefix("--renderer-mode=") {
+            self.renderer_mode = RendererMode::from_short_name(value).map_err(|_| {
+                "Invalid value for --renderer-mode= (expected angle or native-gles)".to_string()
+            })?;
         } else if arg == "--gles-native" {
-            self.gles_native = true;
+            self.renderer_mode = RendererMode::NativeGles;
         } else if arg == "--no-gles-native" {
-            self.gles_native = false;
+            self.renderer_mode = RendererMode::Angle;
         } else if arg == "--fix-texture-min-filter" {
             self.fix_texture_min_filter = true;
             // GLES1Native reads this as its source of truth (it has no
@@ -825,9 +1040,10 @@ impl Options {
             self.fix_texture_min_filter = false;
             std::env::set_var("TOUCHHLE_FIX_TEXTURE_MIN_FILTER", "0");
         } else if let Some(value) = arg.strip_prefix("--zero-stack-after-guest-to-host-call=") {
-            self.zero_stack_after_guest_to_host_call = Some(value.parse().map_err(|_| {
+            let bytes: u32 = value.parse().map_err(|_| {
                 "Invalid value for --zero-stack-after-guest-to-host-call=".to_string()
-            })?);
+            })?;
+            self.zero_stack_after_guest_to_host_call = (bytes != 0).then_some(bytes);
         } else if arg == "--flex" {
             self.runtime_hooks_enabled = true;
         } else if arg == "--no-flex" {
@@ -840,6 +1056,10 @@ impl Options {
             self.globbert_debug = true;
         } else if arg == "--no-globbert-debug" {
             self.globbert_debug = false;
+        } else if arg == "--quick-menu" {
+            self.quick_menu = true;
+        } else if arg == "--no-quick-menu" {
+            self.quick_menu = false;
         } else {
             return Ok(false);
         };
@@ -890,6 +1110,28 @@ pub fn get_options_from_file<F: Read>(file: F, app_id: &str) -> Result<Option<St
     Ok(None)
 }
 
+/// Parses the value of `--memory-limit=` into a heap cap in MiB.
+///
+/// Accepts a positive whole number of mebibytes, or `off`/`default` for the
+/// ceiling derived from the Device model. Zero is rejected: it would make the
+/// very first guest allocation fail, so the emulator could never start an app.
+fn parse_memory_limit_mb(value: &str) -> Result<Option<u32>, String> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("default") {
+        return Ok(None);
+    }
+    let mb: u32 = value.parse().map_err(|_| {
+        "Invalid value for --memory-limit= (expected a whole number of MiB, or off)".to_string()
+    })?;
+    if mb == 0 {
+        return Err(
+            "Invalid value for --memory-limit= (expected a positive number of MiB, or off)"
+                .to_string(),
+        );
+    }
+    Ok(Some(mb))
+}
+
 #[derive(Default, Clone)]
 pub struct DumpingOptions {
     pub linking_info: bool,
@@ -919,6 +1161,16 @@ fn parse_dump_options(options: &str) -> Result<DumpingOptions, String> {
     Ok(dumping_options)
 }
 
+fn parse_corruption_duration(value: &str, option: &str) -> Result<Duration, String> {
+    let seconds = value
+        .parse::<f64>()
+        .ok()
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        .ok_or_else(|| format!("Invalid value for {option} (must be finite and >= 0)"))?;
+    Duration::try_from_secs_f64(seconds)
+        .map_err(|_| format!("Invalid value for {option} (duration is too large)"))
+}
+
 #[cfg(test)]
 mod option_parsing_tests {
     use super::*;
@@ -926,10 +1178,12 @@ mod option_parsing_tests {
     #[test]
     fn landscape_screen_option_is_local_to_the_selected_app() {
         let mut picker_options = Options::default();
-        assert!(!picker_options.landscape_uiscreen_bounds);
-        assert!(picker_options.parse_argument("--landscape-uiscreen-bounds").unwrap());
-        assert!(picker_options.landscape_uiscreen_bounds);
-        assert!(!Options::default().landscape_uiscreen_bounds);
+        assert_eq!(picker_options.landscape_uiscreen_bounds, None);
+        assert!(picker_options
+            .parse_argument("--landscape-uiscreen-bounds")
+            .unwrap());
+        assert_eq!(picker_options.landscape_uiscreen_bounds, Some(true));
+        assert_eq!(Options::default().landscape_uiscreen_bounds, None);
     }
 
     #[test]
@@ -937,12 +1191,120 @@ mod option_parsing_tests {
         let mut options = Options::default();
         assert!(!options.globbert_debug);
         let file = b"com.andydev.globbert: --globbert-debug\n";
-        let argument = get_options_from_file(&file[..], "com.andydev.globbert").unwrap().unwrap();
-        assert!(get_options_from_file(&file[..], "com.iphogame.petswar").unwrap().is_none());
+        let argument = get_options_from_file(&file[..], "com.andydev.globbert")
+            .unwrap()
+            .unwrap();
+        assert!(get_options_from_file(&file[..], "com.iphogame.petswar")
+            .unwrap()
+            .is_none());
         assert!(options.parse_argument(&argument).unwrap());
         assert!(options.globbert_debug);
         assert!(options.parse_argument("--no-globbert-debug").unwrap());
         assert!(!options.globbert_debug);
+    }
+
+    #[test]
+    fn preserving_freed_memory_is_opt_in_and_can_be_disabled() {
+        let mut options = Options::default();
+        assert!(!options.zero_memory_on_alloc);
+        assert!(options.parse_argument("--zero-memory-on-alloc").unwrap());
+        assert!(options.zero_memory_on_alloc);
+        assert!(options.parse_argument("--zero-memory-on-free").unwrap());
+        assert!(!options.zero_memory_on_alloc);
+    }
+
+    #[test]
+    fn corruption_is_disabled_by_default_and_explicit_flag_wins() {
+        let mut options = Options::default();
+        assert!(!options.corruption.enabled);
+        assert_eq!(options.corruption.seed, 0);
+
+        assert!(options.parse_argument("--corrupt-game").unwrap());
+        assert!(options.corruption.enabled);
+
+        assert!(options.parse_argument("--no-corrupt-game").unwrap());
+        assert!(!options.corruption.enabled);
+
+        assert!(options.parse_argument("--corrupt-game").unwrap());
+        assert!(options.corruption.enabled);
+    }
+
+    #[test]
+    fn corruption_tuning_options_enable_and_validate() {
+        let mut options = Options::default();
+        assert!(options.parse_argument("--corrupt-intensity=8").unwrap());
+        assert!(options.corruption.enabled);
+        assert_eq!(options.corruption.bytes_per_burst, 8);
+
+        let mut options = Options::default();
+        assert!(options.parse_argument("--corrupt-intensity=12").unwrap());
+        assert!(options.corruption.enabled);
+        assert_eq!(options.corruption.bytes_per_burst, 12);
+
+        let mut options = Options::default();
+        assert!(options.parse_argument("--corrupt-seed=42").unwrap());
+        assert!(options.corruption.enabled);
+        assert_eq!(options.corruption.seed, 42);
+
+        let mut options = Options::default();
+        assert!(options.parse_argument("--corrupt-max-offset=16").unwrap());
+        assert!(options.corruption.enabled);
+        assert_eq!(options.corruption.max_offset, Some(16));
+
+        let mut options = Options::default();
+        assert!(options.parse_argument("--corrupt-intensity=0").is_err());
+        assert!(options.parse_argument("--corrupt-seed=nope").is_err());
+        assert!(options.parse_argument("--corrupt-max-offset=nope").is_err());
+        assert!(options.parse_argument("--corrupt-max-offset=0").is_err());
+    }
+
+    #[test]
+    fn picker_reset_options_clear_mappings_and_restore_defaults() {
+        let mut options = Options::default();
+        options.parse_argument("--button-to-touch=A,1,2").unwrap();
+        options.parse_argument("--dpad-to-touch=1,2,3,4").unwrap();
+        options.parse_argument("--stick-to-touch=5,6,7,8").unwrap();
+        options.parse_argument("--no-controller-to-touch").unwrap();
+        assert!(options.button_to_touch.is_empty());
+        assert_eq!(options.dpad_to_touch, None);
+        assert_eq!(options.stick_to_touch, None);
+
+        options.parse_argument("--corrupt-max-offset=16").unwrap();
+        options.parse_argument("--no-corrupt-max-offset").unwrap();
+        assert_eq!(options.corruption.max_offset, None);
+    }
+
+    #[test]
+    fn fps_limit_rejects_non_finite_values() {
+        for value in ["NaN", "inf", "-inf", "1e1000"] {
+            assert!(Options::default()
+                .parse_argument(&format!("--fps-limit={value}"))
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn error_popup_can_be_restored_but_not_in_headless_mode() {
+        let mut options = Options::default();
+        options.parse_argument("--no-error-popup").unwrap();
+        assert!(!options.popup_errors);
+        options.parse_argument("--error-popup").unwrap();
+        assert!(options.popup_errors);
+
+        options.parse_argument("--headless").unwrap();
+        options.parse_argument("--error-popup").unwrap();
+        assert!(!options.popup_errors);
+    }
+
+    #[test]
+    fn corruption_tuning_flags_can_be_disabled_by_later_explicit_flag() {
+        let mut options = Options::default();
+        options.parse_argument("--corrupt-intensity=5").unwrap();
+        options.parse_argument("--no-corrupt-game").unwrap();
+        assert!(!options.corruption.enabled);
+
+        options.parse_argument("--corrupt-game").unwrap();
+        assert!(options.corruption.enabled);
     }
 
     #[test]
@@ -955,6 +1317,139 @@ mod option_parsing_tests {
 
         assert!(options.parse_argument("--no-force-composition").unwrap());
         assert!(!options.force_composition);
+    }
+
+    #[test]
+    fn app_compatibility_options_can_override_profile_values() {
+        let mut options = Options::default();
+
+        assert!(!options.ios_es2_direct_present);
+        options.parse_argument("--ios-es2-direct-present").unwrap();
+        assert!(options.ios_es2_direct_present);
+        options
+            .parse_argument("--no-ios-es2-direct-present")
+            .unwrap();
+        assert!(!options.ios_es2_direct_present);
+
+        assert!(!options.prefer_gles2_context);
+        options.parse_argument("--prefer-gles2-context").unwrap();
+        assert!(options.prefer_gles2_context);
+        options.parse_argument("--no-prefer-gles2-context").unwrap();
+        assert!(!options.prefer_gles2_context);
+
+        options.parse_argument("--ignore-gl-errors").unwrap();
+        assert!(options.ignore_gl_errors);
+        options.parse_argument("--no-ignore-gl-errors").unwrap();
+        assert!(!options.ignore_gl_errors);
+
+        options
+            .parse_argument("--landscape-uiscreen-bounds")
+            .unwrap();
+        assert_eq!(options.landscape_uiscreen_bounds, Some(true));
+        assert!(options.landscape_uiscreen_bounds_enabled());
+        options
+            .parse_argument("--no-landscape-uiscreen-bounds")
+            .unwrap();
+        assert_eq!(options.landscape_uiscreen_bounds, Some(false));
+        assert!(!options.landscape_uiscreen_bounds_enabled());
+    }
+
+    #[test]
+    fn presentation_rotation_can_return_to_automatic() {
+        let mut options = Options::default();
+        assert_eq!(options.present_rotate, None);
+
+        options.parse_argument("--present-rotate=0").unwrap();
+        assert_eq!(options.present_rotate, Some(0));
+        options.parse_argument("--no-present-rotate").unwrap();
+        assert_eq!(options.present_rotate, None);
+        assert!(options.parse_argument("--present-rotate=45").is_err());
+    }
+
+    #[test]
+    fn semaphore_spurious_wake_zero_disables_the_workaround() {
+        let mut options = Options::default();
+        assert_eq!(options.mach_semaphore_spurious_wake_ms, None);
+
+        options
+            .parse_argument("--mach-semaphore-spurious-wake=100")
+            .unwrap();
+        assert_eq!(options.mach_semaphore_spurious_wake_ms, Some(100));
+        options
+            .parse_argument("--mach-semaphore-spurious-wake=0")
+            .unwrap();
+        assert_eq!(options.mach_semaphore_spurious_wake_ms, None);
+    }
+
+    #[test]
+    fn zero_stack_option_zero_disables_the_workaround() {
+        let mut options = Options::default();
+        assert_eq!(options.zero_stack_after_guest_to_host_call, None);
+
+        options
+            .parse_argument("--zero-stack-after-guest-to-host-call=52")
+            .unwrap();
+        assert_eq!(options.zero_stack_after_guest_to_host_call, Some(52));
+        options
+            .parse_argument("--zero-stack-after-guest-to-host-call=0")
+            .unwrap();
+        assert_eq!(options.zero_stack_after_guest_to_host_call, None);
+    }
+
+    #[test]
+    fn gl_error_tracing_can_be_enabled_and_disabled() {
+        let mut options = Options::default();
+        assert!(!options.trace_gl_errors);
+
+        options.parse_argument("--trace-gl-errors").unwrap();
+        assert!(options.trace_gl_errors);
+        options.parse_argument("--no-trace-gl-errors").unwrap();
+        assert!(!options.trace_gl_errors);
+    }
+
+    #[test]
+    fn gl_draw_tracing_can_be_enabled_and_disabled() {
+        let mut options = Options::default();
+        assert!(!options.trace_gl_draws);
+
+        options.parse_argument("--trace-gl-draws").unwrap();
+        assert!(options.trace_gl_draws);
+        options.parse_argument("--no-trace-gl-draws").unwrap();
+        assert!(!options.trace_gl_draws);
+    }
+
+    #[test]
+    fn renderer_mode_defaults_to_angle_and_accepts_legacy_switches() {
+        let mut options = Options::default();
+        assert_eq!(options.renderer_mode, RendererMode::Angle);
+
+        assert!(options
+            .parse_argument("--renderer-mode=native-gles")
+            .unwrap());
+        assert_eq!(options.renderer_mode, RendererMode::NativeGles);
+
+        assert!(options.parse_argument("--renderer-mode=angle").unwrap());
+        assert_eq!(options.renderer_mode, RendererMode::Angle);
+
+        assert!(options.parse_argument("--gles-native").unwrap());
+        assert_eq!(options.renderer_mode, RendererMode::NativeGles);
+
+        assert!(options.parse_argument("--no-gles-native").unwrap());
+        assert_eq!(options.renderer_mode, RendererMode::Angle);
+
+        assert!(options.parse_argument("--renderer-mode=vulkan").is_err());
+    }
+
+    #[test]
+    fn quick_menu_is_opt_in_and_can_be_disabled() {
+        let mut options = Options::default();
+        assert!(!options.quick_menu);
+
+        assert!(options.parse_argument("--quick-menu").unwrap());
+        assert!(options.quick_menu);
+
+        assert!(options.parse_argument("--no-quick-menu").unwrap());
+        assert!(!options.quick_menu);
     }
 
     #[test]
@@ -998,12 +1493,28 @@ mod option_parsing_tests {
     }
 
     #[test]
+    fn no_gles3_is_opt_in_and_can_be_disabled() {
+        let mut options = Options::default();
+        assert!(!options.no_gles3);
+
+        assert!(options.parse_argument("--no-gles3").unwrap());
+        assert!(options.no_gles3);
+
+        assert!(options.parse_argument("--gles3").unwrap());
+        assert!(!options.no_gles3);
+    }
+
+    #[test]
     fn local_game_center_sign_in_is_opt_in_and_can_be_disabled() {
         let mut options = Options::default();
         assert!(!options.game_center_authenticated);
-        assert!(options.parse_argument("--game-center-authenticated").unwrap());
+        assert!(options
+            .parse_argument("--game-center-authenticated")
+            .unwrap());
         assert!(options.game_center_authenticated);
-        assert!(options.parse_argument("--no-game-center-authenticated").unwrap());
+        assert!(options
+            .parse_argument("--no-game-center-authenticated")
+            .unwrap());
         assert!(!options.game_center_authenticated);
     }
 
@@ -1026,25 +1537,55 @@ mod option_parsing_tests {
     #[test]
     fn performance_overlay_options_parse_and_validate() {
         let mut options = Options::default();
-        assert!(options.performance_overlay_enabled);
+        assert!(!options.performance_overlay_enabled);
         let default_mode = if cfg!(any(target_os = "android", target_os = "ios")) {
             PerformanceOverlayMode::Minimal
         } else {
             PerformanceOverlayMode::TitleBar
         };
         assert_eq!(options.performance_overlay_mode, default_mode);
-        assert_eq!(options.performance_overlay_corner, PerformanceOverlayCorner::TopRight);
+        assert_eq!(
+            options.performance_overlay_corner,
+            PerformanceOverlayCorner::TopRight
+        );
 
         assert!(options.parse_argument("--overlay=off").unwrap());
         assert!(!options.performance_overlay_enabled);
         assert!(options.parse_argument("--overlay=on").unwrap());
         assert!(options.performance_overlay_enabled);
         assert!(options.parse_argument("--overlay-mode=full").unwrap());
-        assert_eq!(options.performance_overlay_mode, PerformanceOverlayMode::Full);
-        assert!(options.parse_argument("--overlay-corner=bottomleft").unwrap());
-        assert_eq!(options.performance_overlay_corner, PerformanceOverlayCorner::BottomLeft);
+        assert_eq!(
+            options.performance_overlay_mode,
+            PerformanceOverlayMode::Full
+        );
+        assert!(options
+            .parse_argument("--overlay-corner=bottomleft")
+            .unwrap());
+        assert_eq!(
+            options.performance_overlay_corner,
+            PerformanceOverlayCorner::BottomLeft
+        );
         assert!(options.parse_argument("--overlay-mode=invalid").is_err());
         assert!(options.parse_argument("--overlay-corner=invalid").is_err());
+    }
+
+    #[test]
+    fn memory_limit_parses_mib_and_off() {
+        let mut options = Options::default();
+        assert_eq!(options.memory_limit_mb, None);
+
+        assert!(options.parse_argument("--memory-limit=128").unwrap());
+        assert_eq!(options.memory_limit_mb, Some(128));
+
+        assert!(options.parse_argument("--memory-limit=off").unwrap());
+        assert_eq!(options.memory_limit_mb, None);
+
+        assert!(options.parse_argument("--memory-limit=0").is_err());
+        assert!(options.parse_argument("--memory-limit=lots").is_err());
+        // A rejected value must leave the previous setting alone.
+        assert!(options.parse_argument("--memory-limit=64").unwrap());
+        assert!(options.parse_argument("--memory-limit=-1").is_err());
+        assert_eq!(options.memory_limit_mb, Some(64));
     }
 
     #[test]

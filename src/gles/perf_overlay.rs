@@ -23,7 +23,39 @@ const LINE_HEIGHT: usize = 18;
 const HISTORY_SIZE: usize = 128;
 const PIXEL_BYTES: usize = PANEL_WIDTH * PANEL_HEIGHT * 4;
 
-static ENABLED: AtomicBool = AtomicBool::new(true);
+/// The app picker renders through the same present paths as games, but its
+/// settings are only meant to control the next game, never the picker itself.
+struct OverlayVisibility {
+    requested: AtomicBool,
+    app_picker: AtomicBool,
+}
+
+impl OverlayVisibility {
+    const fn new() -> Self {
+        Self {
+            requested: AtomicBool::new(true),
+            app_picker: AtomicBool::new(false),
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.requested.load(Ordering::Relaxed) && !self.app_picker.load(Ordering::Relaxed)
+    }
+
+    fn set_requested(&self, enabled: bool) -> bool {
+        self.requested.swap(enabled, Ordering::Relaxed)
+    }
+
+    fn set_app_picker(&self, app_picker: bool) {
+        self.app_picker.store(app_picker, Ordering::Relaxed);
+    }
+
+    fn is_app_picker(&self) -> bool {
+        self.app_picker.load(Ordering::Relaxed)
+    }
+}
+
+static VISIBILITY: OverlayVisibility = OverlayVisibility::new();
 static MODE: AtomicUsize = AtomicUsize::new(2);
 static CORNER: AtomicUsize = AtomicUsize::new(1);
 static GUEST_FLIPS: AtomicU64 = AtomicU64::new(0);
@@ -186,8 +218,8 @@ impl Stats {
             full_lines: [
                 "FPS 0.0 PRES 0.0 0.0 MS".to_string(),
                 "DRAWS 0/S 0/F Q DIRECT".to_string(),
-                "ALLOC 0.0 MB/S GC 0/0/0".to_string(),
-                "MEM N/A BUF 0K IMG 0K".to_string(),
+                "ALLOC 0.0MB/S  BUF 0K  IMG 0K".to_string(),
+                "MEM N/A  VMEM 0K".to_string(),
                 "CPU N/A GPU N/A".to_string(),
                 "TIME 00:00:00 GLALLOC 0/0".to_string(),
             ],
@@ -340,7 +372,10 @@ pub fn hidden_by_environment() -> bool {
         .unwrap_or(false)
 }
 
-pub fn configure_from_options(options: &Options) {
+pub fn configure_from_options(options: &Options, is_app_picker: bool) {
+    // Set the session gate before any window or splash can present a frame.
+    // Reconfiguring the picker settings cannot lift this gate.
+    VISIBILITY.set_app_picker(is_app_picker);
     let enabled = (options.performance_overlay_enabled
         || crate::env_flag_cached!("TOUCHHLE_ONSCREEN_FPS"))
         && !hidden_by_environment();
@@ -351,21 +386,26 @@ pub fn configure_from_options(options: &Options) {
     );
 }
 
-pub fn configure(enabled: bool, mode: PerformanceOverlayMode, corner: PerformanceOverlayCorner) {
-    crate::set_allocation_meter_enabled(enabled && mode == PerformanceOverlayMode::Full);
-    ENABLED.store(enabled, Ordering::Relaxed);
+pub fn configure(requested: bool, mode: PerformanceOverlayMode, corner: PerformanceOverlayCorner) {
+    VISIBILITY.set_requested(requested);
     MODE.store(mode_index(mode.for_current_platform()), Ordering::Relaxed);
     CORNER.store(corner_index(corner), Ordering::Relaxed);
+    crate::set_allocation_meter_enabled(enabled() && mode == PerformanceOverlayMode::Full);
     reset_session();
 }
 
 pub fn enabled() -> bool {
-    ENABLED.load(Ordering::Relaxed)
+    VISIBILITY.enabled()
 }
 
-pub fn set_enabled(enabled: bool) {
-    crate::set_allocation_meter_enabled(enabled && mode() == PerformanceOverlayMode::Full);
-    if ENABLED.swap(enabled, Ordering::Relaxed) != enabled && enabled {
+pub fn is_app_picker() -> bool {
+    VISIBILITY.is_app_picker()
+}
+
+pub fn set_enabled(requested: bool) {
+    let was_requested = VISIBILITY.set_requested(requested);
+    crate::set_allocation_meter_enabled(enabled() && mode() == PerformanceOverlayMode::Full);
+    if was_requested != requested && enabled() {
         reset_measurements();
     }
 }
@@ -545,7 +585,7 @@ fn refresh_stats(stats: &mut Stats) -> bool {
 
     let cpu_now = process_cpu_seconds();
     stats.cpu_percent = match (cpu_now, stats.previous_cpu_seconds) {
-        (Some(now), Some(previous)) => normalized_cpu_percent(
+        (Some(now), Some(previous)) => cpu_percent(
             now - previous,
             elapsed,
             stats.logical_processors,
@@ -605,6 +645,20 @@ fn refresh_stats(stats: &mut Stats) -> bool {
     let (buffer_bytes, image_bytes, live_allocations, peak_allocations) = guest_resource_stats();
     let buffer_memory = resource_memory_label(buffer_bytes);
     let image_memory = resource_memory_label(image_bytes);
+    // `VMEM` reads `used/limit` while the RAM limiter is active, so it is
+    // obvious at a glance whether the cap is set and how close the app is to
+    // it.
+    let heap_bytes = crate::mem::guest_heap_bytes();
+    let heap_limit = crate::mem::guest_heap_limit_bytes();
+    let guest_memory = if heap_limit > 0 {
+        format!(
+            "{}/{}",
+            resource_memory_label(heap_bytes),
+            resource_memory_label(heap_limit)
+        )
+    } else {
+        resource_memory_label(heap_bytes)
+    };
     let draws_per_frame = if stats.fps > 0.0 {
         stats.draws_per_second / stats.fps
     } else {
@@ -619,11 +673,17 @@ fn refresh_stats(stats: &mut Stats) -> bool {
             "DRAWS {:.0}/S  {:.0}/F  Q DIRECT",
             stats.draws_per_second, draws_per_frame
         ),
+        // The old `GC 0/0/0` counter was dead weight: the Rust runtime has no
+        // garbage collector, so it could never be anything but zero. Its room
+        // now holds the GL buffer/texture totals, which frees the memory row
+        // for VMEM.
         format!(
-            "ALLOC {:.1} MB/S  GC 0/0/0",
-            stats.allocated_mib_per_second
+            "ALLOC {:.1}MB/S  BUF {}  IMG {}",
+            stats.allocated_mib_per_second, buffer_memory, image_memory
         ),
-        format!("MEM {}  BUF {}  IMG {}", memory, buffer_memory, image_memory),
+        // MEM is the host process's resident set; VMEM is what the emulated
+        // app itself has allocated through its own malloc.
+        format!("MEM {}  VMEM {}", memory, guest_memory),
         format!("CPU {}  GPU {}", cpu, gpu),
         format!(
             "TIME {}  GLALLOC {}/{}",
@@ -1302,7 +1362,16 @@ fn parse_cpu_list(contents: &str) -> Option<usize> {
     (count > 0).then_some(count)
 }
 
-fn normalized_cpu_percent(cpu_seconds: f64, wall_seconds: f64, processors: usize) -> Option<f64> {
+/// CPU usage of the whole emulator process, as a percentage of one core.
+///
+/// This is what `top` and Android's own tools report as %CPU: a process that
+/// keeps one core busy shows 100%, and one that keeps two busy shows 200%.
+/// Dividing by the number of logical processors instead (the old behaviour)
+/// made a saturated core read as 13% on an 8-core phone, which looks like the
+/// emulator is idle while it is in fact pegging a core; the processor count is
+/// only used to cap the result, since the process cannot use more than the
+/// whole machine.
+fn cpu_percent(cpu_seconds: f64, wall_seconds: f64, processors: usize) -> Option<f64> {
     if !cpu_seconds.is_finite()
         || !wall_seconds.is_finite()
         || wall_seconds <= 0.0
@@ -1310,7 +1379,7 @@ fn normalized_cpu_percent(cpu_seconds: f64, wall_seconds: f64, processors: usize
     {
         return None;
     }
-    Some((cpu_seconds.max(0.0) / wall_seconds / processors as f64 * 100.0).clamp(0.0, 100.0))
+    Some((cpu_seconds.max(0.0) / wall_seconds * 100.0).clamp(0.0, 100.0 * processors as f64))
 }
 
 #[cfg(unix)]
@@ -1532,7 +1601,7 @@ fn request_gpu_sample() {
         return;
     }
     if std::thread::Builder::new()
-        .name("touchHLE-GPU-meter".to_string())
+        .name("HyperHLE-GPU-meter".to_string())
         .spawn(|| {
             let value = collect_gpu_sample().unwrap_or(f64::NAN);
             GPU_PERCENT_BITS.store(value.to_bits(), Ordering::Relaxed);
@@ -1553,7 +1622,7 @@ fn request_gpu_sample() {
         return;
     }
     if std::thread::Builder::new()
-        .name("touchHLE-GPU-meter".to_string())
+        .name("HyperHLE-GPU-meter".to_string())
         .spawn(|| {
             let value = collect_gpu_sample().unwrap_or(f64::NAN);
             GPU_PERCENT_BITS.store(value.to_bits(), Ordering::Relaxed);
@@ -1661,6 +1730,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn app_picker_never_shows_the_overlay_and_games_honour_the_setting() {
+        let visibility = OverlayVisibility::new();
+        assert!(visibility.enabled());
+        visibility.set_app_picker(true);
+        assert!(!visibility.enabled());
+        visibility.set_requested(false);
+        assert!(!visibility.enabled());
+        visibility.set_requested(true);
+        assert!(!visibility.enabled());
+
+        visibility.set_app_picker(false);
+        assert!(visibility.enabled());
+        visibility.set_requested(false);
+        assert!(!visibility.enabled());
+        visibility.set_app_picker(true);
+        visibility.set_app_picker(false);
+        assert!(!visibility.enabled());
+    }
+
+    #[test]
     fn gpu_percent_parser_accepts_scalar_and_mtk_ged_values() {
         assert_eq!(parse_gpu_percent("42\n"), Some(42.0));
         assert_eq!(parse_gpu_percent("42%\n"), Some(42.0));
@@ -1763,10 +1852,16 @@ mod tests {
     }
 
     #[test]
-    fn cpu_usage_is_normalized_against_all_logical_processors() {
-        assert_eq!(normalized_cpu_percent(1.0, 1.0, 8), Some(12.5));
-        assert_eq!(normalized_cpu_percent(8.0, 1.0, 8), Some(100.0));
-        assert_eq!(normalized_cpu_percent(1.0, 0.0, 8), None);
+    fn cpu_usage_is_a_percentage_of_one_core() {
+        // One busy core reads as 100%, like top's %CPU, not as 1/8th of the
+        // machine.
+        assert_eq!(cpu_percent(1.0, 1.0, 8), Some(100.0));
+        assert_eq!(cpu_percent(0.5, 1.0, 8), Some(50.0));
+        assert_eq!(cpu_percent(1.5, 1.0, 8), Some(150.0));
+        // The whole machine is the ceiling.
+        assert_eq!(cpu_percent(100.0, 1.0, 8), Some(800.0));
+        assert_eq!(cpu_percent(1.0, 0.0, 8), None);
+        assert_eq!(cpu_percent(-1.0, 1.0, 8), Some(0.0));
     }
 
     #[test]
@@ -1778,7 +1873,7 @@ mod tests {
 
     #[test]
     fn text_font_covers_all_overlay_labels() {
-        let text = "FPS | PRES MS DRAWS S F Q DIRECT ALLOC MB GC MEM BUF IMG CPU GPU TIME GLALLOC STALL 0123456789";
+        let text = "FPS | PRES MS DRAWS S F Q DIRECT ALLOC MB VMEM MEM BUF IMG CPU GPU TIME GLALLOC STALL 0123456789 /";
         assert!(text
             .bytes()
             .all(|character| glyph_rows(character.to_ascii_uppercase())

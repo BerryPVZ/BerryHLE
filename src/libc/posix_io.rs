@@ -93,6 +93,15 @@ impl State {
             .and_then(|file_or_none| file_or_none.as_mut())
     }
 
+    /// Guest path `fd` was opened with, for diagnostics (mmap reports the
+    /// file it maps, and `Fs` resolves guest paths to host paths elsewhere).
+    pub fn path_for_fd(&self, fd: FileDescriptor) -> Option<&str> {
+        self.files
+            .get(fd_to_file_idx(fd))
+            .and_then(|file_or_none| file_or_none.as_ref())
+            .and_then(|file| file.path.as_deref())
+    }
+
     /// Whether `fd` refers to a currently-open regular file descriptor (i.e.
     /// not one of the std streams, and not a closed/invalid descriptor).
     pub fn is_fd_open(&self, fd: FileDescriptor) -> bool {
@@ -210,6 +219,8 @@ pub const O_CREAT: OpenFlag = 0x200;
 pub const O_TRUNC: OpenFlag = 0x400;
 pub const O_EXCL: OpenFlag = 0x800;
 pub const O_NOCTTY: OpenFlag = 0x20000;
+pub const O_DSYNC: OpenFlag = 0x00400000;
+pub const O_CLOEXEC: OpenFlag = 0x01000000;
 
 /// File control command flags.
 /// This alias is for readability, POSIX just uses `int`.
@@ -251,6 +262,14 @@ const F_VOLPOSMODE: FileControlCommand = 4;
 pub type FDFlag = i32;
 pub const FD_CLOEXEC: FDFlag = 1;
 
+fn descriptor_flags_from_open(flags: OpenFlag) -> FDFlag {
+    if flags & O_CLOEXEC != 0 {
+        FD_CLOEXEC
+    } else {
+        0
+    }
+}
+
 /// Record Locking flags.
 /// This alias is for readability, POSIX just uses `short`
 pub type RecordLockingFlag = i16;
@@ -270,6 +289,21 @@ struct flock {
 }
 unsafe impl SafeRead for flock {}
 
+/// Darwin's `struct fstore`, the argument of `F_PREALLOCATE`. A 32-bit flags
+/// word, a 32-bit position mode, then three 64-bit `off_t`s, which puts the
+/// 64-bit fields at offsets 8, 16 and 24 on both 32-bit and 64-bit Darwin.
+#[repr(C)]
+#[derive(Debug, Default)]
+#[allow(non_camel_case_types)]
+struct fstore {
+    fst_flags: u32,
+    fst_posmode: i32,
+    fst_offset: off_t,
+    fst_length: off_t,
+    fst_bytesalloc: off_t,
+}
+unsafe impl SafeRead for fstore {}
+
 pub type FLockFlag = i32;
 pub const LOCK_SH: FLockFlag = 1;
 pub const LOCK_EX: FLockFlag = 2;
@@ -277,9 +311,9 @@ pub const LOCK_NB: FLockFlag = 4;
 pub const LOCK_UN: FLockFlag = 8;
 
 #[repr(C, packed)]
-struct iovec {
-    iov_base: ConstPtr<u8>,
-    iov_len: GuestUSize,
+pub(crate) struct iovec {
+    pub(crate) iov_base: ConstPtr<u8>,
+    pub(crate) iov_len: GuestUSize,
 }
 unsafe impl SafeRead for iovec {}
 
@@ -573,7 +607,9 @@ pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> Fil
         | O_CREAT
         | O_TRUNC
         | O_EXCL
-        | O_NOCTTY;
+        | O_NOCTTY
+        | O_DSYNC
+        | O_CLOEXEC;
     let unknown_flags = flags & !known_flags;
     if unknown_flags != 0 {
         log!(
@@ -655,8 +691,8 @@ pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> Fil
             file: GuestFile::random(),
             needs_flush: false,
             reached_eof: false,
-            flags: 0,
-            status_flags: flags & (O_ACCMODE | O_APPEND | O_NONBLOCK),
+            flags: descriptor_flags_from_open(flags),
+            status_flags: flags & (O_ACCMODE | O_APPEND | O_NONBLOCK | O_DSYNC),
             path: Some(path_string.clone()),
             locks: Vec::new(),
             flock_state: None,
@@ -707,8 +743,8 @@ pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> Fil
                 file,
                 needs_flush,
                 reached_eof: false,
-                flags: 0,
-                status_flags: flags & (O_ACCMODE | O_APPEND | O_NONBLOCK),
+                flags: descriptor_flags_from_open(flags),
+                status_flags: flags & (O_ACCMODE | O_APPEND | O_NONBLOCK | O_DSYNC),
                 path: Some(actual_path_string.clone()),
                 locks: Vec::new(),
                 flock_state: None,
@@ -814,7 +850,7 @@ pub fn read(
         let starts_at_beginning = file.file.stream_position().ok() == Some(0);
         let archive_path = file.path.clone();
         let read_result = {
-            let buffer_slice = env.mem.bytes_at_mut(buffer.cast(), size);
+            let buffer_slice = env.mem.bytes_at_mut_for_io(buffer.cast(), size);
             read_into_guest_memory(&mut file.file, buffer_slice)
         };
         if let Ok(bytes_read) = &read_result {
@@ -966,7 +1002,7 @@ pub fn write(
             // A guest's C library and assertion machinery report failures
             // straight to fd 2: dlmalloc prints "free(): invalid pointer" and
             // friends, and libc prints uncaught-abort reasons. The host
-            // process's stdout is not captured into touchHLE_log.txt, so a
+            // process's stdout is not captured into HyperHLE_log.txt, so a
             // crash report would lose the one line that explains it. Mirror
             // stderr into the file log; stdout is left alone because games
             // print there constantly.
@@ -990,9 +1026,14 @@ pub fn write(
         return -1;
     };
 
-    let buffer_slice = env.mem.bytes_at(buffer.cast(), size);
+    let buffer_slice = env.mem.bytes_at_for_io(buffer.cast(), size);
     match file.file.write(buffer_slice) {
         Ok(bytes_written) => {
+            let sync_result = if bytes_written > 0 && file.status_flags & O_DSYNC != 0 {
+                file.file.sync_data()
+            } else {
+                Ok(())
+            };
             if bytes_written < buffer_slice.len() {
                 log!(
                     "Warning: write({:?}, {:?}, {:#x}) wrote only {:#x} bytes",
@@ -1009,6 +1050,14 @@ pub fn write(
                     size,
                     bytes_written
                 );
+            }
+            if let Err(error) = sync_result {
+                log!(
+                    "Warning: O_DSYNC write failed to sync {:?}: {}",
+                    file.path,
+                    error
+                );
+                set_errno(env, EIO);
             }
             bytes_written.try_into().unwrap_or(-1)
         }
@@ -1382,7 +1431,7 @@ fn fcntl(
         }
         F_SETFD => {
             let flags: i32 = args.start().next(env);
-            // FD_CLOEXEC (close-on-exec) is a no-op in HyperHLE because the
+            // FD_CLOEXEC (close-on-exec) is a no-op in AppleJuiceHLE because the
             // emulator is a single guest process that never calls exec().
             // Per Apple's `man 2 fcntl`, FD_CLOEXEC causes the descriptor to
             // be closed when a new process image is created via exec — this
@@ -1424,7 +1473,7 @@ fn fcntl(
         // ----------------------------------------------------------------
         F_GETLK => {
             // POSIX `fcntl(F_GETLK)` reports whether a lock that would
-            // block the request is held by **another process**. HyperHLE
+            // block the request is held by **another process**. AppleJuiceHLE
             // is a single guest process, so there is no external
             // contender — per Apple `man 2 fcntl` we always report
             // F_UNLCK after validating the request struct.
@@ -1440,7 +1489,7 @@ fn fcntl(
         F_SETLK | F_SETLKW => {
             // POSIX advisory locks are owned by the process, not the fd:
             // locks held by the same process **never** conflict with each
-            // other (`man 2 fcntl`, "File Locking"). HyperHLE is a single
+            // other (`man 2 fcntl`, "File Locking"). AppleJuiceHLE is a single
             // guest process, so there are no inter-process conflicts to
             // detect. We still validate the request struct and track the
             // lock per-fd so it is released on `close(2)`.
@@ -1509,15 +1558,50 @@ fn fcntl(
             log_dbg!("fcntl({}, F_RDAHEAD, {}) — ignored", fd, arg);
         }
         F_PREALLOCATE => {
-            log_dbg!("fcntl({}, F_PREALLOCATE) — ignored", fd);
+            // A Darwin app sizes a database file before mapping it by asking
+            // the filesystem for space: xnu copyins an `fstore_t`, allocates
+            // the extent, and copies back how many bytes it allocated. The
+            // file has to really grow, or a later `mmap` of it covers EOF.
+            // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_descrip.c
+            let store_ptr: MutPtr<fstore> = args.start().next(env);
+            let mut store = env.mem.read(store_ptr);
+            let current_size = match env.libc_state.posix_io.file_for_fd(fd) {
+                Some(file) => file.file.stream_len().unwrap_or(0) as off_t,
+                None => {
+                    set_errno(env, EBADF);
+                    return -1;
+                }
+            };
+            let target = if store.fst_posmode == F_VOLPOSMODE {
+                store.fst_offset.saturating_add(store.fst_length)
+            } else {
+                current_size.saturating_add(store.fst_length)
+            };
+            let result = ftruncate(env, fd, target);
+            if result != 0 {
+                return result;
+            }
+            store.fst_bytesalloc = store.fst_length;
+            let allocated = store.fst_bytesalloc;
+            env.mem.write(store_ptr, store);
+            log!(
+                "fcntl({}, F_PREALLOCATE, {}) => grew file to {} bytes",
+                fd,
+                allocated,
+                target
+            );
         }
         F_TRUNCATEOVERSIZE => {
             let _size: i64 = args.start().next(env);
             log_dbg!("fcntl({}, F_TRUNCATEOVERSIZE) — ignored", fd);
         }
         F_SETSIZE => {
-            let size: i64 = args.start().next(env);
-            log_dbg!("fcntl({}, F_SETSIZE, {}) — ignored", fd, size);
+            // xnu's F_SETSIZE takes a pointer to the new length and truncates
+            // or extends the file to it: `copyin(argp, &offset, sizeof(off_t))`.
+            // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_descrip.c
+            let size_ptr: ConstPtr<off_t> = args.start().next(env);
+            let size = env.mem.read(size_ptr);
+            return ftruncate(env, fd, size);
         }
         F_FULLFSYNC => {
             log_dbg!("fcntl({}, F_FULLFSYNC) — no-op", fd);
@@ -1583,7 +1667,7 @@ fn fcntl(
 /// <https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/flock.2.html>
 ///
 /// `flock(2)` advisory locks only contend between *different* processes.
-/// HyperHLE is a single guest process, so any number of locks within the
+/// AppleJuiceHLE is a single guest process, so any number of locks within the
 /// guest can coexist. We still validate the operation, track the lock
 /// state per fd for diagnostics, and release on `close(2)`.
 fn flock(env: &mut Environment, fd: FileDescriptor, operation: FLockFlag) -> i32 {
@@ -1664,7 +1748,12 @@ pub fn ftruncate(env: &mut Environment, fd: FileDescriptor, len: off_t) -> i32 {
         return -1;
     };
     match file.file.set_len(len as u64) {
-        Ok(()) => 0,
+        Ok(()) => {
+            // File sizing is what makes large mappings usable, so it belongs in
+            // the default log rather than only in debug logs.
+            log!("ftruncate({}, {}) => 0", fd, len);
+            0
+        }
         Err(_) => -1,
     }
 }
@@ -2081,7 +2170,31 @@ fn release_range_from_locks(locks: &mut Vec<LockRange>, release: &LockRange) {
 
 #[cfg(test)]
 mod tests {
-    use super::{path_after_app_bundle_component, strip_udk_game_bundle_prefix};
+    use super::{
+        descriptor_flags_from_open, fstore, path_after_app_bundle_component,
+        strip_udk_game_bundle_prefix, FD_CLOEXEC, O_CLOEXEC, O_DSYNC,
+    };
+
+    /// The guest lays out `fstore_t` itself, so our copy has to agree with
+    /// Darwin's: two 32-bit fields, then three 64-bit `off_t`s.
+    #[test]
+    fn fstore_matches_darwins_layout() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(offset_of!(fstore, fst_posmode), 4);
+        assert_eq!(offset_of!(fstore, fst_offset), 8);
+        assert_eq!(offset_of!(fstore, fst_length), 16);
+        assert_eq!(offset_of!(fstore, fst_bytesalloc), 24);
+        assert_eq!(size_of::<fstore>(), 32);
+    }
+
+    #[test]
+    fn apple_open_flags_are_distinct_and_cloexec_maps_to_descriptor_flag() {
+        assert_eq!(O_CLOEXEC, 0x01000000);
+        assert_eq!(O_DSYNC, 0x00400000);
+        assert_eq!(descriptor_flags_from_open(O_CLOEXEC), FD_CLOEXEC);
+        assert_eq!(descriptor_flags_from_open(O_CLOEXEC | O_DSYNC), FD_CLOEXEC);
+        assert_eq!(descriptor_flags_from_open(O_DSYNC), 0);
+    }
 
     #[test]
     fn finds_case_insensitive_complete_app_bundle_components() {

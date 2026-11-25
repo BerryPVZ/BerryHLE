@@ -58,6 +58,11 @@ pub(super) struct AnimationBlockState {
     pub(super) delegate: id,
     pub(super) did_stop_selector: Option<SEL>,
     pub(super) will_start_selector: Option<SEL>,
+    /// `+setAnimationRepeatCount:`; 0 means "run once".
+    pub(super) repeat_count: f32,
+    pub(super) repeat_autoreverses: bool,
+    transition: Option<crate::frameworks::core_animation::view_transition::Pending>,
+    curve: i32,
 }
 impl Default for AnimationBlockState {
     fn default() -> AnimationBlockState {
@@ -70,13 +75,28 @@ impl Default for AnimationBlockState {
             delegate: nil,
             did_stop_selector: None,
             will_start_selector: None,
+            repeat_count: 0.0,
+            repeat_autoreverses: false,
+            transition: None,
+            curve: 0,
         }
     }
+}
+
+/// Total time an animation block occupies: the delay plus every repeat.
+/// `repeatCount` counts repeats, so the animation plays one more time than
+/// that; 0 (the default) means a single run. An autoreversing animation plays
+/// forwards and backwards, so each repeat takes twice the duration.
+fn block_total_duration(block: &AnimationBlockState) -> f64 {
+    let runs = block.repeat_count as f64 + 1.0;
+    let cycle = block.duration * if block.repeat_autoreverses { 2.0 } else { 1.0 };
+    block.delay + cycle * runs
 }
 
 #[derive(Default)]
 pub struct State {
     pub(super) views: Vec<id>,
+    pub(super) web_views: Vec<id>,
     pub ui_image_view: ui_image_view::State,
     pub ui_window: ui_window::State,
     pub(super) animation_block: AnimationBlockState,
@@ -107,9 +127,8 @@ pub(crate) struct UIViewHostObject {
     is_uncontrolled: bool,
     /// Strong refs to attached `UIGestureRecognizer*` instances. Used by
     /// `addGestureRecognizer:` / `removeGestureRecognizer:` /
-    /// `gestureRecognizers`. We don't dispatch real gesture recognition;
-    /// keeping a list is enough to avoid `Unknown selector` panics in
-    /// games that wire pinch/pan/tap recognizers up at startup.
+    /// `gestureRecognizers`. Touches are delivered to these from
+    /// `touchesBegan/Moved/Ended` in `ui_gesture_recognizer`.
     gesture_recognizers: Vec<id>,
     // ----- UIAccessibility informal protocol (NSObject category in real
     // iOS, but in practice only meaningful for views). All properties
@@ -178,6 +197,10 @@ impl Default for UIViewHostObject {
 pub fn set_view_controller(env: &mut Environment, view: id, controller: id) {
     let host_obj = env.objc.borrow_mut::<UIViewHostObject>(view);
     host_obj.view_controller = controller;
+}
+
+pub(crate) fn view_controller(env: &Environment, view: id) -> id {
+    env.objc.borrow::<UIViewHostObject>(view).view_controller
 }
 
 /// Distribute a change of the superview's size along one axis over the
@@ -316,7 +339,9 @@ fn init_common(env: &mut Environment, this: id) -> id {
 /// Deliver deferred layout for views added or invalidated after app launch.
 pub fn layout_pending_views(env: &mut Environment) {
     let views = env.framework_state.uikit.ui_view.views.clone();
-    for &view in &views { retain(env, view); }
+    for &view in &views {
+        retain(env, view);
+    }
     for view in views {
         if env.objc.borrow::<UIViewHostObject>(view).needs_layout {
             let window: id = msg![env; view window];
@@ -405,7 +430,8 @@ fn touchhle_cocos_should_force_landscape_view(env: &mut Environment, view: id) -
     // This Unity player swaps UIScreen's dimensions itself. When its UIKit
     // screens use landscape bounds, keep the game surface in that same space.
     if env.bundle.bundle_identifier() == "com.tayasui.mrpoofree"
-        && env.options.landscape_uiscreen_bounds && class_name == "EAGLView"
+        && env.options.landscape_uiscreen_bounds_enabled()
+        && class_name == "EAGLView"
     {
         return true;
     }
@@ -471,11 +497,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 (env, this, _cmd);
 @implementation UIView: UIResponder
 
+
+
 + (id)allocWithZone:(NSZonePtr)_zone {
     let host_object = Box::<UIViewHostObject>::default();
     let view = env.objc.alloc_object(this, host_object, &mut env.mem);
-    crate::frameworks::foundation::ns_object::invoke_cxx_constructors(env, view);
-    view
+    crate::frameworks::foundation::ns_object::invoke_cxx_constructors(env, view)
 }
 
 + (Class)layerClass {
@@ -512,6 +539,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         );
         if block.delegate != nil { release(env, block.delegate); }
         if block.animation_id != nil { release(env, block.animation_id); }
+        if let Some(transition) = block.transition {
+         crate::frameworks::core_animation::view_transition::discard(env, transition);
+        }
     }
     if animationID != nil { let _: id = msg![env; animationID retain]; }
     env.framework_state.uikit.ui_view.animation_block = AnimationBlockState {
@@ -553,8 +583,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (())commitAnimations {
-    let block = std::mem::take(&mut env.framework_state.uikit.ui_view.animation_block);
+    let mut block = std::mem::take(&mut env.framework_state.uikit.ui_view.animation_block);
     if !block.in_block { return; }
+
+    if let Some(transition) = block.transition.take() {
+     crate::frameworks::core_animation::view_transition::start(
+      env, transition, block.duration, block.delay, block.curve,
+     );
+    }
 
     // Fire `setAnimationWillStartSelector:` synchronously. This is good enough
     // for the apps that touchHLE supports; iOS would normally fire it at the
@@ -571,7 +607,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // Schedule the `setAnimationDidStopSelector:` callback. Even when the
     // delegate is nil we still need to release the retained animation_id, so
     // the early-return paths below take care of that.
-    let total_delay = (block.delay + block.duration).max(0.0);
+    let total_delay = block_total_duration(&block).max(0.0);
 
     if block.delegate == nil || block.did_stop_selector.is_none() {
         if block.delegate != nil { release(env, block.delegate); }
@@ -629,6 +665,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (())_touchHLE_animationDidStopFireMethod:(id)which_timer {
+crate::frameworks::core_animation::view_transition::expire(env);
     let dict: id = msg![env; which_timer userInfo];
     let key_delegate: id = get_static_str(env, "_touchHLE_uiview_anim_delegate");
     let key_sel: id = get_static_str(env, "_touchHLE_uiview_anim_sel");
@@ -665,21 +702,47 @@ pub const CLASSES: ClassExports = objc_classes! {
     let _: () = msg_send_no_type_checking(env, (delegate, sel, animation_id, finished, context));
 }
 
-// Visual properties of animation blocks that touchHLE does not animate.
-// These are intentionally no-ops, but they must remain present so that the
-// app's calls don't fall through to the dynamic dispatcher's "unimplemented
-// selector" path.
-+ (())setAnimationCurve:(NSInteger)_curve { }
+// `setAnimationCurve:` and `setAnimationTransition:forView:cache:` drive the
+// legacy flip and curl transitions. The remaining visual properties of blocks
+// are not animated; they stay as no-ops so the calls do not fall through to
+// the dispatcher's "unimplemented selector" path.
++ (())setAnimationCurve:(NSInteger)curve {
+ if !env.framework_state.uikit.ui_view.animation_block.in_block { return; }
+ env.framework_state.uikit.ui_view.animation_block.curve = curve;
+}
 + (())setAnimationBeginsFromCurrentState:(bool)_from { }
-+ (())setAnimationRepeatAutoreverses:(bool)_autoreverses { }
-+ (())setAnimationRepeatCount:(f32)_count { }
++ (())setAnimationRepeatAutoreverses:(bool)autoreverses {
+ if !env.framework_state.uikit.ui_view.animation_block.in_block { return; }
+ env.framework_state.uikit.ui_view.animation_block.repeat_autoreverses = autoreverses;
+}
++ (())setAnimationRepeatCount:(f32)count {
+ if !env.framework_state.uikit.ui_view.animation_block.in_block { return; }
+ if !(count >= 0.0) { return; }
+ env.framework_state.uikit.ui_view.animation_block.repeat_count = count;
+}
 + (())setAnimationsEnabled:(f32)_enabled { }
-+ (())setAnimationTransition:(NSInteger)_transition forView:(id)_view cache:(bool)_cache { }
++ (())setAnimationTransition:(NSInteger)transition forView:(id)view cache:(bool)cache {
+ if !env.framework_state.uikit.ui_view.animation_block.in_block { return; }
+ if let Some(old) = env.framework_state.uikit.ui_view.animation_block.transition.take() {
+  crate::frameworks::core_animation::view_transition::discard(env, old);
+ }
+ () = msg![env; view layoutIfNeeded];
+ let layer: id = msg![env; view layer];
+ let pending = crate::frameworks::core_animation::view_transition::prepare(
+  env, layer, transition, cache,
+ );
+ env.framework_state.uikit.ui_view.animation_block.transition = pending;
+}
 + (())setAnimationStartDate:(id)_date { }
 + (())setAnimationPosition:(CGPoint)_position { }
 + (bool)areAnimationsEnabled { true }
 
 // MARK: - Block-based animation API (iOS 4+)
+//
+// A property set outside an explicit animation snaps too: there is no
+// implicit-animation path, because that needs -[CALayer actionForKey:],
+// CATransaction disableActions plumbing and a real model/presentation
+// split. Views only move when the guest animates them itself.
 //
 // touchHLE doesn't actually animate property changes — assignments inside
 // the `animations` block snap to their final value immediately. The
@@ -786,23 +849,71 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // `+transitionWithView:duration:options:animations:completion:` and
 // `+transitionFromView:toView:duration:options:completion:` ship in
-// iOS 4 too. Real iOS swaps the view hierarchy with a flip / cross-
-// fade transition; touchHLE has no animator, so we do the swap
-// instantaneously and still fire the completion block — that keeps
-// games whose state machine waits on the completion (e.g. Bubble
-// Witch's level transition) from deadlocking.
+// iOS 4 too. `transitionWithView:` honours the transition bits of
+// `options`: a cross-dissolve, a horizontal flip or a page curl is
+// rendered through the same machinery as
+// `setAnimationTransition:forView:cache:`. The vertical flips are
+// not rendered yet and fall back to an instant swap.
+// `transitionFromView:toView:` still swaps the hierarchy instantly,
+// since the container it would have to animate is the views' shared
+// superview rather than either argument.
+// Either way the completion block still fires, which keeps games whose
+// state machine waits on it (e.g. Bubble Witch's level transition) from
+// deadlocking.
+// https://developer.apple.com/documentation/uikit/uiview/animationoptions
 
-+ (())transitionWithView:(id)_view
-                duration:(f64)duration
-                 options:(u32)options
-              animations:(MutPtr<()>)animations
-              completion:(MutPtr<()>)completion {
++ (())transitionWithView:(id)view
+duration:(f64)duration
+options:(u32)options
+animations:(MutPtr<()>)animations
+completion:(MutPtr<()>)completion {
+    // Apple: bits 20-23 of UIViewAnimationOptions select the transition.
+    // https://developer.apple.com/documentation/uikit/uiview/animationoptions
+    const TRANSITION_MASK: u32 = 0xF << 20;
+    let transition = ((options & TRANSITION_MASK) >> 20) as NSInteger;
+    // 1 and 2 are the horizontal flips, 3 and 4 the page curls,
+    // 5 is the cross-dissolve. The vertical flips (6, 7) are not
+    // rendered yet, so they fall back to the instant swap below.
+    let kind: NSInteger = match transition {
+        1 | 2 | 3 | 4 => transition,
+        5 => -1,
+        _ => 0,
+    };
+    // `beginAnimations:` would discard an outer block, so a
+    // `transitionWithView:` nested inside one keeps the instant swap.
+    // https://developer.apple.com/documentation/uikit/uiview/transition(with:duration:options:animations:completion:)
+    let nested = env.framework_state.uikit.ui_view.animation_block.in_block;
+    if kind == 0 || view == nil || nested {
+        () = msg![env; this
+            animateWithDuration:duration
+            delay:(0.0_f64)
+            options:options
+            animations:animations
+            completion:completion
+        ];
+        return;
+    }
+    // Drive the transition through the legacy animation block so the
+    // compositor picks it up, then let `animateWithDuration:` schedule
+    // the completion block.
+    let animation_id: id = nil;
+    let context: MutPtr<()> = MutPtr::null();
+    () = msg![env; this beginAnimations:animation_id context:context];
+    () = msg![env; this setAnimationDuration:duration];
+    let curve: NSInteger = ((options >> 16) & 0x3) as NSInteger;
+    () = msg![env; this setAnimationCurve:curve];
+    () = msg![env; this setAnimationTransition:kind forView:view cache:false];
+    if !animations.is_null() {
+        invoke_void_block(env, animations);
+    }
+    () = msg![env; this commitAnimations];
+    let no_animations: MutPtr<()> = MutPtr::null();
     () = msg![env; this
         animateWithDuration:duration
-                      delay:(0.0_f64)
-                    options:options
-                 animations:animations
-                 completion:completion
+        delay:(0.0_f64)
+        options:options
+        animations:no_animations
+        completion:completion
     ];
 }
 
@@ -816,7 +927,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // UIViewAnimationOptionShowHideTransitionViews option is set, in
     // which case both views remain in their hierarchy and only their
     // hidden state is toggled).
-    const SHOW_HIDE_OPTION: u32 = 1 << 19;
+    const SHOW_HIDE_OPTION: u32 = 1 << 8;
     if options & SHOW_HIDE_OPTION != 0 {
         if from_view != nil { let _: () = msg![env; from_view setHidden:true]; }
         if to_view != nil { let _: () = msg![env; to_view setHidden:false]; }
@@ -1641,14 +1752,16 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; layer setHidden:hidden]
 }
 
-- (bool)clipsToBounds {
-    let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
-    msg![env; layer masksToBounds]
-}
-- (())setClipsToBounds:(bool)clips {
-    let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
-    () = msg![env; layer setMasksToBounds:clips];
-}
+    // UIView forwards this to the layer, which is what actually clips.
+    // <https://developer.apple.com/documentation/uikit/uiview/clipstobounds>
+    - (bool)clipsToBounds {
+        let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+        msg![env; layer masksToBounds]
+    }
+    - (())setClipsToBounds:(bool)clips {
+        let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+        let _: () = msg![env; layer setMasksToBounds:clips];
+    }
 
 - (())setStyle:(u32)_style { }
 - (id)context { nil }
@@ -1783,7 +1896,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let mut bounds = touchhle_cocos_sanitize_rect(bounds);
 
     if crate::env_flag_cached!("TOUCHHLE_FORCE_LANDSCAPE_VIEW_BOUNDS")
-        || (env.bundle.bundle_identifier() == "com.tayasui.mrpoofree" && env.options.landscape_uiscreen_bounds)
+        || (env.bundle.bundle_identifier() == "com.tayasui.mrpoofree" && env.options.landscape_uiscreen_bounds_enabled())
     {
         let view_class: Class = msg![env; this class];
         let class_name = env.objc.get_class_name(view_class).to_owned();
@@ -2083,6 +2196,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     () = msg![env; this setBounds:(CGRect { origin: CGPoint::default(), size: new_size })];
 }
 
+// `- (void)setNeedsUpdateOfHomeIndicatorAutoHidden` (iOS 11+)
+//
+// Asks UIKit to re-evaluate whether the home indicator should be hidden. The
+// emulator draws no home indicator, so there is nothing to re-evaluate; the
+// call is accepted instead of hitting the "does not respond" path.
+- (())setNeedsUpdateOfHomeIndicatorAutoHidden {
+}
 @end
 
 };

@@ -25,9 +25,11 @@ pub mod _nib_archive_decoder;
 pub mod ab_people_picker_navigation_controller;
 pub mod asidentifier_manager;
 pub mod chipmunk_space;
+mod core_data_model;
+mod core_data_store;
 pub mod ns_array;
-pub mod ns_attributed_string;
 pub mod ns_assertion_handler;
+pub mod ns_attributed_string;
 pub mod ns_autorelease_pool;
 pub mod ns_bundle;
 pub mod ns_calendar;
@@ -48,6 +50,7 @@ pub mod ns_file_manager;
 pub mod ns_garbage_collector;
 pub mod ns_hash_table;
 pub mod ns_host;
+pub mod ns_http_cookie;
 pub mod ns_http_cookie_storage;
 pub mod ns_index_path;
 pub mod ns_index_set;
@@ -58,9 +61,10 @@ pub mod ns_keyed_archiver;
 pub mod ns_keyed_unarchiver;
 pub mod ns_locale;
 pub mod ns_lock;
-pub mod ns_map_table;
 pub mod ns_log;
+pub mod ns_map_table;
 pub mod ns_metadata_query;
+pub mod ns_net_service;
 pub mod ns_notification;
 pub mod ns_notification_center;
 pub mod ns_null;
@@ -73,8 +77,9 @@ pub mod ns_persistent_store_coordinator;
 pub mod ns_pointer_array;
 pub mod ns_port;
 pub mod ns_predicate;
-pub mod ns_progress;
+mod ns_predicate_format;
 pub mod ns_process_info;
+pub mod ns_progress;
 pub mod ns_property_list_serialization;
 pub mod ns_proxy;
 pub mod ns_regular_expression;
@@ -89,18 +94,18 @@ pub mod ns_time_zone;
 pub mod ns_timer;
 pub mod ns_ubiquitous_key_value_store;
 pub mod ns_undo_manager;
-pub mod ns_net_service;
 pub mod ns_url;
-pub mod ns_user_defaults;
-pub mod url_loading;
-pub mod url_protocol;
 pub mod ns_url_connection;
 pub mod ns_url_request;
 pub mod ns_url_response;
 pub mod ns_url_session;
+pub mod ns_user_defaults;
 pub mod ns_uuid;
 pub mod ns_value;
+pub mod ns_value_transformer;
 pub mod ns_xml_parser;
+pub mod url_loading;
+pub mod url_protocol;
 
 pub fn NSGetSizeAndAlignment(
     env: &mut Environment,
@@ -474,6 +479,19 @@ fn av_capture_iso_current(env: &mut Environment) -> ConstVoidPtr {
 }
 
 pub const STUB_CONSTANTS: ConstantExports = &[
+    (
+        "_NSNegateBooleanTransformerName",
+        HostConstant::NSString("NSNegateBoolean"),
+    ),
+    ("_NSIsNilTransformerName", HostConstant::NSString("NSIsNil")),
+    (
+        "_NSIsNotNilTransformerName",
+        HostConstant::NSString("NSIsNotNil"),
+    ),
+    (
+        "_NSKeyedUnarchiveFromDataTransformerName",
+        HostConstant::NSString("NSKeyedUnarchiveFromData"),
+    ),
     // _NSLocalizedFailureReasonErrorKey and _NSURLErrorDomain are exported
     // from foundation::ns_error::CONSTANTS; not duplicated here.
     (
@@ -1530,6 +1548,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ns_file_manager::CLASSES,
         ns_garbage_collector::CLASSES,
         ns_host::CLASSES,
+        ns_http_cookie::CLASSES,
         ns_http_cookie_storage::CLASSES,
         ns_index_path::CLASSES,
         ns_index_set::CLASSES,
@@ -1580,6 +1599,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ns_user_defaults::CLASSES,
         ns_uuid::CLASSES,
         ns_value::CLASSES,
+        ns_value_transformer::CLASSES,
         ns_xml_parser::CLASSES,
         #[cfg(test)]
         ns_xml_parser::tests::CLASSES,
@@ -1587,17 +1607,18 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
     constant_exports: &[
         ns_calendar::CONSTANTS,
         ns_error::CONSTANTS,
-        ns_url::CONSTANTS,
         ns_exception::CONSTANTS,
         ns_file_manager::CONSTANTS,
         ns_keyed_unarchiver::CONSTANTS,
         ns_locale::CONSTANTS,
         ns_persistent_store_coordinator::CONSTANTS,
         ns_run_loop::CONSTANTS,
+        ns_url::CONSTANTS,
         STUB_CONSTANTS,
     ],
     function_exports: &[
         FUNCTIONS,
+        ns_dictionary::FUNCTIONS,
         ns_exception::FUNCTIONS,
         ns_file_manager::FUNCTIONS,
         ns_log::FUNCTIONS,
@@ -1625,6 +1646,7 @@ pub struct State {
     ns_user_defaults: ns_user_defaults::State,
     ns_url_session: ns_url_session::State,
     ns_value: ns_value::State,
+    ns_value_transformer: ns_value_transformer::State,
     url_protocol: url_protocol::State,
     /// Singleton for [NSURLCache sharedURLCache].
     pub url_cache_singleton: crate::objc::id,
@@ -1669,9 +1691,14 @@ impl crate::abi::GuestArg for NSRange {
 
 fn NSUnionRange(_env: &mut Environment, first: NSRange, second: NSRange) -> NSRange {
     let location = first.location.min(second.location);
-    let end = first.location.wrapping_add(first.length)
+    let end = first
+        .location
+        .wrapping_add(first.length)
         .max(second.location.wrapping_add(second.length));
-    NSRange { location, length: end.wrapping_sub(location) }
+    NSRange {
+        location,
+        length: end.wrapping_sub(location),
+    }
 }
 
 fn NSStringFromRange(env: &mut Environment, range: NSRange) -> id {
@@ -1680,6 +1707,43 @@ fn NSStringFromRange(env: &mut Environment, range: NSRange) -> id {
     let len = range.length;
     let string = format!("{{{loc}, {len}}}");
     ns_string::from_rust_string(env, string)
+}
+
+/// One integer of `NSRangeFromString`'s text: a run of digits, optionally
+/// signed. A run with no digits is not a number; one too long for `i64` is
+/// clamped, so the caller still gets a value instead of a zero in its place.
+fn ns_range_number(part: &str) -> Option<i64> {
+    let digits = part.strip_prefix('-').unwrap_or(part);
+    if digits.is_empty() {
+        return None;
+    }
+    Some(match part.parse::<i64>() {
+        Ok(value) => value,
+        Err(_) if part.starts_with('-') => i64::MIN,
+        Err(_) => i64::MAX,
+    })
+}
+
+/// `NSRange NSRangeFromString(NSString *aString)` — parses the first two
+/// integers of `"{location, length}"`. Everything else in the string is
+/// ignored, so `"{7}"` is `{7, 0}` and a string with no digits is `{0, 0}`, as
+/// Apple's implementation does. A number is clamped to `0..=NSNotFound`.
+/// <https://developer.apple.com/documentation/foundation/1395176-nsrangefromstring>
+fn ns_range_from_string_of_text(text: &str) -> NSRange {
+    let mut numbers = text
+        .split(|c: char| !c.is_ascii_digit() && c != '-')
+        .filter_map(ns_range_number)
+        .map(|value| value.clamp(0, NSNotFound as i64) as NSUInteger);
+    let mut next = || numbers.next().unwrap_or(0);
+    NSRange {
+        location: next(),
+        length: next(),
+    }
+}
+
+fn NSRangeFromString(env: &mut Environment, string: id) -> NSRange {
+    // `to_rust_string` reads nil as the empty string, which gives `{0, 0}`.
+    ns_range_from_string_of_text(&ns_string::to_rust_string(env, string))
 }
 
 pub type NSComparisonResult = NSInteger;
@@ -1696,7 +1760,7 @@ pub type NSTimeInterval = f64;
 ///
 /// [`std::time::Duration::from_secs_f64`] panics when handed `NaN`, infinity,
 /// negative values, or values beyond `u64::MAX` seconds. Real iPhone OS apps
-/// have been observed passing all of these — for example HyperHLE log #4
+/// have been observed passing all of these — for example AppleJuiceHLE log #4
 /// (Crazy Frog Racer) panicked at `time.rs:964:23` after the first
 /// `NSTimer` fired because the game scheduled a callback with a non-finite
 /// interval, and the Resident Evil 4 / accelerometer paths similarly emit
@@ -1752,25 +1816,76 @@ const FUNCTIONS: FunctionExports = &[
 // Foundation scans up to the first two decimal integers, even without braces.
 // https://github.com/swiftlang/swift-corelibs-foundation/blob/main/Sources/Foundation/NSRange.swift
 fn range_from_string(string: &str) -> NSRange {
-    let mut numbers = string.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty());
-    let mut next = || numbers.next().map_or(0, |digits| digits.bytes().fold(0u32,
-        |n, digit| n.saturating_mul(10).saturating_add((digit - b'0') as u32)));
-    NSRange { location: next(), length: next() }
-}
-fn NSRangeFromString(env: &mut Environment, string: id) -> NSRange {
-    range_from_string(&ns_string::to_rust_string(env, string))
+    let mut numbers = string
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty());
+    let mut next = || {
+        numbers.next().map_or(0, |digits| {
+            digits.bytes().fold(0u32, |n, digit| {
+                n.saturating_mul(10).saturating_add((digit - b'0') as u32)
+            })
+        })
+    };
+    NSRange {
+        location: next(),
+        length: next(),
+    }
 }
 #[cfg(test)]
 mod range_string_tests {
     use super::*;
     #[test]
     fn range_strings_and_partial_ranges() {
-        for (text, location, length) in [("{35, 213}", 35, 213), ("", 0, 0),
-            ("invalid", 0, 0), ("12", 12, 0), ("location=12 length=34 ignored=56", 12, 34),
-            ("{4294967295, 0}", u32::MAX, 0)] {
+        for (text, location, length) in [
+            ("{35, 213}", 35, 213),
+            ("", 0, 0),
+            ("invalid", 0, 0),
+            ("12", 12, 0),
+            ("location=12 length=34 ignored=56", 12, 34),
+            ("{4294967295, 0}", u32::MAX, 0),
+        ] {
             let range = range_from_string(text);
             let actual = (range.location, range.length);
             assert_eq!(actual, (location, length));
         }
+    }
+}
+#[cfg(test)]
+mod ns_range_from_string_tests {
+    use super::*;
+
+    fn pair(text: &str) -> (u32, u32) {
+        let range = ns_range_from_string_of_text(text);
+        (range.location, range.length)
+    }
+
+    #[test]
+    fn parses_the_pairs_that_appear_in_plists_and_logs() {
+        assert_eq!(pair("{5, 3}"), (5, 3));
+        assert_eq!(pair("{5,3}"), (5, 3));
+        assert_eq!(pair("5, 3"), (5, 3));
+        assert_eq!(pair("{0,0}"), (0, 0));
+    }
+
+    #[test]
+    fn missing_numbers_read_as_zero() {
+        assert_eq!(pair(""), (0, 0));
+        assert_eq!(pair("{}, {}"), (0, 0));
+        assert_eq!(pair("{7, 2, 9}"), (7, 2));
+        assert_eq!(pair("{7}"), (7, 0));
+    }
+
+    #[test]
+    fn a_negative_or_huge_number_stays_inside_the_type() {
+        assert_eq!(pair("{-1, 0}"), (0, 0));
+        assert_eq!(pair("{-99999999999, 0}"), (0, 0));
+        assert_eq!(pair("{99999999999, 0}"), (NSNotFound as u32, 0));
+    }
+
+    #[test]
+    fn a_number_too_big_for_i64_is_clamped_not_dropped() {
+        let too_long = "{123456789012345678901234, 0}";
+        assert_eq!(pair(too_long), (NSNotFound as u32, 0));
+        assert_eq!(pair("{-123456789012345678901234, 0}"), (0, 0));
     }
 }

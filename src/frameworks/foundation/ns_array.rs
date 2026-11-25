@@ -284,6 +284,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     nil
 }
 
+- (NSUInteger)hash {
+    // TODO: define better hash
+    msg![env; this count]
+}
+
 - (bool)isEqual:(id)other {
     if this == other {
         return true;
@@ -430,14 +435,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     let arr = from_vec(env, result);
     autorelease(env, arr)
-}
-
-- (())makeObjectsPerformSelector:(SEL)sel {
-    let count: NSUInteger = msg![env; this count];
-    for i in 0..count {
-        let obj: id = msg![env; this objectAtIndex:i];
-        let _: id = msg![env; obj performSelector:sel];
-    }
 }
 
 - (())encodeWithCoder:(id)coder {

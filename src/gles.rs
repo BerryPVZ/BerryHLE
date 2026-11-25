@@ -72,15 +72,15 @@ pub mod gles2_on_gl3;
 pub mod gles3_native;
 pub mod gles3_on_gl3;
 mod gles_generic;
-pub mod present;
 pub mod perf_overlay;
+pub mod present;
 pub mod util;
 use touchHLE_gl_bindings::gl21compat as gl21compat_raw;
 use touchHLE_gl_bindings::gl33core as gl33core_raw;
 pub use touchHLE_gl_bindings::gles11 as gles11_raw;
+pub use touchHLE_gl_bindings::gles11::types::*;
 pub use touchHLE_gl_bindings::gles2 as gles2_raw;
 pub use touchHLE_gl_bindings::gles30 as gles30_raw;
-pub use touchHLE_gl_bindings::gles11::types::*;
 pub use util::try_decode_pvrtc;
 
 use crate::environment::Environment;
@@ -93,11 +93,66 @@ use gles2_on_gl3::GLES2OnGL3Context;
 use gles3_native::GLES3NativeContext;
 use gles3_on_gl3::GLES3OnGL3Context;
 pub use gles_generic::GLESContext;
-pub use gles_generic::GLES;
 pub(crate) use gles_generic::GuestGlesCallGuard;
+pub use gles_generic::GLES;
+
+/// A context-bound GL interface. Renderers use inline wrappers instead of
+/// allocating and freeing a box on every guest GL entry. Their
+/// lifetime and transient staging buffers still end at the call boundary.
+pub enum CurrentGLES<'a> {
+    NativeES1(gles1_native::GLES1Native<'a>),
+    NativeES2(gles2_native::GLES2Native<'a>),
+    NativeES3(gles3_native::GLES3Native<'a>),
+    ES1OnGL2(gles1_on_gl2::GLES1OnGL2<'a>),
+    ES1OnGLES2(gles1_on_gles2::GLES1OnGLES2<'a>),
+    ES3OnGL3(gles3_on_gl3::GLES3OnGL3<'a>),
+    Other(Box<dyn GLES + 'a>),
+}
+
+impl<'a> std::ops::Deref for CurrentGLES<'a> {
+    type Target = dyn GLES + 'a;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::NativeES1(gles) => gles,
+            Self::NativeES2(gles) => gles,
+            Self::NativeES3(gles) => gles,
+            Self::ES1OnGL2(gles) => gles,
+            Self::ES1OnGLES2(gles) => gles,
+            Self::ES3OnGL3(gles) => gles,
+            Self::Other(gles) => gles.as_ref(),
+        }
+    }
+}
+
+impl std::ops::DerefMut for CurrentGLES<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::NativeES1(gles) => gles,
+            Self::NativeES2(gles) => gles,
+            Self::NativeES3(gles) => gles,
+            Self::ES1OnGL2(gles) => gles,
+            Self::ES1OnGLES2(gles) => gles,
+            Self::ES3OnGL3(gles) => gles,
+            Self::Other(gles) => gles.as_mut(),
+        }
+    }
+}
+
+impl<'a> CurrentGLES<'a> {
+    pub fn as_mut(&mut self) -> &mut (dyn GLES + 'a) {
+        &mut **self
+    }
+}
+
+impl<'a, T: GLES + 'a> From<Box<T>> for CurrentGLES<'a> {
+    fn from(gles: Box<T>) -> Self {
+        Self::Other(gles)
+    }
+}
 
 pub struct LoggingGLES<'a> {
-    pub inner: Box<dyn GLES + 'a>,
+    pub inner: CurrentGLES<'a>,
     pub verbose: bool,
 }
 
@@ -120,24 +175,28 @@ impl GLESContext for LoggingGLESContext {
     fn make_current<'gl_ctx, 'win: 'gl_ctx>(
         &'gl_ctx mut self,
         window: &'win mut crate::window::Window,
-    ) -> Box<dyn GLES + 'gl_ctx> {
+    ) -> crate::gles::CurrentGLES<'gl_ctx> {
         let gles = self.inner.make_current(window);
         Box::new(LoggingGLES {
             inner: gles,
             verbose: self.verbose,
         })
+        .into()
     }
 
     unsafe fn make_current_unchecked_for_window<'gl_ctx>(
         &'gl_ctx mut self,
         make_current_fn: &mut dyn FnMut(&GLContext),
         loader_fn: &mut dyn FnMut(&'static str) -> *const std::ffi::c_void,
-    ) -> Box<dyn GLES + 'gl_ctx> {
-        let gles = self.inner.make_current_unchecked_for_window(make_current_fn, loader_fn);
+    ) -> crate::gles::CurrentGLES<'gl_ctx> {
+        let gles = self
+            .inner
+            .make_current_unchecked_for_window(make_current_fn, loader_fn);
         Box::new(LoggingGLES {
             inner: gles,
             verbose: self.verbose,
         })
+        .into()
     }
 }
 
@@ -145,6 +204,20 @@ impl<'a> GLES for LoggingGLES<'a> {
     fn has_separate_framebuffer_bindings(&self) -> bool {
         self.inner.has_separate_framebuffer_bindings()
     }
+
+
+
+    fn supports_map_buffer_range(&self) -> bool {
+        self.inner.supports_map_buffer_range()
+    }
+    fn is_native_es1(&self) -> bool {
+        self.inner.is_native_es1()
+    }
+    fn is_gles1_on_gl2(&self) -> bool {
+        self.inner.is_gles1_on_gl2()
+    }
+    // The logging wrapper must forward every capability query: profiles such
+    // as ES 2.0 are selected from these, not from the raw GL strings.
     fn is_es2(&self) -> bool {
         self.inner.is_es2()
     }
@@ -154,11 +227,14 @@ impl<'a> GLES for LoggingGLES<'a> {
     fn is_translator(&self) -> bool {
         self.inner.is_translator()
     }
-    fn is_native_es1(&self) -> bool {
-        self.inner.is_native_es1()
+    fn pvrtc_native(&self) -> bool {
+        self.inner.pvrtc_native()
     }
-    fn is_gles1_on_gl2(&self) -> bool {
-        self.inner.is_gles1_on_gl2()
+    fn supports_vao_oes(&self) -> bool {
+        self.inner.supports_vao_oes()
+    }
+    fn diagnostic_profile(&self) -> &'static str {
+        self.inner.diagnostic_profile()
     }
     fn discard_ext_supported(&self) -> bool {
         self.inner.discard_ext_supported()
@@ -200,30 +276,63 @@ impl<'a> GLES for LoggingGLES<'a> {
 
     unsafe fn DrawArrays(&mut self, mode: GLenum, first: GLint, count: GLsizei) {
         if self.verbose {
-            log_file_only!("glDrawArrays(mode={:#x}, first={}, count={})", mode, first, count);
+            log_file_only!(
+                "glDrawArrays(mode={:#x}, first={}, count={})",
+                mode,
+                first,
+                count
+            );
         }
         self.inner.DrawArrays(mode, first, count);
     }
 
-    unsafe fn DrawElements(&mut self, mode: GLenum, count: GLsizei, type_: GLenum, indices: *const GLvoid) {
+    unsafe fn DrawElements(
+        &mut self,
+        mode: GLenum,
+        count: GLsizei,
+        type_: GLenum,
+        indices: *const GLvoid,
+    ) {
         if self.verbose {
-            log_file_only!("glDrawElements(mode={:#x}, count={}, type={:#x})", mode, count, type_);
+            log_file_only!(
+                "glDrawElements(mode={:#x}, count={}, type={:#x})",
+                mode,
+                count,
+                type_
+            );
         }
         self.inner.DrawElements(mode, count, type_, indices);
     }
 
     unsafe fn BindFramebuffer(&mut self, target: GLenum, framebuffer: GLuint) {
         if self.verbose {
-            log_file_only!("glBindFramebuffer(target={:#x}, fb={})", target, framebuffer);
+            log_file_only!(
+                "glBindFramebuffer(target={:#x}, fb={})",
+                target,
+                framebuffer
+            );
         }
         self.inner.BindFramebuffer(target, framebuffer);
     }
 
-    unsafe fn FramebufferRenderbuffer(&mut self, target: GLenum, attachment: GLenum, renderbuffertarget: GLenum, renderbuffer: GLuint) {
+    unsafe fn FramebufferRenderbuffer(
+        &mut self,
+        target: GLenum,
+        attachment: GLenum,
+        renderbuffertarget: GLenum,
+        renderbuffer: GLuint,
+    ) {
         if self.verbose {
-            log_file_only!("glFramebufferRenderbuffer(target={:#x}, attach={:#x}, rb_target={:#x}, rb={})", target, attachment, renderbuffertarget, renderbuffer);
+            log_file_only!(
+                "glFramebufferRenderbuffer(target={:#x}, attach={:#x}, rb_target={:#x}, rb={})",
+                target,
+                attachment,
+                renderbuffertarget,
+                renderbuffer
+            );
         }
-        self.inner.FramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer);
+        self.inner
+            .FramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer);
     }
 
     unsafe fn TexImage2D(
@@ -241,7 +350,17 @@ impl<'a> GLES for LoggingGLES<'a> {
         if self.verbose {
             log_file_only!("glTexImage2D(target={:#x}, level={}, int_fmt={:#x}, size={}x{}, format={:#x}, type={:#x})", target, level, internalformat, width, height, format, type_);
         }
-        self.inner.TexImage2D(target, level, internalformat, width, height, border, format, type_, pixels);
+        self.inner.TexImage2D(
+            target,
+            level,
+            internalformat,
+            width,
+            height,
+            border,
+            format,
+            type_,
+            pixels,
+        );
     }
 
     unsafe fn BindTexture(&mut self, target: GLenum, texture: GLuint) {
@@ -262,9 +381,18 @@ impl<'a> GLES for LoggingGLES<'a> {
         pixels: *mut GLvoid,
     ) {
         if self.verbose {
-            log_file_only!("glReadPixels({}, {}, {}, {}, format={:#x}, type={:#x})", x, y, width, height, format, type_);
+            log_file_only!(
+                "glReadPixels({}, {}, {}, {}, format={:#x}, type={:#x})",
+                x,
+                y,
+                width,
+                height,
+                format,
+                type_
+            );
         }
-        self.inner.ReadPixels(x, y, width, height, format, type_, pixels);
+        self.inner
+            .ReadPixels(x, y, width, height, format, type_, pixels);
     }
 
     unsafe fn GetIntegerv(&mut self, pname: GLenum, params: *mut GLint) {
@@ -295,6 +423,9 @@ impl<'a> GLES for LoggingGLES<'a> {
     }
 
     unsafe fn BindBuffer(&mut self, target: GLenum, buffer: GLuint) {
+        if self.verbose {
+            log_file_only!("glBindBuffer(target={:#x}, buffer={})", target, buffer);
+        }
         self.inner.BindBuffer(target, buffer);
     }
 
@@ -302,11 +433,23 @@ impl<'a> GLES for LoggingGLES<'a> {
         self.inner.EnableClientState(array);
     }
 
-    unsafe fn VertexPointer(&mut self, size: GLint, type_: GLenum, stride: GLsizei, pointer: *const GLvoid) {
+    unsafe fn VertexPointer(
+        &mut self,
+        size: GLint,
+        type_: GLenum,
+        stride: GLsizei,
+        pointer: *const GLvoid,
+    ) {
         self.inner.VertexPointer(size, type_, stride, pointer);
     }
 
-    unsafe fn TexCoordPointer(&mut self, size: GLint, type_: GLenum, stride: GLsizei, pointer: *const GLvoid) {
+    unsafe fn TexCoordPointer(
+        &mut self,
+        size: GLint,
+        type_: GLenum,
+        stride: GLsizei,
+        pointer: *const GLvoid,
+    ) {
         self.inner.TexCoordPointer(size, type_, stride, pointer);
     }
 
@@ -358,7 +501,15 @@ impl<'a> GLES for LoggingGLES<'a> {
         self.inner.PopMatrix();
     }
 
-    unsafe fn Orthof(&mut self, left: GLfloat, right: GLfloat, bottom: GLfloat, top: GLfloat, near: GLfloat, far: GLfloat) {
+    unsafe fn Orthof(
+        &mut self,
+        left: GLfloat,
+        right: GLfloat,
+        bottom: GLfloat,
+        top: GLfloat,
+        near: GLfloat,
+        far: GLfloat,
+    ) {
         self.inner.Orthof(left, right, bottom, top, near, far);
     }
 
@@ -454,7 +605,13 @@ impl<'a> GLES for LoggingGLES<'a> {
         self.inner.BlendEquationOES(mode);
     }
 
-    unsafe fn ColorMask(&mut self, red: GLboolean, green: GLboolean, blue: GLboolean, alpha: GLboolean) {
+    unsafe fn ColorMask(
+        &mut self,
+        red: GLboolean,
+        green: GLboolean,
+        blue: GLboolean,
+        alpha: GLboolean,
+    ) {
         self.inner.ColorMask(red, green, blue, alpha);
     }
 
@@ -619,11 +776,41 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn DeleteBuffers(&mut self, _n: GLsizei, _buffers: *const GLuint) {
         self.inner.DeleteBuffers(_n, _buffers);
     }
-    unsafe fn BufferData( &mut self, _target: GLenum, _size: GLsizeiptr, _data: *const GLvoid, _usage: GLenum, ) {
-        self.inner.BufferData(_target, _size, _data, _usage);
+    unsafe fn BufferData(
+        &mut self,
+        target: GLenum,
+        size: GLsizeiptr,
+        data: *const GLvoid,
+        usage: GLenum,
+    ) {
+        if self.verbose {
+            log_file_only!(
+                "glBufferData(target={:#x}, size={}, data={:?}, usage={:#x})",
+                target,
+                size,
+                data,
+                usage
+            );
+        }
+        self.inner.BufferData(target, size, data, usage);
     }
-    unsafe fn BufferSubData( &mut self, _target: GLenum, _offset: GLintptr, _size: GLsizeiptr, _data: *const GLvoid, ) {
-        self.inner.BufferSubData(_target, _offset, _size, _data);
+    unsafe fn BufferSubData(
+        &mut self,
+        target: GLenum,
+        offset: GLintptr,
+        size: GLsizeiptr,
+        data: *const GLvoid,
+    ) {
+        if self.verbose {
+            log_file_only!(
+                "glBufferSubData(target={:#x}, offset={}, size={}, data={:?})",
+                target,
+                offset,
+                size,
+                data
+            );
+        }
+        self.inner.BufferSubData(target, offset, size, data);
     }
     unsafe fn Color4x(&mut self, _red: GLfixed, _green: GLfixed, _blue: GLfixed, _alpha: GLfixed) {
         self.inner.Color4x(_red, _green, _blue, _alpha);
@@ -637,13 +824,24 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn Normal3x(&mut self, _nx: GLfixed, _ny: GLfixed, _nz: GLfixed) {
         self.inner.Normal3x(_nx, _ny, _nz);
     }
-    unsafe fn ColorPointer( &mut self, _size: GLint, _type_: GLenum, _stride: GLsizei, _pointer: *const GLvoid, ) {
+    unsafe fn ColorPointer(
+        &mut self,
+        _size: GLint,
+        _type_: GLenum,
+        _stride: GLsizei,
+        _pointer: *const GLvoid,
+    ) {
         self.inner.ColorPointer(_size, _type_, _stride, _pointer);
     }
     unsafe fn NormalPointer(&mut self, _type_: GLenum, _stride: GLsizei, _pointer: *const GLvoid) {
         self.inner.NormalPointer(_type_, _stride, _pointer);
     }
-    unsafe fn PointSizePointerOES( &mut self, type_: GLenum, stride: GLsizei, pointer: *const GLvoid, ) {
+    unsafe fn PointSizePointerOES(
+        &mut self,
+        type_: GLenum,
+        stride: GLsizei,
+        pointer: *const GLvoid,
+    ) {
         self.inner.PointSizePointerOES(type_, stride, pointer);
     }
     unsafe fn CurrentPaletteMatrixOES(&mut self, _matrixpaletteindex: GLuint) {
@@ -652,16 +850,43 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn LoadPaletteFromModelViewMatrixOES(&mut self) {
         self.inner.LoadPaletteFromModelViewMatrixOES();
     }
-    unsafe fn MatrixIndexPointerOES( &mut self, _size: GLint, _type_: GLenum, _stride: GLsizei, _pointer: *const GLvoid, ) {
-        self.inner.MatrixIndexPointerOES(_size, _type_, _stride, _pointer);
+    unsafe fn MatrixIndexPointerOES(
+        &mut self,
+        _size: GLint,
+        _type_: GLenum,
+        _stride: GLsizei,
+        _pointer: *const GLvoid,
+    ) {
+        self.inner
+            .MatrixIndexPointerOES(_size, _type_, _stride, _pointer);
     }
-    unsafe fn WeightPointerOES( &mut self, _size: GLint, _type_: GLenum, _stride: GLsizei, _pointer: *const GLvoid, ) {
-        self.inner.WeightPointerOES(_size, _type_, _stride, _pointer);
+    unsafe fn WeightPointerOES(
+        &mut self,
+        _size: GLint,
+        _type_: GLenum,
+        _stride: GLsizei,
+        _pointer: *const GLvoid,
+    ) {
+        self.inner
+            .WeightPointerOES(_size, _type_, _stride, _pointer);
     }
-    unsafe fn DrawTexfOES( &mut self, x: GLfloat, y: GLfloat, z: GLfloat, width: GLfloat, height: GLfloat, ) {
+    unsafe fn DrawTexfOES(
+        &mut self,
+        x: GLfloat,
+        y: GLfloat,
+        z: GLfloat,
+        width: GLfloat,
+        height: GLfloat,
+    ) {
         self.inner.DrawTexfOES(x, y, z, width, height);
     }
-    unsafe fn ClearColorx( &mut self, _red: GLclampx, _green: GLclampx, _blue: GLclampx, _alpha: GLclampx, ) {
+    unsafe fn ClearColorx(
+        &mut self,
+        _red: GLclampx,
+        _green: GLclampx,
+        _blue: GLclampx,
+        _alpha: GLclampx,
+    ) {
         self.inner.ClearColorx(_red, _green, _blue, _alpha);
     }
     unsafe fn ClearDepthf(&mut self, _depth: GLclampf) {
@@ -700,20 +925,103 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn TexParameterxv(&mut self, _target: GLenum, _pname: GLenum, _params: *const GLfixed) {
         self.inner.TexParameterxv(_target, _pname, _params);
     }
-    unsafe fn TexSubImage2D( &mut self, _target: GLenum, _level: GLint, _xoffset: GLint, _yoffset: GLint, _width: GLsizei, _height: GLsizei, _format: GLenum, _type_: GLenum, _pixels: *const GLvoid, ) {
-        self.inner.TexSubImage2D(_target, _level, _xoffset, _yoffset, _width, _height, _format, _type_, _pixels);
+    unsafe fn TexSubImage2D(
+        &mut self,
+        _target: GLenum,
+        _level: GLint,
+        _xoffset: GLint,
+        _yoffset: GLint,
+        _width: GLsizei,
+        _height: GLsizei,
+        _format: GLenum,
+        _type_: GLenum,
+        _pixels: *const GLvoid,
+    ) {
+        self.inner.TexSubImage2D(
+            _target, _level, _xoffset, _yoffset, _width, _height, _format, _type_, _pixels,
+        );
     }
-    unsafe fn CompressedTexImage2D( &mut self, _target: GLenum, _level: GLint, _internalformat: GLenum, _width: GLsizei, _height: GLsizei, _border: GLint, _image_size: GLsizei, _data: *const GLvoid, ) {
-        self.inner.CompressedTexImage2D(_target, _level, _internalformat, _width, _height, _border, _image_size, _data);
+    unsafe fn CompressedTexImage2D(
+        &mut self,
+        _target: GLenum,
+        _level: GLint,
+        _internalformat: GLenum,
+        _width: GLsizei,
+        _height: GLsizei,
+        _border: GLint,
+        _image_size: GLsizei,
+        _data: *const GLvoid,
+    ) {
+        self.inner.CompressedTexImage2D(
+            _target,
+            _level,
+            _internalformat,
+            _width,
+            _height,
+            _border,
+            _image_size,
+            _data,
+        );
     }
-    unsafe fn CompressedTexSubImage2D( &mut self, _target: GLenum, _level: GLint, _xoffset: GLint, _yoffset: GLint, _width: GLsizei, _height: GLsizei, _format: GLenum, _image_size: GLsizei, _data: *const GLvoid, ) {
-        self.inner.CompressedTexSubImage2D(_target, _level, _xoffset, _yoffset, _width, _height, _format, _image_size, _data);
+    unsafe fn CompressedTexSubImage2D(
+        &mut self,
+        _target: GLenum,
+        _level: GLint,
+        _xoffset: GLint,
+        _yoffset: GLint,
+        _width: GLsizei,
+        _height: GLsizei,
+        _format: GLenum,
+        _image_size: GLsizei,
+        _data: *const GLvoid,
+    ) {
+        self.inner.CompressedTexSubImage2D(
+            _target,
+            _level,
+            _xoffset,
+            _yoffset,
+            _width,
+            _height,
+            _format,
+            _image_size,
+            _data,
+        );
     }
-    unsafe fn CopyTexImage2D( &mut self, _target: GLenum, _level: GLint, _internalformat: GLenum, _x: GLint, _y: GLint, _width: GLsizei, _height: GLsizei, _border: GLint, ) {
-        self.inner.CopyTexImage2D(_target, _level, _internalformat, _x, _y, _width, _height, _border);
+    unsafe fn CopyTexImage2D(
+        &mut self,
+        _target: GLenum,
+        _level: GLint,
+        _internalformat: GLenum,
+        _x: GLint,
+        _y: GLint,
+        _width: GLsizei,
+        _height: GLsizei,
+        _border: GLint,
+    ) {
+        self.inner.CopyTexImage2D(
+            _target,
+            _level,
+            _internalformat,
+            _x,
+            _y,
+            _width,
+            _height,
+            _border,
+        );
     }
-    unsafe fn CopyTexSubImage2D( &mut self, _target: GLenum, _level: GLint, _xoffset: GLint, _yoffset: GLint, _x: GLint, _y: GLint, _width: GLsizei, _height: GLsizei, ) {
-        self.inner.CopyTexSubImage2D(_target, _level, _xoffset, _yoffset, _x, _y, _width, _height);
+    unsafe fn CopyTexSubImage2D(
+        &mut self,
+        _target: GLenum,
+        _level: GLint,
+        _xoffset: GLint,
+        _yoffset: GLint,
+        _x: GLint,
+        _y: GLint,
+        _width: GLsizei,
+        _height: GLsizei,
+    ) {
+        self.inner
+            .CopyTexSubImage2D(_target, _level, _xoffset, _yoffset, _x, _y, _width, _height);
     }
     unsafe fn TexEnvf(&mut self, _target: GLenum, _pname: GLenum, _param: GLfloat) {
         self.inner.TexEnvf(_target, _pname, _param);
@@ -739,7 +1047,14 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn DrawTexiOES(&mut self, x: GLint, y: GLint, z: GLint, width: GLint, height: GLint) {
         self.inner.DrawTexiOES(x, y, z, width, height);
     }
-    unsafe fn DrawTexxOES( &mut self, x: GLfixed, y: GLfixed, z: GLfixed, width: GLfixed, height: GLfixed, ) {
+    unsafe fn DrawTexxOES(
+        &mut self,
+        x: GLfixed,
+        y: GLfixed,
+        z: GLfixed,
+        width: GLfixed,
+        height: GLfixed,
+    ) {
         self.inner.DrawTexxOES(x, y, z, width, height);
     }
     unsafe fn DrawTexsvOES(&mut self, coords: *const i16) {
@@ -754,10 +1069,24 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn DrawTexfvOES(&mut self, coords: *const GLfloat) {
         self.inner.DrawTexfvOES(coords);
     }
-    unsafe fn MultiTexCoord4f( &mut self, _target: GLenum, _s: GLfloat, _t: GLfloat, _r: GLfloat, _q: GLfloat, ) {
+    unsafe fn MultiTexCoord4f(
+        &mut self,
+        _target: GLenum,
+        _s: GLfloat,
+        _t: GLfloat,
+        _r: GLfloat,
+        _q: GLfloat,
+    ) {
         self.inner.MultiTexCoord4f(_target, _s, _t, _r, _q);
     }
-    unsafe fn MultiTexCoord4x( &mut self, _target: GLenum, _s: GLfixed, _t: GLfixed, _r: GLfixed, _q: GLfixed, ) {
+    unsafe fn MultiTexCoord4x(
+        &mut self,
+        _target: GLenum,
+        _s: GLfixed,
+        _t: GLfixed,
+        _r: GLfixed,
+        _q: GLfixed,
+    ) {
         self.inner.MultiTexCoord4x(_target, _s, _t, _r, _q);
     }
     unsafe fn LoadMatrixx(&mut self, _m: *const GLfixed) {
@@ -769,14 +1098,40 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn MultMatrixx(&mut self, _m: *const GLfixed) {
         self.inner.MultMatrixx(_m);
     }
-    unsafe fn Orthox( &mut self, _left: GLfixed, _right: GLfixed, _bottom: GLfixed, _top: GLfixed, _near: GLfixed, _far: GLfixed, ) {
+    unsafe fn Orthox(
+        &mut self,
+        _left: GLfixed,
+        _right: GLfixed,
+        _bottom: GLfixed,
+        _top: GLfixed,
+        _near: GLfixed,
+        _far: GLfixed,
+    ) {
         self.inner.Orthox(_left, _right, _bottom, _top, _near, _far);
     }
-    unsafe fn Frustumf( &mut self, _left: GLfloat, _right: GLfloat, _bottom: GLfloat, _top: GLfloat, _near: GLfloat, _far: GLfloat, ) {
-        self.inner.Frustumf(_left, _right, _bottom, _top, _near, _far);
+    unsafe fn Frustumf(
+        &mut self,
+        _left: GLfloat,
+        _right: GLfloat,
+        _bottom: GLfloat,
+        _top: GLfloat,
+        _near: GLfloat,
+        _far: GLfloat,
+    ) {
+        self.inner
+            .Frustumf(_left, _right, _bottom, _top, _near, _far);
     }
-    unsafe fn Frustumx( &mut self, _left: GLfixed, _right: GLfixed, _bottom: GLfixed, _top: GLfixed, _near: GLfixed, _far: GLfixed, ) {
-        self.inner.Frustumx(_left, _right, _bottom, _top, _near, _far);
+    unsafe fn Frustumx(
+        &mut self,
+        _left: GLfixed,
+        _right: GLfixed,
+        _bottom: GLfixed,
+        _top: GLfixed,
+        _near: GLfixed,
+        _far: GLfixed,
+    ) {
+        self.inner
+            .Frustumx(_left, _right, _bottom, _top, _near, _far);
     }
     unsafe fn Rotatef(&mut self, _angle: GLfloat, _x: GLfloat, _y: GLfloat, _z: GLfloat) {
         self.inner.Rotatef(_angle, _x, _y, _z);
@@ -814,20 +1169,59 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn BindRenderbufferOES(&mut self, _target: GLenum, _renderbuffer: GLuint) {
         self.inner.BindRenderbufferOES(_target, _renderbuffer);
     }
-    unsafe fn RenderbufferStorageOES( &mut self, _target: GLenum, _internalformat: GLenum, _width: GLsizei, _height: GLsizei, ) {
-        self.inner.RenderbufferStorageOES(_target, _internalformat, _width, _height);
+    unsafe fn RenderbufferStorageOES(
+        &mut self,
+        _target: GLenum,
+        _internalformat: GLenum,
+        _width: GLsizei,
+        _height: GLsizei,
+    ) {
+        self.inner
+            .RenderbufferStorageOES(_target, _internalformat, _width, _height);
     }
-    unsafe fn FramebufferRenderbufferOES( &mut self, _target: GLenum, _attachment: GLenum, _renderbuffertarget: GLenum, _renderbuffer: GLuint, ) {
-        self.inner.FramebufferRenderbufferOES(_target, _attachment, _renderbuffertarget, _renderbuffer);
+    unsafe fn FramebufferRenderbufferOES(
+        &mut self,
+        _target: GLenum,
+        _attachment: GLenum,
+        _renderbuffertarget: GLenum,
+        _renderbuffer: GLuint,
+    ) {
+        self.inner.FramebufferRenderbufferOES(
+            _target,
+            _attachment,
+            _renderbuffertarget,
+            _renderbuffer,
+        );
     }
-    unsafe fn FramebufferTexture2DOES( &mut self, _target: GLenum, _attachment: GLenum, _textarget: GLenum, _texture: GLuint, _level: i32, ) {
-        self.inner.FramebufferTexture2DOES(_target, _attachment, _textarget, _texture, _level);
+    unsafe fn FramebufferTexture2DOES(
+        &mut self,
+        _target: GLenum,
+        _attachment: GLenum,
+        _textarget: GLenum,
+        _texture: GLuint,
+        _level: i32,
+    ) {
+        self.inner
+            .FramebufferTexture2DOES(_target, _attachment, _textarget, _texture, _level);
     }
-    unsafe fn GetFramebufferAttachmentParameterivOES( &mut self, _target: GLenum, _attachment: GLenum, _pname: GLenum, _params: *mut GLint, ) {
-        self.inner.GetFramebufferAttachmentParameterivOES(_target, _attachment, _pname, _params);
+    unsafe fn GetFramebufferAttachmentParameterivOES(
+        &mut self,
+        _target: GLenum,
+        _attachment: GLenum,
+        _pname: GLenum,
+        _params: *mut GLint,
+    ) {
+        self.inner
+            .GetFramebufferAttachmentParameterivOES(_target, _attachment, _pname, _params);
     }
-    unsafe fn GetRenderbufferParameterivOES( &mut self, _target: GLenum, _pname: GLenum, _params: *mut GLint, ) {
-        self.inner.GetRenderbufferParameterivOES(_target, _pname, _params);
+    unsafe fn GetRenderbufferParameterivOES(
+        &mut self,
+        _target: GLenum,
+        _pname: GLenum,
+        _params: *mut GLint,
+    ) {
+        self.inner
+            .GetRenderbufferParameterivOES(_target, _pname, _params);
     }
     unsafe fn CheckFramebufferStatusOES(&mut self, _target: GLenum) -> GLenum {
         self.inner.CheckFramebufferStatusOES(_target)
@@ -841,8 +1235,21 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn GenerateMipmapOES(&mut self, _target: GLenum) {
         self.inner.GenerateMipmapOES(_target);
     }
-    unsafe fn RenderbufferStorageMultisampleAPPLE( &mut self, target: GLenum, samples: GLsizei, internalformat: GLenum, width: GLsizei, height: GLsizei, ) {
-        self.inner.RenderbufferStorageMultisampleAPPLE(target, samples, internalformat, width, height);
+    unsafe fn RenderbufferStorageMultisampleAPPLE(
+        &mut self,
+        target: GLenum,
+        samples: GLsizei,
+        internalformat: GLenum,
+        width: GLsizei,
+        height: GLsizei,
+    ) {
+        self.inner.RenderbufferStorageMultisampleAPPLE(
+            target,
+            samples,
+            internalformat,
+            width,
+            height,
+        );
     }
     unsafe fn ResolveMultisampleFramebufferAPPLE(&mut self) {
         self.inner.ResolveMultisampleFramebufferAPPLE();
@@ -862,11 +1269,26 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn BindRenderbuffer(&mut self, _target: GLenum, _renderbuffer: GLuint) {
         self.inner.BindRenderbuffer(_target, _renderbuffer);
     }
-    unsafe fn RenderbufferStorage( &mut self, _target: GLenum, _internalformat: GLenum, _width: GLsizei, _height: GLsizei, ) {
-        self.inner.RenderbufferStorage(_target, _internalformat, _width, _height);
+    unsafe fn RenderbufferStorage(
+        &mut self,
+        _target: GLenum,
+        _internalformat: GLenum,
+        _width: GLsizei,
+        _height: GLsizei,
+    ) {
+        self.inner
+            .RenderbufferStorage(_target, _internalformat, _width, _height);
     }
-    unsafe fn FramebufferTexture2D( &mut self, _target: GLenum, _attachment: GLenum, _textarget: GLenum, _texture: GLuint, _level: i32, ) {
-        self.inner.FramebufferTexture2D(_target, _attachment, _textarget, _texture, _level);
+    unsafe fn FramebufferTexture2D(
+        &mut self,
+        _target: GLenum,
+        _attachment: GLenum,
+        _textarget: GLenum,
+        _texture: GLuint,
+        _level: i32,
+    ) {
+        self.inner
+            .FramebufferTexture2D(_target, _attachment, _textarget, _texture, _level);
     }
     unsafe fn CheckFramebufferStatus(&mut self, _target: GLenum) -> GLenum {
         self.inner.CheckFramebufferStatus(_target)
@@ -880,13 +1302,31 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn GenerateMipmap(&mut self, _target: GLenum) {
         self.inner.GenerateMipmap(_target);
     }
-    unsafe fn GetFramebufferAttachmentParameteriv( &mut self, _target: GLenum, _attachment: GLenum, _pname: GLenum, _params: *mut GLint, ) {
-        self.inner.GetFramebufferAttachmentParameteriv(_target, _attachment, _pname, _params);
+    unsafe fn GetFramebufferAttachmentParameteriv(
+        &mut self,
+        _target: GLenum,
+        _attachment: GLenum,
+        _pname: GLenum,
+        _params: *mut GLint,
+    ) {
+        self.inner
+            .GetFramebufferAttachmentParameteriv(_target, _attachment, _pname, _params);
     }
-    unsafe fn GetRenderbufferParameteriv( &mut self, _target: GLenum, _pname: GLenum, _params: *mut GLint, ) {
-        self.inner.GetRenderbufferParameteriv(_target, _pname, _params);
+    unsafe fn GetRenderbufferParameteriv(
+        &mut self,
+        _target: GLenum,
+        _pname: GLenum,
+        _params: *mut GLint,
+    ) {
+        self.inner
+            .GetRenderbufferParameteriv(_target, _pname, _params);
     }
-    unsafe fn GetBufferParameteriv( &mut self, _target: GLenum, _pname: GLenum, _params: *mut GLint, ) {
+    unsafe fn GetBufferParameteriv(
+        &mut self,
+        _target: GLenum,
+        _pname: GLenum,
+        _params: *mut GLint,
+    ) {
         self.inner.GetBufferParameteriv(_target, _pname, _params);
     }
     unsafe fn MapBufferOES(&mut self, _target: GLenum, _access: GLenum) -> *mut GLvoid {
@@ -901,7 +1341,13 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn DeleteShader(&mut self, _shader: GLuint) {
         self.inner.DeleteShader(_shader);
     }
-    unsafe fn ShaderSource( &mut self, _shader: GLuint, _count: GLsizei, _string: *const *const GLchar, _length: *const GLint, ) {
+    unsafe fn ShaderSource(
+        &mut self,
+        _shader: GLuint,
+        _count: GLsizei,
+        _string: *const *const GLchar,
+        _length: *const GLint,
+    ) {
         self.inner.ShaderSource(_shader, _count, _string, _length);
     }
     unsafe fn CompileShader(&mut self, _shader: GLuint) {
@@ -910,8 +1356,15 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn GetShaderiv(&mut self, _shader: GLuint, _pname: GLenum, _params: *mut GLint) {
         self.inner.GetShaderiv(_shader, _pname, _params);
     }
-    unsafe fn GetShaderInfoLog( &mut self, _shader: GLuint, _maxLength: GLsizei, _length: *mut GLsizei, _infoLog: *mut GLchar, ) {
-        self.inner.GetShaderInfoLog(_shader, _maxLength, _length, _infoLog);
+    unsafe fn GetShaderInfoLog(
+        &mut self,
+        _shader: GLuint,
+        _maxLength: GLsizei,
+        _length: *mut GLsizei,
+        _infoLog: *mut GLchar,
+    ) {
+        self.inner
+            .GetShaderInfoLog(_shader, _maxLength, _length, _infoLog);
     }
     unsafe fn IsShader(&mut self, _shader: GLuint) -> GLboolean {
         self.inner.IsShader(_shader)
@@ -937,8 +1390,15 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn GetProgramiv(&mut self, _program: GLuint, _pname: GLenum, _params: *mut GLint) {
         self.inner.GetProgramiv(_program, _pname, _params);
     }
-    unsafe fn GetProgramInfoLog( &mut self, _program: GLuint, _maxLength: GLsizei, _length: *mut GLsizei, _infoLog: *mut GLchar, ) {
-        self.inner.GetProgramInfoLog(_program, _maxLength, _length, _infoLog);
+    unsafe fn GetProgramInfoLog(
+        &mut self,
+        _program: GLuint,
+        _maxLength: GLsizei,
+        _length: *mut GLsizei,
+        _infoLog: *mut GLchar,
+    ) {
+        self.inner
+            .GetProgramInfoLog(_program, _maxLength, _length, _infoLog);
     }
     unsafe fn IsProgram(&mut self, _program: GLuint) -> GLboolean {
         self.inner.IsProgram(_program)
@@ -946,7 +1406,12 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn ValidateProgram(&mut self, _program: GLuint) {
         self.inner.ValidateProgram(_program);
     }
-    unsafe fn BindAttribLocation( &mut self, _program: GLuint, _index: GLuint, _name: *const GLchar, ) {
+    unsafe fn BindAttribLocation(
+        &mut self,
+        _program: GLuint,
+        _index: GLuint,
+        _name: *const GLchar,
+    ) {
         self.inner.BindAttribLocation(_program, _index, _name);
     }
     unsafe fn GetAttribLocation(&mut self, _program: GLuint, _name: *const GLchar) -> GLint {
@@ -955,11 +1420,31 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn GetUniformLocation(&mut self, _program: GLuint, _name: *const GLchar) -> GLint {
         self.inner.GetUniformLocation(_program, _name)
     }
-    unsafe fn GetActiveAttrib( &mut self, _program: GLuint, _index: GLuint, _bufSize: GLsizei, _length: *mut GLsizei, _size: *mut GLint, _type_: *mut GLenum, _name: *mut GLchar, ) {
-        self.inner.GetActiveAttrib(_program, _index, _bufSize, _length, _size, _type_, _name);
+    unsafe fn GetActiveAttrib(
+        &mut self,
+        _program: GLuint,
+        _index: GLuint,
+        _bufSize: GLsizei,
+        _length: *mut GLsizei,
+        _size: *mut GLint,
+        _type_: *mut GLenum,
+        _name: *mut GLchar,
+    ) {
+        self.inner
+            .GetActiveAttrib(_program, _index, _bufSize, _length, _size, _type_, _name);
     }
-    unsafe fn GetActiveUniform( &mut self, _program: GLuint, _index: GLuint, _bufSize: GLsizei, _length: *mut GLsizei, _size: *mut GLint, _type_: *mut GLenum, _name: *mut GLchar, ) {
-        self.inner.GetActiveUniform(_program, _index, _bufSize, _length, _size, _type_, _name);
+    unsafe fn GetActiveUniform(
+        &mut self,
+        _program: GLuint,
+        _index: GLuint,
+        _bufSize: GLsizei,
+        _length: *mut GLsizei,
+        _size: *mut GLint,
+        _type_: *mut GLenum,
+        _name: *mut GLchar,
+    ) {
+        self.inner
+            .GetActiveUniform(_program, _index, _bufSize, _length, _size, _type_, _name);
     }
     unsafe fn EnableVertexAttribArray(&mut self, _index: GLuint) {
         self.inner.EnableVertexAttribArray(_index);
@@ -967,8 +1452,20 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn DisableVertexAttribArray(&mut self, _index: GLuint) {
         self.inner.DisableVertexAttribArray(_index);
     }
-    unsafe fn VertexAttribPointer( &mut self, _index: GLuint, _size: GLint, _type_: GLenum, _normalized: GLboolean, _stride: GLsizei, _pointer: *const GLvoid, ) {
-        self.inner.VertexAttribPointer(_index, _size, _type_, _normalized, _stride, _pointer);
+    unsafe fn VertexAttribPointer(
+        &mut self,
+        index: GLuint,
+        size: GLint,
+        type_: GLenum,
+        normalized: GLboolean,
+        stride: GLsizei,
+        pointer: *const GLvoid,
+    ) {
+        if self.verbose {
+            log_file_only!("glVertexAttribPointer(index={}, size={}, type={:#x}, normalized={}, stride={}, pointer={:?})", index, size, type_, normalized, stride, pointer);
+        }
+        self.inner
+            .VertexAttribPointer(index, size, type_, normalized, stride, pointer);
     }
     unsafe fn VertexAttrib1f(&mut self, _index: GLuint, _x: GLfloat) {
         self.inner.VertexAttrib1f(_index, _x);
@@ -979,7 +1476,14 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn VertexAttrib3f(&mut self, _index: GLuint, _x: GLfloat, _y: GLfloat, _z: GLfloat) {
         self.inner.VertexAttrib3f(_index, _x, _y, _z);
     }
-    unsafe fn VertexAttrib4f( &mut self, _index: GLuint, _x: GLfloat, _y: GLfloat, _z: GLfloat, _w: GLfloat, ) {
+    unsafe fn VertexAttrib4f(
+        &mut self,
+        _index: GLuint,
+        _x: GLfloat,
+        _y: GLfloat,
+        _z: GLfloat,
+        _w: GLfloat,
+    ) {
         self.inner.VertexAttrib4f(_index, _x, _y, _z, _w);
     }
     unsafe fn VertexAttrib1fv(&mut self, _index: GLuint, _v: *const GLfloat) {
@@ -1003,7 +1507,14 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn Uniform3f(&mut self, _location: GLint, _v0: GLfloat, _v1: GLfloat, _v2: GLfloat) {
         self.inner.Uniform3f(_location, _v0, _v1, _v2);
     }
-    unsafe fn Uniform4f( &mut self, _location: GLint, _v0: GLfloat, _v1: GLfloat, _v2: GLfloat, _v3: GLfloat, ) {
+    unsafe fn Uniform4f(
+        &mut self,
+        _location: GLint,
+        _v0: GLfloat,
+        _v1: GLfloat,
+        _v2: GLfloat,
+        _v3: GLfloat,
+    ) {
         self.inner.Uniform4f(_location, _v0, _v1, _v2, _v3);
     }
     unsafe fn Uniform1i(&mut self, _location: GLint, _v0: GLint) {
@@ -1015,7 +1526,14 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn Uniform3i(&mut self, _location: GLint, _v0: GLint, _v1: GLint, _v2: GLint) {
         self.inner.Uniform3i(_location, _v0, _v1, _v2);
     }
-    unsafe fn Uniform4i( &mut self, _location: GLint, _v0: GLint, _v1: GLint, _v2: GLint, _v3: GLint, ) {
+    unsafe fn Uniform4i(
+        &mut self,
+        _location: GLint,
+        _v0: GLint,
+        _v1: GLint,
+        _v2: GLint,
+        _v3: GLint,
+    ) {
         self.inner.Uniform4i(_location, _v0, _v1, _v2, _v3);
     }
     unsafe fn Uniform1fv(&mut self, _location: GLint, _count: GLsizei, _value: *const GLfloat) {
@@ -1042,14 +1560,35 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn Uniform4iv(&mut self, _location: GLint, _count: GLsizei, _value: *const GLint) {
         self.inner.Uniform4iv(_location, _count, _value);
     }
-    unsafe fn UniformMatrix2fv( &mut self, _location: GLint, _count: GLsizei, _transpose: GLboolean, _value: *const GLfloat, ) {
-        self.inner.UniformMatrix2fv(_location, _count, _transpose, _value);
+    unsafe fn UniformMatrix2fv(
+        &mut self,
+        _location: GLint,
+        _count: GLsizei,
+        _transpose: GLboolean,
+        _value: *const GLfloat,
+    ) {
+        self.inner
+            .UniformMatrix2fv(_location, _count, _transpose, _value);
     }
-    unsafe fn UniformMatrix3fv( &mut self, _location: GLint, _count: GLsizei, _transpose: GLboolean, _value: *const GLfloat, ) {
-        self.inner.UniformMatrix3fv(_location, _count, _transpose, _value);
+    unsafe fn UniformMatrix3fv(
+        &mut self,
+        _location: GLint,
+        _count: GLsizei,
+        _transpose: GLboolean,
+        _value: *const GLfloat,
+    ) {
+        self.inner
+            .UniformMatrix3fv(_location, _count, _transpose, _value);
     }
-    unsafe fn UniformMatrix4fv( &mut self, _location: GLint, _count: GLsizei, _transpose: GLboolean, _value: *const GLfloat, ) {
-        self.inner.UniformMatrix4fv(_location, _count, _transpose, _value);
+    unsafe fn UniformMatrix4fv(
+        &mut self,
+        _location: GLint,
+        _count: GLsizei,
+        _transpose: GLboolean,
+        _value: *const GLfloat,
+    ) {
+        self.inner
+            .UniformMatrix4fv(_location, _count, _transpose, _value);
     }
     unsafe fn BlendColor(&mut self, _r: GLclampf, _g: GLclampf, _b: GLclampf, _a: GLclampf) {
         self.inner.BlendColor(_r, _g, _b, _a);
@@ -1060,14 +1599,34 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn BlendEquationSeparate(&mut self, _modeRGB: GLenum, _modeAlpha: GLenum) {
         self.inner.BlendEquationSeparate(_modeRGB, _modeAlpha);
     }
-    unsafe fn BlendFuncSeparate( &mut self, _srcRGB: GLenum, _dstRGB: GLenum, _srcAlpha: GLenum, _dstAlpha: GLenum, ) {
-        self.inner.BlendFuncSeparate(_srcRGB, _dstRGB, _srcAlpha, _dstAlpha);
+    unsafe fn BlendFuncSeparate(
+        &mut self,
+        _srcRGB: GLenum,
+        _dstRGB: GLenum,
+        _srcAlpha: GLenum,
+        _dstAlpha: GLenum,
+    ) {
+        self.inner
+            .BlendFuncSeparate(_srcRGB, _dstRGB, _srcAlpha, _dstAlpha);
     }
-    unsafe fn StencilFuncSeparate( &mut self, _face: GLenum, _func: GLenum, _ref_: GLint, _mask: GLuint, ) {
+    unsafe fn StencilFuncSeparate(
+        &mut self,
+        _face: GLenum,
+        _func: GLenum,
+        _ref_: GLint,
+        _mask: GLuint,
+    ) {
         self.inner.StencilFuncSeparate(_face, _func, _ref_, _mask);
     }
-    unsafe fn StencilOpSeparate( &mut self, _face: GLenum, _sfail: GLenum, _dpfail: GLenum, _dppass: GLenum, ) {
-        self.inner.StencilOpSeparate(_face, _sfail, _dpfail, _dppass);
+    unsafe fn StencilOpSeparate(
+        &mut self,
+        _face: GLenum,
+        _sfail: GLenum,
+        _dpfail: GLenum,
+        _dppass: GLenum,
+    ) {
+        self.inner
+            .StencilOpSeparate(_face, _sfail, _dpfail, _dppass);
     }
     unsafe fn StencilMaskSeparate(&mut self, _face: GLenum, _mask: GLuint) {
         self.inner.StencilMaskSeparate(_face, _mask);
@@ -1078,7 +1637,12 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn GetVertexAttribfv(&mut self, _index: GLuint, _pname: GLenum, _params: *mut GLfloat) {
         self.inner.GetVertexAttribfv(_index, _pname, _params);
     }
-    unsafe fn GetVertexAttribPointerv( &mut self, _index: GLuint, _pname: GLenum, _pointer: *mut *mut GLvoid, ) {
+    unsafe fn GetVertexAttribPointerv(
+        &mut self,
+        _index: GLuint,
+        _pname: GLenum,
+        _pointer: *mut *mut GLvoid,
+    ) {
         self.inner.GetVertexAttribPointerv(_index, _pname, _pointer);
     }
     unsafe fn GetUniformiv(&mut self, _program: GLuint, _location: GLint, _params: *mut GLint) {
@@ -1087,20 +1651,49 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn GetUniformfv(&mut self, _program: GLuint, _location: GLint, _params: *mut GLfloat) {
         self.inner.GetUniformfv(_program, _location, _params);
     }
-    unsafe fn GetAttachedShaders( &mut self, _program: GLuint, _maxCount: GLsizei, _count: *mut GLsizei, _shaders: *mut GLuint, ) {
-        self.inner.GetAttachedShaders(_program, _maxCount, _count, _shaders);
+    unsafe fn GetAttachedShaders(
+        &mut self,
+        _program: GLuint,
+        _maxCount: GLsizei,
+        _count: *mut GLsizei,
+        _shaders: *mut GLuint,
+    ) {
+        self.inner
+            .GetAttachedShaders(_program, _maxCount, _count, _shaders);
     }
-    unsafe fn GetShaderSource( &mut self, _shader: GLuint, _bufSize: GLsizei, _length: *mut GLsizei, _source: *mut GLchar, ) {
-        self.inner.GetShaderSource(_shader, _bufSize, _length, _source);
+    unsafe fn GetShaderSource(
+        &mut self,
+        _shader: GLuint,
+        _bufSize: GLsizei,
+        _length: *mut GLsizei,
+        _source: *mut GLchar,
+    ) {
+        self.inner
+            .GetShaderSource(_shader, _bufSize, _length, _source);
     }
     unsafe fn ReleaseShaderCompiler(&mut self) {
         self.inner.ReleaseShaderCompiler();
     }
-    unsafe fn GetShaderPrecisionFormat( &mut self, _shadertype: GLenum, _precisiontype: GLenum, _range: *mut GLint, _precision: *mut GLint, ) {
-        self.inner.GetShaderPrecisionFormat(_shadertype, _precisiontype, _range, _precision);
+    unsafe fn GetShaderPrecisionFormat(
+        &mut self,
+        _shadertype: GLenum,
+        _precisiontype: GLenum,
+        _range: *mut GLint,
+        _precision: *mut GLint,
+    ) {
+        self.inner
+            .GetShaderPrecisionFormat(_shadertype, _precisiontype, _range, _precision);
     }
-    unsafe fn ShaderBinary( &mut self, _count: GLsizei, _shaders: *const GLuint, _binaryformat: GLenum, _binary: *const GLvoid, _length: GLsizei, ) {
-        self.inner.ShaderBinary(_count, _shaders, _binaryformat, _binary, _length);
+    unsafe fn ShaderBinary(
+        &mut self,
+        _count: GLsizei,
+        _shaders: *const GLuint,
+        _binaryformat: GLenum,
+        _binary: *const GLvoid,
+        _length: GLsizei,
+    ) {
+        self.inner
+            .ShaderBinary(_count, _shaders, _binaryformat, _binary, _length);
     }
     unsafe fn IsVertexArray(&mut self, _array: GLuint) -> GLboolean {
         self.inner.IsVertexArray(_array)
@@ -1126,65 +1719,291 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn IsVertexArrayOES(&mut self, _array: GLuint) -> GLboolean {
         self.inner.IsVertexArrayOES(_array)
     }
-    unsafe fn MapBufferRange( &mut self, _target: GLenum, _offset: GLintptr, _length: GLsizeiptr, _access: GLbitfield, ) -> *mut GLvoid {
-        self.inner.MapBufferRange(_target, _offset, _length, _access)
+    unsafe fn MapBufferRange(
+        &mut self,
+        target: GLenum,
+        offset: GLintptr,
+        length: GLsizeiptr,
+        access: GLbitfield,
+    ) -> *mut GLvoid {
+        if self.verbose {
+            log_file_only!(
+                "glMapBufferRange(target={:#x}, offset={}, length={}, access={:#x})",
+                target,
+                offset,
+                length,
+                access
+            );
+        }
+        let pointer = self.inner.MapBufferRange(target, offset, length, access);
+        if self.verbose {
+            log_file_only!("glMapBufferRange returned {:?}", pointer);
+        }
+        pointer
     }
-    unsafe fn FlushMappedBufferRange( &mut self, _target: GLenum, _offset: GLintptr, _length: GLsizeiptr, ) {
-        self.inner.FlushMappedBufferRange(_target, _offset, _length);
+    unsafe fn FlushMappedBufferRange(
+        &mut self,
+        target: GLenum,
+        offset: GLintptr,
+        length: GLsizeiptr,
+    ) {
+        if self.verbose {
+            log_file_only!(
+                "glFlushMappedBufferRange(target={:#x}, offset={}, length={})",
+                target,
+                offset,
+                length
+            );
+        }
+        self.inner.FlushMappedBufferRange(target, offset, length);
     }
-    unsafe fn GetBufferPointerv( &mut self, _target: GLenum, _pname: GLenum, _params: *mut *mut GLvoid, ) {
+    unsafe fn GetBufferPointerv(
+        &mut self,
+        _target: GLenum,
+        _pname: GLenum,
+        _params: *mut *mut GLvoid,
+    ) {
         self.inner.GetBufferPointerv(_target, _pname, _params);
     }
-    unsafe fn GetBufferParameteri64v( &mut self, _target: GLenum, _pname: GLenum, _params: *mut i64, ) {
+    unsafe fn GetBufferParameteri64v(
+        &mut self,
+        _target: GLenum,
+        _pname: GLenum,
+        _params: *mut i64,
+    ) {
         self.inner.GetBufferParameteri64v(_target, _pname, _params);
     }
-    unsafe fn CopyBufferSubData( &mut self, _readTarget: GLenum, _writeTarget: GLenum, _readOffset: GLintptr, _writeOffset: GLintptr, _size: GLsizeiptr, ) {
-        self.inner.CopyBufferSubData(_readTarget, _writeTarget, _readOffset, _writeOffset, _size);
+    unsafe fn CopyBufferSubData(
+        &mut self,
+        _readTarget: GLenum,
+        _writeTarget: GLenum,
+        _readOffset: GLintptr,
+        _writeOffset: GLintptr,
+        _size: GLsizeiptr,
+    ) {
+        self.inner
+            .CopyBufferSubData(_readTarget, _writeTarget, _readOffset, _writeOffset, _size);
     }
     unsafe fn BindBufferBase(&mut self, _target: GLenum, _index: GLuint, _buffer: GLuint) {
         self.inner.BindBufferBase(_target, _index, _buffer);
     }
-    unsafe fn BindBufferRange( &mut self, _target: GLenum, _index: GLuint, _buffer: GLuint, _offset: GLintptr, _size: GLsizeiptr, ) {
-        self.inner.BindBufferRange(_target, _index, _buffer, _offset, _size);
+    unsafe fn BindBufferRange(
+        &mut self,
+        _target: GLenum,
+        _index: GLuint,
+        _buffer: GLuint,
+        _offset: GLintptr,
+        _size: GLsizeiptr,
+    ) {
+        self.inner
+            .BindBufferRange(_target, _index, _buffer, _offset, _size);
     }
-    unsafe fn UnmapBuffer(&mut self, _target: GLenum) -> GLboolean {
-        self.inner.UnmapBuffer(_target)
+    unsafe fn UnmapBuffer(&mut self, target: GLenum) -> GLboolean {
+        let result = self.inner.UnmapBuffer(target);
+        if self.verbose {
+            log_file_only!("glUnmapBuffer(target={:#x}) returned {}", target, result);
+        }
+        result
     }
-    unsafe fn TexImage3D( &mut self, _target: GLenum, _level: GLint, _internalformat: GLint, _width: GLsizei, _height: GLsizei, _depth: GLsizei, _border: GLint, _format: GLenum, _type_: GLenum, _pixels: *const GLvoid, ) {
-        self.inner.TexImage3D(_target, _level, _internalformat, _width, _height, _depth, _border, _format, _type_, _pixels);
+    unsafe fn TexImage3D(
+        &mut self,
+        _target: GLenum,
+        _level: GLint,
+        _internalformat: GLint,
+        _width: GLsizei,
+        _height: GLsizei,
+        _depth: GLsizei,
+        _border: GLint,
+        _format: GLenum,
+        _type_: GLenum,
+        _pixels: *const GLvoid,
+    ) {
+        self.inner.TexImage3D(
+            _target,
+            _level,
+            _internalformat,
+            _width,
+            _height,
+            _depth,
+            _border,
+            _format,
+            _type_,
+            _pixels,
+        );
     }
-    unsafe fn TexSubImage3D( &mut self, _target: GLenum, _level: GLint, _xoffset: GLint, _yoffset: GLint, _zoffset: GLint, _width: GLsizei, _height: GLsizei, _depth: GLsizei, _format: GLenum, _type_: GLenum, _pixels: *const GLvoid, ) {
-        self.inner.TexSubImage3D(_target, _level, _xoffset, _yoffset, _zoffset, _width, _height, _depth, _format, _type_, _pixels);
+    unsafe fn TexSubImage3D(
+        &mut self,
+        _target: GLenum,
+        _level: GLint,
+        _xoffset: GLint,
+        _yoffset: GLint,
+        _zoffset: GLint,
+        _width: GLsizei,
+        _height: GLsizei,
+        _depth: GLsizei,
+        _format: GLenum,
+        _type_: GLenum,
+        _pixels: *const GLvoid,
+    ) {
+        self.inner.TexSubImage3D(
+            _target, _level, _xoffset, _yoffset, _zoffset, _width, _height, _depth, _format,
+            _type_, _pixels,
+        );
     }
-    unsafe fn CopyTexSubImage3D( &mut self, _target: GLenum, _level: GLint, _xoffset: GLint, _yoffset: GLint, _zoffset: GLint, _x: GLint, _y: GLint, _width: GLsizei, _height: GLsizei, ) {
-        self.inner.CopyTexSubImage3D(_target, _level, _xoffset, _yoffset, _zoffset, _x, _y, _width, _height);
+    unsafe fn CopyTexSubImage3D(
+        &mut self,
+        _target: GLenum,
+        _level: GLint,
+        _xoffset: GLint,
+        _yoffset: GLint,
+        _zoffset: GLint,
+        _x: GLint,
+        _y: GLint,
+        _width: GLsizei,
+        _height: GLsizei,
+    ) {
+        self.inner.CopyTexSubImage3D(
+            _target, _level, _xoffset, _yoffset, _zoffset, _x, _y, _width, _height,
+        );
     }
-    unsafe fn CompressedTexImage3D( &mut self, _target: GLenum, _level: GLint, _internalformat: GLenum, _width: GLsizei, _height: GLsizei, _depth: GLsizei, _border: GLint, _imageSize: GLsizei, _data: *const GLvoid, ) {
-        self.inner.CompressedTexImage3D(_target, _level, _internalformat, _width, _height, _depth, _border, _imageSize, _data);
+    unsafe fn CompressedTexImage3D(
+        &mut self,
+        _target: GLenum,
+        _level: GLint,
+        _internalformat: GLenum,
+        _width: GLsizei,
+        _height: GLsizei,
+        _depth: GLsizei,
+        _border: GLint,
+        _imageSize: GLsizei,
+        _data: *const GLvoid,
+    ) {
+        self.inner.CompressedTexImage3D(
+            _target,
+            _level,
+            _internalformat,
+            _width,
+            _height,
+            _depth,
+            _border,
+            _imageSize,
+            _data,
+        );
     }
-    unsafe fn CompressedTexSubImage3D( &mut self, _target: GLenum, _level: GLint, _xoffset: GLint, _yoffset: GLint, _zoffset: GLint, _width: GLsizei, _height: GLsizei, _depth: GLsizei, _format: GLenum, _imageSize: GLsizei, _data: *const GLvoid, ) {
-        self.inner.CompressedTexSubImage3D(_target, _level, _xoffset, _yoffset, _zoffset, _width, _height, _depth, _format, _imageSize, _data);
+    unsafe fn CompressedTexSubImage3D(
+        &mut self,
+        _target: GLenum,
+        _level: GLint,
+        _xoffset: GLint,
+        _yoffset: GLint,
+        _zoffset: GLint,
+        _width: GLsizei,
+        _height: GLsizei,
+        _depth: GLsizei,
+        _format: GLenum,
+        _imageSize: GLsizei,
+        _data: *const GLvoid,
+    ) {
+        self.inner.CompressedTexSubImage3D(
+            _target, _level, _xoffset, _yoffset, _zoffset, _width, _height, _depth, _format,
+            _imageSize, _data,
+        );
     }
-    unsafe fn TexStorage2D( &mut self, _target: GLenum, _levels: GLsizei, _internalformat: GLenum, _width: GLsizei, _height: GLsizei, ) {
-        self.inner.TexStorage2D(_target, _levels, _internalformat, _width, _height);
+    unsafe fn TexStorage2D(
+        &mut self,
+        _target: GLenum,
+        _levels: GLsizei,
+        _internalformat: GLenum,
+        _width: GLsizei,
+        _height: GLsizei,
+    ) {
+        self.inner
+            .TexStorage2D(_target, _levels, _internalformat, _width, _height);
     }
-    unsafe fn TexStorage3D( &mut self, _target: GLenum, _levels: GLsizei, _internalformat: GLenum, _width: GLsizei, _height: GLsizei, _depth: GLsizei, ) {
-        self.inner.TexStorage3D(_target, _levels, _internalformat, _width, _height, _depth);
+    unsafe fn TexStorage3D(
+        &mut self,
+        _target: GLenum,
+        _levels: GLsizei,
+        _internalformat: GLenum,
+        _width: GLsizei,
+        _height: GLsizei,
+        _depth: GLsizei,
+    ) {
+        self.inner
+            .TexStorage3D(_target, _levels, _internalformat, _width, _height, _depth);
     }
-    unsafe fn BlitFramebuffer( &mut self, _srcX0: GLint, _srcY0: GLint, _srcX1: GLint, _srcY1: GLint, _dstX0: GLint, _dstY0: GLint, _dstX1: GLint, _dstY1: GLint, _mask: GLbitfield, _filter: GLenum, ) {
-        self.inner.BlitFramebuffer(_srcX0, _srcY0, _srcX1, _srcY1, _dstX0, _dstY0, _dstX1, _dstY1, _mask, _filter);
+    unsafe fn BlitFramebuffer(
+        &mut self,
+        _srcX0: GLint,
+        _srcY0: GLint,
+        _srcX1: GLint,
+        _srcY1: GLint,
+        _dstX0: GLint,
+        _dstY0: GLint,
+        _dstX1: GLint,
+        _dstY1: GLint,
+        _mask: GLbitfield,
+        _filter: GLenum,
+    ) {
+        self.inner.BlitFramebuffer(
+            _srcX0, _srcY0, _srcX1, _srcY1, _dstX0, _dstY0, _dstX1, _dstY1, _mask, _filter,
+        );
     }
-    unsafe fn RenderbufferStorageMultisample( &mut self, _target: GLenum, _samples: GLsizei, _internalformat: GLenum, _width: GLsizei, _height: GLsizei, ) {
-        self.inner.RenderbufferStorageMultisample(_target, _samples, _internalformat, _width, _height);
+    unsafe fn RenderbufferStorageMultisample(
+        &mut self,
+        _target: GLenum,
+        _samples: GLsizei,
+        _internalformat: GLenum,
+        _width: GLsizei,
+        _height: GLsizei,
+    ) {
+        self.inner.RenderbufferStorageMultisample(
+            _target,
+            _samples,
+            _internalformat,
+            _width,
+            _height,
+        );
     }
-    unsafe fn FramebufferTextureLayer( &mut self, _target: GLenum, _attachment: GLenum, _texture: GLuint, _level: GLint, _layer: GLint, ) {
-        self.inner.FramebufferTextureLayer(_target, _attachment, _texture, _level, _layer);
+    unsafe fn FramebufferTextureLayer(
+        &mut self,
+        _target: GLenum,
+        _attachment: GLenum,
+        _texture: GLuint,
+        _level: GLint,
+        _layer: GLint,
+    ) {
+        self.inner
+            .FramebufferTextureLayer(_target, _attachment, _texture, _level, _layer);
     }
-    unsafe fn InvalidateFramebuffer( &mut self, _target: GLenum, _numAttachments: GLsizei, _attachments: *const GLenum, ) {
-        self.inner.InvalidateFramebuffer(_target, _numAttachments, _attachments);
+    unsafe fn InvalidateFramebuffer(
+        &mut self,
+        _target: GLenum,
+        _numAttachments: GLsizei,
+        _attachments: *const GLenum,
+    ) {
+        self.inner
+            .InvalidateFramebuffer(_target, _numAttachments, _attachments);
     }
-    unsafe fn InvalidateSubFramebuffer( &mut self, _target: GLenum, _numAttachments: GLsizei, _attachments: *const GLenum, _x: GLint, _y: GLint, _width: GLsizei, _height: GLsizei, ) {
-        self.inner.InvalidateSubFramebuffer(_target, _numAttachments, _attachments, _x, _y, _width, _height);
+    unsafe fn InvalidateSubFramebuffer(
+        &mut self,
+        _target: GLenum,
+        _numAttachments: GLsizei,
+        _attachments: *const GLenum,
+        _x: GLint,
+        _y: GLint,
+        _width: GLsizei,
+        _height: GLsizei,
+    ) {
+        self.inner.InvalidateSubFramebuffer(
+            _target,
+            _numAttachments,
+            _attachments,
+            _x,
+            _y,
+            _width,
+            _height,
+        );
     }
     unsafe fn ReadBuffer(&mut self, _src: GLenum) {
         self.inner.ReadBuffer(_src);
@@ -1192,20 +2011,46 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn DrawBuffers(&mut self, _n: GLsizei, _bufs: *const GLenum) {
         self.inner.DrawBuffers(_n, _bufs);
     }
-    unsafe fn DrawRangeElements( &mut self, _mode: GLenum, _start: GLuint, _end: GLuint, _count: GLsizei, _type_: GLenum, _indices: *const GLvoid, ) {
-        self.inner.DrawRangeElements(_mode, _start, _end, _count, _type_, _indices);
+    unsafe fn DrawRangeElements(
+        &mut self,
+        _mode: GLenum,
+        _start: GLuint,
+        _end: GLuint,
+        _count: GLsizei,
+        _type_: GLenum,
+        _indices: *const GLvoid,
+    ) {
+        self.inner
+            .DrawRangeElements(_mode, _start, _end, _count, _type_, _indices);
     }
     unsafe fn ClearBufferiv(&mut self, _buffer: GLenum, _drawbuffer: GLint, _value: *const GLint) {
         self.inner.ClearBufferiv(_buffer, _drawbuffer, _value);
     }
-    unsafe fn ClearBufferuiv( &mut self, _buffer: GLenum, _drawbuffer: GLint, _value: *const GLuint, ) {
+    unsafe fn ClearBufferuiv(
+        &mut self,
+        _buffer: GLenum,
+        _drawbuffer: GLint,
+        _value: *const GLuint,
+    ) {
         self.inner.ClearBufferuiv(_buffer, _drawbuffer, _value);
     }
-    unsafe fn ClearBufferfv( &mut self, _buffer: GLenum, _drawbuffer: GLint, _value: *const GLfloat, ) {
+    unsafe fn ClearBufferfv(
+        &mut self,
+        _buffer: GLenum,
+        _drawbuffer: GLint,
+        _value: *const GLfloat,
+    ) {
         self.inner.ClearBufferfv(_buffer, _drawbuffer, _value);
     }
-    unsafe fn ClearBufferfi( &mut self, _buffer: GLenum, _drawbuffer: GLint, _depth: GLfloat, _stencil: GLint, ) {
-        self.inner.ClearBufferfi(_buffer, _drawbuffer, _depth, _stencil);
+    unsafe fn ClearBufferfi(
+        &mut self,
+        _buffer: GLenum,
+        _drawbuffer: GLint,
+        _depth: GLfloat,
+        _stencil: GLint,
+    ) {
+        self.inner
+            .ClearBufferfi(_buffer, _drawbuffer, _depth, _stencil);
     }
     unsafe fn GenQueries(&mut self, _n: GLsizei, _ids: *mut GLuint) {
         self.inner.GenQueries(_n, _ids);
@@ -1243,19 +2088,39 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn SamplerParameteri(&mut self, _sampler: GLuint, _pname: GLenum, _param: GLint) {
         self.inner.SamplerParameteri(_sampler, _pname, _param);
     }
-    unsafe fn SamplerParameteriv( &mut self, _sampler: GLuint, _pname: GLenum, _params: *const GLint, ) {
+    unsafe fn SamplerParameteriv(
+        &mut self,
+        _sampler: GLuint,
+        _pname: GLenum,
+        _params: *const GLint,
+    ) {
         self.inner.SamplerParameteriv(_sampler, _pname, _params);
     }
     unsafe fn SamplerParameterf(&mut self, _sampler: GLuint, _pname: GLenum, _param: GLfloat) {
         self.inner.SamplerParameterf(_sampler, _pname, _param);
     }
-    unsafe fn SamplerParameterfv( &mut self, _sampler: GLuint, _pname: GLenum, _params: *const GLfloat, ) {
+    unsafe fn SamplerParameterfv(
+        &mut self,
+        _sampler: GLuint,
+        _pname: GLenum,
+        _params: *const GLfloat,
+    ) {
         self.inner.SamplerParameterfv(_sampler, _pname, _params);
     }
-    unsafe fn GetSamplerParameteriv( &mut self, _sampler: GLuint, _pname: GLenum, _params: *mut GLint, ) {
+    unsafe fn GetSamplerParameteriv(
+        &mut self,
+        _sampler: GLuint,
+        _pname: GLenum,
+        _params: *mut GLint,
+    ) {
         self.inner.GetSamplerParameteriv(_sampler, _pname, _params);
     }
-    unsafe fn GetSamplerParameterfv( &mut self, _sampler: GLuint, _pname: GLenum, _params: *mut GLfloat, ) {
+    unsafe fn GetSamplerParameterfv(
+        &mut self,
+        _sampler: GLuint,
+        _pname: GLenum,
+        _params: *mut GLfloat,
+    ) {
         self.inner.GetSamplerParameterfv(_sampler, _pname, _params);
     }
     unsafe fn BeginTransformFeedback(&mut self, _primitiveMode: GLenum) {
@@ -1282,14 +2147,39 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn ResumeTransformFeedback(&mut self) {
         self.inner.ResumeTransformFeedback();
     }
-    unsafe fn TransformFeedbackVaryings( &mut self, _program: GLuint, _count: GLsizei, _varyings: *const *const GLchar, _bufferMode: GLenum, ) {
-        self.inner.TransformFeedbackVaryings(_program, _count, _varyings, _bufferMode);
+    unsafe fn TransformFeedbackVaryings(
+        &mut self,
+        _program: GLuint,
+        _count: GLsizei,
+        _varyings: *const *const GLchar,
+        _bufferMode: GLenum,
+    ) {
+        self.inner
+            .TransformFeedbackVaryings(_program, _count, _varyings, _bufferMode);
     }
-    unsafe fn GetTransformFeedbackVarying( &mut self, _program: GLuint, _index: GLuint, _bufSize: GLsizei, _length: *mut GLsizei, _size: *mut GLsizei, _type_: *mut GLenum, _name: *mut GLchar, ) {
-        self.inner.GetTransformFeedbackVarying(_program, _index, _bufSize, _length, _size, _type_, _name);
+    unsafe fn GetTransformFeedbackVarying(
+        &mut self,
+        _program: GLuint,
+        _index: GLuint,
+        _bufSize: GLsizei,
+        _length: *mut GLsizei,
+        _size: *mut GLsizei,
+        _type_: *mut GLenum,
+        _name: *mut GLchar,
+    ) {
+        self.inner
+            .GetTransformFeedbackVarying(_program, _index, _bufSize, _length, _size, _type_, _name);
     }
-    unsafe fn VertexAttribIPointer( &mut self, _index: GLuint, _size: GLint, _type_: GLenum, _stride: GLsizei, _pointer: *const GLvoid, ) {
-        self.inner.VertexAttribIPointer(_index, _size, _type_, _stride, _pointer);
+    unsafe fn VertexAttribIPointer(
+        &mut self,
+        _index: GLuint,
+        _size: GLint,
+        _type_: GLenum,
+        _stride: GLsizei,
+        _pointer: *const GLvoid,
+    ) {
+        self.inner
+            .VertexAttribIPointer(_index, _size, _type_, _stride, _pointer);
     }
     unsafe fn GetVertexAttribIiv(&mut self, _index: GLuint, _pname: GLenum, _params: *mut GLint) {
         self.inner.GetVertexAttribIiv(_index, _pname, _params);
@@ -1297,10 +2187,24 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn GetVertexAttribIuiv(&mut self, _index: GLuint, _pname: GLenum, _params: *mut GLuint) {
         self.inner.GetVertexAttribIuiv(_index, _pname, _params);
     }
-    unsafe fn VertexAttribI4i( &mut self, _index: GLuint, _x: GLint, _y: GLint, _z: GLint, _w: GLint, ) {
+    unsafe fn VertexAttribI4i(
+        &mut self,
+        _index: GLuint,
+        _x: GLint,
+        _y: GLint,
+        _z: GLint,
+        _w: GLint,
+    ) {
         self.inner.VertexAttribI4i(_index, _x, _y, _z, _w);
     }
-    unsafe fn VertexAttribI4ui( &mut self, _index: GLuint, _x: GLuint, _y: GLuint, _z: GLuint, _w: GLuint, ) {
+    unsafe fn VertexAttribI4ui(
+        &mut self,
+        _index: GLuint,
+        _x: GLuint,
+        _y: GLuint,
+        _z: GLuint,
+        _w: GLuint,
+    ) {
         self.inner.VertexAttribI4ui(_index, _x, _y, _z, _w);
     }
     unsafe fn VertexAttribI4iv(&mut self, _index: GLuint, _v: *const GLint) {
@@ -1318,7 +2222,14 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn Uniform3ui(&mut self, _location: GLint, _v0: GLuint, _v1: GLuint, _v2: GLuint) {
         self.inner.Uniform3ui(_location, _v0, _v1, _v2);
     }
-    unsafe fn Uniform4ui( &mut self, _location: GLint, _v0: GLuint, _v1: GLuint, _v2: GLuint, _v3: GLuint, ) {
+    unsafe fn Uniform4ui(
+        &mut self,
+        _location: GLint,
+        _v0: GLuint,
+        _v1: GLuint,
+        _v2: GLuint,
+        _v3: GLuint,
+    ) {
         self.inner.Uniform4ui(_location, _v0, _v1, _v2, _v3);
     }
     unsafe fn Uniform1uiv(&mut self, _location: GLint, _count: GLsizei, _value: *const GLuint) {
@@ -1336,47 +2247,149 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn GetUniformuiv(&mut self, _program: GLuint, _location: GLint, _params: *mut GLuint) {
         self.inner.GetUniformuiv(_program, _location, _params);
     }
-    unsafe fn UniformMatrix2x3fv( &mut self, _location: GLint, _count: GLsizei, _transpose: GLboolean, _value: *const GLfloat, ) {
-        self.inner.UniformMatrix2x3fv(_location, _count, _transpose, _value);
+    unsafe fn UniformMatrix2x3fv(
+        &mut self,
+        _location: GLint,
+        _count: GLsizei,
+        _transpose: GLboolean,
+        _value: *const GLfloat,
+    ) {
+        self.inner
+            .UniformMatrix2x3fv(_location, _count, _transpose, _value);
     }
-    unsafe fn UniformMatrix3x2fv( &mut self, _location: GLint, _count: GLsizei, _transpose: GLboolean, _value: *const GLfloat, ) {
-        self.inner.UniformMatrix3x2fv(_location, _count, _transpose, _value);
+    unsafe fn UniformMatrix3x2fv(
+        &mut self,
+        _location: GLint,
+        _count: GLsizei,
+        _transpose: GLboolean,
+        _value: *const GLfloat,
+    ) {
+        self.inner
+            .UniformMatrix3x2fv(_location, _count, _transpose, _value);
     }
-    unsafe fn UniformMatrix2x4fv( &mut self, _location: GLint, _count: GLsizei, _transpose: GLboolean, _value: *const GLfloat, ) {
-        self.inner.UniformMatrix2x4fv(_location, _count, _transpose, _value);
+    unsafe fn UniformMatrix2x4fv(
+        &mut self,
+        _location: GLint,
+        _count: GLsizei,
+        _transpose: GLboolean,
+        _value: *const GLfloat,
+    ) {
+        self.inner
+            .UniformMatrix2x4fv(_location, _count, _transpose, _value);
     }
-    unsafe fn UniformMatrix4x2fv( &mut self, _location: GLint, _count: GLsizei, _transpose: GLboolean, _value: *const GLfloat, ) {
-        self.inner.UniformMatrix4x2fv(_location, _count, _transpose, _value);
+    unsafe fn UniformMatrix4x2fv(
+        &mut self,
+        _location: GLint,
+        _count: GLsizei,
+        _transpose: GLboolean,
+        _value: *const GLfloat,
+    ) {
+        self.inner
+            .UniformMatrix4x2fv(_location, _count, _transpose, _value);
     }
-    unsafe fn UniformMatrix3x4fv( &mut self, _location: GLint, _count: GLsizei, _transpose: GLboolean, _value: *const GLfloat, ) {
-        self.inner.UniformMatrix3x4fv(_location, _count, _transpose, _value);
+    unsafe fn UniformMatrix3x4fv(
+        &mut self,
+        _location: GLint,
+        _count: GLsizei,
+        _transpose: GLboolean,
+        _value: *const GLfloat,
+    ) {
+        self.inner
+            .UniformMatrix3x4fv(_location, _count, _transpose, _value);
     }
-    unsafe fn UniformMatrix4x3fv( &mut self, _location: GLint, _count: GLsizei, _transpose: GLboolean, _value: *const GLfloat, ) {
-        self.inner.UniformMatrix4x3fv(_location, _count, _transpose, _value);
+    unsafe fn UniformMatrix4x3fv(
+        &mut self,
+        _location: GLint,
+        _count: GLsizei,
+        _transpose: GLboolean,
+        _value: *const GLfloat,
+    ) {
+        self.inner
+            .UniformMatrix4x3fv(_location, _count, _transpose, _value);
     }
-    unsafe fn GetUniformIndices( &mut self, _program: GLuint, _uniformCount: GLsizei, _uniformNames: *const *const GLchar, _uniformIndices: *mut GLuint, ) {
-        self.inner.GetUniformIndices(_program, _uniformCount, _uniformNames, _uniformIndices);
+    unsafe fn GetUniformIndices(
+        &mut self,
+        _program: GLuint,
+        _uniformCount: GLsizei,
+        _uniformNames: *const *const GLchar,
+        _uniformIndices: *mut GLuint,
+    ) {
+        self.inner
+            .GetUniformIndices(_program, _uniformCount, _uniformNames, _uniformIndices);
     }
-    unsafe fn GetActiveUniformsiv( &mut self, _program: GLuint, _uniformCount: GLsizei, _uniformIndices: *const GLuint, _pname: GLenum, _params: *mut GLint, ) {
-        self.inner.GetActiveUniformsiv(_program, _uniformCount, _uniformIndices, _pname, _params);
+    unsafe fn GetActiveUniformsiv(
+        &mut self,
+        _program: GLuint,
+        _uniformCount: GLsizei,
+        _uniformIndices: *const GLuint,
+        _pname: GLenum,
+        _params: *mut GLint,
+    ) {
+        self.inner
+            .GetActiveUniformsiv(_program, _uniformCount, _uniformIndices, _pname, _params);
     }
-    unsafe fn GetUniformBlockIndex( &mut self, _program: GLuint, _uniformBlockName: *const GLchar, ) -> GLuint {
+    unsafe fn GetUniformBlockIndex(
+        &mut self,
+        _program: GLuint,
+        _uniformBlockName: *const GLchar,
+    ) -> GLuint {
         self.inner.GetUniformBlockIndex(_program, _uniformBlockName)
     }
-    unsafe fn GetActiveUniformBlockiv( &mut self, _program: GLuint, _uniformBlockIndex: GLuint, _pname: GLenum, _params: *mut GLint, ) {
-        self.inner.GetActiveUniformBlockiv(_program, _uniformBlockIndex, _pname, _params);
+    unsafe fn GetActiveUniformBlockiv(
+        &mut self,
+        _program: GLuint,
+        _uniformBlockIndex: GLuint,
+        _pname: GLenum,
+        _params: *mut GLint,
+    ) {
+        self.inner
+            .GetActiveUniformBlockiv(_program, _uniformBlockIndex, _pname, _params);
     }
-    unsafe fn GetActiveUniformBlockName( &mut self, _program: GLuint, _uniformBlockIndex: GLuint, _bufSize: GLsizei, _length: *mut GLsizei, _uniformBlockName: *mut GLchar, ) {
-        self.inner.GetActiveUniformBlockName(_program, _uniformBlockIndex, _bufSize, _length, _uniformBlockName);
+    unsafe fn GetActiveUniformBlockName(
+        &mut self,
+        _program: GLuint,
+        _uniformBlockIndex: GLuint,
+        _bufSize: GLsizei,
+        _length: *mut GLsizei,
+        _uniformBlockName: *mut GLchar,
+    ) {
+        self.inner.GetActiveUniformBlockName(
+            _program,
+            _uniformBlockIndex,
+            _bufSize,
+            _length,
+            _uniformBlockName,
+        );
     }
-    unsafe fn UniformBlockBinding( &mut self, _program: GLuint, _uniformBlockIndex: GLuint, _uniformBlockBinding: GLuint, ) {
-        self.inner.UniformBlockBinding(_program, _uniformBlockIndex, _uniformBlockBinding);
+    unsafe fn UniformBlockBinding(
+        &mut self,
+        _program: GLuint,
+        _uniformBlockIndex: GLuint,
+        _uniformBlockBinding: GLuint,
+    ) {
+        self.inner
+            .UniformBlockBinding(_program, _uniformBlockIndex, _uniformBlockBinding);
     }
-    unsafe fn DrawArraysInstanced( &mut self, _mode: GLenum, _first: GLint, _count: GLsizei, _instanceCount: GLsizei, ) {
-        self.inner.DrawArraysInstanced(_mode, _first, _count, _instanceCount);
+    unsafe fn DrawArraysInstanced(
+        &mut self,
+        _mode: GLenum,
+        _first: GLint,
+        _count: GLsizei,
+        _instanceCount: GLsizei,
+    ) {
+        self.inner
+            .DrawArraysInstanced(_mode, _first, _count, _instanceCount);
     }
-    unsafe fn DrawElementsInstanced( &mut self, _mode: GLenum, _count: GLsizei, _type_: GLenum, _indices: *const GLvoid, _instanceCount: GLsizei, ) {
-        self.inner.DrawElementsInstanced(_mode, _count, _type_, _indices, _instanceCount);
+    unsafe fn DrawElementsInstanced(
+        &mut self,
+        _mode: GLenum,
+        _count: GLsizei,
+        _type_: GLenum,
+        _indices: *const GLvoid,
+        _instanceCount: GLsizei,
+    ) {
+        self.inner
+            .DrawElementsInstanced(_mode, _count, _type_, _indices, _instanceCount);
     }
     unsafe fn VertexAttribDivisor(&mut self, _index: GLuint, _divisor: GLuint) {
         self.inner.VertexAttribDivisor(_index, _divisor);
@@ -1399,8 +2412,16 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn WaitSync(&mut self, _sync: usize, _flags: GLbitfield, _timeout: u64) {
         self.inner.WaitSync(_sync, _flags, _timeout);
     }
-    unsafe fn GetSynciv( &mut self, _sync: usize, _pname: GLenum, _bufSize: GLsizei, _length: *mut GLsizei, _values: *mut GLint, ) {
-        self.inner.GetSynciv(_sync, _pname, _bufSize, _length, _values);
+    unsafe fn GetSynciv(
+        &mut self,
+        _sync: usize,
+        _pname: GLenum,
+        _bufSize: GLsizei,
+        _length: *mut GLsizei,
+        _values: *mut GLint,
+    ) {
+        self.inner
+            .GetSynciv(_sync, _pname, _bufSize, _length, _values);
     }
     unsafe fn GetInteger64v(&mut self, _pname: GLenum, _data: *mut i64) {
         self.inner.GetInteger64v(_pname, _data);
@@ -1414,11 +2435,26 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn ProgramParameteri(&mut self, _program: GLuint, _pname: GLenum, _value: GLint) {
         self.inner.ProgramParameteri(_program, _pname, _value);
     }
-    unsafe fn ProgramBinary( &mut self, _program: GLuint, _binaryFormat: GLenum, _binary: *const GLvoid, _length: GLsizei, ) {
-        self.inner.ProgramBinary(_program, _binaryFormat, _binary, _length);
+    unsafe fn ProgramBinary(
+        &mut self,
+        _program: GLuint,
+        _binaryFormat: GLenum,
+        _binary: *const GLvoid,
+        _length: GLsizei,
+    ) {
+        self.inner
+            .ProgramBinary(_program, _binaryFormat, _binary, _length);
     }
-    unsafe fn GetProgramBinary( &mut self, _program: GLuint, _bufSize: GLsizei, _length: *mut GLsizei, _binaryFormat: *mut GLenum, _binary: *mut GLvoid, ) {
-        self.inner.GetProgramBinary(_program, _bufSize, _length, _binaryFormat, _binary);
+    unsafe fn GetProgramBinary(
+        &mut self,
+        _program: GLuint,
+        _bufSize: GLsizei,
+        _length: *mut GLsizei,
+        _binaryFormat: *mut GLenum,
+        _binary: *mut GLvoid,
+    ) {
+        self.inner
+            .GetProgramBinary(_program, _bufSize, _length, _binaryFormat, _binary);
     }
     unsafe fn GetStringi(&mut self, _name: GLenum, _index: GLuint) -> *const GLubyte {
         self.inner.GetStringi(_name, _index)
@@ -1426,12 +2462,20 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn GetFragDataLocation(&mut self, _program: GLuint, _name: *const GLchar) -> GLint {
         self.inner.GetFragDataLocation(_program, _name)
     }
-    unsafe fn GetInternalformativ( &mut self, _target: GLenum, _internalformat: GLenum, _pname: GLenum, _bufSize: GLsizei, _params: *mut GLint, ) {
-        self.inner.GetInternalformativ(_target, _internalformat, _pname, _bufSize, _params);
+    unsafe fn GetInternalformativ(
+        &mut self,
+        _target: GLenum,
+        _internalformat: GLenum,
+        _pname: GLenum,
+        _bufSize: GLsizei,
+        _params: *mut GLint,
+    ) {
+        self.inner
+            .GetInternalformativ(_target, _internalformat, _pname, _bufSize, _params);
     }
 }
 
-    // Forward other methods to inner
+// Forward other methods to inner
 
 // We need to implement the rest of the GLES trait for LoggingGLES.
 // Since there are many, we can use a macro or just implement the key ones.
@@ -1595,86 +2639,174 @@ pub fn create_gles1_ctx(env: &mut Environment) -> Box<dyn GLESContext> {
     })
 }
 
-/// Try to create an OpenGL ES 2.0 context, panicking on failure.
+/// Backends tried for guest GLES2 contexts in priority order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GLES2Backend {
+    Native,
+    GL3,
+    GL2Compat,
+}
+
+/// Whether the host GLES stack is ANGLE (bundled default on Android).
 ///
-/// The preference order, from "most-correct" to "only as a last resort":
+/// ANGLE exposes only OpenGL ES entry points, so the desktop-GL backends
+/// (GL 3.3 Core, GL 2.1 compat) can never succeed under it; trying them
+/// only wastes a context-creation attempt and logs a misleading
+/// EGL_BAD_MATCH. Mirrors the check in `create_gles1_ctx_no_parent_stack`.
+fn using_angle_driver() -> bool {
+    std::env::var("SDL_VIDEO_EGL_DRIVER")
+        .map(|driver| driver.contains("angle"))
+        .unwrap_or(false)
+}
+
+fn gles2_backend_order(force_compat: bool) -> &'static [GLES2Backend] {
+    gles2_backend_order_opts(force_compat, using_angle_driver())
+}
+
+fn gles2_backend_order_opts(force_compat: bool, using_angle: bool) -> &'static [GLES2Backend] {
+    if using_angle {
+        if force_compat {
+            // `--gles2-compat` is a desktop-only setting; under ANGLE its sole
+            // backend cannot work, so fall back to native ES instead of
+            // guaranteeing failure and a panic.
+            log!("Ignoring --gles2-compat under ANGLE: desktop GL 2.1 is unavailable there");
+        }
+        &[GLES2Backend::Native]
+    } else if force_compat {
+        &[GLES2Backend::GL2Compat]
+    } else {
+        &[
+            GLES2Backend::Native,
+            GLES2Backend::GL3,
+            GLES2Backend::GL2Compat,
+        ]
+    }
+}
+
+/// Try native ES 2.0, GL 3.3 Core, then legacy GL 2.1 compatibility.
+/// `--gles2-compat` forces the last backend for apps that need its desktop
+/// compatibility behavior.
+
+#[cfg(test)]
+mod gles2_context_selection_tests {
+    use super::{gles2_backend_order_opts, GLES2Backend};
+
+    #[test]
+    fn compatibility_mode_skips_native_and_gl3_backends() {
+        assert_eq!(
+            gles2_backend_order_opts(true, false),
+            &[GLES2Backend::GL2Compat]
+        );
+        assert_eq!(
+            gles2_backend_order_opts(false, false),
+            &[
+                GLES2Backend::Native,
+                GLES2Backend::GL3,
+                GLES2Backend::GL2Compat,
+            ]
+        );
+    }
+    #[test]
+    fn angle_skips_desktop_gl_backends() {
+        assert_eq!(
+            gles2_backend_order_opts(false, true),
+            &[GLES2Backend::Native]
+        );
+    }
+
+    #[test]
+    fn angle_ignores_forced_compat() {
+        assert_eq!(
+            gles2_backend_order_opts(true, true),
+            &[GLES2Backend::Native]
+        );
+    }
+}
+
+/// Create an OpenGL ES 2.0 context for the guest.
 ///
-/// 1. [`GLES2NativeContext`] — a real OpenGL ES 2.0 driver. This is the
-///    only thing that works on platforms without desktop OpenGL such as
-///    Android, and on real iOS hardware emulation. Every ES 2.0 entry point
-///    is a direct passthrough to the host driver.
-/// 2. [`GLES2OnGL3Context`] — a full ES 2.0 backend built on top of
-///    desktop OpenGL 3.3 Core. This shares its implementation with the ES
-///    3.0 fallback ([`GLES3OnGL3Context`]), giving us a single source of
-///    truth for ES 2.0 / ES 3.0 emulation, full shader support, and proper
-///    GLSL ES → desktop GLSL translation via
-///    [`gles2_glsl::translate_glsl_es_to_120`]. This is the preferred
-///    fallback on x86 Linux/macOS desktops where Mesa lacks a native ES 2.0
-///    surface.
-/// 3. [`GLES1OnGL2Context`] — legacy fallback that piggy-backs on a desktop
-///    OpenGL 2.1 compatibility profile context. Only used on the rare host
-///    that has GL 2.1 compat but no GL 3.3 Core (e.g. very old macOS
-///    installations); kept around for backwards compatibility.
-pub fn create_gles2_ctx(env: &mut Environment) -> Box<dyn GLESContext> {
+/// Tries the backends from [gles2_backend_order]; under ANGLE only native ES
+/// 2.0 can work. Returns every attempt's error when none succeeds so callers
+/// can fail gracefully instead of aborting the app.
+pub fn create_gles2_ctx(env: &mut Environment) -> Result<Box<dyn GLESContext>, String> {
     env.on_parent_stack_in_coroutine(|window, options| {
         assert!(window.on_main_stack());
         log!("Creating an OpenGL ES 2.0 context:");
 
-        let ctx = {
-            log!("Trying: {}", GLES2NativeContext::description());
-            match GLES2NativeContext::new(window) {
-                Ok(ctx) => {
-                    log!("=> Success!");
-                    Some(Box::new(ctx) as Box<dyn GLESContext>)
-                }
-                Err(err) => {
-                    log!("=> Failed: {}.", err);
-                    None
-                }
-            }
-            .or_else(|| {
-                log!(
-                    "Trying: {} (used for OpenGL ES 2.0)",
-                    GLES2OnGL3Context::description()
-                );
-                match GLES2OnGL3Context::new(window) {
-                    Ok(ctx) => {
-                        log!("=> Success!");
-                        Some(Box::new(ctx) as Box<dyn GLESContext>)
+        let forced_compat = options.gles2_compat;
+        let mut failures = Vec::new();
+        let ctx = gles2_backend_order(forced_compat)
+            .iter()
+            .find_map(|backend| match backend {
+                GLES2Backend::Native => {
+                    let description = GLES2NativeContext::description();
+                    log!("Trying: {}", description);
+                    match GLES2NativeContext::new(window) {
+                        Ok(ctx) => {
+                            log!("=> Success!");
+                            Some(Box::new(ctx) as Box<dyn GLESContext>)
+                        }
+                        Err(err) => {
+                            log!("=> Failed: {}.", err);
+                            failures.push(format!("{}: {}", description, err));
+                            None
+                        }
                     }
-                    Err(err) => {
-                        log!("=> Failed: {}.", err);
-                        None
+                }
+                GLES2Backend::GL3 => {
+                    let description = GLES2OnGL3Context::description();
+                    log!("Trying: {}", description);
+                    match GLES2OnGL3Context::new(window) {
+                        Ok(ctx) => {
+                            log!("=> Success!");
+                            Some(Box::new(ctx) as Box<dyn GLESContext>)
+                        }
+                        Err(err) => {
+                            log!("=> Failed: {}.", err);
+                            failures.push(format!("{}: {}", description, err));
+                            None
+                        }
+                    }
+                }
+                GLES2Backend::GL2Compat => {
+                    let description = GLES1OnGL2Context::description();
+                    log!(
+                        "Trying: {}{}",
+                        description,
+                        if forced_compat {
+                            " (forced by --gles2-compat)"
+                        } else {
+                            " (legacy GL 2.1 fallback)"
+                        }
+                    );
+                    match GLES1OnGL2Context::new(window) {
+                        Ok(ctx) => {
+                            log!("=> Success!");
+                            Some(Box::new(ctx) as Box<dyn GLESContext>)
+                        }
+                        Err(err) => {
+                            log!("=> Failed: {}.", err);
+                            failures.push(format!("{}: {}", description, err));
+                            None
+                        }
                     }
                 }
             })
-            .or_else(|| {
-                log!(
-                    "Trying: {} (legacy GL 2.1 fallback for OpenGL ES 2.0)",
-                    GLES1OnGL2Context::description()
-                );
-                match GLES1OnGL2Context::new(window) {
-                    Ok(ctx) => {
-                        log!("=> Success!");
-                        Some(Box::new(ctx) as Box<dyn GLESContext>)
-                    }
-                    Err(err) => {
-                        log!("=> Failed: {}.", err);
-                        None
-                    }
-                }
-            })
-            .expect("Couldn't create OpenGL ES 2.0 context")
-        };
+            .ok_or_else(|| {
+                format!(
+                    "Couldn't create OpenGL ES 2.0 context. Tried: {}",
+                    failures.join("; ")
+                )
+            })?;
 
-        if options.trace_gl_errors {
+        Ok(if options.trace_gl_errors {
             Box::new(LoggingGLESContext {
                 inner: ctx,
                 verbose: options.trace_gl_errors || options.verbose_gles,
             })
         } else {
             ctx
-        }
+        })
     })
 }
 
@@ -1686,13 +2818,21 @@ pub fn create_gles2_ctx(env: &mut Environment) -> Box<dyn GLESContext> {
 /// on Android and on desktop drivers configured for an ES context — and
 /// falls back to the desktop GL 3.3 Core translation backend on hosts
 /// without a native ES 3.0 driver (most x86 Linux/macOS desktops).
-pub fn create_gles3_ctx(env: &mut Environment) -> Box<dyn GLESContext> {
+/// Create an OpenGL ES 3.0 context for the guest.
+///
+/// Tries the native ES 3.0 backend first — the only thing that works on
+/// Android and on desktop drivers configured for an ES context — then falls
+/// back to the desktop GL 3.3 Core translation backend on hosts without a
+/// native ES 3.0 driver (most x86 Linux/macOS desktops).
+pub fn create_gles3_ctx(env: &mut Environment) -> Result<Box<dyn GLESContext>, String> {
     env.on_parent_stack_in_coroutine(|window, options| {
         assert!(window.on_main_stack());
         log!("Creating an OpenGL ES 3.0 context:");
 
+        let mut failures = Vec::new();
         let ctx = {
-            log!("Trying: {}", GLES3NativeContext::description());
+            let description = GLES3NativeContext::description();
+            log!("Trying: {}", description);
             match GLES3NativeContext::new(window) {
                 Ok(ctx) => {
                     log!("=> Success!");
@@ -1700,14 +2840,13 @@ pub fn create_gles3_ctx(env: &mut Environment) -> Box<dyn GLESContext> {
                 }
                 Err(err) => {
                     log!("=> Failed: {}.", err);
+                    failures.push(format!("{}: {}", description, err));
                     None
                 }
             }
             .or_else(|| {
-                log!(
-                    "Trying: {} (used for OpenGL ES 3.0)",
-                    GLES3OnGL3Context::description()
-                );
+                let description = GLES3OnGL3Context::description();
+                log!("Trying: {} (used for OpenGL ES 3.0)", description);
                 match GLES3OnGL3Context::new(window) {
                     Ok(ctx) => {
                         log!("=> Success!");
@@ -1715,21 +2854,27 @@ pub fn create_gles3_ctx(env: &mut Environment) -> Box<dyn GLESContext> {
                     }
                     Err(err) => {
                         log!("=> Failed: {}.", err);
+                        failures.push(format!("{}: {}", description, err));
                         None
                     }
                 }
             })
-            .expect("Couldn't create OpenGL ES 3.0 context")
+            .ok_or_else(|| {
+                format!(
+                    "Couldn't create OpenGL ES 3.0 context. Tried: {}",
+                    failures.join("; ")
+                )
+            })?
         };
 
-        if options.trace_gl_errors {
+        Ok(if options.trace_gl_errors {
             Box::new(LoggingGLESContext {
                 inner: ctx,
                 verbose: options.trace_gl_errors || options.verbose_gles,
             })
         } else {
             ctx
-        }
+        })
     })
 }
 
@@ -1744,51 +2889,62 @@ pub fn create_gles2_ctx_no_parent_stack(
     log!("Creating an OpenGL ES 2.0 context:");
     let mut failures = Vec::new();
 
-    let description = GLES2NativeContext::description();
-    log!("Trying: {}", description);
-    match GLES2NativeContext::new(window) {
-        Ok(ctx) => {
-            log!("=> Success!");
-            return Ok(Box::new(ctx));
-        }
-        Err(err) => {
-            log!("=> Failed: {}.", err);
-            failures.push(format!("{}: {}", description, err));
+    // Same backend selection as `create_gles2_ctx`: under ANGLE the desktop-GL
+    // backends cannot succeed, so only native ES is tried.
+    for backend in gles2_backend_order(false) {
+        match backend {
+            GLES2Backend::Native => {
+                let description = GLES2NativeContext::description();
+                log!("Trying: {}", description);
+                match GLES2NativeContext::new(window) {
+                    Ok(ctx) => {
+                        log!("=> Success!");
+                        return Ok(Box::new(ctx));
+                    }
+                    Err(err) => {
+                        log!("=> Failed: {}.", err);
+                        failures.push(format!("{}: {}", description, err));
+                    }
+                }
+            }
+            GLES2Backend::GL3 => {
+                let description = GLES2OnGL3Context::description();
+                log!("Trying: {} (used for OpenGL ES 2.0)", description);
+                match GLES2OnGL3Context::new(window) {
+                    Ok(ctx) => {
+                        log!("=> Success!");
+                        return Ok(Box::new(ctx));
+                    }
+                    Err(err) => {
+                        log!("=> Failed: {}.", err);
+                        failures.push(format!("{}: {}", description, err));
+                    }
+                }
+            }
+            GLES2Backend::GL2Compat => {
+                let description = GLES1OnGL2Context::description();
+                log!(
+                    "Trying: {} (legacy GL 2.1 fallback for OpenGL ES 2.0)",
+                    description
+                );
+                match GLES1OnGL2Context::new(window) {
+                    Ok(ctx) => {
+                        log!("=> Success!");
+                        return Ok(Box::new(ctx));
+                    }
+                    Err(err) => {
+                        log!("=> Failed: {}.", err);
+                        failures.push(format!("{}: {}", description, err));
+                    }
+                }
+            }
         }
     }
 
-    let description = GLES2OnGL3Context::description();
-    log!("Trying: {} (used for OpenGL ES 2.0)", description);
-    match GLES2OnGL3Context::new(window) {
-        Ok(ctx) => {
-            log!("=> Success!");
-            return Ok(Box::new(ctx));
-        }
-        Err(err) => {
-            log!("=> Failed: {}.", err);
-            failures.push(format!("{}: {}", description, err));
-        }
-    }
-
-    let description = GLES1OnGL2Context::description();
-    log!(
-        "Trying: {} (legacy GL 2.1 fallback for OpenGL ES 2.0)",
-        description
-    );
-    match GLES1OnGL2Context::new(window) {
-        Ok(ctx) => {
-            log!("=> Success!");
-            Ok(Box::new(ctx))
-        }
-        Err(err) => {
-            log!("=> Failed: {}.", err);
-            failures.push(format!("{}: {}", description, err));
-            Err(format!(
-                "Couldn't create OpenGL ES 2.0 context. Tried: {}",
-                failures.join("; ")
-            ))
-        }
-    }
+    Err(format!(
+        "Couldn't create OpenGL ES 2.0 context. Tried: {}",
+        failures.join("; ")
+    ))
 }
 
 /// Same as [create_gles1_ctx], but without calling

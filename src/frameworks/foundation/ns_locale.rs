@@ -5,7 +5,7 @@
  */
 //! `NSLocale`.
 
-use super::{ns_array, ns_string};
+use super::{ns_array, ns_string, NSUInteger};
 use crate::dyld::{ConstantExports, HostConstant};
 use crate::frameworks::core_foundation::cf_locale::{kCFLocaleCountryCode, kCFLocaleLanguageCode};
 use crate::objc::{
@@ -571,6 +571,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     let a: id = msg![env; this localeIdentifier];
     let b: id = msg![env; other localeIdentifier];
     msg![env; a isEqualToString:b]
+}
+- (NSUInteger)hash {
+    // Agree with -isEqual:, which compares the locale identifier. The NSObject
+    // default hashes the pointer, so two equal locales would miss each other as
+    // dictionary keys.
+    let identifier: id = msg![env; this localeIdentifier];
+    msg![env; identifier hash]
 }
 
 @end

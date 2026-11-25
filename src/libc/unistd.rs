@@ -13,7 +13,7 @@ use crate::libc::errno::{
     EPERM,
 };
 use crate::libc::posix_io::{FileDescriptor, STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
-use crate::mem::{ConstPtr, GuestISize, GuestUSize, MutPtr, PAGE_SIZE};
+use crate::mem::{ConstPtr, ConstVoidPtr, GuestISize, GuestUSize, MutPtr, PAGE_SIZE};
 use crate::Environment;
 use std::time::Duration;
 
@@ -319,7 +319,7 @@ fn rmdir(env: &mut Environment, path: ConstPtr<u8>) -> i32 {
 /// refers to the same file as `path1`. Both names share the same inode
 /// and changes through one are visible through the other.
 ///
-/// HyperHLE's guest filesystem is an in-memory tree with no concept of
+/// AppleJuiceHLE's guest filesystem is an in-memory tree with no concept of
 /// inodes or hard links, so we emulate the documented externally-visible
 /// behaviour for the common single-writer case by copying the file
 /// contents. This is the same fallback Apple's man page describes for
@@ -393,7 +393,7 @@ fn link(env: &mut Environment, path1: ConstPtr<u8>, path2: ConstPtr<u8>) -> i32 
 /// (<https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/symlink.2.html>)
 /// documents `ENOTSUP` ("The file system does not support the creation of
 /// symbolic links") as the canonical errno when the underlying filesystem
-/// has no symlink primitive. HyperHLE's guest filesystem has no symlink
+/// has no symlink primitive. AppleJuiceHLE's guest filesystem has no symlink
 /// type — `readlink(2)` here already returns `EINVAL` for every path —
 /// so we honestly fail with `ENOTSUP`, mirroring what real Darwin does
 /// on a FAT/MS-DOS volume.
@@ -507,6 +507,40 @@ fn sysconf(_env: &mut Environment, name: SysConfName) -> i32 {
             -1
         }
     }
+}
+
+/// `int execl(const char *path, const char *arg, ...)`
+///
+/// touchHLE cannot start a new process, so report ENOSYS. The variadic
+/// arguments are deliberately not inspected.
+fn execl(
+    env: &mut Environment,
+    path: ConstPtr<u8>,
+    _arg0: ConstPtr<u8>,
+    _args: DotDotDot,
+) -> i32 {
+    log!(
+        "Warning: execl({:?}) unsupported; returning -1/ENOSYS",
+        env.mem.cstr_at_utf8(path).unwrap_or_default()
+    );
+    set_errno(env, ENOSYS);
+    -1
+}
+
+/// `int kill(pid_t pid, int sig)` — there is only one guest process, so
+/// signal delivery is a successful no-op.
+fn kill(_env: &mut Environment, _pid: i32, _sig: i32) -> i32 {
+    0
+}
+
+/// `int utimes(const char *path, const struct timeval times[2])` — the guest
+/// filesystem is virtual and timestamps are not persisted.
+fn utimes(env: &mut Environment, path: ConstPtr<u8>, _times: ConstVoidPtr) -> i32 {
+    if path.is_null() {
+        set_errno(env, EFAULT);
+        return -1;
+    }
+    0
 }
 
 fn pipe(env: &mut Environment, fds: MutPtr<FileDescriptor>) -> i32 {
@@ -644,6 +678,44 @@ fn setpriority(_env: &mut Environment, _which: i32, _who: i32, _priority: i32) -
     0
 }
 
+/// `const char *getprogname(void)` — Darwin's process name. The emulator's
+/// own name is a stable, non-NULL answer; the buffer is allocated once and
+/// cached so repeated calls return the same pointer, as on Darwin.
+fn getprogname(env: &mut Environment) -> MutPtr<u8> {
+    if let Some(buf) = env.libc_state.getprogname_buf {
+        return buf;
+    }
+    const NAME: &[u8] = b"AppleJuiceHLE\0";
+    let buf: MutPtr<u8> = env.mem.alloc(NAME.len() as GuestUSize).cast();
+    env.mem
+        .bytes_at_mut(buf.cast(), NAME.len() as GuestUSize)
+        .copy_from_slice(NAME);
+    env.libc_state.getprogname_buf = Some(buf);
+    buf
+}
+
+/// Darwin `struct termios` is 44 bytes (four 32-bit flags, 20 control
+/// characters and two 32-bit speeds). Nothing in AppleJuiceHLE is attached to a
+/// real terminal, so report a deterministic zeroed configuration instead of
+/// leaking uninitialised guest memory.
+fn tcgetattr(env: &mut Environment, _fd: i32, termios_p: MutPtr<u8>) -> i32 {
+    if termios_p.is_null() {
+        return -1;
+    }
+    for i in 0..44u32 {
+        env.mem.write(termios_p + i as GuestUSize, 0u8);
+    }
+    0
+}
+
+fn tcsetattr(_env: &mut Environment, _fd: i32, _optional_actions: i32, _termios_p: MutPtr<u8>) -> i32 {
+    0
+}
+
+fn tcflush(_env: &mut Environment, _fd: i32, _queue_selector: i32) -> i32 {
+    0
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(syscall(_, _)),
     export_c_func!(sleep(_)),
@@ -667,12 +739,19 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(getdtablesize()),
     export_c_func!(sysconf(_)),
     export_c_func!(pipe(_)),
+    export_c_func!(execl(_, _, _)),
+    export_c_func!(kill(_, _)),
+    export_c_func!(utimes(_, _)),
     export_c_func!(fork()),
     export_c_func!(sbrk(_)),
     export_c_func!(chmod(_, _)),
     export_c_func!(fchmod(_, _)),
     export_c_func!(sync()),
     export_c_func!(setpriority(_, _, _)),
+    export_c_func!(getprogname()),
+    export_c_func!(tcgetattr(_, _)),
+    export_c_func!(tcsetattr(_, _, _)),
+    export_c_func!(tcflush(_, _)),
 ];
 
 #[cfg(test)]

@@ -54,7 +54,7 @@ pub const CORE_MEDIA: super::HostDylib = super::HostDylib {
     aliases: &[],
     class_exports: &[],
     constant_exports: &[frameworks::core_media::CONSTANTS],
-    function_exports: &[frameworks::core_media::FUNCTIONS],
+    function_exports: &[frameworks::core_media::FUNCTIONS, frameworks::core_media::TIME_FUNCTIONS],
 };
 
 // MapKit (stub — no real map rendering yet, just satisfies the dependency)
@@ -217,12 +217,14 @@ pub const DYLIB_LIST: &[&super::HostDylib] = &[
     &frameworks::core_animation::DYLIB,
     &frameworks::core_foundation::DYLIB,
     &frameworks::core_graphics::DYLIB,
+    &frameworks::core_haptics::DYLIB,
     &frameworks::core_location::DYLIB,
     &frameworks::core_motion::DYLIB,
     &frameworks::foundation::DYLIB,
     &frameworks::game_kit::DYLIB,
     &frameworks::media_player::DYLIB,
     &frameworks::metal::DYLIB,
+    &frameworks::metric_kit::DYLIB,
     &frameworks::openal::DYLIB,
     &frameworks::opengles::DYLIB,
     &frameworks::security::DYLIB,
@@ -338,6 +340,20 @@ mod tests {
     }
 
     #[test]
+    fn wide_integer_conversions_are_exported() {
+        for function_name in ["_wcstol", "_wcstoul", "_wcstoll", "_wcstoull"] {
+            let is_exported = DYLIB_LIST
+                .iter()
+                .flat_map(|dylib| dylib.function_exports)
+                .copied()
+                .flatten()
+                .any(|(name, _)| *name == function_name);
+
+            assert!(is_exported, "Missing libc export {function_name}");
+        }
+    }
+
+    #[test]
     fn exp10_double_is_exported() {
         let is_exported = DYLIB_LIST
             .iter()
@@ -418,5 +434,86 @@ mod tests {
         );
         assert!(has_protected_open, "open_dprotected_np is missing");
         assert!(has_screen_recorder, "ReplayKit screen recorder is missing");
+    }
+
+    /// Files whose exports are deliberately not registered, with the reason.
+    const INTENTIONALLY_UNREGISTERED: &[(&str, &str)] = &[
+        (
+            "chipmunk_space.rs",
+            "Drive Ahead bundles its own Objective-Chipmunk classes; registering the \
+             host placeholders would shadow the app's implementations",
+        ),
+        (
+            "tw_tweet_compose_view_controller.rs",
+            "Twitter.framework is a stub superseded by Social",
+        ),
+        (
+            "cf_network/cf_http_message.rs",
+            "stale duplicate of cf_http_message.rs; its constants are already \
+             registered by cf_network and cf_stream",
+        ),
+    ];
+
+    fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// A module can define `CLASSES`/`CONSTANTS`/`FUNCTIONS` and still never reach the
+    /// guest, because only the `Library`/`HostDylib` literals are consulted when
+    /// linking. That is invisible until an app links the symbol and gets a nil value
+    /// or a panic, so check the source instead.
+    #[test]
+    fn every_export_is_registered() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut paths = Vec::new();
+        rust_sources(&src, &mut paths);
+        // (path, module name, contents)
+        let sources: Vec<(String, String, String)> = paths
+            .iter()
+            .map(|path| {
+                (
+                    path.to_string_lossy().replace('\\', "/"),
+                    path.file_stem().unwrap().to_string_lossy().into_owned(),
+                    std::fs::read_to_string(path).unwrap(),
+                )
+            })
+            .collect();
+
+        let mut unregistered = Vec::new();
+        for (path, module, text) in &sources {
+            if INTENTIONALLY_UNREGISTERED
+                .iter()
+                .any(|(allowed, _)| path.ends_with(allowed))
+            {
+                continue;
+            }
+            for kind in ["CLASSES", "CONSTANTS", "FUNCTIONS"] {
+                if !text.contains(&format!("pub const {kind}:")) {
+                    continue;
+                }
+                // Registered either in this file (`class_exports: &[CLASSES]`) or from
+                // another one (`module::CLASSES`).
+                let used_here = text.matches(kind).count() > 1;
+                let used_elsewhere = sources
+                    .iter()
+                    .any(|(_, _, other)| other.contains(&format!("{module}::{kind}")));
+                if !used_here && !used_elsewhere {
+                    unregistered.push(format!("{module}::{kind}"));
+                }
+            }
+        }
+
+        assert!(
+            unregistered.is_empty(),
+            "these exports are defined but never registered in a library, so the guest \
+             cannot link them: {unregistered:?}"
+        );
     }
 }

@@ -207,6 +207,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.dealloc_object(this, &mut env.mem)
 }
 
+// NSCopying implementation
+- (id)copyWithZone:(NSZonePtr)_zone {
+    retain(env, this)
+}
+
 - (id)name {
     env.objc.borrow_mut::<NSTimeZoneHostObject>(this).time_zone
 }

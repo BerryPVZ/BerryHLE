@@ -5,6 +5,31 @@
  */
 //! Cross-platform memory management wrappers using the host's system calls.
 
+/// Windows kernel I/O cannot invoke the user-mode fault handler that commits
+/// guest pages. Touch each page before passing a buffer to ReadFile/Winsock.
+/// Reading preserves its contents and is cheap for already committed pages.
+/// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-readfile
+pub(super) fn prepare_for_host_io(bytes: &[u8]) {
+    #[cfg(windows)]
+    if !bytes.is_empty() {
+        let pointer = bytes.as_ptr();
+        let page = crate::mem::PAGE_SIZE as usize;
+        // SAFETY: All offsets are within the validated guest buffer. Access
+        // faults inside the guest mapping commit its reserved backing pages.
+        unsafe {
+            std::ptr::read_volatile(pointer);
+        }
+        let first_boundary = page - (pointer as usize & (page - 1));
+        for offset in (first_boundary..bytes.len()).step_by(page) {
+            unsafe {
+                std::ptr::read_volatile(pointer.add(offset));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = bytes;
+}
+
 /// Protects a guest memory segment from host reads and writes.
 ///
 /// # Safety
@@ -197,6 +222,90 @@ pub(super) unsafe fn free_guest_memory(
     size: usize,
 ) -> std::io::Result<()> {
     unsafe { free_memory(address, size) }
+}
+
+/// Advises the host that pages of a freed guest allocation can be reclaimed.
+/// The advice is best-effort; the host may ignore it.
+///
+/// The caller can report a failed request, but success does not guarantee the
+/// host has immediately removed pages from resident memory.
+///
+/// # Safety
+/// - `address` and `size` must be inside the guest memory mapping, aligned to
+///   the host page size.
+/// - No live allocation may cover the range.
+#[cfg(unix)]
+pub(super) unsafe fn release_guest_pages(
+    address: *mut core::ffi::c_void,
+    size: usize,
+) -> bool {
+    let host_page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if host_page_size <= 0 {
+        return false;
+    }
+    let Some((address, size)) = host_page_range(address as usize, size, host_page_size as usize)
+    else {
+        return false;
+    };
+    let result = unsafe { libc::madvise(address as *mut _, size, libc::MADV_DONTNEED) };
+    if result != 0 {
+        log_dbg!(
+            "Could not advise host to reclaim {} guest-memory bytes: {}",
+            size,
+            std::io::Error::last_os_error()
+        );
+    }
+    result == 0
+}
+
+/// # Safety
+/// Same requirements as the Unix version above.
+#[cfg(windows)]
+pub(super) unsafe fn release_guest_pages(
+    address: *mut core::ffi::c_void,
+    size: usize,
+) -> bool {
+    use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_RESET, PAGE_READWRITE};
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+
+    let mut system_info = unsafe { std::mem::zeroed::<SYSTEM_INFO>() };
+    unsafe { GetSystemInfo(&mut system_info) };
+    if system_info.dwPageSize == 0 {
+        return false;
+    }
+    let Some((address, size)) = host_page_range(
+        address as usize,
+        size,
+        system_info.dwPageSize as usize,
+    ) else {
+        return false;
+    };
+
+    !unsafe { VirtualAlloc(address as *const _, size, MEM_RESET, PAGE_READWRITE) }.is_null()
+}
+
+fn host_page_range(address: usize, size: usize, page_size: usize) -> Option<(usize, usize)> {
+    if page_size == 0 || !page_size.is_power_of_two() {
+        return None;
+    }
+    let start = address.checked_add(page_size - 1)? & !(page_size - 1);
+    let end = address.checked_add(size)? & !(page_size - 1);
+    if end <= start {
+        None
+    } else {
+        Some((start, end - start))
+    }
+}
+
+#[cfg(test)]
+mod host_page_range_tests {
+    use super::host_page_range;
+
+    #[test]
+    fn keeps_only_full_host_pages_inside_released_guest_range() {
+        assert_eq!(host_page_range(0x1001, 0x8000, 0x4000), Some((0x4000, 0x4000)));
+        assert_eq!(host_page_range(0x1001, 0x2000, 0x4000), None);
+    }
 }
 
 #[cfg(windows)]

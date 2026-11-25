@@ -12,7 +12,8 @@
 use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::{ns_string, NSInteger, NSUInteger};
 use crate::objc::{
-    id, impl_HostObject_with_superclass, msg, msg_class, nil, objc_classes, objc_retainBlock,
+    id, impl_HostObject_with_superclass, msg, msg_class, msg_super, nil, objc_classes,
+    objc_retainBlock,
     release, retain, ClassExports, HostObject, NSZonePtr,
 };
 use crate::window;
@@ -167,12 +168,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     let host = std::mem::take(env.objc.borrow_mut::<UIAlertControllerHostObject>(this));
+    // Preserve superclass ownership until its own deallocator runs.
+    env.objc.borrow_mut::<UIAlertControllerHostObject>(this).superclass = host.superclass;
     release(env, host.title);
     release(env, host.message);
     release(env, host.actions);
     release(env, host.text_fields);
     release(env, host.preferred_action);
-    env.objc.dealloc_object(this, &mut env.mem);
+    msg_super![env; this dealloc]
 }
 
 - (id)title {

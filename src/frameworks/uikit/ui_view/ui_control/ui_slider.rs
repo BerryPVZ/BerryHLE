@@ -71,6 +71,10 @@ fn layout(env: &mut Environment, this: id) {
         ..
     } = env.objc.borrow(this);
 
+    if thumb == nil {
+        return;
+    }
+
     let bounds: CGRect = msg![env; this bounds];
     let frac = normalized(value, minimum_value, maximum_value);
 
@@ -231,7 +235,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     let key = get_static_str(env, "UIMinValue");
     let min: f32 = msg![env; coder decodeFloatForKey:key];
     let key = get_static_str(env, "UIMaxValue");
-    let max: f32 = msg![env; coder decodeFloatForKey:key];
+    // Interface Builder omits the default upper bound of 1.0.
+    // https://developer.apple.com/documentation/uikit/uislider/maximumvalue
+    let max: f32 = if msg![env; coder containsValueForKey:key] {
+        msg![env; coder decodeFloatForKey:key]
+    } else {
+        1.0
+    };
 
     {
         let host = env.objc.borrow_mut::<UISliderHostObject>(this);
@@ -245,16 +255,29 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     let UISliderHostObject {
-        superclass: _, value: _, minimum_value: _, maximum_value: _, continuous: _,
+        superclass,
+        value: _, minimum_value: _, maximum_value: _, continuous: _,
         track_left, track_right, thumb,
     } = std::mem::take(env.objc.borrow_mut(this));
     release(env, track_left);
     release(env, track_right);
     release(env, thumb);
+    // Preserve superclass ownership until its own deallocator runs.
+    env.objc.borrow_mut::<UISliderHostObject>(this).superclass = superclass;
     msg_super![env; this dealloc]
 }
 
 - (())layoutSubviews {
+    layout(env, this);
+}
+
+- (())setFrame:(CGRect)frame {
+    () = msg_super![env; this setFrame:frame];
+    layout(env, this);
+}
+
+- (())setBounds:(CGRect)bounds {
+    () = msg_super![env; this setBounds:bounds];
     layout(env, this);
 }
 

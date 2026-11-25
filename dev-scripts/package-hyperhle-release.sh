@@ -1,5 +1,5 @@
 #!/bin/sh
-# Package BerryHLE release zips and write release notes for action-gh-release.
+# Package AppleJuiceHLE release zips and write release notes for action-gh-release.
 set -eu
 
 VERSION="$1"
@@ -37,7 +37,7 @@ done
 
 android_apk=""
 for candidate in \
-    artifacts/android/BerryHLE.apk \
+    artifacts/android/AppleJuiceHLE.apk \
     artifacts/android/touchHLE.apk
 do
     if [ -e "$candidate" ]; then
@@ -56,7 +56,7 @@ if [ -z "$windows_exe" ]; then
     echo "Missing build artifact (all platform builds must succeed): artifacts/windows/touchHLE.exe" >&2
     exit 1
 fi
-windows_installer="artifacts/windows-installer/BerryHLE_Windows_x86_64_Setup.exe"
+windows_installer="artifacts/windows-installer/AppleJuiceHLE_Windows_x86_64_Setup.exe"
 if [ ! -f "$windows_installer" ]; then
     echo "Missing build artifact (all platform builds must succeed): $windows_installer" >&2
     exit 1
@@ -134,7 +134,7 @@ write_changelog() {
 }
 
 {
-    printf '%s\n\n' "BerryHLE ${VERSION}"
+    printf '%s\n\n' "AppleJuiceHLE ${VERSION}"
     if [ "${FORCE_HYPERHLE_RELEASE:-}" = "true" ]; then
         printf '%s\n\n' "_Manual release — changelog shows the latest 6 commits._"
     fi
@@ -151,7 +151,7 @@ write_changelog() {
 cd "$ROOT/dev-scripts"
 ./prepare-release.sh --prepare-files
 
-prefix="BerryHLE"
+prefix="AppleJuiceHLE"
 
 ./prepare-release.sh --create-zip-android "$ROOT/$android_apk" \
     -o "$ROOT/release/${prefix}_Android_AArch64.zip"
@@ -162,4 +162,4 @@ prefix="BerryHLE"
     "$ROOT/$linux_bin" \
     -o "$ROOT/release/${prefix}_Linux_x86_64.zip"
 # The Windows installer is attached as it is (see build-win).
-cp "$ROOT/$windows_installer" "$ROOT/release/BerryHLE_Windows_x86_64_Setup.exe"
+cp "$ROOT/$windows_installer" "$ROOT/release/AppleJuiceHLE_Windows_x86_64_Setup.exe"

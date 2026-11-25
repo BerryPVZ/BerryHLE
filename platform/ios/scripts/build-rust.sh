@@ -6,9 +6,9 @@ REPO=$(CDPATH= cd -- "$ROOT/../.." && pwd)
 TARGET=${1:-aarch64-apple-ios-sim}
 CONFIGURATION=${2:-Debug}
 
-# Which emulator core to build. This repository holds HyperHLE; point
+# Which emulator core to build. This repository holds AppleJuiceHLE; point
 # TOUCHHLE_CORE_REPO at a checkout of another core (an upstream touchHLE tree,
-# say) to build that one instead. Its dylib is copied in beside HyperHLE's so
+# say) to build that one instead. Its dylib is copied in beside AppleJuiceHLE's so
 # the app can ship both and load whichever a game is set to use.
 CORE_REPO=${TOUCHHLE_CORE_REPO:-"$REPO"}
 CORE_REPO=$(CDPATH= cd -- "$CORE_REPO" && pwd)
@@ -112,7 +112,7 @@ export CARGO_TARGET_DIR TOUCHHLE_BOOST_ROOT
 
 # This repository's Dynarmic submodule lacks the changes the iOS JIT needs
 # (MAP_JIT memory with separate writable and executable views, and so on).
-# Build HyperHLE's core from a patched copy, so the submodule the other
+# Build AppleJuiceHLE's core from a patched copy, so the submodule the other
 # platforms build from stays untouched. Another core brings its own Dynarmic.
 if [ "$CORE_REPO" = "$REPO" ]; then
     TOUCHHLE_DYNARMIC_DIR=$(sh "$ROOT/scripts/patched-source.sh" \

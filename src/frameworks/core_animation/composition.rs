@@ -15,7 +15,6 @@ use super::ca_layer::CALayerHostObject;
 use crate::frameworks::core_animation::animation;
 use crate::frameworks::core_graphics::cg_color::CGColorHostObject;
 use crate::frameworks::core_graphics::{cg_bitmap_context, cg_image, CGFloat, CGRect, CGSize};
-use crate::frameworks::foundation::ns_time_interval_to_duration_or_zero;
 use crate::gles::gles11_raw as gles11; // constants only
 use crate::gles::gles11_raw::types::*;
 use crate::gles::present::{present_frame, FpsCounter};
@@ -35,8 +34,147 @@ pub(super) struct State {
     /// makes the compositor sample undefined texels (often a black screen).
     texture_framebuffer: Option<(GLuint, GLuint, u32, u32)>,
     recomposite_next: Option<Instant>,
+    /// Set by `request_recomposite`; consumed by the next
+    /// `recomposite_if_necessary` call, which then composites unconditionally.
+    recomposite_pending: bool,
     fps_counter: Option<FpsCounter>,
     misc_gl_objects: Option<MiscGlObjects>,
+    last_scene: Option<CompositedScene>,
+    /// Offscreen `(texture, framebuffer, width, height)` targets used to
+    /// composite masked layers. Pooled across frames and nested masks so a
+    /// mask does not allocate a full-screen target every time.
+    mask_targets: Vec<(GLuint, GLuint, u32, u32)>,
+}
+
+#[derive(PartialEq)]
+struct CompositedScene {
+    layers: Vec<(id, CALayerHostObject)>,
+    viewport: (u32, u32, u32, u32),
+    rotation: Matrix<2>,
+    cursor: Option<(f32, f32, bool)>,
+    scale: (u32, u32),
+    framebuffer: u32,
+    host_revision: u64,
+}
+
+// A composited EAGL frame only needs another draw when its layer tree or
+// host presentation changes. Core Animation retains backing stores between
+// commits; it does not rasterize unchanged layers on every run-loop poll.
+// https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/CoreAnimation_guide/CoreAnimationBasics/CoreAnimationBasics.html
+fn snapshot_layers(objc: &mut ObjC, roots: &[id]) -> Option<Vec<(id, CALayerHostObject)>> {
+    fn visit(
+        objc: &mut ObjC,
+        layer: id,
+        depth: usize,
+        layers: &mut Vec<(id, CALayerHostObject)>,
+        has_readback: &mut bool,
+    ) -> bool {
+        if depth >= 128 {
+            return false;
+        }
+        let snapshot = objc
+            .borrow_mut::<CALayerHostObject>(layer)
+            .composition_snapshot();
+        if !snapshot.hidden {
+            // Animation values are calculated during composition; never
+            // reuse a scene while an animation or bitmap redraw is pending.
+            if snapshot.needs_display
+                || !snapshot.animations.is_empty()
+                || !snapshot.anonymous_animations.is_empty()
+            {
+                return false;
+            }
+            *has_readback |= snapshot.presented_pixels.is_some();
+        }
+        let children = if snapshot.hidden {
+            Vec::new()
+        } else {
+            snapshot.sublayers.clone()
+        };
+        layers.push((layer, snapshot));
+        for child in children {
+            if !visit(objc, child, depth + 1, layers, has_readback) {
+                return false;
+            }
+        }
+        true
+    }
+    let mut layers = Vec::new();
+    let mut has_readback = false;
+    for &root in roots {
+        if !visit(objc, root, 0, &mut layers, &mut has_readback) {
+            return None;
+        }
+    }
+    // Keep the existing periodic compositor for apps with UIKit-only UI.
+    has_readback.then_some(layers)
+}
+
+fn snapshot_scene(env: &mut Environment) -> Option<CompositedScene> {
+    if crate::frameworks::media_player::has_active_video(env) {
+        return None;
+    }
+    let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
+    let roots: Vec<id> = windows
+        .into_iter()
+        .map(|window| msg![env; window layer])
+        .collect();
+    let layers = snapshot_layers(&mut env.objc, &roots)?;
+    let window = env.window.as_ref()?;
+    Some(CompositedScene {
+        layers,
+        viewport: window.viewport(),
+        rotation: window.rotation_matrix(),
+        cursor: window.virtual_cursor_visible_at(),
+        scale: (env.options.scale_hack.get(), env.options.ui_scale.get()),
+        framebuffer: window.host_framebuffer(),
+        host_revision: window.presentation_revision(),
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn compositor_reuse_observes_ui_changes_and_pending_animation() {
+    let mut mem = crate::mem::Mem::new();
+    mem.set_null_segment_size(0x1000);
+    let mut objc = ObjC::new();
+    objc.register_host_selectors(&mut mem);
+    let class = objc.get_known_class("CALayer", &mut mem);
+    let mut root_host = CALayerHostObject::default();
+    root_host.opacity = 1.0;
+    let root = objc.alloc_object(class, Box::new(root_host), &mut mem);
+    let mut child_host = CALayerHostObject::default();
+    child_host.opacity = 1.0;
+    child_host.presented_pixels = Some((vec![255; 4], 1, 1));
+    child_host.gles_texture_is_up_to_date = true;
+    let child = objc.alloc_object(class, Box::new(child_host), &mut mem);
+    objc.borrow_mut::<CALayerHostObject>(root)
+        .sublayers
+        .push(child);
+    let first = snapshot_layers(&mut objc, &[root]).unwrap();
+    assert!(snapshot_layers(&mut objc, &[root]).unwrap() == first);
+    assert_eq!(
+        objc.borrow::<CALayerHostObject>(child)
+            .presented_pixels
+            .as_ref()
+            .unwrap()
+            .0,
+        vec![255; 4]
+    );
+    // Moving a UIKit overlay must invalidate an otherwise identical frame.
+    objc.borrow_mut::<CALayerHostObject>(child).position.x = 5.0;
+    assert!(snapshot_layers(&mut objc, &[root]).unwrap() != first);
+    objc.borrow_mut::<CALayerHostObject>(child).position.x = 0.0;
+    objc.borrow_mut::<CALayerHostObject>(child)
+        .gles_texture_is_up_to_date = false;
+    assert!(snapshot_layers(&mut objc, &[root]).unwrap() != first);
+    objc.borrow_mut::<CALayerHostObject>(child).needs_display = true;
+    assert!(snapshot_layers(&mut objc, &[root]).is_none());
+    objc.borrow_mut::<CALayerHostObject>(child).needs_display = false;
+    objc.borrow_mut::<CALayerHostObject>(child)
+        .animations
+        .insert("opacity".into(), nil);
+    assert!(snapshot_layers(&mut objc, &[root]).is_none());
 }
 
 struct MiscGlObjects {
@@ -61,6 +199,56 @@ unsafe fn load_matrix(gles: &mut dyn GLES, matrix: Matrix<4>) {
     gles.LoadMatrixf(matrix.columns().as_ptr() as *const _);
 }
 
+// Core Animation presents at refresh boundaries and drops missed frames.
+// https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/CoreAnimation_guide/Introduction/Introduction.html
+const COMPOSITION_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
+
+fn composition_deadline(previous: Option<Instant>, finished: Instant) -> Instant {
+    let Some(previous) = previous else {
+        return finished + COMPOSITION_INTERVAL;
+    };
+    if previous > finished {
+        return previous;
+    }
+    let intervals =
+        finished.duration_since(previous).as_nanos() / COMPOSITION_INTERVAL.as_nanos() + 1;
+    u32::try_from(intervals)
+        .ok()
+        .and_then(|n| COMPOSITION_INTERVAL.checked_mul(n))
+        .and_then(|advance| previous.checked_add(advance))
+        .unwrap_or(finished + COMPOSITION_INTERVAL)
+}
+
+#[cfg(test)]
+#[test]
+fn composition_drops_missed_refreshes_without_immediate_redraw() {
+    let now = Instant::now();
+    assert_eq!(composition_deadline(None, now), now + COMPOSITION_INTERVAL);
+    let due = now + COMPOSITION_INTERVAL;
+    assert_eq!(composition_deadline(Some(due), now), due);
+    assert_eq!(
+        composition_deadline(Some(due), due),
+        due + COMPOSITION_INTERVAL
+    );
+    let finished = due + COMPOSITION_INTERVAL * 4 + Duration::from_millis(2);
+    let next = composition_deadline(Some(due), finished);
+    assert_eq!(next, due + COMPOSITION_INTERVAL * 5);
+    assert!(next > finished);
+    assert!(next.duration_since(finished) <= COMPOSITION_INTERVAL);
+}
+
+/// Ask the next `recomposite_if_necessary` call to composite even if the
+/// fullscreen EAGL layer is being presented directly. Call this after removing
+/// a UIKit overlay (e.g. a movie view): the fast path does not redraw the
+/// window, so the removed view would otherwise stay on screen until the app
+/// presents another GL frame.
+pub fn request_recomposite(env: &mut Environment) {
+    env.framework_state
+        .core_animation
+        .composition
+        .recomposite_pending = true;
+}
+
 /// For use by `NSRunLoop`: call this 60 times per second. Composites the app's
 /// visible layers (i.e. UI) and presents it to the screen. Does nothing if
 /// composition isn't in use or it's too soon (the latter check is skipped if
@@ -68,11 +256,41 @@ unsafe fn load_matrix(gles: &mut dyn GLES, matrix: Matrix<4>) {
 ///
 /// Returns the time a recomposite is due, if any.
 pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<Instant> {
+    super::view_transition::expire(env);
+    // A UIKit overlay that was removed (see `request_recomposite`) must be
+    // painted out of the window even while the fullscreen EAGL layer is being
+    // presented directly, because the fast path never redraws the window.
+    let force = force
+        || std::mem::take(
+            &mut env
+                .framework_state
+                .core_animation
+                .composition
+                .recomposite_pending,
+        );
     // Compositing requires a window/render target. In headless mode there is
     // none, so there is nothing to composite; skip rather than touching the
     // absent window further down.
     if env.window.is_none() {
         return None;
+    }
+
+    // Run loops may poll much faster than the display refresh rate. Avoid
+    // guest isHidden messages, image animation updates and a layer-tree
+    // search when this iteration cannot present anything yet. Forced draws
+    // still process changes immediately.
+    // https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/CoreAnimation_guide/Introduction/Introduction.html
+    if !force {
+        if let Some(next) = env
+            .framework_state
+            .core_animation
+            .composition
+            .recomposite_next
+        {
+            if next > Instant::now() {
+                return Some(next);
+            }
+        }
     }
 
     let mut animation_state = animation::State::default();
@@ -92,6 +310,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
 
     // Advance any UIImageView frame animations before compositing.
     crate::frameworks::uikit::ui_view::ui_image_view::update_animations(env);
+    super::view_transition::display_outgoing(env);
 
     let fullscreen_eagl_layer = find_fullscreen_eagl_layer(env);
     if fullscreen_eagl_layer != nil {
@@ -118,7 +337,32 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
             // layer) in between every GPU-presented game frame, which shows
             // up as constant black flicker.
             log_dbg!("Using CAEAGLLayer fast path, skipping composition");
-            return None;
+            // Recheck UIKit overlays at the display rate instead of walking
+            // the entire layer tree on every run-loop poll during gameplay.
+            let next = Instant::now() + Duration::from_secs_f64(1.0 / 60.0);
+            env.framework_state
+                .core_animation
+                .composition
+                .recomposite_next = Some(next);
+            return Some(next);
+        }
+    }
+
+    if !force {
+        if let Some(scene) = snapshot_scene(env) {
+            if env
+                .framework_state
+                .core_animation
+                .composition
+                .last_scene
+                .as_ref()
+                == Some(&scene)
+            {
+                let state = &mut env.framework_state.core_animation.composition;
+                let next = composition_deadline(state.recomposite_next, Instant::now());
+                state.recomposite_next = Some(next);
+                return Some(next);
+            }
         }
     }
 
@@ -136,38 +380,6 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
                 env.options.print_fps,
             );
     }
-
-    let now = Instant::now();
-    let interval = 1.0 / 60.0; // 60Hz
-    let new_recomposite_next = if let Some(recomposite_next) = env
-        .framework_state
-        .core_animation
-        .composition
-        .recomposite_next
-    {
-        if !force && recomposite_next > now {
-            log_dbg!("Not recompositing yet, wait {:?}", recomposite_next - now);
-            return Some(recomposite_next);
-        }
-
-        Some(crate::frameworks::foundation::ns_timer::next_repeating_deadline(
-            recomposite_next, now, ns_time_interval_to_duration_or_zero(interval),
-        ))
-    } else {
-        // Apple's NSTimer/CADisplayLink "missed deadline" handling is
-        // tolerant of bogus intervals: if the guest hands us a negative
-        // or NaN value (seen with games that compute frameInterval from
-        // an uninitialised float), we treat it as "fire immediately"
-        // instead of panicking inside `Duration::from_secs_f64`.
-        Some(
-            now.checked_add(ns_time_interval_to_duration_or_zero(interval))
-                .unwrap_or(now),
-        )
-    };
-    env.framework_state
-        .core_animation
-        .composition
-        .recomposite_next = new_recomposite_next;
 
     let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
     let window_layers: Vec<id> = windows
@@ -383,11 +595,11 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
             .core_animation
             .composition
             .texture_framebuffer = Some((
-                texture,
-                cached_texture_framebuffer.unwrap().1,
-                fb_width,
-                fb_height,
-            ));
+            texture,
+            cached_texture_framebuffer.unwrap().1,
+            fb_width,
+            fb_height,
+        ));
     }
 
     // Set up various other GL objects that will be reused on every frame.
@@ -519,6 +731,14 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) % 600 == 0 {
+            log!(
+                "COMPOSITE-GEOM screen={:?} framebuffer={}x{} viewport={:?} orientation={:?}",
+                screen_bounds,
+                fb_width,
+                fb_height,
+                env.window().viewport(),
+                env.window().current_rotation()
+            );
             fn dump(env: &Environment, layer: id, depth: usize) {
                 let h = env.objc.borrow::<CALayerHostObject>(layer);
                 let delegate: id = h.delegate_for_debug();
@@ -531,13 +751,14 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
                     }
                 };
                 log!(
-                    "LAYER {:indent$}{} ({:?}) delegate={} bounds={:?} pos={:?} hidden={} opaque={} opacity={} bg={:?} contents={} pixels={} ctx={}",
+                    "LAYER {:indent$}{} ({:?}) delegate={} bounds={:?} pos={:?} transform={:?} hidden={} opaque={} opacity={} bg={:?} contents={} pixels={} ctx={}",
                     "",
                     cls(layer),
                     layer,
                     cls(delegate),
                     h.bounds,
                     h.position,
+                    h.affine_transform,
                     h.hidden,
                     h.opaque,
                     h.opacity,
@@ -571,8 +792,16 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
                 root_layer,
                 cumulative_transform,
                 opacity,
-                [0.0, 0.0, screen_bounds.size.width, screen_bounds.size.height],
-                [fb_width as f32 / screen_bounds.size.width, fb_height as f32 / screen_bounds.size.height],
+                [
+                    0.0,
+                    0.0,
+                    screen_bounds.size.width,
+                    screen_bounds.size.height,
+                ],
+                [
+                    fb_width as f32 / screen_bounds.size.width,
+                    fb_height as f32 / screen_bounds.size.height,
+                ],
                 fb_height as i32,
             );
         }
@@ -609,6 +838,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
             gles.as_mut(),
             present_frame_args.0,
             present_frame_args.1,
+            /* uv_scale: */ (1.0, 1.0),
             present_frame_args.2,
             present_frame_args.3,
         );
@@ -625,13 +855,21 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     window.swap_window();
 
     animation_state.update_started_and_finished_animations(env);
+    let scene = snapshot_scene(env);
+    env.framework_state.core_animation.composition.last_scene = scene;
 
-    new_recomposite_next
+    // A readback/composition can exceed one display interval. Schedule
+    // against completion so NSRunLoop does not immediately redraw the same
+    // frame and starve the next guest timer or input event.
+    let state = &mut env.framework_state.core_animation.composition;
+    let next = composition_deadline(state.recomposite_next, Instant::now());
+    state.recomposite_next = Some(next);
+    Some(next)
 }
 
 /// Call `displayIfNeeded` on all relevant layers in the tree, so their bitmaps
 /// are up to date before compositing.
-fn display_layers(env: &mut Environment, root_layer: id) {
+pub(super) fn display_layers(env: &mut Environment, root_layer: id) {
     // Tell layers to redraw themselves if needed.
 
     fn traverse(objc: &ObjC, layer: id, layers_needing_display: &mut Vec<id>) {
@@ -644,6 +882,9 @@ fn display_layers(env: &mut Environment, root_layer: id) {
         }
         for &layer in &host_obj.sublayers {
             traverse(objc, layer, layers_needing_display);
+        }
+        if host_obj.mask != nil {
+            traverse(objc, host_obj.mask, layers_needing_display);
         }
     }
 
@@ -693,6 +934,48 @@ unsafe fn composite_layer_recursive(
     pixel_scale: [f32; 2],
     framebuffer_height: i32,
 ) {
+    let (layer, local_transform) =
+        super::view_transition::presentation(env, layer).unwrap_or((layer, Matrix::identity()));
+    // A CATransition fade is a cross-dissolve: draw the outgoing snapshot
+    // underneath the live layer, then let the live layer fade in over it.
+    let fade_in = match super::view_transition::fade(env, layer) {
+        Some((outgoing, outgoing_opacity, fade_in)) => {
+            composite_layer_recursive(
+                env,
+                animation_state,
+                outgoing,
+                cumulative_transform,
+                opacity * outgoing_opacity,
+                inherited_clip, pixel_scale, framebuffer_height,
+            );
+            fade_in
+        }
+        None => 1.0,
+    };
+    // Fade the whole subtree, not just this layer's own quad.
+    composite_layer_transformed(
+        env,
+        animation_state,
+        layer,
+        cumulative_transform,
+        opacity * fade_in,
+        local_transform,
+        inherited_clip,pixel_scale,framebuffer_height,
+    );
+}
+
+/// Draw one layer: build its presentation copy, skip it if hidden, and
+/// send it either straight to the framebuffer or through an offscreen
+/// target when it clips.
+unsafe fn composite_layer_transformed(
+    env: &mut Environment,
+    animation_state: &mut animation::State,
+    layer: id,
+    cumulative_transform: Matrix<4>,
+    opacity: CGFloat,
+    local_transform: Matrix<4>,
+    inherited_clip:[f32;4],pixel_scale:[f32;2],framebuffer_height:i32,
+) {
     // TODO: this can't handle zPosition among other things, but it is not
     //       supported yet :)
     // TODO: back-to-front drawing is not efficient, could we use front-to-back?
@@ -723,17 +1006,70 @@ unsafe fn composite_layer_recursive(
         return;
     }
 
+    let opacity = opacity * host_obj.opacity;
+    if opacity <= 0.0 {
+        // Skip GL work for transparent subtrees, but still advance child
+        // animations and deliver their start/stop callbacks on time.
+        for child in host_obj.sublayers {
+            composite_layer_recursive(env, animation_state, child, cumulative_transform, opacity, inherited_clip, pixel_scale, framebuffer_height);
+        }
+        return;
+    }
+
+    // `mask` and `masksToBounds` both clip the composited subtree, so they go
+    // through an offscreen target instead of being drawn straight into the
+    // framebuffer.
+    // <https://developer.apple.com/documentation/quartzcore/calayer/mask>
+    if host_obj.mask != nil || host_obj.masks_to_bounds {
+        composite_masked_layer(
+            env,
+            animation_state,
+            layer,
+            cumulative_transform,
+            opacity,
+            local_transform,
+            host_obj,
+            inherited_clip, pixel_scale, framebuffer_height,
+        );
+    } else {
+        composite_layer_contents(
+            env,
+            animation_state,
+            layer,
+            cumulative_transform,
+            opacity,
+            local_transform,
+            host_obj,
+            inherited_clip, pixel_scale, framebuffer_height,
+        );
+    }
+}
+
+/// Draw a layer and its subtree into the current framebuffer: background,
+/// contents texture, then children back-to-front. `host_obj` is the
+/// presentation copy, and it is the only thing read here, so callers may
+/// pass a synthetic layer (see `CALayerHostObject::bounds_mask`).
+unsafe fn composite_layer_contents(
+    env: &mut Environment,
+    animation_state: &mut animation::State,
+    layer: id,
+    cumulative_transform: Matrix<4>,
+    opacity: CGFloat,
+    local_transform: Matrix<4>,
+    host_obj: CALayerHostObject,
+    inherited_clip:[f32;4],pixel_scale:[f32;2],framebuffer_height:i32,
+) {
     let window = env.window.as_mut().unwrap();
     let mut gles = window.make_internal_gl_ctx_current();
-
-    let opacity = opacity * host_obj.opacity;
     let cumulative_transform = {
         let CALayerHostObject { bounds, .. } = host_obj;
 
         // Update the transform to match this layer's co-ordinate space.
-        let cumulative_transform =
-            <Matrix<4> as From<_>>::from(host_obj.superlayer_to_layer_transform())
-                .multiply(&cumulative_transform);
+        let cumulative_transform = local_transform
+            .multiply(&<Matrix<4> as From<_>>::from(
+                host_obj.superlayer_to_layer_transform(),
+            ))
+            .multiply(&cumulative_transform);
 
         // Reposition and scale the unit quad (see ARRAY_BUFFER binding)
         // so it will have the right size in this layer's co-ordinate space.
@@ -756,7 +1092,9 @@ unsafe fn composite_layer_recursive(
         inherited_clip
     };
     let [left, top, right, bottom] = clip;
-    if right <= left || bottom <= top { return; }
+    if right <= left || bottom <= top {
+        return;
+    }
     let x = (left * pixel_scale[0]).floor() as i32;
     let y_top = (top * pixel_scale[1]).floor() as i32;
     let x_end = (right * pixel_scale[0]).ceil() as i32;
@@ -1088,8 +1426,7 @@ unsafe fn composite_layer_recursive(
     // We clone the sublayer list, sort by zPosition (stable sort preserves
     // order of equal elements), then composite each child.
     let sorted_sublayers = {
-        let original_host_obj = env.objc.borrow::<CALayerHostObject>(layer);
-        let mut sublayers_copy = original_host_obj.sublayers.clone();
+        let mut sublayers_copy = host_obj.sublayers.clone();
         sublayers_copy.sort_by(|&a, &b| {
             let z_a = env.objc.borrow::<CALayerHostObject>(a).z_position;
             let z_b = env.objc.borrow::<CALayerHostObject>(b).z_position;
@@ -1119,8 +1456,251 @@ const FLIPPED_SQUARE_POINTS: [f32; 4 * FLOATS_PER_POINT] = [0.0, 0.0, 0.0, 1.0, 
 const FLOATS_PER_9PATCH: usize = BASIC_SQUARE_POINTS.len() * 3 * 3;
 const INDICES_PER_9PATCH: usize = SQUARE_INDICES.len() * 3 * 3;
 
+/// Full-screen offscreen targets are pooled across frames and nested masks.
+/// The viewport is left alone so the caller's transform, including any
+/// rotation, still maps onto the target
+unsafe fn mask_target(env: &mut Environment) -> Option<(GLuint, GLuint, u32, u32)> {
+    let (_, _, width, height) = env
+        .framework_state
+        .core_animation
+        .composition
+        .texture_framebuffer
+        .unwrap();
+    let cached = env
+        .framework_state
+        .core_animation
+        .composition
+        .mask_targets
+        .pop();
+    let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
+    let (texture, framebuffer) = if let Some((t, f, w, h)) = cached {
+        if (w, h) == (width, height) {
+            gl.BindFramebufferOES(gles11::FRAMEBUFFER_OES, f);
+            return Some((t, f, w, h));
+        }
+        gl.DeleteTextures(1, &t);
+        gl.DeleteFramebuffersOES(1, &f);
+        (0, 0)
+    } else {
+        (0, 0)
+    };
+    let (mut texture, mut framebuffer) = (texture, framebuffer);
+    gl.GenTextures(1, &mut texture);
+    gl.BindTexture(gles11::TEXTURE_2D, texture);
+    gl.TexImage2D(
+        gles11::TEXTURE_2D,
+        0,
+        gles11::RGBA as _,
+        width as _,
+        height as _,
+        0,
+        gles11::RGBA,
+        gles11::UNSIGNED_BYTE,
+        std::ptr::null(),
+    );
+    for (name, value) in [
+        (gles11::TEXTURE_MIN_FILTER, gles11::LINEAR),
+        (gles11::TEXTURE_MAG_FILTER, gles11::LINEAR),
+        (gles11::TEXTURE_WRAP_S, gles11::CLAMP_TO_EDGE),
+        (gles11::TEXTURE_WRAP_T, gles11::CLAMP_TO_EDGE),
+    ] {
+        gl.TexParameteri(gles11::TEXTURE_2D, name, value as _);
+    }
+    gl.GenFramebuffersOES(1, &mut framebuffer);
+    gl.BindFramebufferOES(gles11::FRAMEBUFFER_OES, framebuffer);
+    gl.FramebufferTexture2DOES(
+        gles11::FRAMEBUFFER_OES,
+        gles11::COLOR_ATTACHMENT0_OES,
+        gles11::TEXTURE_2D,
+        texture,
+        0,
+    );
+    if gl.CheckFramebufferStatusOES(gles11::FRAMEBUFFER_OES) != gles11::FRAMEBUFFER_COMPLETE_OES {
+        log_dbg!("Could not create an offscreen target for a masked layer");
+        gl.DeleteTextures(1, &texture);
+        gl.DeleteFramebuffersOES(1, &framebuffer);
+        return None;
+    }
+    Some((texture, framebuffer, width, height))
+}
+
+/// Bind an offscreen target and wipe it to fully transparent, so the layer
+/// drawn into it starts from nothing rather than the previous frame.
+unsafe fn clear_mask_target(env: &mut Environment, framebuffer: GLuint) {
+    let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
+    gl.BindFramebufferOES(gles11::FRAMEBUFFER_OES, framebuffer);
+    gl.Disable(gles11::SCISSOR_TEST);
+    gl.ClearColor(0.0, 0.0, 0.0, 0.0);
+    gl.Clear(gles11::COLOR_BUFFER_BIT);
+}
+
+/// Draw a full-screen target. With `multiply_alpha` the destination is scaled
+/// by the source's alpha instead of being blended over, which is how a mask
+/// target is applied to a content target.
+unsafe fn draw_target(env: &mut Environment, texture: GLuint, opacity: f32, multiply_alpha: bool) {
+    let misc = env
+        .framework_state
+        .core_animation
+        .composition
+        .misc_gl_objects
+        .as_ref()
+        .unwrap();
+    let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
+    gl.Disable(gles11::SCISSOR_TEST);
+    gl.MatrixMode(gles11::PROJECTION);
+    gl.PushMatrix();
+    gl.LoadIdentity();
+    gl.MatrixMode(gles11::MODELVIEW);
+    gl.PushMatrix();
+    load_matrix(
+        gl.as_mut(),
+        Matrix::<4>::from(&Matrix::scale_2d(2.0, 2.0))
+            .multiply(&Matrix::translate_3d(-1.0, -1.0, 0.0)),
+    );
+    gl.Color4f(opacity, opacity, opacity, opacity);
+    gl.Enable(gles11::BLEND);
+    if multiply_alpha {
+        gl.BlendFunc(gles11::ZERO, gles11::SRC_ALPHA);
+    } else {
+        gl.BlendFunc(gles11::ONE, gles11::ONE_MINUS_SRC_ALPHA);
+    }
+    gl.Enable(gles11::TEXTURE_2D);
+    gl.BindTexture(gles11::TEXTURE_2D, texture);
+    gl.EnableClientState(gles11::VERTEX_ARRAY);
+    gl.BindBuffer(gles11::ARRAY_BUFFER, misc.basic_square_buffer);
+    gl.VertexPointer(2, gles11::FLOAT, 0, std::ptr::null());
+    gl.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
+    gl.TexCoordPointer(2, gles11::FLOAT, 0, std::ptr::null());
+    gl.BindBuffer(gles11::ELEMENT_ARRAY_BUFFER, misc.index_buffer);
+    gl.DrawElements(
+        gles11::TRIANGLES,
+        6,
+        gles11::UNSIGNED_BYTE,
+        std::ptr::null(),
+    );
+    gl.PopMatrix();
+    gl.MatrixMode(gles11::PROJECTION);
+    gl.PopMatrix();
+    gl.MatrixMode(gles11::MODELVIEW);
+}
+
+/// Apply the mask's alpha to the complete subtree, not just its image.
+/// <https://developer.apple.com/documentation/quartzcore/calayer/mask>
+unsafe fn composite_masked_layer(
+    env: &mut Environment,
+    state: &mut animation::State,
+    layer: id,
+    parent: Matrix<4>,
+    opacity: f32,
+    local: Matrix<4>,
+    mut host: CALayerHostObject,
+    inherited_clip:[f32;4],pixel_scale:[f32;2],framebuffer_height:i32,
+) {
+    // The offscreen route exists so that `masksToBounds` can clip the
+    // LAYER'S CHILDREN, and so that a `mask` layer can carve the subtree.
+    // Neither is needed when there is no mask and nothing that can
+    // overflow: without children the rounded background is the whole
+    // story, and `composite_layer_contents` already rounds it from
+    // `corner_radius`. An unrounded clip is an ordinary rectangle, which
+    // the compositor gets for free because it never draws a layer outside
+    // its own quad. Those two cases skip the detour.
+    //
+    // Taking the detour anyway cost two full-composition-size RGBA targets
+    // for every `clipsToBounds` view, every frame, so it is worth skipping
+    // when the clip cannot change the result. A rounded clip with children
+    // still pays, because dropping the clip there would let them paint
+    // over the corners.
+    let rounded = host.corner_radius > 0.0;
+    let clip_can_bite = host.masks_to_bounds && rounded && !host.sublayers.is_empty();
+    if host.mask == nil && !clip_can_bite {
+        composite_layer_contents(env, state, layer, parent, opacity, local, host, inherited_clip, pixel_scale, framebuffer_height);
+        return;
+    }
+
+    let transform = local
+        .multiply(&<Matrix<4> as From<_>>::from(
+            host.superlayer_to_layer_transform(),
+        ))
+        .multiply(&parent);
+    let mask = host.mask;
+    let clip = host.masks_to_bounds;
+    let bounds = host.bounds;
+    let radius = host.corner_radius;
+    let group_opacity = opacity;
+    // `mask_target` binds the target it hands back, so remember the
+    // caller's framebuffer before asking for one.
+    let mut previous = 0;
+    {
+        let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
+        gl.GetIntegerv(gles11::FRAMEBUFFER_BINDING_OES, &mut previous);
+    }
+    // Offscreen targets are best-effort: if the driver refuses them, draw
+    // the layer unmasked rather than dropping it from the frame.
+    let (content, alpha) = match (mask_target(env), mask_target(env)) {
+        (Some(content), Some(alpha)) => (content, alpha),
+        (content, alpha) => {
+            let mut spare = Vec::new();
+            spare.extend(content);
+            spare.extend(alpha);
+            env.framework_state
+                .core_animation
+                .composition
+                .mask_targets
+                .extend(spare);
+            composite_layer_contents(env, state, layer, parent, opacity, local, host, inherited_clip, pixel_scale, framebuffer_height);
+            return;
+        }
+    };
+    host.opacity = 1.0;
+    clear_mask_target(env, content.1);
+    composite_layer_contents(env, state, layer, parent, 1.0, local, host, inherited_clip, pixel_scale, framebuffer_height);
+    if mask != nil {
+        clear_mask_target(env, alpha.1);
+        composite_layer_recursive(env, state, mask, transform, 1.0, inherited_clip, pixel_scale, framebuffer_height);
+        {
+            let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
+            gl.BindFramebufferOES(gles11::FRAMEBUFFER_OES, content.1);
+        }
+        draw_target(env, alpha.0, 1.0, true);
+    }
+    if clip {
+        clear_mask_target(env, alpha.1);
+        // `bounds_mask`'s own transform is the identity, so the clip needs the
+        // layer's full matrix and nothing else. `parent` plus `local` drops the
+        // layer's position and puts the clip at the parent's origin, where it
+        // multiplies the subtree by zero.
+        let clipping = CALayerHostObject::bounds_mask(bounds, radius);
+        composite_layer_contents(
+            env,
+            state,
+            nil,
+            transform,
+            1.0,
+            Matrix::identity(),
+            clipping,
+            inherited_clip, pixel_scale, framebuffer_height,
+        );
+        {
+            let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
+            gl.BindFramebufferOES(gles11::FRAMEBUFFER_OES, content.1);
+        }
+        draw_target(env, alpha.0, 1.0, true);
+    }
+    {
+        let mut gl = env.window.as_mut().unwrap().make_internal_gl_ctx_current();
+        gl.BindFramebufferOES(gles11::FRAMEBUFFER_OES, previous as _);
+    }
+    draw_target(env, content.0, group_opacity, false);
+    env.framework_state
+        .core_animation
+        .composition
+        .mask_targets
+        .extend([content, alpha]);
+}
+
 fn make_9patch_coords(x_edges: [f32; 4], y_edges: [f32; 4]) -> [f32; FLOATS_PER_9PATCH] {
     let mut out_points = [0.0; FLOATS_PER_9PATCH];
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     for (i, out_points_chunk) in out_points
         .chunks_exact_mut(BASIC_SQUARE_POINTS.len())
         .enumerate()
@@ -1142,6 +1722,7 @@ fn make_9patch_coords(x_edges: [f32; 4], y_edges: [f32; 4]) -> [f32; FLOATS_PER_
 
 fn make_9patch_indices() -> [u8; INDICES_PER_9PATCH] {
     let mut out_indices = [0; SQUARE_INDICES.len() * 3 * 3];
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     for (i, out_indices_chunk) in out_indices
         .chunks_exact_mut(SQUARE_INDICES.len())
         .enumerate()
@@ -1248,9 +1829,26 @@ mod clipping_tests {
     use crate::frameworks::core_graphics::{CGPoint, CGSize};
     #[test]
     fn intersects_nested_clips_and_landscape_rotation() {
-        let bounds = CGRect { origin: CGPoint { x: 10.0, y: 20.0 }, size: CGSize { width: 100.0, height: 50.0 } };
-        assert_eq!(intersect_layer_clip([30.0, 0.0, 200.0, 60.0], bounds, Matrix::identity()), [30.0, 20.0, 110.0, 60.0]);
-        let rotation = Matrix::from_columns([[0.0, 1.0, 0.0, 0.0], [-1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [320.0, 0.0, 0.0, 1.0]]);
-        assert_eq!(intersect_layer_clip([0.0, 0.0, 320.0, 480.0], bounds, rotation), [250.0, 10.0, 300.0, 110.0]);
+        let bounds = CGRect {
+            origin: CGPoint { x: 10.0, y: 20.0 },
+            size: CGSize {
+                width: 100.0,
+                height: 50.0,
+            },
+        };
+        assert_eq!(
+            intersect_layer_clip([30.0, 0.0, 200.0, 60.0], bounds, Matrix::identity()),
+            [30.0, 20.0, 110.0, 60.0]
+        );
+        let rotation = Matrix::from_columns([
+            [0.0, 1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [320.0, 0.0, 0.0, 1.0],
+        ]);
+        assert_eq!(
+            intersect_layer_clip([0.0, 0.0, 320.0, 480.0], bounds, rotation),
+            [250.0, 10.0, 300.0, 110.0]
+        );
     }
 }

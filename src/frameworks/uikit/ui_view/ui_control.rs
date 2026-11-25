@@ -38,7 +38,7 @@ pub const UIControlEventValueChanged: UIControlEvents = 1 << 12;
 pub const UIControlEventEditingDidBegin: UIControlEvents = 1 << 16;
 pub const UIControlEventEditingChanged: UIControlEvents = 1 << 17;
 pub const UIControlEventEditingDidEnd: UIControlEvents = 1 << 18;
-const UIControlEventEditingDidEndOnExit: UIControlEvents = 1 << 19;
+pub const UIControlEventEditingDidEndOnExit: UIControlEvents = 1 << 19;
 
 pub type UIControlContentVerticalAlignment = NSInteger;
 const UIControlContentVerticalAlignmentCenter: UIControlContentVerticalAlignment = 0;
@@ -117,7 +117,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     let UIControlHostObject {
-        superclass: _,
+        superclass,
         enabled: _,
         selected: _,
         highlighted: _,
@@ -129,6 +129,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     release(env, tracked_touch);
 
+    // Preserve superclass ownership until its own deallocator runs.
+    env.objc.borrow_mut::<UIControlHostObject>(this).superclass = superclass;
     msg_super![env; this dealloc]
 }
 

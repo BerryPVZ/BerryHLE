@@ -24,7 +24,7 @@ use crate::dyld::{export_c_func, FunctionExports};
 use crate::libc::errno::{
     get_errno, set_errno, EACCES, EADDRINUSE, EADDRNOTAVAIL, EAFNOSUPPORT, EAGAIN, EBADF,
     ECONNABORTED, ECONNREFUSED, ECONNRESET, EFAULT, EINVAL, EIO, EISCONN, ENETUNREACH,
-    ENOPROTOOPT, ENOTCONN, ENOTSUP, ENOTTY, EPROTONOSUPPORT, ESOCKTNOSUPPORT, ETIMEDOUT,
+    ENOPROTOOPT, ENOTCONN, ENOSYS, ENOTSUP, ENOTTY, EPROTONOSUPPORT, ESOCKTNOSUPPORT, ETIMEDOUT,
 };
 use crate::libc::posix_io::{
     close, find_or_create_socket, is_nonblocking, is_socket, set_nonblocking, FileDescriptor,
@@ -1519,7 +1519,7 @@ fn try_recvfrom(
             let Some(udp_socket) = socket_host_object.udp_socket.as_ref() else {
                 return Err(EAGAIN);
             };
-            let buf = env.mem.bytes_at_mut(buffer.cast(), length);
+            let buf = env.mem.bytes_at_mut_for_io(buffer.cast(), length);
             let result = if peek {
                 udp_socket.peek_from(buf)
             } else {
@@ -1538,7 +1538,7 @@ fn try_recvfrom(
             let Some(mut tcp_stream) = socket_host_object.tcp_stream.as_ref() else {
                 return Err(ENOTCONN);
             };
-            let buf = env.mem.bytes_at_mut(buffer.cast(), length);
+            let buf = env.mem.bytes_at_mut_for_io(buffer.cast(), length);
             let read = match if peek {
                 tcp_stream.peek(buf)
             } else {
@@ -1703,7 +1703,7 @@ fn send(
                 set_errno(env, ENOTCONN);
                 return -1;
             };
-            let buf = env.mem.bytes_at(buffer.cast(), length);
+            let buf = env.mem.bytes_at_for_io(buffer.cast(), length);
             match stream.write(buf) {
                 Ok(n) => {
                     log_dbg!("send: wrote {} bytes to TCP socket {}", n, socket);
@@ -1741,7 +1741,7 @@ fn send(
                 set_errno(env, EBADF);
                 return -1;
             };
-            let buf = env.mem.bytes_at(buffer.cast(), length);
+            let buf = env.mem.bytes_at_for_io(buffer.cast(), length);
             match udp.send(buf) {
                 Ok(n) => {
                     log_dbg!("send: sent {} bytes on UDP socket {}", n, socket);
@@ -1903,7 +1903,7 @@ fn sendto(
                     }
                 }
             }
-            let buf = env.mem.bytes_at(buffer.cast(), length);
+            let buf = env.mem.bytes_at_for_io(buffer.cast(), length);
             match udp_socket.send_to(buf, socket_address) {
                 Ok(written) => written,
                 // FIX: was unimplemented!() — return EAGAIN so the app's
@@ -2219,8 +2219,59 @@ pub(crate) fn socket_poll_events(
     ready
 }
 
+/// `int ___darwin_check_fd_set_overflow(int fd, const void *fdset,
+///      int fdsetsize)`
+///
+/// Newer SDKs implement `FD_ISSET` as a call to this helper instead of reading
+/// the bitmask inline, so builds from around iOS 10 on (RetroArch's armv7 slice
+/// included) bind it at load time and call it from every `select()` loop.
+/// Without a host implementation it stayed an `unhandled external relocation`:
+/// `FD_ISSET` then had no safe place to read and the readiness loop stalled.
+///
+/// It answers whether `fd`'s bit is set in `fdset`, exactly like the macro it
+/// replaced. `fdsetsize` is `sizeof(fd_set)`; a descriptor outside that range
+/// is reported as not set, which is what Darwin does instead of reading past
+/// the caller's buffer.
+/// https://opensource.apple.com/source/Libc/Libc-1158.1.2/include/sys/_types/_fd_def.h.auto.html
+fn __darwin_check_fd_set_overflow(
+    env: &mut Environment,
+    fd: i32,
+    fdset: ConstPtr<u8>,
+    fdsetsize: i32,
+) -> i32 {
+    if fd < 0 || fdset.is_null() {
+        return 0;
+    }
+    let byte_index = (fd / 8) as u32;
+    if fdsetsize >= 0 && byte_index >= fdsetsize as u32 {
+        return 0;
+    }
+    let bytes = env.mem.bytes_at(fdset, byte_index + 1);
+    ((bytes[byte_index as usize] >> (fd % 8)) & 1) as i32
+}
+
+/// `char *link_ntoa(const struct sockaddr_dl *sdl)` — render a link-layer
+/// address. touchHLE has no interface table, so return the loopback name.
+fn link_ntoa(env: &mut Environment, _sdl: ConstVoidPtr) -> MutPtr<u8> {
+    env.mem.alloc_and_write_cstr(b"lo0")
+}
+
+/// `int socketpair(int domain, int type, int protocol, int sv[2])` — touchHLE's
+// socket layer only models TCP/UDP host sockets, not AF_UNIX pairs.
+fn socketpair(
+    env: &mut Environment,
+    _domain: i32,
+    _type: i32,
+    _protocol: i32,
+    _sv: MutPtr<i32>,
+) -> i32 {
+    set_errno(env, ENOSYS);
+    -1
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(socket(_, _, _)),
+    export_c_func!(__darwin_check_fd_set_overflow(_, _, _)),
     export_c_func!(ioctl(_, _, _)),
     export_c_func!(getsockopt(_, _, _, _, _)),
     export_c_func!(setsockopt(_, _, _, _, _)),
@@ -2236,6 +2287,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(shutdown(_, _)),
     export_c_func!(getsockname(_, _, _)),
     export_c_func!(getpeername(_, _, _)),
+    export_c_func!(socketpair(_, _, _, _)),
+    export_c_func!(link_ntoa(_)),
 ];
 
 /// A helper to close a socket, not a part of API

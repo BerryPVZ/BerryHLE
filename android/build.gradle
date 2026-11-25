@@ -13,10 +13,21 @@ buildscript {
         kotlin_version = '2.0.21'
     }
     repositories {
-        mavenCentral()
         google()
+        mavenCentral()
         maven {
             url "https://plugins.gradle.org/m2/"
+        }
+        // Central answers through several front ends, and a 404 storm on one
+        // of them (as on repo.maven.apache.org and the plugins.gradle.org
+        // mirror) leaves the others serving the same artifacts. Gradle moves
+        // to the next repository when a POM is missing, so these are only
+        // reached when the canonical ones fail.
+        maven {
+            url "https://maven-central.storage-download.googleapis.com/maven2/"
+        }
+        maven {
+            url "https://repo1.maven.org/maven2"
         }
     }
     dependencies {
@@ -31,8 +42,15 @@ buildscript {
 
 allprojects {
     repositories {
-        mavenCentral()
         google()
+        mavenCentral()
+        // Same Central fallbacks as the buildscript block above.
+        maven {
+            url "https://maven-central.storage-download.googleapis.com/maven2/"
+        }
+        maven {
+            url "https://repo1.maven.org/maven2"
+        }
     }
 }
 

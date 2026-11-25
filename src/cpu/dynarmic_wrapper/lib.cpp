@@ -3,8 +3,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <exception>
 
 #include "dynarmic/interface/A32/a32.h"
 #include "dynarmic/interface/A32/config.h"
@@ -37,6 +39,7 @@ struct touchHLE_DynarmicContext {
 const auto HaltReasonSvc = Dynarmic::HaltReason::UserDefined1;
 const auto HaltReasonUndefinedInstruction = Dynarmic::HaltReason::UserDefined2;
 const auto HaltReasonBreakpoint = Dynarmic::HaltReason::UserDefined3;
+const auto HaltReasonInterpreterFallback = Dynarmic::HaltReason::UserDefined4;
 
 class Environment final : public Dynarmic::A32::UserCallbacks {
 public:
@@ -52,6 +55,7 @@ public:
   // the instruction length from the register file alone. See
   // `touchHLE_DynarmicWrapper_last_exception_pc`.
   std::uint32_t last_exception_pc = 0;
+  std::uint32_t interpreter_fallback_pc = 0;
 
 private:
   std::uint8_t MemoryRead8(VAddr vaddr) override {
@@ -151,8 +155,11 @@ private:
     return true;
   }
 
-  void InterpreterFallback(std::uint32_t, size_t) override {
-    abort(); // TODO
+  void InterpreterFallback(std::uint32_t pc, size_t) override {
+    // Stop guest execution and report the unsupported instruction instead
+    // of aborting the emulator process.
+    interpreter_fallback_pc = pc;
+    cpu->HaltExecution(HaltReasonInterpreterFallback);
   }
   void CallSVC(std::uint32_t svc) override {
     halting_svc = svc;
@@ -369,6 +376,9 @@ public:
 
 
   std::uint32_t last_exception_pc() const { return env.last_exception_pc; }
+  std::uint32_t interpreter_fallback_pc() const {
+    return env.interpreter_fallback_pc;
+  }
 
   void invalidate_cache_range(VAddr start, std::uint32_t size) {
     cpu->InvalidateCacheRange(start, size);
@@ -404,6 +414,8 @@ public:
       res = -4;
     } else if (Dynarmic::Has(hr, HaltReasonSvc)) {
       res = std::int32_t(env.halting_svc);
+    } else if (Dynarmic::Has(hr, HaltReasonInterpreterFallback)) {
+      res = -5;
     } else {
       printf("unhandled halt reason %u\n", unsigned(hr));
       abort();
@@ -467,6 +479,11 @@ touchHLE_DynarmicWrapper_last_exception_pc(const DynarmicWrapper *cpu) {
   return cpu->last_exception_pc();
 }
 
+std::uint32_t touchHLE_DynarmicWrapper_interpreter_fallback_pc(
+    const DynarmicWrapper *cpu) {
+  return cpu->interpreter_fallback_pc();
+}
+
 void touchHLE_DynarmicWrapper_swap_context(DynarmicWrapper *cpu,
                                            touchHLE_DynarmicContext *context) {
   cpu->swap_context(context);
@@ -481,7 +498,33 @@ void touchHLE_DynarmicWrapper_invalidate_cache_range(DynarmicWrapper *cpu,
 std::int32_t touchHLE_DynarmicWrapper_run_or_step(DynarmicWrapper *cpu,
                                                   touchHLE_Mem *mem,
                                                   std::uint64_t *ticks) {
-  return cpu->run_or_step(mem, ticks);
+  // The guest can steer the emulated PC into data, and Dynarmic reports
+  // anything it cannot compile by failing an assertion (see
+  // externals/mcl/src/assert.cpp in the vendored copy, which throws instead of
+  // calling std::terminate()). Catching it here keeps a bogus guest jump from
+  // killing the host process: the emulator sees an UndefinedInstruction and
+  // runs its usual trap diagnostics and recovery, which is also what produces
+  // an actionable log line naming the fault.
+  static std::atomic_bool reported = false;
+  try {
+    return cpu->run_or_step(mem, ticks);
+  } catch (const std::exception &e) {
+    if (!reported.exchange(true)) {
+      std::fprintf(stderr,
+                   "touchHLE: dynarmic raised while compiling guest code: %s\n",
+                   e.what());
+      std::fflush(stderr);
+    }
+    return -3; // UndefinedInstruction
+  } catch (...) {
+    if (!reported.exchange(true)) {
+      std::fprintf(stderr,
+                   "touchHLE: dynarmic raised an unknown exception while "
+                   "compiling guest code\n");
+      std::fflush(stderr);
+    }
+    return -3; // UndefinedInstruction
+  }
 }
 }
 

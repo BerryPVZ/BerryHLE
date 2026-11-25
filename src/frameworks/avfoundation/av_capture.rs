@@ -359,7 +359,7 @@ struct AVCaptureDeviceHostObject {
     media_type: id,
     /// Position (front/back). 1=back (default), 2=front.
     position: i32,
-    /// Localized display name. Always "HyperHLE Stub Camera" in this stub.
+    /// Localized display name. Always "AppleJuiceHLE Stub Camera" in this stub.
     localized_name: id,
     /// Unique device id.
     unique_id: id,
@@ -425,7 +425,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         let host = env.objc.borrow_mut::<AVCaptureSessionHostObject>(this);
         host.preset = preset;
     }
-    log!("[(AVCaptureSession*){:?} init] (HyperHLE stub)", this);
+    log!("[(AVCaptureSession*){:?} init] (AppleJuiceHLE stub)", this);
     this
 }
 
@@ -533,7 +533,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: Lifecycle
 
 - (())startRunning {
-    log!("[(AVCaptureSession*){:?} startRunning] (HyperHLE stub)", this);
+    log!("[(AVCaptureSession*){:?} startRunning] (AppleJuiceHLE stub)", this);
     env.objc.borrow_mut::<AVCaptureSessionHostObject>(this).running = true;
     if !env.framework_state.avfoundation.av_capture.running_sessions.contains(&this) {
         env.framework_state.avfoundation.av_capture.running_sessions.push(this);
@@ -545,7 +545,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())stopRunning {
-    log!("[(AVCaptureSession*){:?} stopRunning] (HyperHLE stub)", this);
+    log!("[(AVCaptureSession*){:?} stopRunning] (AppleJuiceHLE stub)", this);
     env.objc.borrow_mut::<AVCaptureSessionHostObject>(this).running = false;
     env.framework_state.avfoundation.av_capture.running_sessions.retain(|&s| s != this);
     let nc: id = msg_class![env; NSNotificationCenter defaultCenter];
@@ -716,7 +716,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)init {
-    log!("[(AVCaptureVideoDataOutput*){:?} init] (HyperHLE stub)", this);
+    log!("[(AVCaptureVideoDataOutput*){:?} init] (AppleJuiceHLE stub)", this);
     this
 }
 
@@ -780,7 +780,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)init {
-    log!("[(AVCaptureMetadataOutput*){:?} init] (HyperHLE stub)", this);
+    log!("[(AVCaptureMetadataOutput*){:?} init] (AppleJuiceHLE stub)", this);
     let host = env.objc.borrow_mut::<AVCaptureMetadataOutputHostObject>(this);
     host.rect_of_interest = CGRect {
         origin: crate::frameworks::core_graphics::CGPoint { x: 0.0, y: 0.0 },
@@ -914,7 +914,7 @@ fn make_default_video_device(env: &mut crate::Environment) -> id {
     let init: id = msg![env; alloc init];
     let media_type = ns_string::get_static_str(env, AVMediaTypeVideo);
     retain(env, media_type);
-    let name = ns_string::from_rust_string(env, "HyperHLE Stub Camera".to_string());
+    let name = ns_string::from_rust_string(env, "AppleJuiceHLE Stub Camera".to_string());
     let uid = ns_string::from_rust_string(env, "com.hyperhle.camera.stub".to_string());
     {
         let host = env.objc.borrow_mut::<AVCaptureDeviceHostObject>(init);

@@ -443,7 +443,7 @@ pub fn AudioFileInitializeWithCallbacks(
     // caller control where data is stored (memory buffer, network stream,
     // etc.). After initialization the AudioFile handle is ready for writing.
     //
-    // In HyperHLE we create the same virtual writable file as
+    // In AppleJuiceHLE we create the same virtual writable file as
     // AudioFileCreateWithURL. The write callback is not invoked — all data
     // stays in our in-memory buffer. This is sufficient for games that use
     // callback-based audio file creation (e.g. for streaming to a memory

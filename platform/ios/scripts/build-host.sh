@@ -38,7 +38,7 @@ TOUCHHLE_CORE_REPO= sh "$ROOT/scripts/build-rust.sh" "$RUST_TARGET" "$CONFIGURAT
 
 # The app ships every core it is built with. TOUCHHLE_CORE_REPO points at a
 # checkout of the other core (johnny901901901/touchHLE, branch ios-core-dylib);
-# without it the app is built with HyperHLE alone and the core picker hides
+# without it the app is built with AppleJuiceHLE alone and the core picker hides
 # itself.
 if [ -n "${TOUCHHLE_CORE_REPO:-}" ]; then
     TOUCHHLE_CORE_REPO="$TOUCHHLE_CORE_REPO" \

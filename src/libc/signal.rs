@@ -27,7 +27,7 @@
 
 use crate::abi::{CallFromHost, GuestFunction};
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
-use crate::libc::errno::{set_errno, EINVAL};
+use crate::libc::errno::{set_errno, EINTR, EINVAL};
 use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr, MutVoidPtr, Ptr};
 use crate::Environment;
 use std::collections::HashMap;
@@ -476,12 +476,20 @@ fn sigaltstack(env: &mut Environment, _ss: ConstVoidPtr, _old_ss: MutVoidPtr) ->
     0
 }
 
+// `int pause(void)` — suspend until a signal arrives. There is no signal
+// delivery thread, so report EINTR immediately rather than hanging the guest.
+fn pause(env: &mut Environment) -> i32 {
+    set_errno(env, EINTR);
+    -1
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(sigaction(_, _, _)),
     export_c_func!(signal(_, _)),
     export_c_func!(raise(_)),
     export_c_func!(sigprocmask(_, _, _)), // Строго 3 аргумента (how, set, old_set)
     export_c_func!(sigaltstack(_, _)),    // Строго 2 аргумента (ss, old_ss)
+    export_c_func!(pause()),
 ];
 
 /// Name of `signum` for logging, matching `_sys_siglist` below.
@@ -496,15 +504,15 @@ fn signal_name(signum: i32) -> &'static str {
 /// `const char *const sys_siglist[NSIG]` — POSIX/BSD signal-name table.
 /// On Apple platforms (`sys/signal.h`) the array has `NSIG` (= 32)
 /// entries. Each slot is a pointer to a C string describing the
-/// signal (`"Terminated"`, `"Segmentation fault"`, …). Per the
-/// libc source `<sys/signal.c>`, the values are stable and exposed
-/// as a non-lazy symbol.
+/// signal (`"Terminated"`, `"Segmentation fault"`, …). Per Apple's libc
+/// (`gen/FreeBSD/siglist.c`), the values are stable and exposed as a
+/// non-lazy symbol.
 ///
 /// We build the table at first reference time by allocating 32
 /// guest-side `char *` slots, each pointing at the canonical name
-/// from Apple's `sys/signal.h`.
+/// from `gen/FreeBSD/siglist.c`.
 const SIG_NAMES: [&str; 32] = [
-    "Unknown",
+    "Signal 0",
     "Hangup",
     "Interrupt",
     "Quit",
@@ -538,25 +546,42 @@ const SIG_NAMES: [&str; 32] = [
     "User defined signal 2",
 ];
 
-pub const CONSTANTS: ConstantExports = &[(
-    "_sys_siglist",
-    HostConstant::Custom(|env| {
-        let table: crate::mem::MutPtr<u32> = env.mem.alloc(32 * 4).cast();
-        for (i, &name) in SIG_NAMES.iter().enumerate() {
-            // Allocate a null-terminated C string in guest memory.
-            let bytes = name.as_bytes();
-            let s = env.mem.alloc((bytes.len() + 1) as u32);
-            env.mem
-                .bytes_at_mut(s.cast(), (bytes.len() + 1) as u32)
-                .copy_from_slice(
-                    &bytes
-                        .iter()
-                        .copied()
-                        .chain(std::iter::once(0u8))
-                        .collect::<Vec<_>>(),
-                );
-            env.mem.write(table + (i as u32), s.to_bits());
-        }
-        Ptr::from_bits(table.to_bits())
-    }),
-)];
+/// Short signal names exposed as `sys_signame`, indexed by signal number
+/// like `SIG_NAMES`. Apple's table (`gen/FreeBSD/siglist.c`) uses the
+/// lower-case form without the `SIG` prefix.
+const SIG_SHORT_NAMES: [&str; 32] = [
+    "Signal 0", "hup", "int", "quit", "ill", "trap", "abrt", "emt", "fpe", "kill", "bus", "segv",
+    "sys", "pipe", "alrm", "term", "urg", "stop", "tstp", "cont", "chld", "ttin", "ttou", "io",
+    "xcpu", "xfsz", "vtalrm", "prof", "winch", "info", "usr1", "usr2",
+];
+/// Allocates a guest-side `const char *[names.len()]` table, one
+/// null-terminated C string per entry.
+fn signal_name_table(env: &mut crate::Environment, names: &[&str]) -> crate::mem::ConstVoidPtr {
+    let table: crate::mem::MutPtr<u32> = env.mem.alloc(names.len() as u32 * 4).cast();
+    for (i, &name) in names.iter().enumerate() {
+        // Allocate a null-terminated C string in guest memory.
+        let bytes = name.as_bytes();
+        let s = env.mem.alloc((bytes.len() + 1) as u32);
+        env.mem
+            .bytes_at_mut(s.cast(), (bytes.len() + 1) as u32)
+            .copy_from_slice(
+                &bytes
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(0u8))
+                    .collect::<Vec<_>>(),
+            );
+        env.mem.write(table + (i as u32), s.to_bits());
+    }
+    Ptr::from_bits(table.to_bits())
+}
+pub const CONSTANTS: ConstantExports = &[
+    (
+        "_sys_siglist",
+        HostConstant::Custom(|env| signal_name_table(env, &SIG_NAMES)),
+    ),
+    (
+        "_sys_signame",
+        HostConstant::Custom(|env| signal_name_table(env, &SIG_SHORT_NAMES)),
+    ),
+];

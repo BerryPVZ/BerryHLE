@@ -53,9 +53,9 @@ trap 'rm -rf "$STAGE"' EXIT HUP INT TERM
 unzip -tq "$IPA" >/dev/null
 unzip -q "$IPA" -d "$STAGE"
 
-APP="$STAGE/Payload/HyperHLE.app"
+APP="$STAGE/Payload/AppleJuiceHLE.app"
 if [ ! -d "$APP" ]; then
-    echo "Payload/HyperHLE.app is missing." >&2
+    echo "Payload/AppleJuiceHLE.app is missing." >&2
     exit 1
 fi
 
@@ -75,7 +75,7 @@ if ! command -v ldid >/dev/null 2>&1; then
     exit 1
 fi
 
-ENTITLEMENTS=$(ldid -e "$APP/HyperHLE" 2>/dev/null || true)
+ENTITLEMENTS=$(ldid -e "$APP/AppleJuiceHLE" 2>/dev/null || true)
 
 require_entitlement() {
     if ! printf '%s' "$ENTITLEMENTS" | python3 -c \
@@ -151,7 +151,7 @@ if [ "$BUNDLE_ID" != "com.klugklug.hyperhle" ]; then
     exit 1
 fi
 
-file "$APP/HyperHLE" | grep -q 'arm64'
+file "$APP/AppleJuiceHLE" | grep -q 'arm64'
 
 echo "Verified $EXPECT IPA"
 echo "Bundle: $BUNDLE_ID"

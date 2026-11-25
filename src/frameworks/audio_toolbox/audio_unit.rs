@@ -6,6 +6,7 @@
  */
 //! `AudioUnit.h` (Audio Unit Services)
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use crate::audio::openal::al_types::{ALsizei, ALuint, ALvoid};
@@ -228,12 +229,24 @@ const k3DMixerParam_PlaybackRate: AudioUnitParameterID = 4;
 
 fn AudioUnitInitialize(env: &mut Environment, in_unit: AudioUnit) -> OSStatus {
     log_dbg!("AudioUnitInitialize({:?})", in_unit);
+    if let Some(unit) = audio_components::State::get(&mut env.framework_state)
+        .audio_component_instances
+        .get_mut(&in_unit)
+    {
+        unit.initialized = true;
+    }
     let run_loop = CFRunLoopGetMain(env);
     ns_run_loop::add_audio_unit(env, run_loop, in_unit);
     0
 }
 
 fn AudioUnitUninitialize(env: &mut Environment, in_unit: AudioUnit) -> OSStatus {
+    if let Some(unit) = audio_components::State::get(&mut env.framework_state)
+        .audio_component_instances
+        .get_mut(&in_unit)
+    {
+        unit.initialized = false;
+    }
     let run_loop = CFRunLoopGetMain(env);
     match ns_run_loop::remove_audio_unit(env, run_loop, in_unit) {
         Ok(_) => 0,
@@ -267,10 +280,8 @@ fn notify_audio_unit_property(
         .unwrap_or_default();
 
     for (_, callback, ref_con) in listeners {
-        let _: OSStatus = callback.call_from_host(
-            env,
-            (ref_con, in_unit, in_id, in_scope, in_element),
-        );
+        let _: OSStatus =
+            callback.call_from_host(env, (ref_con, in_unit, in_id, in_scope, in_element));
     }
 }
 
@@ -822,6 +833,7 @@ fn set_units_running(env: &mut Environment, units: Vec<AudioUnit>, running: bool
             // unit is connected again.
             obj.started = false;
             obj.last_render_time = None;
+            obj.last_queued_buffers = -1;
             for bus in obj.mixer_buses.values_mut() {
                 bus.last_render_time = None;
             }
@@ -831,12 +843,7 @@ fn set_units_running(env: &mut Environment, units: Vec<AudioUnit>, running: bool
     }
 }
 
-fn connect_audio_units(
-    env: &mut Environment,
-    dest: AudioUnit,
-    dest_input: u32,
-    source: AudioUnit,
-) {
+fn connect_audio_units(env: &mut Environment, dest: AudioUnit, dest_input: u32, source: AudioUnit) {
     let connections = &mut audio_components::State::get(&mut env.framework_state).connections;
     let old_source = if source.is_null() {
         connections.remove(&(dest, dest_input))
@@ -877,7 +884,12 @@ fn apply_mixer_bus_gain_and_rate(env: &mut Environment, mixer: AudioUnit, bus_id
         .and_then(|unit| state.audio_component_instances.get(unit))
     {
         sources.extend(source_unit.al_source);
-        sources.extend(source_unit.mixer_buses.values().filter_map(|bus| bus.al_source));
+        sources.extend(
+            source_unit
+                .mixer_buses
+                .values()
+                .filter_map(|bus| bus.al_source),
+        );
     }
     if sources.is_empty() {
         return;
@@ -1276,6 +1288,7 @@ fn AudioUnitReset(
         .get_mut(&in_unit)
     {
         obj.last_render_time = None;
+        obj.last_queued_buffers = -1;
     }
     0
 }
@@ -1367,6 +1380,7 @@ pub fn setup_audio_unit_for_render(env: &mut Environment, ci: AudioUnit) {
         }
         bus_sources.push((*bus_id, s));
     }
+    // Release the borrow before spawning the render thread below.
     drop(context);
 
     let now = Instant::now();
@@ -1395,6 +1409,59 @@ pub fn setup_audio_unit_for_render(env: &mut Environment, ci: AudioUnit) {
     if !was_started {
         notify_audio_unit_is_running(env, ci);
     }
+    if env.options.audio_unit_render_thread {
+        start_audio_unit_render_thread(env, ci);
+    }
+}
+
+// Apple's render callbacks run asynchronously on a real-time audio thread:
+// https://developer.apple.com/library/archive/documentation/MusicAudio/Conceptual/AudioUnitHostingGuide_iOS/AudioUnitHostingFundamentals/AudioUnitHostingFundamentals.html
+// Driving them only from NSRunLoop deadlocks FMOD's blocking bank load before
+// UIApplicationMain reaches that loop. Use a cooperative guest thread so the
+// callbacks can run while the main thread is asleep or waiting on a semaphore.
+fn start_audio_unit_render_thread(env: &mut Environment, unit: AudioUnit) {
+    let Some(state) = audio_components::State::get(&mut env.framework_state)
+        .audio_component_instances
+        .get(&unit)
+    else {
+        return;
+    };
+    if state.render_thread.is_some() {
+        return;
+    }
+    let routine = env
+        .dyld
+        .create_proc_address(
+            &mut env.mem,
+            &mut env.cpu,
+            "_touchHLE_audio_unit_render_thread",
+        )
+        .unwrap();
+    let thread = env.new_thread(routine, unit.cast(), 128 * 1024);
+    audio_components::State::get(&mut env.framework_state)
+        .audio_component_instances
+        .get_mut(&unit)
+        .unwrap()
+        .render_thread = Some(thread);
+    log!("Audio Unit {:?} rendering on guest thread {}", unit, thread);
+}
+
+/// Internal entry point for the guest audio worker, not an iOS API.
+fn touchHLE_audio_unit_render_thread(env: &mut Environment, unit: AudioUnit) -> MutVoidPtr {
+    // `while let` instead of `loop` + `break` keeps the exit condition where
+    // it belongs: the instance is gone (deallocated, or the handle was reused
+    // before this worker next ran).
+    while let Some(state) = audio_components::State::get(&mut env.framework_state)
+        .audio_component_instances
+        .get(&unit)
+        .filter(|state| state.render_thread == Some(env.current_thread))
+    {
+        if state.initialized && state.started {
+            render_audio_unit(env, unit);
+        }
+        env.sleep_guest(std::time::Duration::from_millis(5));
+    }
+    MutVoidPtr::null()
 }
 
 fn AudioOutputUnitStop(env: &mut Environment, ci: AudioUnit) -> OSStatus {
@@ -1649,9 +1716,10 @@ fn fill_mic_input(
         slice.copy_from_slice(&out[..n]);
         // Zero the remainder rather than leaving stale guest memory.
         if n < b.data_byte_size as usize {
-            let rest = env
-                .mem
-                .bytes_at_mut(b.data.cast::<u8>() + n as u32, (b.data_byte_size as usize - n) as u32);
+            let rest = env.mem.bytes_at_mut(
+                b.data.cast::<u8>() + n as u32,
+                (b.data_byte_size as usize - n) as u32,
+            );
             rest.fill(0);
         }
     }
@@ -1993,11 +2061,9 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
                     env.mem.bytes_at(buffer_data.cast(), buffer_size),
                     env.mem.bytes_at(right.cast(), buffer_size),
                 ];
-                let interleaved = interleave_planar_pcm(
-                    &planes,
-                    (fmt.bits_per_channel / 8) as usize,
-                )
-                .unwrap_or_default();
+                let interleaved =
+                    interleave_planar_pcm(&planes, (fmt.bits_per_channel / 8) as usize)
+                        .unwrap_or_default();
                 let interleaved_format = interleaved_format_for_planar_pcm(fmt);
                 decode_buffer_from_bytes(&interleaved_format, &interleaved, &[])
             } else {
@@ -2083,6 +2149,9 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
 // before an audible underrun. The throttle below still drains and re-syncs
 // if we ever run ahead of playback.
 const AUDIO_RENDER_TARGET_DEPTH: i32 = 6;
+/// Pumped ticks that found the queue empty, so the log reports the first one
+/// and then every hundredth instead of on every frame.
+static AUDIO_UNDERRUNS: AtomicU32 = AtomicU32::new(0);
 
 /// `kAudioUnitRenderAction_PreRender` / `PostRender` flags passed to render
 /// notify callbacks (see AUComponent.h).
@@ -2214,6 +2283,7 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
         has_input_format,
         al_source,
         last_render_time,
+        last_queued_buffers,
         callback,
         start_sample_time,
     ) = {
@@ -2240,6 +2310,7 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
             obj.input_stream_format.is_some(),
             obj.al_source,
             obj.last_render_time,
+            obj.last_queued_buffers,
             obj.render_callback,
             obj.sample_time,
         )
@@ -2335,6 +2406,39 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
     // (~140ms) rides out hitches at the cost of imperceptible extra latency;
     // the throttle below still reclaims buffers and re-syncs if we run ahead.
     let remaining_buffers = queued_buffers.saturating_sub(processed_buffers);
+    let io_buffer_seconds = f64::from(
+        env.framework_state
+            .audio_toolbox
+            .audio_session
+            .current_hardware_io_buffer_duration,
+    );
+    let gap = now.duration_since(last_render_time);
+    if last_queued_buffers > 0 && remaining_buffers == 0 {
+        // The queue held buffers at the previous pump and is empty now, so
+        // the app's frame outlasted the audio queued ahead of it and the
+        // sound had already stopped. Report it so "the sound cuts out when
+        // the frame rate drops" can be told apart from a mixing bug, and so
+        // the size of the gap is known. A queue that was empty before this
+        // pump too (audio not started yet) is not an underrun.
+        let underruns = AUDIO_UNDERRUNS.fetch_add(1, Ordering::Relaxed) + 1;
+        if underruns == 1 || underruns % 100 == 0 {
+            log!(
+                "Audio underrun #{}: the OpenAL queue was empty when the run \
+                 loop pumped it, {} ms since the previous pump.",
+                underruns,
+                gap.as_millis()
+            );
+        }
+    }
+    if let Some(obj) = env
+        .framework_state
+        .audio_toolbox
+        .audio_components
+        .audio_component_instances
+        .get_mut(&audio_unit)
+    {
+        obj.last_queued_buffers = remaining_buffers;
+    }
     if remaining_buffers > AUDIO_RENDER_TARGET_DEPTH {
         let mut drained_buffers = Vec::new();
         {
@@ -2386,13 +2490,7 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
         }
     }
 
-    let target_frames = (sample_rate
-        * env
-            .framework_state
-            .audio_toolbox
-            .audio_session
-            .current_hardware_io_buffer_duration as f64)
-        .round() as u32;
+    let target_frames = (sample_rate * io_buffer_seconds).round() as u32;
     let frames = target_frames.clamp(64, 2048);
     let planar_stereo_buffers = uses_planar_stereo_buffers(&stream_format, has_input_format);
     let bytes_per_sample = stream_format.bits_per_channel / 8;
@@ -2643,6 +2741,7 @@ pub fn render_audio_unit(env: &mut Environment, audio_unit: AudioUnit) {
 }
 
 pub const FUNCTIONS: FunctionExports = &[
+    export_c_func!(touchHLE_audio_unit_render_thread(_)),
     export_c_func!(AudioUnitInitialize(_)),
     export_c_func!(AudioUnitUninitialize(_)),
     export_c_func!(AudioUnitAddPropertyListener(_, _, _, _)),

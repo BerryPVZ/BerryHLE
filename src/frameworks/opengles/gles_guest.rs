@@ -6,6 +6,7 @@
 
 //! Wrapper functions exposing OpenGL ES to the guest.
 
+use super::buffer_mapping::{self, BufferObjects};
 use crate::dyld::{export_c_func, export_c_func_aliased, FunctionExports};
 use crate::frameworks::opengles::eagl::{EAGLContextHostObject, GLShadowState};
 use crate::frameworks::opengles::software_vao::{self, ArrayPointer, FixedArray};
@@ -44,6 +45,27 @@ const SUPPORTED_COMPRESSED_TEXTURE_FORMATS: &[GLenum] = &[
     gles11::PALETTE8_RGBA8_OES,
 ];
 
+fn trace_draw_delay_elapsed() -> bool {
+    static DELAY: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let delay = *DELAY.get_or_init(|| {
+        std::env::var("TOUCHHLE_TRACE_DRAW_AFTER_SECONDS")
+            .ok()
+            .and_then(|seconds| seconds.parse::<u64>().ok())
+            .map(std::time::Duration::from_secs)
+            .unwrap_or_default()
+    });
+    START.get_or_init(std::time::Instant::now).elapsed() >= delay
+}
+
+fn trace_draw_enabled() -> bool {
+    crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") && trace_draw_delay_elapsed()
+}
+
+fn trace_debug_draw_enabled() -> bool {
+    crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") && trace_draw_delay_elapsed()
+}
+
 fn trace_potatogold_render() -> bool {
     crate::env_flag_cached!("TOUCHHLE_TRACE_POTATOGOLD_RENDER")
 }
@@ -73,11 +95,44 @@ fn texture_binding_pname(target: GLenum) -> Option<GLenum> {
     }
 }
 
+fn texture_binding_query_supported(is_native_es1: bool, pname: GLenum) -> bool {
+    !(is_native_es1 && pname == TEXTURE_BINDING_CUBE_MAP)
+}
+
 unsafe fn current_bound_texture(gles: &mut dyn GLES, target: GLenum) -> Option<GLuint> {
     let pname = texture_binding_pname(target)?;
+    // The guest GLES 1.1 extension list does not advertise cube maps. This
+    // bookkeeping query can enqueue GL_INVALID_ENUM on strict native ES 1.1
+    // drivers, so skip it there; the guest texture call still goes through.
+    // shortcut: omit cube-map allocation accounting on native ES 1.1 until
+    // cube-map extension support is added.
+    if !texture_binding_query_supported(gles.is_native_es1(), pname) {
+        return None;
+    }
     let mut texture = 0;
     gles.GetIntegerv(pname, &mut texture);
     GLuint::try_from(texture).ok()
+}
+
+#[cfg(test)]
+mod texture_binding_query_tests {
+    use super::{gles11, texture_binding_query_supported, TEXTURE_BINDING_CUBE_MAP};
+
+    #[test]
+    fn native_es1_skips_optional_cube_map_binding_query() {
+        assert!(!texture_binding_query_supported(
+            true,
+            TEXTURE_BINDING_CUBE_MAP
+        ));
+        assert!(texture_binding_query_supported(
+            true,
+            gles11::TEXTURE_BINDING_2D
+        ));
+        assert!(texture_binding_query_supported(
+            false,
+            TEXTURE_BINDING_CUBE_MAP
+        ));
+    }
 }
 
 fn pvrtc_subimage_matches_level(
@@ -100,7 +155,7 @@ fn pvrtc_subimage_matches_level(
 }
 
 #[track_caller]
-fn with_ctx_and_mem<T, U: Default>(env: &mut Environment, f: T) -> U
+pub(crate) fn with_ctx_and_mem<T, U: Default>(env: &mut Environment, f: T) -> U
 where
     T: FnOnce(&mut dyn GLES, &mut Mem) -> U,
 {
@@ -122,7 +177,7 @@ where
     // calling thread. The guard above already short-circuits the common
     // case where the *guest* never made a context current, but on edge
     // cases (e.g. context destroyed mid-call, headless GLES driver missing,
-    // see HyperHLE log #5) we may still hit None here. Treat it the same
+    // see AppleJuiceHLE log #5) we may still hit None here. Treat it the same
     // as the no-context branch above: log once and return the default.
     let Some(mut gles) = super::sync_context(
         &mut env.framework_state.opengles,
@@ -143,8 +198,25 @@ where
     // leftovers from untraced internal code paths (EAGL present, context
     // sync, etc.). Without this, one bad call makes every later traced
     // call report the same code at the wrong line.
+    //
+    // A non-zero value is reported rather than silently dropped: "an error was
+    // already pending when this call started" and "this call raised an error"
+    // are otherwise indistinguishable in a trace, and telling them apart is the
+    // difference between blaming the app for the emulator's own start-up
+    // probes and the other way round.
     if trace {
-        unsafe { gles.GetError() };
+        let pending = unsafe { gles.GetError() };
+        if pending != 0 {
+            log!(
+                "[--trace-gl-errors] {} had glGetError() = {:#x} pending \
+                 before a call dispatched from {}:{}; that error predates this \
+                 call, so do not attribute it to the call that follows.",
+                gles.diagnostic_profile(),
+                pending,
+                caller.file(),
+                caller.line()
+            );
+        }
     }
     let res = {
         let _guest_call_guard = GuestGlesCallGuard::enter();
@@ -237,7 +309,7 @@ where
     let trace = env.options.trace_gl_errors;
     let caller = std::panic::Location::caller();
     // _no_skip historically panicked if there was no current context,
-    // but real games (HyperHLE log #5 / Resident Evil 4) hit this on
+    // but real games (AppleJuiceHLE log #5 / Resident Evil 4) hit this on
     // worker threads that issue GL calls after `setCurrentContext:nil`.
     // Apple's documented behaviour is "GL calls silently fail" — mirror
     // that by returning the type's default instead of aborting the
@@ -281,10 +353,110 @@ where
     res
 }
 
+/// Dispatch buffer operations while preserving driver errors and the shared
+/// mapping state. Validation errors remain visible to the guest's glGetError.
+#[track_caller]
+fn with_ctx_mem_and_buffers<T, U: Default>(env: &mut Environment, f: T) -> U
+where
+    T: FnOnce(&mut dyn GLES, &mut Mem, &mut GLShadowState, &mut BufferObjects) -> Result<U, GLenum>,
+{
+    let Some(current_ctx) = *env
+        .framework_state
+        .opengles
+        .current_ctx_for_thread(env.current_thread)
+    else {
+        return U::default();
+    };
+    let caller = std::panic::Location::caller();
+    let trace = env.options.trace_gl_errors;
+    let host = env.objc.borrow_mut::<EAGLContextHostObject>(current_ctx);
+    let Some(context) = host.gles_ctx.as_deref_mut() else {
+        return U::default();
+    };
+    let mut gles = context.make_current(env.window.as_mut().expect("OpenGL ES needs a window"));
+    let shadow = &mut host.shadow;
+    // Clearing a prior driver error must not hide it from the app.
+    loop {
+        let error = unsafe { gles.GetError() };
+        if error == gles11::NO_ERROR {
+            break;
+        }
+        shadow.record_error(error);
+    }
+    let result = {
+        let _guard = GuestGlesCallGuard::enter();
+        f(
+            gles.as_mut(),
+            &mut env.mem,
+            shadow,
+            &mut host.buffers.borrow_mut(),
+        )
+    };
+    let result = match result {
+        Ok(value) => value,
+        Err(error) => {
+            shadow.record_error(error);
+            if trace {
+                log!("[--trace-gl-errors] buffer call reported glGetError() = {:#x} dispatched from {}:{}",
+                    error, caller.file(), caller.line());
+            }
+            U::default()
+        }
+    };
+    loop {
+        let error = unsafe { gles.GetError() };
+        if error == gles11::NO_ERROR {
+            break;
+        }
+        shadow.record_error(error);
+        if trace {
+            log!("[--trace-gl-errors] buffer call reported glGetError() = {:#x} dispatched from {}:{}",
+                error, caller.file(), caller.line());
+        }
+    }
+    result
+}
+
+/// Return error flags preserved by an internal validation query before asking
+/// the driver. OpenGL leaves error-return order implementation-dependent.
+unsafe fn guest_gl_error(gles: &mut dyn GLES, shadow: &mut GLShadowState) -> GLenum {
+    shadow
+        .pending_guest_errors
+        .pop_front()
+        .unwrap_or_else(|| gles.GetError())
+}
+
+/// Record the driver's error flags so the guest can still read them.
+///
+/// Only entry points that consume driver errors while validating a call
+/// need this: everywhere else the flags stay in the driver until
+/// `glGetError` asks for them. Duplicates are collapsed because an app
+/// that never calls `glGetError` would otherwise grow the queue with
+/// every such call.
+unsafe fn preserve_driver_errors(gles: &mut dyn GLES, shadow: &mut GLShadowState) -> bool {
+    let mut any = false;
+    // GL has a finite set of error flags. Bound the loop for a broken driver
+    // that repeatedly reports an error without clearing it.
+    for _ in 0..16 {
+        let error = gles.GetError();
+        if error == gles11::NO_ERROR {
+            break;
+        }
+        any = true;
+        if !shadow.pending_guest_errors.contains(&error) {
+            shadow.pending_guest_errors.push_back(error);
+        }
+    }
+    any
+}
+
 fn glGetError(env: &mut Environment) -> GLenum {
     let ignore_gl_errors = env.options.ignore_gl_errors;
-    with_ctx_and_mem(env, |gles, _mem| {
-        let err = unsafe { gles.GetError() };
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| {
+        let err = shadow
+            .errors
+            .pop_front()
+            .unwrap_or_else(|| unsafe { guest_gl_error(gles, shadow) });
         if err != 0 {
             if ignore_gl_errors {
                 return 0;
@@ -360,8 +532,37 @@ fn glGetError(env: &mut Environment) -> GLenum {
         err
     })
 }
+/// Apply the guest's `GL_DEPTH_TEST` request to the host, taking the bound
+/// framebuffer's attachments into account.
+///
+/// Must be called whenever either side of that decision changes: a
+/// `glEnable`/`glDisable` of `GL_DEPTH_TEST`, a framebuffer binding, or a depth
+/// attachment change on the framebuffer that is already bound. See
+/// `State::depthless_framebuffers` for why the guest's request is not
+/// simply forwarded.
+fn sync_depth_test(env: &mut Environment) {
+    let host_enabled = env
+        .framework_state
+        .opengles
+        .host_depth_test(env.current_thread);
+    with_ctx_and_mem(env, |gles, _mem| unsafe {
+        if host_enabled {
+            gles.Enable(gles11::DEPTH_TEST)
+        } else {
+            gles.Disable(gles11::DEPTH_TEST)
+        }
+    });
+}
+
 fn glEnable(env: &mut Environment, cap: GLenum) {
-    if cap == gles11::FOG {
+    if cap == gles11::DEPTH_TEST {
+        let thread = env.current_thread;
+        env.framework_state
+            .opengles
+            .set_guest_depth_test(thread, true);
+        super::draw_stats::record_guest_depth_test(true);
+        sync_depth_test(env);
+    } else if cap == gles11::FOG {
         with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
             shadow.fog_enabled = true;
             gles.Enable(cap)
@@ -371,10 +572,26 @@ fn glEnable(env: &mut Environment, cap: GLenum) {
     }
 }
 fn glIsEnabled(env: &mut Environment, cap: GLenum) -> GLboolean {
+    if cap == gles11::DEPTH_TEST {
+        // Report the guest's own request: the host bit is forced off while a
+        // framebuffer without a guest-attached depth buffer is bound, and an
+        // app that checks its own state must not see that.
+        return env
+            .framework_state
+            .opengles
+            .guest_depth_test(env.current_thread) as GLboolean;
+    }
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.IsEnabled(cap) })
 }
 fn glDisable(env: &mut Environment, cap: GLenum) {
-    if cap == gles11::FOG {
+    if cap == gles11::DEPTH_TEST {
+        let thread = env.current_thread;
+        env.framework_state
+            .opengles
+            .set_guest_depth_test(thread, false);
+        super::draw_stats::record_guest_depth_test(false);
+        sync_depth_test(env);
+    } else if cap == gles11::FOG {
         with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
             shadow.fog_enabled = false;
             gles.Disable(cap)
@@ -450,6 +667,27 @@ fn glGetFloatv(env: &mut Environment, pname: GLenum, params: MutPtr<GLfloat>) {
 fn glGetIntegerv(env: &mut Environment, pname: GLenum, params: MutPtr<GLint>) {
     if params.is_null() {
         return;
+    }
+    if pname == 0x821D {
+        // GL_NUM_EXTENSIONS
+        let Some(context) = *env
+            .framework_state
+            .opengles
+            .current_ctx_for_thread(env.current_thread)
+        else {
+            return;
+        };
+        if env.objc.borrow::<EAGLContextHostObject>(context).api >= 3 {
+            let extensions = glGetString(env, gles11::EXTENSIONS);
+            let count = env
+                .mem
+                .cstr_at_utf8(extensions)
+                .unwrap()
+                .split_whitespace()
+                .count() as GLint;
+            env.mem.write(params, count);
+            return;
+        }
     }
     match pname {
         gles11::NUM_COMPRESSED_TEXTURE_FORMATS => {
@@ -572,13 +810,22 @@ fn glGetString(env: &mut Environment, name: GLenum) -> ConstPtr<GLubyte> {
     // We therefore branch on the *currently-bound context's* API instead of
     // hard-coding the ES 1.1 strings. The cache is keyed by `(is_es2, name)`
     // because the two profiles share the same `name` enum values.
-    let is_es2 = with_ctx_and_mem(env, |gles, _mem| gles.is_es2());
+    let Some(context) = *env
+        .framework_state
+        .opengles
+        .current_ctx_for_thread(env.current_thread)
+    else {
+        return Ptr::null();
+    };
+    let api = env.objc.borrow::<EAGLContextHostObject>(context).api;
+    let is_es2 = api >= 2;
 
+    let matrix_palette = with_ctx_and_mem(env, |gles, _| gles.supports_matrix_palette());
     if let Some(&str) = env
         .framework_state
         .opengles
         .strings_cache
-        .get(&(is_es2, name))
+        .get(&(api, matrix_palette, name))
     {
         return str;
     }
@@ -603,12 +850,15 @@ fn glGetString(env: &mut Environment, name: GLenum) -> ConstPtr<GLubyte> {
             gles11::VENDOR => b"Imagination Technologies",
             gles11::RENDERER => b"PowerVR MBXLite with VGPLite",
             gles11::VERSION => b"OpenGL ES-CM 1.1 (76)",
-            // Includes GL_OES_matrix_palette: the real PowerVR SGX in the
-            // iPhone 3GS exposes it, and touchHLE now emulates palette
-            // skinning CPU-side (see gles1_on_gl2's skin_vertices). Games such
-            // as LEGO Ninjago: Rise of the Snakes feature-test this string and
-            // use the palette path for skinned character meshes.
-            gles11::EXTENSIONS => b"GL_APPLE_texture_max_level GL_EXT_discard_framebuffer GL_EXT_texture_filter_anisotropic GL_EXT_texture_lod_bias GL_IMG_read_format GL_IMG_texture_compression_pvrtc GL_IMG_texture_format_BGRA8888 GL_OES_blend_subtract GL_OES_compressed_paletted_texture GL_OES_depth24 GL_OES_draw_texture GL_OES_framebuffer_object GL_OES_mapbuffer GL_OES_matrix_palette GL_OES_point_size_array GL_OES_point_sprite GL_OES_read_format GL_OES_rgb8_rgba8 GL_OES_texture_mirrored_repeat GL_OES_vertex_array_object ",
+            // GL_OES_matrix_palette is *not* in this base list: the real
+            // PowerVR SGX in the iPhone 3GS exposes it, but whether we can
+            // honour it depends on the active backend (see the
+            // `palette_suffix` splice below). Games such as LEGO
+            // Ninjago: Rise of the Snakes feature-test this string and use the
+            // palette path for skinned character meshes, so advertising an
+            // extension we drop on the floor leaves every skinned mesh
+            // mis-transformed.
+            gles11::EXTENSIONS => b"GL_APPLE_texture_max_level GL_EXT_discard_framebuffer GL_EXT_texture_filter_anisotropic GL_EXT_texture_lod_bias GL_IMG_read_format GL_IMG_texture_compression_pvrtc GL_IMG_texture_format_BGRA8888 GL_OES_blend_subtract GL_OES_compressed_paletted_texture GL_OES_depth24 GL_OES_draw_texture GL_OES_framebuffer_object GL_OES_mapbuffer GL_OES_point_size_array GL_OES_point_sprite GL_OES_read_format GL_OES_rgb8_rgba8 GL_OES_texture_mirrored_repeat GL_OES_vertex_array_object ",
             _ => b"Unknown",
         }
     } else {
@@ -619,10 +869,12 @@ fn glGetString(env: &mut Environment, name: GLenum) -> ConstPtr<GLubyte> {
         match name {
             gles11::VENDOR => b"Imagination Technologies",
             gles11::RENDERER => b"PowerVR SGX 535",
+            gles11::VERSION if api >= 3 => b"OpenGL ES 3.0 AppleJuiceHLE",
             gles11::VERSION => b"OpenGL ES 2.0 IMGSGX535-63.27",
             // `GL_SHADING_LANGUAGE_VERSION` is 0x8B8C in both ES 2.0 and
             // desktop GL; reference it by numeric literal so we don't have
             // to pull in the ES 2.0 enum table here.
+            0x8B8C if api >= 3 => b"OpenGL ES GLSL ES 3.00",
             0x8B8C => b"OpenGL ES GLSL ES 1.00",
             // GAMELOFT BYPASS: the Asphalt 8 engine feature-tests
             // GL_OES_element_index_uint before selecting its renderer; without
@@ -642,14 +894,25 @@ fn glGetString(env: &mut Environment, name: GLenum) -> ConstPtr<GLubyte> {
     } else {
         b""
     };
+    if s == b"Unknown" {
+        with_ctx_mem_and_shadow(env, |_gles, _mem, shadow| {
+            shadow.record_error(gles11::INVALID_ENUM)
+        });
+        return Ptr::null();
+    }
+    let palette_suffix: &[u8] = if !is_es2 && name == gles11::EXTENSIONS && matrix_palette {
+        b"GL_OES_matrix_palette "
+    } else {
+        b""
+    };
     let new_str = env
         .mem
-        .alloc_and_write_cstr(&[npot_prefix, s].concat())
+        .alloc_and_write_cstr(&[npot_prefix, s, palette_suffix].concat())
         .cast_const();
     env.framework_state
         .opengles
         .strings_cache
-        .insert((is_es2, name), new_str);
+        .insert((api, matrix_palette, name), new_str);
     new_str
 }
 
@@ -753,7 +1016,13 @@ fn glScissor(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height: 
         gles.Scissor(x, y, width, height)
     })
 }
-fn glViewport(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height: GLsizei) {
+pub(crate) fn glViewport(
+    env: &mut Environment,
+    x: GLint,
+    y: GLint,
+    width: GLsizei,
+    height: GLsizei,
+) {
     // ULTRAHLE_MINIONJUMP_VIEWPORT_BEGIN
     let (x, y, width, height) = if matches!(
         env.bundle.bundle_identifier(),
@@ -844,9 +1113,66 @@ fn glViewport(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height:
     } else {
         (x, y, width, height)
     };
+    // The pre-scale request is what `set_guest_viewport` remembered above.
+    let guest_viewport = env
+        .framework_state
+        .opengles
+        .guest_viewport(thread)
+        .unwrap_or((x, y, width, height));
+    let framebuffer = env.framework_state.opengles.bound_framebuffer(thread);
+    log_viewport_mapping(guest_viewport, (x, y, width, height), framebuffer);
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.Viewport(x, y, width, height)
     })
+}
+
+/// Log the first few *distinct* viewport mappings: what the guest asked for,
+/// what the host was actually given, and which framebuffer was bound.
+///
+/// A log line saying `glViewport(0, 0, 640, 960)` cannot be read on its own:
+/// the scale hack multiplies the guest's request, and whether it does so
+/// depends on which framebuffer is bound (see
+/// `State::scale_hack_applies_to_viewport`). "The guest draws at twice the
+/// size of its renderbuffer" is one of the readings of a zoomed/cropped scene,
+/// and it is wrong when the difference is ours. This line makes the two
+/// numbers, and the reason for the difference, visible at a glance.
+///
+/// Six lines per session, deduplicated, so a render loop that sets the viewport
+/// every frame costs nothing after the first few.
+fn log_viewport_mapping(
+    guest: (GLint, GLint, GLsizei, GLsizei),
+    host: (GLint, GLint, GLsizei, GLsizei),
+    framebuffer: GLuint,
+) {
+    use std::sync::Mutex;
+    /// One (requested viewport, bound framebuffer) pair.
+    type Combination = ((GLint, GLint, GLsizei, GLsizei), GLuint);
+    static SEEN: Mutex<Vec<Combination>> = Mutex::new(Vec::new());
+    const MAX_LINES: usize = 6;
+    let mut seen = match SEEN.lock() {
+        Ok(guard) => guard,
+        // A panic while holding this lock must not disable the diagnostic.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if seen.len() >= MAX_LINES || seen.contains(&(guest, framebuffer)) {
+        return;
+    }
+    seen.push((guest, framebuffer));
+    let index = seen.len();
+    log!(
+        "glViewport mapping #{}: guest (x={}, y={}, w={}, h={}) -> host \
+         (x={}, y={}, w={}, h={}) with framebuffer {} bound",
+        index,
+        guest.0,
+        guest.1,
+        guest.2,
+        guest.3,
+        host.0,
+        host.1,
+        host.2,
+        host.3,
+        framebuffer
+    );
 }
 fn glLineWidth(env: &mut Environment, val: GLfloat) {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.LineWidth(val) })
@@ -1027,14 +1353,18 @@ fn glDeleteBuffers(env: &mut Environment, n: GLsizei, buffers: ConstPtr<GLuint>)
     if n <= 0 || buffers.is_null() {
         return;
     }
-    with_ctx_mem_and_shadow(env, |gles, mem, shadow| {
+    with_ctx_mem_and_buffers(env, |gles, mem, shadow, objects| {
         let n_usize: GuestUSize = n.try_into().unwrap();
         let deleted: Vec<GLuint> = (0..n_usize).map(|i| mem.read(buffers + i)).collect();
+        let mut cache = diag_buffer_cache().lock().unwrap();
         for buffer in &deleted {
             shadow.on_buffers_deleted(*buffer);
+            objects.delete(mem, *buffer);
         }
+        drop(cache);
         unsafe { gles.DeleteBuffers(n, deleted.as_ptr()) };
         crate::gles::perf_overlay::delete_gl_buffers(shadow.resource_group_token, &deleted);
+        Ok(())
     })
 }
 fn glBindBuffer(env: &mut Environment, target: GLenum, buffer: GLuint) {
@@ -1064,12 +1394,21 @@ fn glBindBuffer(env: &mut Environment, target: GLenum, buffer: GLuint) {
         gles.BindBuffer(target, buffer)
     })
 }
-/// DIAG: host-side cache of ARRAY_BUFFER contents keyed by buffer name, so
-/// TOUCHHLE_TRACE_DRAW can read actual vertex (texcoord) values at draw time.
-fn diag_buffer_cache() -> &'static std::sync::Mutex<HashMap<GLuint, Vec<u8>>> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<GLuint, Vec<u8>>>> =
+// shortcut: cap diagnostic VBO cache at 16 MiB; raise if traces miss needed data.
+const DIAG_BUFFER_CACHE_ENTRIES: usize = 16;
+const DIAG_BUFFER_CACHE_BYTES: usize = 1_048_576;
+/// DIAG: cache ARRAY_BUFFER contents by resource group and name so IDs reused
+/// by independent contexts cannot produce another context's texcoords.
+fn diag_buffer_cache() -> &'static std::sync::Mutex<HashMap<(usize, GLuint), Vec<u8>>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<(usize, GLuint), Vec<u8>>>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+fn diag_buffer_cache_has_room(entry_count: usize, already_cached: bool) -> bool {
+    already_cached || entry_count < DIAG_BUFFER_CACHE_ENTRIES
+}
+fn trace_gl_draws_enabled(env: &Environment) -> bool {
+    env.options.trace_gl_draws || crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW")
 }
 unsafe fn debug_log_buffer_upload(
     gles: &mut dyn GLES,
@@ -1080,7 +1419,7 @@ unsafe fn debug_log_buffer_upload(
     size: GuestGLsizeiptr,
     data: ConstPtr<GLvoid>,
 ) {
-    if !crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
+    if !trace_debug_draw_enabled() {
         return;
     }
     static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1106,7 +1445,11 @@ unsafe fn debug_log_buffer_upload(
             mem.ptr_at(data.cast::<u8>(), sample_len),
             sample_len as usize,
         );
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().join(" ")
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     };
     log!(
         "[GLES BUFFER TRACE] {} target={:#x} binding={} offset={} size={} data={:#x} first_bytes={}",
@@ -1127,18 +1470,28 @@ fn glBufferData(
     data: ConstPtr<GLvoid>,
     usage: GLenum,
 ) {
-    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+    with_ctx_mem_and_buffers(env, |gles, mem, shadow, objects| unsafe {
+        let buffer = buffer_mapping::binding(gles, target)?;
+        if size < 0 {
+            return Err(gles11::INVALID_VALUE);
+        }
+        let guest_data = data;
         debug_log_buffer_upload(gles, mem, "BufferData", target, 0, size, data);
-        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") && target == ARRAY_BUFFER && !data.is_null()
+        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW")
+            && target == ARRAY_BUFFER
+            && !data.is_null()
         {
             let mut bound: GLint = 0;
             gles.GetIntegerv(0x8894 /*ARRAY_BUFFER_BINDING*/, &mut bound);
             if bound > 0 && (1..=1_048_576).contains(&size) {
                 let bytes = mem.bytes_at(data.cast::<u8>(), size as GuestUSize).to_vec();
-                diag_buffer_cache().lock().unwrap().insert(bound as GLuint, bytes);
+                diag_buffer_cache()
+                    .lock()
+                    .unwrap()
+                    .insert((shadow.resource_group_token,bound as GLuint), bytes);
             }
         }
-        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW")
+        if trace_draw_enabled()
             && target == ARRAY_BUFFER
             && !data.is_null()
             && (1..=256).contains(&size)
@@ -1152,7 +1505,12 @@ fn glBufferData(
                     .chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect();
-                log!("BUFDATA-DIAG #{} ARRAY_BUFFER size={} floats={:?}", bn, size, floats);
+                log!(
+                    "BUFDATA-DIAG #{} ARRAY_BUFFER size={} floats={:?}",
+                    bn,
+                    size,
+                    floats
+                );
             }
         }
         let binding = match target {
@@ -1181,6 +1539,11 @@ fn glBufferData(
                 .cast()
         };
         gles.BufferData(target, size as HostGLsizeiptr, data, usage);
+        let error = gles.GetError();
+        if error != gles11::NO_ERROR {
+            return Err(error);
+        }
+        objects.data(gles, mem, buffer, size, guest_data);
         if bound_buffer > 0 && size >= 0 {
             crate::gles::perf_overlay::record_gl_buffer_allocation(
                 shadow.resource_group_token,
@@ -1188,6 +1551,7 @@ fn glBufferData(
                 size as u64,
             );
         }
+        Ok(())
     })
 }
 fn glBufferSubData(
@@ -1197,22 +1561,35 @@ fn glBufferSubData(
     size: GuestGLsizeiptr,
     data: ConstPtr<GLvoid>,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
+    with_ctx_mem_and_buffers(env, |gles, mem, shadow, objects| unsafe {
+        let buffer = buffer_mapping::binding(gles, target)?;
+        let range = objects.validate_sub_data(gles, target, buffer, offset, size)?;
+        let guest_data = data;
         debug_log_buffer_upload(gles, mem, "BufferSubData", target, offset, size, data);
-        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") && target == ARRAY_BUFFER && !data.is_null()
+        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW")
+            && target == ARRAY_BUFFER
+            && !data.is_null()
         {
             let mut bound: GLint = 0;
             gles.GetIntegerv(0x8894 /*ARRAY_BUFFER_BINDING*/, &mut bound);
             if bound > 0 && offset >= 0 && size > 0 {
                 let src = mem.bytes_at(data.cast::<u8>(), size as GuestUSize);
                 let mut cache = diag_buffer_cache().lock().unwrap();
-                let buf = cache.entry(bound as GLuint).or_default();
+                let buffer = bound as GLuint;
+                let key = (shadow.resource_group_token, buffer);
                 let start = offset as usize;
-                if let Some(end) = start.checked_add(size as usize).filter(|end| *end <= 4_194_304) {
-                    if buf.len() < end {
-                        buf.resize(end, 0);
+                let end = start
+                    .checked_add(size as usize)
+                    .filter(|end| *end <= DIAG_BUFFER_CACHE_BYTES);
+                if let Some(end) = end {
+                    if let Some(buf) = cache.get_mut(&key) {
+                        if buf.len() < end {
+                            buf.resize(end, 0);
+                        }
+                        buf[start..end].copy_from_slice(src);
                     }
-                    buf[start..end].copy_from_slice(src);
+                } else {
+                    cache.remove(&key);
                 }
             }
         }
@@ -1222,7 +1599,19 @@ fn glBufferSubData(
             mem.ptr_at(data.cast::<u8>(), size.try_into().unwrap())
                 .cast()
         };
-        gles.BufferSubData(target, offset as HostGLintptr, size as HostGLsizeiptr, data)
+        gles.BufferSubData(target, offset as HostGLintptr, size as HostGLsizeiptr, data);
+        let error = gles.GetError();
+        if error != gles11::NO_ERROR {
+            return Err(error);
+        }
+        if !guest_data.is_null() {
+            objects.sub_data(
+                buffer,
+                range.start,
+                mem.bytes_at(guest_data.cast(), size as GuestUSize),
+            );
+        }
+        Ok(())
     })
 }
 
@@ -1533,16 +1922,10 @@ fn glCompressedTexSubImage2D(
             }
         };
         let bound_texture = current_bound_texture(gles, target);
-        let texture_level = bound_texture
-            .and_then(|texture| shadow.pvrtc_texture_level(target, texture, level));
-        if pvrtc_subimage_matches_level(
-            texture_level,
-            xoffset,
-            yoffset,
-            width,
-            height,
-            format,
-        ) && !data.is_null()
+        let texture_level =
+            bound_texture.and_then(|texture| shadow.pvrtc_texture_level(target, texture, level));
+        if pvrtc_subimage_matches_level(texture_level, xoffset, yoffset, width, height, format)
+            && !data.is_null()
             && crate::gles::util::pvrtc_payload_size(format, width, height)
                 == Some(image_size_usize)
         {
@@ -1571,8 +1954,15 @@ fn glCompressedTexSubImage2D(
                             let b = (px as u32).to_le_bytes();
                             ppm.extend_from_slice(&[b[0], b[1], b[2]]);
                         }
-                        let _ = std::fs::write(format!("tex_{}_{}x{}_fmt{:#x}.ppm", k, w, h, format), &ppm);
-                        log!("DUMP-TEX wrote tex_{}_{}x{}_fmt{:#x}.ppm", k, w, h, format);
+                        let name = format!("pvrtc_tex_{}_{}x{}_fmt{:#x}.ppm", k, w, h, format);
+                        if let Some(path) = crate::paths::diagnostic_dump_path(&name) {
+                            match std::fs::write(&path, &ppm) {
+                                Ok(()) => log!("DUMP-TEX wrote {}", path.display()),
+                                Err(e) => {
+                                    log!("DUMP-TEX failed to write {}: {}", path.display(), e)
+                                }
+                            }
+                        }
                     }
                 }
                 // PVRTC compressed subimages may only replace a complete level.
@@ -1649,6 +2039,7 @@ fn glDrawTexfOES(
     width: GLfloat,
     height: GLfloat,
 ) {
+    super::draw_stats::record_quad_draw();
     {
         use std::sync::atomic::{AtomicBool, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
@@ -1669,6 +2060,7 @@ fn glDrawTexfOES(
     })
 }
 fn glDrawTexiOES(env: &mut Environment, x: GLint, y: GLint, z: GLint, width: GLint, height: GLint) {
+    super::draw_stats::record_quad_draw();
     {
         use std::sync::atomic::{AtomicBool, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
@@ -1696,6 +2088,7 @@ fn glDrawTexxOES(
     width: GLfixed,
     height: GLfixed,
 ) {
+    super::draw_stats::record_quad_draw();
     {
         use std::sync::atomic::{AtomicBool, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
@@ -1716,6 +2109,7 @@ fn glDrawTexxOES(
     })
 }
 fn glDrawTexfvOES(env: &mut Environment, coords: ConstPtr<GLfloat>) {
+    super::draw_stats::record_quad_draw();
     with_ctx_and_mem(env, |gles, mem| {
         let coords = mem.ptr_at(coords, 5);
         crate::gles::perf_overlay::record_draw();
@@ -1723,6 +2117,7 @@ fn glDrawTexfvOES(env: &mut Environment, coords: ConstPtr<GLfloat>) {
     })
 }
 fn glDrawTexivOES(env: &mut Environment, coords: ConstPtr<GLint>) {
+    super::draw_stats::record_quad_draw();
     with_ctx_and_mem(env, |gles, mem| {
         let coords = mem.ptr_at(coords, 5);
         crate::gles::perf_overlay::record_draw();
@@ -1730,6 +2125,7 @@ fn glDrawTexivOES(env: &mut Environment, coords: ConstPtr<GLint>) {
     })
 }
 fn glDrawTexxvOES(env: &mut Environment, coords: ConstPtr<GLfixed>) {
+    super::draw_stats::record_quad_draw();
     with_ctx_and_mem(env, |gles, mem| {
         let coords = mem.ptr_at(coords, 5);
         crate::gles::perf_overlay::record_draw();
@@ -1737,12 +2133,14 @@ fn glDrawTexxvOES(env: &mut Environment, coords: ConstPtr<GLfixed>) {
     })
 }
 fn glDrawTexsOES(env: &mut Environment, x: i16, y: i16, z: i16, width: i16, height: i16) {
+    super::draw_stats::record_quad_draw();
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         crate::gles::perf_overlay::record_draw();
         gles.DrawTexsOES(x, y, z, width, height)
     })
 }
 fn glDrawTexsvOES(env: &mut Environment, coords: ConstPtr<i16>) {
+    super::draw_stats::record_quad_draw();
     with_ctx_and_mem(env, |gles, mem| {
         let coords = mem.ptr_at(coords, 5);
         crate::gles::perf_overlay::record_draw();
@@ -1788,6 +2186,12 @@ fn glDiscardFramebufferEXT(
     // guest attachment enums (GL_COLOR_EXT / GL_DEPTH_EXT / GL_STENCIL_EXT)
     // share their values with the host extension, so forward them unchanged.
     with_ctx_and_mem(env, |gles, mem| unsafe {
+        // Discarding is only a bandwidth hint; on backends without
+        // GL_EXT_discard_framebuffer there is nothing to forward, and asking
+        // anyway would log an "unimplemented GLES API" warning per frame.
+        if !gles.discard_ext_supported() {
+            return;
+        }
         let n = numAttachments.max(0) as GuestUSize;
         let ptr = if n == 0 || attachments.is_null() {
             std::ptr::null()
@@ -1854,7 +2258,10 @@ fn glDeleteVertexArraysOES(env: &mut Environment, n: GLsizei, arrays: ConstPtr<G
         let count = n as GuestUSize;
         if gles.supports_vao_oes() {
             let slice = mem.bytes_at(arrays.cast(), count * 4);
-            for array in slice.chunks_exact(4).map(|bytes| u32::from_ne_bytes(bytes.try_into().unwrap())) {
+            for array in slice
+                .chunks_exact(4)
+                .map(|bytes| u32::from_ne_bytes(bytes.try_into().unwrap()))
+            {
                 if array == shadow.current_vertex_array {
                     shadow.current_vertex_array = 0;
                     shadow.invalidate_vao_state();
@@ -1947,11 +2354,22 @@ fn glWeightPointerOES(
 }
 fn glGetBufferPointervOES(
     env: &mut Environment,
-    _target: GLenum,
-    _pname: GLenum,
+    target: GLenum,
+    pname: GLenum,
     params: MutPtr<ConstVoidPtr>,
 ) {
-    env.mem.write(params, Ptr::null());
+    with_ctx_mem_and_buffers(env, |gles, mem, shadow, objects| {
+        let buffer = buffer_mapping::binding(gles, target)?;
+        if pname != 0x88bd {
+            // GL_BUFFER_MAP_POINTER[_OES]
+            return Err(gles11::INVALID_ENUM);
+        }
+        let pointer = objects
+            .mapping(buffer)
+            .map_or(Ptr::null(), |m| m.guest.cast_const());
+        mem.write(params, pointer);
+        Ok(())
+    });
 }
 
 /// Guard against a whole-emulator crash caused by enabled *client-side* vertex
@@ -2042,6 +2460,81 @@ unsafe fn guard_client_vertex_arrays(
     disabled
 }
 
+/// Pointer setters specify storage; they must not change client-array enable
+/// bits. Guard undefined NULL client reads only for the duration of a draw,
+/// using the tracked state instead of querying the mobile driver per array.
+/// https://registry.khronos.org/OpenGL-Refpages/es1.1/xhtml/glVertexPointer.xml
+#[derive(Default)]
+struct NativeClientArraysGuard {
+    fixed: u8,
+    tex_coords: u8,
+    client_unit: usize,
+}
+
+const GUARDED_FIXED_ARRAYS: [FixedArray; 5] = [
+    FixedArray::Normal,
+    FixedArray::Color,
+    FixedArray::PointSize,
+    FixedArray::MatrixIndex,
+    FixedArray::Weight,
+];
+
+fn has_unbacked_client_storage(state: &software_vao::ArrayState) -> bool {
+    state.enabled && state.pointer.buffer == 0 && state.pointer.pointer == 0
+}
+
+unsafe fn guard_native_client_arrays(
+    gles: &mut dyn GLES,
+    shadow: &GLShadowState,
+) -> Option<NativeClientArraysGuard> {
+    let mut guard = NativeClientArraysGuard::default();
+    if !gles.is_native_es1() {
+        return Some(guard);
+    }
+    let state = &shadow.vertex_array_state;
+    if has_unbacked_client_storage(state.fixed(FixedArray::Vertex)) {
+        log_once!("Skipping draw with an enabled NULL vertex array and no VBO");
+        return None;
+    }
+    guard.client_unit = shadow.client_active_texture;
+    for (index, &array) in GUARDED_FIXED_ARRAYS.iter().enumerate() {
+        if has_unbacked_client_storage(state.fixed(array)) {
+            gles.DisableClientState(array.client_state());
+            guard.fixed |= 1 << index;
+        }
+    }
+    for unit in 0..software_vao::MAX_TEXTURE_UNITS {
+        if has_unbacked_client_storage(state.tex_coord(unit).unwrap()) {
+            gles.ClientActiveTexture(gles11::TEXTURE0 + unit as GLenum);
+            gles.DisableClientState(gles11::TEXTURE_COORD_ARRAY);
+            guard.tex_coords |= 1 << unit;
+        }
+    }
+    if guard.tex_coords != 0 {
+        gles.ClientActiveTexture(gles11::TEXTURE0 + guard.client_unit as GLenum);
+    }
+    Some(guard)
+}
+
+impl NativeClientArraysGuard {
+    unsafe fn restore(self, gles: &mut dyn GLES) {
+        for (index, &array) in GUARDED_FIXED_ARRAYS.iter().enumerate() {
+            if self.fixed & (1 << index) != 0 {
+                gles.EnableClientState(array.client_state());
+            }
+        }
+        for unit in 0..software_vao::MAX_TEXTURE_UNITS {
+            if self.tex_coords & (1 << unit) != 0 {
+                gles.ClientActiveTexture(gles11::TEXTURE0 + unit as GLenum);
+                gles.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
+            }
+        }
+        if self.tex_coords != 0 {
+            gles.ClientActiveTexture(gles11::TEXTURE0 + self.client_unit as GLenum);
+        }
+    }
+}
+
 /// Valid primitive modes for GLES1/2 draw calls. A guest passing anything else
 /// would raise GL_INVALID_ENUM (0x500) on the host driver; we filter those
 /// draws out with a one-time warning instead of feeding the driver garbage.
@@ -2054,27 +2547,89 @@ const VALID_DRAW_MODES: [GLenum; 7] = [
     0x0005, // GL_TRIANGLE_STRIP
     0x0006, // GL_TRIANGLE_FAN
 ];
+// Keep the opt-in draw diagnostics bounded for long-running games.
+const DRAW_TRACE_INITIAL_LIMIT: u32 = 12;
+const DRAW_TRACE_LARGE_LIMIT: u32 = 128;
 
-fn draw_mode_is_valid(mode: GLenum) -> bool {
-    VALID_DRAW_MODES.contains(&mode)
+fn should_trace_draw(draw_index: u32, count: GLsizei, large_draw_index: Option<u32>) -> bool {
+    draw_index < DRAW_TRACE_INITIAL_LIMIT
+        || (count > DRAW_TRACE_INITIAL_LIMIT as GLsizei
+            && large_draw_index.is_some_and(|index| index < DRAW_TRACE_LARGE_LIMIT))
 }
 
-/// Warn once per (call site, bad mode) about an invalid draw mode.
-fn warn_invalid_draw_mode(what: &str, mode: GLenum) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static SEEN: AtomicBool = AtomicBool::new(false);
-    if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        log!(
-            "Warning: guest issued a draw call with invalid mode 0x{:x} ({}); \
-             skipping the draw instead of feeding the host driver an invalid \
-             enum (avoids GL_INVALID_ENUM spam and driver-side stalls)",
-            mode,
-            what
+fn next_draw_trace_indices(
+    draw_index: &mut u32,
+    large_draw_index: &mut u32,
+    count: GLsizei,
+) -> (u32, Option<u32>) {
+    let index = *draw_index;
+    *draw_index = index.saturating_add(1);
+    let large_index = (count > DRAW_TRACE_INITIAL_LIMIT as GLsizei).then(|| {
+        let index = *large_draw_index;
+        *large_draw_index = index.saturating_add(1);
+        index
+    });
+    (index, large_index)
+}
+
+#[cfg(test)]
+mod draw_trace_selection_tests {
+    use super::{
+        diag_buffer_cache_has_room, next_draw_trace_indices, should_trace_draw,
+        DIAG_BUFFER_CACHE_ENTRIES,
+    };
+
+    #[test]
+    fn captures_startup_and_bounded_large_draws() {
+        assert!(should_trace_draw(0, 3, None));
+        assert!(!should_trace_draw(12, 12, None));
+        assert!(should_trace_draw(12, 13, Some(0)));
+        assert!(should_trace_draw(12, 13, Some(127)));
+        assert!(!should_trace_draw(12, 13, Some(128)));
+    }
+
+    #[test]
+    fn diagnostic_buffer_cache_is_bounded_but_refreshes_existing_buffers() {
+        assert!(diag_buffer_cache_has_room(
+            DIAG_BUFFER_CACHE_ENTRIES - 1,
+            false
+        ));
+        assert!(!diag_buffer_cache_has_room(
+            DIAG_BUFFER_CACHE_ENTRIES,
+            false
+        ));
+        assert!(diag_buffer_cache_has_room(DIAG_BUFFER_CACHE_ENTRIES, true));
+    }
+
+    #[test]
+    fn draw_trace_budget_is_independent_for_each_context() {
+        let mut first_context_draws = 0;
+        let mut first_context_large_draws = 0;
+        let mut second_context_draws = 0;
+        let mut second_context_large_draws = 0;
+
+        assert_eq!(
+            next_draw_trace_indices(&mut first_context_draws, &mut first_context_large_draws, 20,),
+            (0, Some(0))
+        );
+        assert_eq!(
+            next_draw_trace_indices(&mut first_context_draws, &mut first_context_large_draws, 20,),
+            (1, Some(1))
+        );
+        assert_eq!(
+            next_draw_trace_indices(
+                &mut second_context_draws,
+                &mut second_context_large_draws,
+                20,
+            ),
+            (0, Some(0))
         );
     }
 }
 
 fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsizei) {
+    // Frame workload tally for the present-time probe (see `draw_stats`).
+    super::draw_stats::record_draw(count.max(0) as u64);
     {
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
@@ -2089,9 +2644,8 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
             static COUNT: AtomicU32 = AtomicU32::new(0);
             static LARGE_COUNT: AtomicU32 = AtomicU32::new(0);
             let n = COUNT.fetch_add(1, Ordering::Relaxed);
-            let log_large = n >= 120
-                && count > 12
-                && LARGE_COUNT.fetch_add(1, Ordering::Relaxed) < 256;
+            let log_large =
+                n >= 120 && count > 12 && LARGE_COUNT.fetch_add(1, Ordering::Relaxed) < 256;
             if n < 120 || log_large {
                 log!(
                     "[POTATO RENDER TRACE] glDrawArrays #{} mode=0x{:x} first={} count={}",
@@ -2103,25 +2657,30 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
             }
         }
     }
-    if !draw_mode_is_valid(mode) {
-        warn_invalid_draw_mode("glDrawArrays", mode);
-        return;
-    }
+    let trace_draws = trace_gl_draws_enabled(env);
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
-        // DIAG (TOUCHHLE_TRACE_DRAW=1): dump the vertex-attribute + texture
-        // state for the first several draws, to see whether the texcoord
-        // attribute (A1 / loc 1) is actually fed and a texture is bound.
-        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") {
-            use std::sync::atomic::{AtomicU32, Ordering};
-            static DN: AtomicU32 = AtomicU32::new(0);
-            let dn = DN.fetch_add(1, Ordering::Relaxed);
-            if dn < 12 {
+        // Capture startup draws plus larger draws, which are more likely to
+        // include the model rather than only UI quads.
+        if trace_draws {
+            let native_es1 = gles.is_native_es1();
+            let (dn, large_draw_index) = next_draw_trace_indices(
+                &mut shadow.draw_arrays_trace_count,
+                &mut shadow.draw_arrays_trace_large_count,
+                count,
+            );
+            if should_trace_draw(dn, count, large_draw_index) {
                 let mut prog: GLint = 0;
-                gles.GetIntegerv(0x8B8D /*CURRENT_PROGRAM*/, &mut prog);
+                if !native_es1 {
+                    gles.GetIntegerv(0x8B8D /*CURRENT_PROGRAM*/, &mut prog);
+                }
                 let mut tex: GLint = 0;
+                let mut active_texture: GLint = 0;
+                gles.GetIntegerv(0x84E0 /*ACTIVE_TEXTURE*/, &mut active_texture);
                 gles.GetIntegerv(0x8069 /*TEXTURE_BINDING_2D*/, &mut tex);
                 let mut maxa: GLint = 0;
-                gles.GetIntegerv(0x8869 /*MAX_VERTEX_ATTRIBS*/, &mut maxa);
+                if !native_es1 {
+                    gles.GetIntegerv(0x8869 /*MAX_VERTEX_ATTRIBS*/, &mut maxa);
+                }
                 // Blend / depth / scissor state (layering suspects).
                 let blend_on = gles.IsEnabled(0x0BE2 /*BLEND*/);
                 let depth_on = gles.IsEnabled(0x0B71 /*DEPTH_TEST*/);
@@ -2138,12 +2697,14 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
                 let mut minf: GLint = 0;
                 let mut magf: GLint = 0;
                 let mut wraps: GLint = 0;
-                gles.GetTexParameteriv(0x0DE1, 0x2801 /*MIN_FILTER*/, &mut minf);
-                gles.GetTexParameteriv(0x0DE1, 0x2800 /*MAG_FILTER*/, &mut magf);
-                gles.GetTexParameteriv(0x0DE1, 0x2802 /*WRAP_S*/, &mut wraps);
+                if tex != 0 {
+                    gles.GetTexParameteriv(0x0DE1, 0x2801 /*MIN_FILTER*/, &mut minf);
+                    gles.GetTexParameteriv(0x0DE1, 0x2800 /*MAG_FILTER*/, &mut magf);
+                    gles.GetTexParameteriv(0x0DE1, 0x2802 /*WRAP_S*/, &mut wraps);
+                }
                 let mut line = format!(
-                    "DRAW-DIAG #{} mode={:#x} count={} program={} tex2d={} minf={:#x} magf={:#x} wrapS={:#x} blend={} src={:#x} dst={:#x} depth={} dfunc={:#x} scissor={} vp={:?} attribs:",
-                    dn, mode, count, prog, tex, minf, magf, wraps, blend_on, bsrc, bdst, depth_on, dfunc, scissor_on, vp
+                    "DRAW-DIAG #{} mode={:#x} count={} nativeES1={} program={} activeTex={:#x} tex2d={} minf={:#x} magf={:#x} wrapS={:#x} blend={} src={:#x} dst={:#x} depth={} dfunc={:#x} scissor={} vp={:?} attribs:",
+                    dn, mode, count, native_es1, prog, active_texture, tex, minf, magf, wraps, blend_on, bsrc, bdst, depth_on, dfunc, scissor_on, vp
                 );
                 for i in 0..(maxa.clamp(0, 16) as GLuint) {
                     let mut en: GLint = 0;
@@ -2169,9 +2730,8 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
                     ));
                 }
                 log!("{}", line);
-                // Read the ACTUAL texcoord values for attr #1 from the cached
-                // VBO content, for `first..first+count` vertices.
-                {
+                // Shader attribute state is unavailable to a native ES1 driver.
+                if !native_es1 {
                     let mut en: GLint = 0;
                     gles.GetVertexAttribiv(1, 0x8622, &mut en);
                     let mut vbo: GLint = 0;
@@ -2180,18 +2740,28 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
                     gles.GetVertexAttribiv(1, 0x8624, &mut strd);
                     let mut p: *mut GLvoid = std::ptr::null_mut();
                     gles.GetVertexAttribPointerv(1, 0x8645, &mut p);
-                    if en != 0 && vbo > 0 {
+                    if en != 0 && vbo > 0 && first >= 0 {
                         let off = p as usize;
                         let stride = if strd > 0 { strd as usize } else { 16 };
                         let cache = diag_buffer_cache().lock().unwrap();
-                        if let Some(bytes) = cache.get(&(vbo as GLuint)) {
+                        if let Some(bytes) =
+                            cache.get(&(shadow.resource_group_token, vbo as GLuint))
+                        {
                             let mut tc = String::new();
-                            for v in 0..(count.min(6) as usize) {
-                                let base = off + (first as usize + v) * stride;
-                                if base + 8 <= bytes.len() {
+                            for v in 0..count.clamp(0, 6) as usize {
+                                let base = (first as usize)
+                                    .checked_add(v)
+                                    .and_then(|vertex| vertex.checked_mul(stride))
+                                    .and_then(|offset| off.checked_add(offset));
+                                if let Some(base) = base.filter(|base| {
+                                    base.checked_add(8).is_some_and(|end| end <= bytes.len())
+                                }) {
                                     let rd = |o: usize| {
                                         f32::from_le_bytes([
-                                            bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3],
+                                            bytes[o],
+                                            bytes[o + 1],
+                                            bytes[o + 2],
+                                            bytes[o + 3],
                                         ])
                                     };
                                     tc.push_str(&format!(" ({:.4},{:.4})", rd(base), rd(base + 4)));
@@ -2199,7 +2769,13 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
                                     tc.push_str(" (oob)");
                                 }
                             }
-                            log!("  DRAW-TC vbo={} off={} stride={} tc:{}", vbo, off, stride, tc);
+                            log!(
+                                "  DRAW-TC vbo={} off={} stride={} tc:{}",
+                                vbo,
+                                off,
+                                stride,
+                                tc
+                            );
                         } else {
                             log!("  DRAW-TC vbo={} not in cache", vbo);
                         }
@@ -2207,6 +2783,9 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
                 }
             }
         }
+        let Some(native_arrays) = guard_native_client_arrays(gles, shadow) else {
+            return;
+        };
         let disabled_arrays = guard_client_vertex_arrays(gles, mem, shadow);
         let fog_state_backup = clamp_fog_state_values(gles, shadow);
         if crate::env_flag_cached!("TOUCHHLE_POTATO_NATIVE_GLES2_PC_STATE") {
@@ -2227,35 +2806,43 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
         crate::gles::perf_overlay::record_draw();
         gles.DrawArrays(mode, first, count);
         restore_fog_state_values(gles, fog_state_backup);
+        native_arrays.restore(gles);
         for index in disabled_arrays {
             gles.EnableVertexAttribArray(index);
         }
     })
 }
 
-/// One-shot state dump at the first larger indexed draw, gated by
-/// `TOUCHHLE_DEBUG_ES2_DRAW`. Helps diagnose "render loop alive but
-/// renderbuffer stays black" situations.
+/// Bounded state dump for each program, gated by `TOUCHHLE_DEBUG_ES2_DRAW`.
+/// Sampling more than the first program includes lit meshes as well as UI.
 unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, mem: &Mem) {
-    if !crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
+    if !trace_debug_draw_enabled() || !gles.is_es2() {
         return;
     }
-    static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        return;
-    }
-    let mut fbo: GLint = 0;
-    gles.GetIntegerv(0x8CA6 /* GL_FRAMEBUFFER_BINDING */, &mut fbo);
     let mut program: GLint = 0;
     gles.GetIntegerv(0x8B8D /* GL_CURRENT_PROGRAM */, &mut program);
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(usize, GLint)>>> =
+        std::sync::OnceLock::new();
+    let mut seen = SEEN.get_or_init(Default::default).lock().unwrap();
+    if program == 0 || seen.len() >= 64 || !seen.insert((shadow.resource_group_token, program)) {
+        return;
+    }
+    drop(seen);
+    let mut fbo: GLint = 0;
+    gles.GetIntegerv(0x8CA6 /* GL_FRAMEBUFFER_BINDING */, &mut fbo);
     let mut tex: GLint = 0;
     gles.GetIntegerv(0x8069 /* GL_TEXTURE_BINDING_2D */, &mut tex);
     let mut arr_buf: GLint = 0;
     gles.GetIntegerv(0x8894 /* GL_ARRAY_BUFFER_BINDING */, &mut arr_buf);
     let mut elem_buf: GLint = 0;
-    gles.GetIntegerv(0x8895 /* GL_ELEMENT_ARRAY_BUFFER_BINDING */, &mut elem_buf);
+    gles.GetIntegerv(
+        0x8895, /* GL_ELEMENT_ARRAY_BUFFER_BINDING */
+        &mut elem_buf,
+    );
     let mut viewport = [0 as GLint; 4];
     gles.GetIntegerv(0x0BA2 /* GL_VIEWPORT */, viewport.as_mut_ptr());
+    let mut scissor = [0 as GLint; 4];
+    gles.GetIntegerv(0x0C10 /* GL_SCISSOR_BOX */, scissor.as_mut_ptr());
     let mut rb: GLint = 0;
     gles.GetIntegerv(0x8CA7 /* GL_RENDERBUFFER_BINDING */, &mut rb);
     let status = gles.CheckFramebufferStatus(0x8D40 /* GL_FRAMEBUFFER */);
@@ -2267,14 +2854,18 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
         err = gles.GetError();
     }
     let mut color_mask = [0u8; 4];
-    gles.GetBooleanv(0x0C23 /* GL_COLOR_WRITEMASK */, color_mask.as_mut_ptr());
-    let states = [0x0BE2, 0x0B71, 0x0B44, 0x0C11, 0x0B90]
-        .map(|cap| gles.IsEnabled(cap) != 0);
+    gles.GetBooleanv(
+        0x0C23, /* GL_COLOR_WRITEMASK */
+        color_mask.as_mut_ptr(),
+    );
+    let states = [0x0BE2, 0x0B71, 0x0B44, 0x0C11, 0x0B90].map(|cap| gles.IsEnabled(cap) != 0);
     let mut attribs = Vec::new();
     for name in ["a_position", "a_texCoord", "a_color"] {
         let name_c = std::ffi::CString::new(name).unwrap();
         let loc = gles.GetAttribLocation(program as GLuint, name_c.as_ptr());
-        if loc < 0 { continue; }
+        if loc < 0 {
+            continue;
+        }
         let i = loc as GLuint;
         let mut enabled = 0;
         let mut size = 0;
@@ -2288,13 +2879,33 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
         gles.GetVertexAttribiv(i, 0x8624, &mut stride);
         gles.GetVertexAttribiv(i, 0x889F, &mut buffer);
         gles.GetVertexAttribPointerv(i, 0x8645, &mut ptr);
-        let first = if buffer == 0 && type_ as u32 == 0x1406 && !ptr.is_null() && mem.is_host_ptr_in_guest_mem(ptr) {
+        let first = if buffer == 0
+            && type_ as u32 == 0x1406
+            && !ptr.is_null()
+            && mem.is_host_ptr_in_guest_mem(ptr)
+        {
             Some(std::slice::from_raw_parts(ptr.cast::<f32>(), (size as usize).min(4)).to_vec())
-        } else { None };
-        attribs.push((name, loc, enabled, size, type_, stride, buffer, ptr as usize, first));
+        } else {
+            None
+        };
+        attribs.push((
+            name,
+            loc,
+            enabled,
+            size,
+            type_,
+            stride,
+            buffer,
+            ptr as usize,
+            first,
+        ));
     }
     let mut active_count = 0;
-    gles.GetProgramiv(program as GLuint, 0x8B89 /* GL_ACTIVE_ATTRIBUTES */, &mut active_count);
+    gles.GetProgramiv(
+        program as GLuint,
+        0x8B89, /* GL_ACTIVE_ATTRIBUTES */
+        &mut active_count,
+    );
     let mut active_attribs = Vec::new();
     for index in 0..active_count.clamp(0, 32) as GLuint {
         let mut name = [0_u8; 128];
@@ -2311,34 +2922,102 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
             name.as_mut_ptr().cast(),
         );
         let used = length.clamp(0, name.len() as GLsizei) as usize;
-        active_attribs.push((String::from_utf8_lossy(&name[..used]).into_owned(), size, type_));
+        let c_name = std::ffi::CString::new(&name[..used]).unwrap();
+        let location = gles.GetAttribLocation(program as GLuint, c_name.as_ptr());
+        let mut current = [0.0_f32; 4];
+        if location >= 0 {
+            gles.GetVertexAttribfv(location as GLuint, 0x8626, current.as_mut_ptr());
+        }
+        active_attribs.push((
+            String::from_utf8_lossy(&name[..used]).into_owned(),
+            size,
+            type_,
+            location,
+            current,
+        ));
     }
     let mut enabled_attribs = Vec::new();
     let mut max_attribs: GLint = 0;
     gles.GetIntegerv(0x8869 /* GL_MAX_VERTEX_ATTRIBS */, &mut max_attribs);
     for index in 0..max_attribs.clamp(0, 32) as GLuint {
         let mut enabled = 0;
-        gles.GetVertexAttribiv(index, 0x8622 /* GL_VERTEX_ATTRIB_ARRAY_ENABLED */, &mut enabled);
-        if enabled == 0 { continue; }
+        gles.GetVertexAttribiv(
+            index,
+            0x8622, /* GL_VERTEX_ATTRIB_ARRAY_ENABLED */
+            &mut enabled,
+        );
+        if enabled == 0 {
+            continue;
+        }
         let mut size = 0;
         let mut type_ = 0;
+        let mut normalized = 0;
         let mut stride = 0;
         let mut buffer = 0;
         let mut ptr: *mut GLvoid = std::ptr::null_mut();
-        gles.GetVertexAttribiv(index, 0x8623 /* GL_VERTEX_ATTRIB_ARRAY_SIZE */, &mut size);
-        gles.GetVertexAttribiv(index, 0x8625 /* GL_VERTEX_ATTRIB_ARRAY_TYPE */, &mut type_);
-        gles.GetVertexAttribiv(index, 0x8624 /* GL_VERTEX_ATTRIB_ARRAY_STRIDE */, &mut stride);
-        gles.GetVertexAttribiv(index, 0x889F /* GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING */, &mut buffer);
-        gles.GetVertexAttribPointerv(index, 0x8645 /* GL_VERTEX_ATTRIB_ARRAY_POINTER */, &mut ptr);
-        let first = if buffer == 0 && type_ as u32 == 0x1406 && !ptr.is_null() && mem.is_host_ptr_in_guest_mem(ptr) {
+        gles.GetVertexAttribiv(
+            index, 0x8623, /* GL_VERTEX_ATTRIB_ARRAY_SIZE */
+            &mut size,
+        );
+        gles.GetVertexAttribiv(
+            index, 0x8625, /* GL_VERTEX_ATTRIB_ARRAY_TYPE */
+            &mut type_,
+        );
+        gles.GetVertexAttribiv(index, 0x886A, &mut normalized);
+        gles.GetVertexAttribiv(
+            index,
+            0x8624, /* GL_VERTEX_ATTRIB_ARRAY_STRIDE */
+            &mut stride,
+        );
+        gles.GetVertexAttribiv(
+            index,
+            0x889F, /* GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING */
+            &mut buffer,
+        );
+        gles.GetVertexAttribPointerv(
+            index, 0x8645, /* GL_VERTEX_ATTRIB_ARRAY_POINTER */
+            &mut ptr,
+        );
+        let first = if buffer == 0
+            && type_ as u32 == 0x1406
+            && !ptr.is_null()
+            && mem.is_host_ptr_in_guest_mem(ptr)
+        {
             Some(std::slice::from_raw_parts(ptr.cast::<f32>(), (size as usize).min(4)).to_vec())
-        } else { None };
-        enabled_attribs.push((index, size, type_, stride, buffer, ptr as usize, first));
+        } else {
+            None
+        };
+        let buffer_sample = if buffer > 0 {
+            let cache = diag_buffer_cache().lock().unwrap();
+            cache.get(&(shadow.resource_group_token,buffer as GLuint)).and_then(|bytes| {
+                bytes
+                    .get(ptr as usize..(ptr as usize).saturating_add(16))
+                    .map(|bytes| format!("{:02x?}", bytes))
+            })
+        } else {
+            None
+        };
+        enabled_attribs.push((
+            index,
+            size,
+            type_,
+            normalized,
+            stride,
+            buffer,
+            ptr as usize,
+            first,
+            buffer_sample,
+        ));
     }
     let mut active_uniform_count: GLint = 0;
-    gles.GetProgramiv(program as GLuint, 0x8B86 /* GL_ACTIVE_UNIFORMS */, &mut active_uniform_count);
+    gles.GetProgramiv(
+        program as GLuint,
+        0x8B86, /* GL_ACTIVE_UNIFORMS */
+        &mut active_uniform_count,
+    );
     let mut active_uniforms = Vec::new();
-    for index in 0..active_uniform_count.clamp(0, 32) as GLuint {
+    let mut samplers = Vec::new();
+    for index in 0..active_uniform_count.clamp(0, 128) as GLuint {
         let mut name = [0_u8; 128];
         let mut length: GLsizei = 0;
         let mut size: GLint = 0;
@@ -2372,11 +3051,40 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
                 _ => 1,
             };
             format!("{:?}", &value[..components])
+        } else if matches!(type_, 0x8B5E | 0x8B60) {
+            let mut unit = 0;
+            gles.GetUniformiv(program as GLuint, location, &mut unit);
+            samplers.push((uniform_name.clone(), unit, type_));
+            format!("unit={}", unit)
         } else {
             "non-float uniform".to_string()
         };
         active_uniforms.push((uniform_name, size, type_, location, value));
     }
+    let mut active_texture = 0;
+    gles.GetIntegerv(0x84E0 /* GL_ACTIVE_TEXTURE */, &mut active_texture);
+    let mut textures = Vec::new();
+    for (name, unit, type_) in samplers {
+        if !(0..32).contains(&unit) {
+            continue;
+        }
+        gles.ActiveTexture(gles11::TEXTURE0 + unit as GLenum);
+        let target = if type_ == 0x8B60 {
+            TEXTURE_CUBE_MAP
+        } else {
+            gles11::TEXTURE_2D
+        };
+        let binding = current_bound_texture(gles, target).unwrap_or(0);
+        let mut parameters = [0; 4];
+        for (pname, value) in [0x2801, 0x2800, 0x2802, 0x2803]
+            .into_iter()
+            .zip(&mut parameters)
+        {
+            gles.GetTexParameteriv(target, pname, value);
+        }
+        textures.push((name, unit, target, binding, parameters));
+    }
+    gles.ActiveTexture(active_texture as GLenum);
     let mut err = gles.GetError();
     while err != 0 && errs.len() < 16 {
         errs.push(err);
@@ -2384,8 +3092,8 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
     }
     log!(
         "ES2 draw state: fbo={} status={:#x} program={} texture={} \
-         array_buf={} elem_buf={} renderbuffer={} viewport={:?} color_mask={:?} states={:?} attribs={:?} \
-         active_count={} active_attribs={:?} enabled_attribs={:?} active_uniform_count={} active_uniforms={:?} generic_attribs_used={} err={:?}",
+         array_buf={} elem_buf={} renderbuffer={} viewport={:?} scissor={:?} color_mask={:?} states={:?} attribs={:?} \
+         active_count={} active_attribs={:?} enabled_attribs={:?} active_uniform_count={} active_uniforms={:?} textures={:?} generic_attribs_used={} err={:?}",
         fbo,
         status,
         program,
@@ -2394,6 +3102,7 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
         elem_buf,
         rb,
         viewport,
+        scissor,
         color_mask,
         states,
         attribs,
@@ -2402,8 +3111,135 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
         enabled_attribs,
         active_uniform_count,
         active_uniforms,
+        textures,
         shadow.generic_attribs_used,
         errs,
+    );
+}
+
+unsafe fn trace_native_draw_state(gles: &mut dyn GLES, shadow: &GLShadowState) {
+    if !gles.is_native_es1() || !crate::env_flag_cached!("TOUCHHLE_TRACE_NATIVE_GL_STATE") {
+        return;
+    }
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static DRAWS: AtomicU32 = AtomicU32::new(0);
+    let draw = DRAWS.fetch_add(1, Ordering::Relaxed);
+    if !matches!(draw, 0 | 100 | 1000 | 5000 | 10000 | 20000 | 40000) {
+        return;
+    }
+    let mut modelview = [0.0; 16];
+    let mut projection = [0.0; 16];
+    let mut colour = [0.0; 4];
+    let mut viewport = [0; 4];
+    let mut colour_mask = [0; 4];
+    gles.GetFloatv(gles11::MODELVIEW_MATRIX, modelview.as_mut_ptr());
+    gles.GetFloatv(gles11::PROJECTION_MATRIX, projection.as_mut_ptr());
+    gles.GetFloatv(gles11::CURRENT_COLOR, colour.as_mut_ptr());
+    gles.GetIntegerv(gles11::VIEWPORT, viewport.as_mut_ptr());
+    gles.GetBooleanv(gles11::COLOR_WRITEMASK, colour_mask.as_mut_ptr());
+    let states = [
+        gles11::VERTEX_ARRAY,
+        gles11::COLOR_ARRAY,
+        gles11::TEXTURE_COORD_ARRAY,
+        gles11::TEXTURE_2D,
+        gles11::LIGHTING,
+        gles11::ALPHA_TEST,
+        gles11::DEPTH_TEST,
+        gles11::CULL_FACE,
+        gles11::SCISSOR_TEST,
+        gles11::BLEND,
+    ]
+    .map(|cap| (cap, gles.IsEnabled(cap)));
+    log!("Native draw #{}: viewport={:?} colour={:?} mask={:?} states={:?} arrays={:?} modelview={:?} projection={:?}",
+        draw, viewport, colour, colour_mask, states, shadow.vertex_array_state, modelview, projection);
+}
+
+unsafe fn log_indexed_draw_trace(
+    gles: &mut dyn GLES,
+    draw_index: u32,
+    native_es1: bool,
+    mode: GLenum,
+    count: GLsizei,
+    type_: GLenum,
+    indices: ConstVoidPtr,
+) {
+    let mut active_texture: GLint = 0;
+    let mut texture: GLint = 0;
+    let mut program: GLint = 0;
+    let mut max_attributes: GLint = 0;
+    gles.GetIntegerv(0x84E0 /* GL_ACTIVE_TEXTURE */, &mut active_texture);
+    gles.GetIntegerv(0x8069 /* GL_TEXTURE_BINDING_2D */, &mut texture);
+    if !native_es1 {
+        gles.GetIntegerv(0x8B8D /* GL_CURRENT_PROGRAM */, &mut program);
+        gles.GetIntegerv(0x8869 /* GL_MAX_VERTEX_ATTRIBS */, &mut max_attributes);
+    }
+
+    let mut min_filter: GLint = 0;
+    let mut mag_filter: GLint = 0;
+    if texture != 0 {
+        gles.GetTexParameteriv(0x0DE1 /* GL_TEXTURE_2D */, 0x2801, &mut min_filter);
+        gles.GetTexParameteriv(0x0DE1 /* GL_TEXTURE_2D */, 0x2800, &mut mag_filter);
+    }
+    let blend = gles.IsEnabled(0x0BE2 /* GL_BLEND */) != 0;
+    let depth = gles.IsEnabled(0x0B71 /* GL_DEPTH_TEST */) != 0;
+
+    let mut attributes = Vec::new();
+    for index in 0..max_attributes.clamp(0, 16) as GLuint {
+        let mut enabled: GLint = 0;
+        gles.GetVertexAttribiv(
+            index,
+            0x8622, /* GL_VERTEX_ATTRIB_ARRAY_ENABLED */
+            &mut enabled,
+        );
+        if enabled == 0 {
+            continue;
+        }
+        let mut size: GLint = 0;
+        let mut type_: GLint = 0;
+        let mut stride: GLint = 0;
+        let mut buffer: GLint = 0;
+        let mut pointer: *mut GLvoid = std::ptr::null_mut();
+        gles.GetVertexAttribiv(
+            index, 0x8623, /* GL_VERTEX_ATTRIB_ARRAY_SIZE */
+            &mut size,
+        );
+        gles.GetVertexAttribiv(
+            index, 0x8625, /* GL_VERTEX_ATTRIB_ARRAY_TYPE */
+            &mut type_,
+        );
+        gles.GetVertexAttribiv(
+            index,
+            0x8624, /* GL_VERTEX_ATTRIB_ARRAY_STRIDE */
+            &mut stride,
+        );
+        gles.GetVertexAttribiv(
+            index,
+            0x889F, /* GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING */
+            &mut buffer,
+        );
+        gles.GetVertexAttribPointerv(
+            index,
+            0x8645, /* GL_VERTEX_ATTRIB_ARRAY_POINTER */
+            &mut pointer,
+        );
+        attributes.push((index, size, type_, stride, buffer, pointer as usize));
+    }
+    log!(
+        "DRAW-ELEMENTS-DIAG #{} mode={:#x} count={} type={:#x} indices={:#x} nativeES1={} program={} activeTex={:#x} tex2d={} minf={:#x} magf={:#x} blend={} depth={} attribs={:?}",
+        draw_index,
+        mode,
+        count,
+        type_,
+        indices.to_bits(),
+        native_es1,
+        program,
+        active_texture,
+        texture,
+        min_filter,
+        mag_filter,
+        blend,
+        depth,
+        attributes,
     );
 }
 
@@ -2414,6 +3250,7 @@ fn glDrawElements(
     type_: GLenum,
     indices: ConstVoidPtr,
 ) {
+    super::draw_stats::record_draw(count.max(0) as u64);
     {
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
@@ -2428,9 +3265,8 @@ fn glDrawElements(
             static COUNT: AtomicU32 = AtomicU32::new(0);
             static LARGE_COUNT: AtomicU32 = AtomicU32::new(0);
             let n = COUNT.fetch_add(1, Ordering::Relaxed);
-            let log_large = n >= 160
-                && count > 3
-                && LARGE_COUNT.fetch_add(1, Ordering::Relaxed) < 256;
+            let log_large =
+                n >= 160 && count > 3 && LARGE_COUNT.fetch_add(1, Ordering::Relaxed) < 256;
             if n < 160 || log_large {
                 log!(
                     "[POTATO RENDER TRACE] glDrawElements #{} mode=0x{:x} count={} type=0x{:x} indices=0x{:x}",
@@ -2443,10 +3279,7 @@ fn glDrawElements(
             }
         }
     }
-    if !draw_mode_is_valid(mode) {
-        warn_invalid_draw_mode("glDrawElements", mode);
-        return;
-    }
+    let trace_draws = trace_gl_draws_enabled(env);
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         if count > 0 && indices.is_null() && !buffer_is_bound(gles, shadow, ELEMENT_ARRAY_BUFFER) {
             log_once!(
@@ -2454,15 +3287,22 @@ fn glDrawElements(
             );
             return;
         }
-        if count > 3 && crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
-            log!(
-                "ES2 first larger indexed draw: mode=0x{:x} count={} type=0x{:x} indices=0x{:x}",
-                mode,
-                count,
-                type_,
-                indices.to_bits()
-            );
+        if count > 3 && trace_debug_draw_enabled() {
             log_es2_draw_state_once(gles, shadow, mem);
+        }
+        let Some(native_arrays) = guard_native_client_arrays(gles, shadow) else {
+            return;
+        };
+        if trace_draws {
+            let native_es1 = gles.is_native_es1();
+            let (draw_index, large_draw_index) = next_draw_trace_indices(
+                &mut shadow.draw_elements_trace_count,
+                &mut shadow.draw_elements_trace_large_count,
+                count,
+            );
+            if should_trace_draw(draw_index, count, large_draw_index) {
+                log_indexed_draw_trace(gles, draw_index, native_es1, mode, count, type_, indices);
+            }
         }
         let disabled_arrays = guard_client_vertex_arrays(gles, mem, shadow);
         let fog_state_backup = clamp_fog_state_values(gles, shadow);
@@ -2483,10 +3323,12 @@ fn glDrawElements(
 
         let indices =
             translate_pointer_or_offset_to_host(gles, mem, shadow, indices, ELEMENT_ARRAY_BUFFER);
+        trace_native_draw_state(gles, shadow);
         crate::gles::perf_overlay::record_draw();
         gles.DrawElements(mode, count, type_, indices);
-        if count > 3 && crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
-            static FB_DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if count > 3 && trace_debug_draw_enabled() {
+            static FB_DUMPED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
             if !FB_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 let mut vp = [0 as GLint; 4];
                 gles.GetIntegerv(0x0BA2 /* GL_VIEWPORT */, vp.as_mut_ptr());
@@ -2503,7 +3345,11 @@ fn glDrawElements(
                         0x1401, /* GL_UNSIGNED_BYTE */
                         pix.as_mut_ptr() as *mut _,
                     );
-                    dump_rgb_ppm(&pix, w as u32, h as u32, 0x1908, 0x1401, "/tmp/a8run/fb_after_larger_draw.ppm");
+                    if let Some(path) =
+                        crate::paths::diagnostic_dump_path("fb_after_larger_draw.ppm")
+                    {
+                        dump_rgb_ppm(&pix, w as u32, h as u32, 0x1908, 0x1401, &path);
+                    }
                 }
                 let mut err = gles.GetError();
                 let mut errs = Vec::new();
@@ -2515,6 +3361,7 @@ fn glDrawElements(
             }
         }
         restore_fog_state_values(gles, fog_state_backup);
+        native_arrays.restore(gles);
         for index in disabled_arrays {
             gles.EnableVertexAttribArray(index);
         }
@@ -2522,6 +3369,7 @@ fn glDrawElements(
 }
 
 fn glClear(env: &mut Environment, mask: GLbitfield) {
+    super::draw_stats::record_clear(mask as u64);
     {
         use std::sync::atomic::{AtomicBool, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
@@ -2794,10 +3642,7 @@ fn glDeleteTextures(env: &mut Environment, n: GLsizei, textures: ConstPtr<GLuint
         unsafe { gles.DeleteTextures(n, deleted.as_ptr()) };
         for texture in &deleted {
             shadow.forget_pvrtc_texture(*texture);
-            crate::gles::perf_overlay::delete_gl_texture(
-                shadow.resource_group_token,
-                *texture,
-            );
+            crate::gles::perf_overlay::delete_gl_texture(shadow.resource_group_token, *texture);
         }
     })
 }
@@ -2861,9 +3706,185 @@ fn demipmap_filter_value(pname: GLenum, param: GLint) -> GLint {
     demipmapped as GLint
 }
 
-fn maybe_demipmap_min_filter(env: &Environment, pname: GLenum, param: GLint) -> GLint {
-    if !env.options.fix_texture_min_filter {
+/// Whether `param` is one of the four mipmap `GL_TEXTURE_MIN_FILTER` modes.
+fn is_mipmap_min_filter(param: GLint) -> bool {
+    matches!(
+        param as GLenum,
+        gles11::NEAREST_MIPMAP_NEAREST
+            | gles11::NEAREST_MIPMAP_LINEAR
+            | gles11::LINEAR_MIPMAP_NEAREST
+            | gles11::LINEAR_MIPMAP_LINEAR
+    )
+}
+
+/// Give the bound texture a mip chain so a mipmap min-filter can stay set.
+///
+/// iOS-era GPUs sample the mip chain when an app asks for mipmap minification.
+/// On a strict driver a level-0-only texture is incomplete and samples black,
+/// which is why the guest's filter used to be replaced with its non-mipmap
+/// equivalent. That keeps the texture usable but throws away all minification
+/// filtering, so an app that minifies a large atlas into a small viewport
+/// (Blockheads renders a 2048x2048 world atlas into a 320x320 camera) samples
+/// arbitrary single texels and shows blocks of white atlas gutter art.
+/// Generating the chain once per level-0 upload restores what iOS did.
+///
+/// Only ES 2.0 backends do this: ES 1.1 has no mipmaps for non-power-of-two
+/// textures, so generation there can fail on a texture the guest already uses.
+///
+/// Returns whether the bound texture has a complete mip chain afterwards: a
+/// host that rejects generation leaves the texture level-0-only, so the caller
+/// must fall back to a non-mipmap filter or the texture samples black.
+unsafe fn generate_mipmaps(
+    gles: &mut dyn GLES,
+    shadow: &mut GLShadowState,
+    target: GLenum,
+) -> bool {
+    // Cube-map faces share one texture object and one mip chain.
+    let target = crate::gles::util::tex_parameter_target(target);
+    let Some(texture) = current_bound_texture(gles, target) else {
+        return false;
+    };
+    if texture == 0 {
+        return false;
+    }
+    if !shadow.record_generated_mipmaps(target, texture) {
+        return true;
+    }
+    gles.GenerateMipmap(target);
+    let generate_error = gles.GetError();
+    if generate_error != 0 {
+        // Keep the record honest: a later filter change must retry rather than
+        // assume a chain this host refused to build.
+        shadow.forget_generated_mipmaps(target, texture);
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SEEN_FAILED: AtomicBool = AtomicBool::new(false);
+        if !SEEN_FAILED.swap(true, Ordering::Relaxed) {
+            log!(
+                "fix_texture_min_filter: the host cannot generate mipmaps for \
+                 texture {} (target 0x{:x}, GL error 0x{:x}); using a non-mipmap \
+                 filter [this log will only be shown once]",
+                texture,
+                target,
+                generate_error
+            );
+        }
+        return false;
+    }
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    if !SEEN.swap(true, Ordering::Relaxed) {
+        log!(
+            "fix_texture_min_filter: generating a mip chain for texture {} \
+             (target 0x{:x}) instead of replacing the guest's mipmap \
+             GL_TEXTURE_MIN_FILTER [this log will only be shown once]",
+            texture,
+            target
+        );
+    }
+    true
+}
+
+/// Restore the guest's min filter after a level-0 upload.
+///
+/// A mipmap min-filter stays set and the chain is generated, because the
+/// upload supplied a full level 0. A backend or host format that cannot build
+/// the chain keeps the old `GL_LINEAR` substitute: an incomplete texture
+/// samples black, which is worse than losing minification.
+unsafe fn supply_min_filter_after_upload(
+    gles: &mut dyn GLES,
+    shadow: &mut GLShadowState,
+    target: GLenum,
+    texture: Option<GLuint>,
+) {
+    // TexParameter and the parameter queries take the cube target, not a face.
+    let parameter_target = crate::gles::util::tex_parameter_target(target);
+    let mut current: GLint = 0;
+    gles.GetTexParameteriv(parameter_target, gles11::TEXTURE_MIN_FILTER, &mut current);
+    let pending = match texture {
+        Some(texture) => {
+            shadow.forget_generated_mipmaps(parameter_target, texture);
+            shadow.take_pending_min_filter(parameter_target, texture)
+        }
+        None => None,
+    };
+    if !gles.is_es2() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SEEN: AtomicBool = AtomicBool::new(false);
+        if !SEEN.swap(true, Ordering::Relaxed) {
+            log!(
+                "First fix_texture_min_filter override: forcing \
+                 GL_TEXTURE_MIN_FILTER=GL_LINEAR after a level-0 upload \
+                 [this log will only be shown once]"
+            );
+        }
+        gles.TexParameteri(
+            parameter_target,
+            gles11::TEXTURE_MIN_FILTER,
+            gles11::LINEAR as GLint,
+        );
+        return;
+    }
+    // A mipmap filter set before this upload could not build a chain then
+    // because there was no level 0 yet. Now there is, so apply what the guest
+    // asked for: keeping the substitute instead would lose minification for
+    // the life of the texture.
+    if let Some(requested) = pending {
+        let filter = if generate_mipmaps(gles, shadow, target) {
+            requested
+        } else {
+            demipmap_filter_value(gles11::TEXTURE_MIN_FILTER, requested)
+        };
+        gles.TexParameteri(parameter_target, gles11::TEXTURE_MIN_FILTER, filter);
+        return;
+    }
+    if !is_mipmap_min_filter(current) {
+        return;
+    }
+    if generate_mipmaps(gles, shadow, target) {
+        return;
+    }
+    // The host kept the guest's compressed texels and cannot build a chain
+    // for them; replace the filter instead of leaving the texture incomplete,
+    // which samples black.
+    gles.TexParameteri(
+        parameter_target,
+        gles11::TEXTURE_MIN_FILTER,
+        gles11::LINEAR as GLint,
+    );
+}
+
+/// Keep the guest's mipmap `GL_TEXTURE_MIN_FILTER` when a mip chain can be
+/// supplied, otherwise fall back to the non-mipmap substitute.
+fn adjust_min_filter(
+    fix_min_filter: bool,
+    gles: &mut dyn GLES,
+    shadow: &mut GLShadowState,
+    target: GLenum,
+    pname: GLenum,
+    param: GLint,
+) -> GLint {
+    if !fix_min_filter || pname != gles11::TEXTURE_MIN_FILTER {
         return param;
+    }
+    let texture_target = crate::gles::util::tex_parameter_target(target);
+    let texture = unsafe { current_bound_texture(gles, texture_target) }.unwrap_or(0);
+    if !is_mipmap_min_filter(param) {
+        // The guest wants a plain filter, so drop any deferred request.
+        if texture != 0 {
+            shadow.forget_pending_min_filter(texture_target, texture);
+        }
+        return param;
+    }
+    if !gles.is_es2() {
+        return demipmap_filter_value(pname, param);
+    }
+    if unsafe { generate_mipmaps(gles, shadow, target) } {
+        return param;
+    }
+    // The texture has no level 0 yet, which is the usual order: create it, set
+    // the filter, then upload. Keep the request for the upload to honour.
+    if texture != 0 {
+        shadow.record_pending_min_filter(texture_target, texture, param);
     }
     demipmap_filter_value(pname, param)
 }
@@ -2882,8 +3903,9 @@ fn glTexParameteri(env: &mut Environment, target: GLenum, pname: GLenum, param: 
     if pname == gles11::TEXTURE_CROP_RECT_OES {
         return;
     }
-    let param = maybe_demipmap_min_filter(env, pname, param);
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
+    let fix_min_filter = env.options.fix_texture_min_filter && pname == gles11::TEXTURE_MIN_FILTER;
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        let param = adjust_min_filter(fix_min_filter, gles, shadow, target, pname, param);
         gles.TexParameteri(target, pname, param)
     })
 }
@@ -2893,9 +3915,10 @@ fn glTexParameterf(env: &mut Environment, target: GLenum, pname: GLenum, param: 
     }
     // Floats can also be used to pass enum-valued min-filter params (an
     // OpenGL quirk), so route them through the same substitution.
-    let param = maybe_demipmap_min_filter(env, pname, param as GLint) as GLfloat;
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.TexParameterf(target, pname, param)
+    let fix_min_filter = env.options.fix_texture_min_filter && pname == gles11::TEXTURE_MIN_FILTER;
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        let param = adjust_min_filter(fix_min_filter, gles, shadow, target, pname, param as GLint);
+        gles.TexParameterf(target, pname, param as GLfloat)
     })
 }
 fn glTexParameterx(env: &mut Environment, target: GLenum, pname: GLenum, param: GLfixed) {
@@ -2903,43 +3926,54 @@ fn glTexParameterx(env: &mut Environment, target: GLenum, pname: GLenum, param: 
         return;
     }
     // Fixed-point can also encode enum values; route through substitution.
-    let param = maybe_demipmap_min_filter(env, pname, param) as GLfixed;
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
+    let fix_min_filter = env.options.fix_texture_min_filter && pname == gles11::TEXTURE_MIN_FILTER;
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        let param = adjust_min_filter(fix_min_filter, gles, shadow, target, pname, param);
         gles.TexParameterx(target, pname, param)
     })
 }
+/// Crop rectangles are texture-object state used by every DrawTex variant.
+/// Forward all four signed components, including negative sizes for flipping.
+/// https://registry.khronos.org/OpenGL/extensions/OES/OES_draw_texture.txt
+/// https://developer.apple.com/documentation/opengles/gl_oes_draw_texture
+enum TextureCropVector {
+    Integer(ConstPtr<GLint>),
+    Float(ConstPtr<GLfloat>),
+    Fixed(ConstPtr<GLfixed>),
+}
+
+unsafe fn dispatch_texture_crop_rect(
+    gles: &mut dyn GLES,
+    mem: &Mem,
+    target: GLenum,
+    vector: TextureCropVector,
+) {
+    match vector {
+        TextureCropVector::Integer(params) => {
+            gles.TexParameteriv(target, gles11::TEXTURE_CROP_RECT_OES, mem.ptr_at(params, 4))
+        }
+        TextureCropVector::Float(params) => {
+            gles.TexParameterfv(target, gles11::TEXTURE_CROP_RECT_OES, mem.ptr_at(params, 4))
+        }
+        TextureCropVector::Fixed(params) => {
+            gles.TexParameterxv(target, gles11::TEXTURE_CROP_RECT_OES, mem.ptr_at(params, 4))
+        }
+    }
+}
+
 fn glTexParameteriv(env: &mut Environment, target: GLenum, pname: GLenum, params: ConstPtr<GLint>) {
     if pname == gles11::TEXTURE_CROP_RECT_OES {
-        if !crate::env_flag_cached!("TOUCHHLE_ENABLE_TEXTURE_CROP_RECT") {
-            return;
-        }
-
         with_ctx_and_mem(env, |gles, mem| unsafe {
-            let params_ptr = mem.ptr_at(params, 4);
-            {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static SEEN: AtomicBool = AtomicBool::new(false);
-                if !SEEN.swap(true, Ordering::Relaxed) {
-                    let crop = from_raw_parts(params_ptr, 4);
-                    log!(
-                        "TOUCHHLE_ENABLE_TEXTURE_CROP_RECT=1: first glTexParameteriv(GL_TEXTURE_CROP_RECT_OES) = [{}, {}, {}, {}]",
-                        crop[0],
-                        crop[1],
-                        crop[2],
-                        crop[3]
-                    );
-                }
-            }
-            gles.TexParameteriv(target, pname, params_ptr)
+            dispatch_texture_crop_rect(gles, mem, target, TextureCropVector::Integer(params));
         });
         return;
     }
     let fix_min_filter = env.options.fix_texture_min_filter && pname == gles11::TEXTURE_MIN_FILTER;
-    with_ctx_and_mem(env, |gles, mem| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         let params_ptr = mem.ptr_at(params, 1);
         if fix_min_filter {
             let original: GLint = *params_ptr;
-            let substituted = demipmap_filter_value(pname, original);
+            let substituted = adjust_min_filter(true, gles, shadow, target, pname, original);
             if substituted != original {
                 let v = [substituted];
                 gles.TexParameteriv(target, pname, v.as_ptr());
@@ -2956,36 +3990,18 @@ fn glTexParameterfv(
     params: ConstPtr<GLfloat>,
 ) {
     if pname == gles11::TEXTURE_CROP_RECT_OES {
-        if !crate::env_flag_cached!("TOUCHHLE_ENABLE_TEXTURE_CROP_RECT") {
-            return;
-        }
-
         with_ctx_and_mem(env, |gles, mem| unsafe {
-            let params_ptr = mem.ptr_at(params, 4);
-            {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static SEEN: AtomicBool = AtomicBool::new(false);
-                if !SEEN.swap(true, Ordering::Relaxed) {
-                    let crop = from_raw_parts(params_ptr, 4);
-                    log!(
-                        "TOUCHHLE_ENABLE_TEXTURE_CROP_RECT=1: first glTexParameterfv(GL_TEXTURE_CROP_RECT_OES) = [{}, {}, {}, {}]",
-                        crop[0],
-                        crop[1],
-                        crop[2],
-                        crop[3]
-                    );
-                }
-            }
-            gles.TexParameterfv(target, pname, params_ptr)
+            dispatch_texture_crop_rect(gles, mem, target, TextureCropVector::Float(params));
         });
         return;
     }
     let fix_min_filter = env.options.fix_texture_min_filter && pname == gles11::TEXTURE_MIN_FILTER;
-    with_ctx_and_mem(env, |gles, mem| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         let params_ptr = mem.ptr_at(params, 1);
         if fix_min_filter {
             let original: GLfloat = *params_ptr;
-            let substituted = demipmap_filter_value(pname, original as GLint) as GLfloat;
+            let substituted =
+                adjust_min_filter(true, gles, shadow, target, pname, original as GLint) as GLfloat;
             if substituted != original {
                 let v = [substituted];
                 gles.TexParameterfv(target, pname, v.as_ptr());
@@ -3002,36 +4018,17 @@ fn glTexParameterxv(
     params: ConstPtr<GLfixed>,
 ) {
     if pname == gles11::TEXTURE_CROP_RECT_OES {
-        if !crate::env_flag_cached!("TOUCHHLE_ENABLE_TEXTURE_CROP_RECT") {
-            return;
-        }
-
         with_ctx_and_mem(env, |gles, mem| unsafe {
-            let params_ptr = mem.ptr_at(params, 4);
-            {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static SEEN: AtomicBool = AtomicBool::new(false);
-                if !SEEN.swap(true, Ordering::Relaxed) {
-                    let crop = from_raw_parts(params_ptr, 4);
-                    log!(
-                        "TOUCHHLE_ENABLE_TEXTURE_CROP_RECT=1: first glTexParameterxv(GL_TEXTURE_CROP_RECT_OES) = [{}, {}, {}, {}]",
-                        crop[0],
-                        crop[1],
-                        crop[2],
-                        crop[3]
-                    );
-                }
-            }
-            gles.TexParameterxv(target, pname, params_ptr)
+            dispatch_texture_crop_rect(gles, mem, target, TextureCropVector::Fixed(params));
         });
         return;
     }
     let fix_min_filter = env.options.fix_texture_min_filter && pname == gles11::TEXTURE_MIN_FILTER;
-    with_ctx_and_mem(env, |gles, mem| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         let params_ptr = mem.ptr_at(params, 1);
         if fix_min_filter {
             let original: GLfixed = *params_ptr;
-            let substituted = demipmap_filter_value(pname, original) as GLfixed;
+            let substituted = adjust_min_filter(true, gles, shadow, target, pname, original);
             if substituted != original {
                 let v = [substituted];
                 gles.TexParameterxv(target, pname, v.as_ptr());
@@ -3198,6 +4195,7 @@ fn glTexImage2D(
     type_: GLenum,
     pixels: ConstVoidPtr,
 ) {
+    super::draw_stats::record_texture_upload();
     {
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
@@ -3227,8 +4225,22 @@ fn glTexImage2D(
             }
         }
     }
+    if env.options.verbose_gles {
+        log!(
+            "glTexImage2D: target=0x{:x} level={} size={}x{} internalformat=0x{:x} format=0x{:x} type=0x{:x} pixels_null={}",
+            target,
+            level,
+            width,
+            height,
+            internalformat as u32,
+            format,
+            type_,
+            pixels.is_null()
+        );
+    }
     let guest_pixels = pixels;
     let fix_filter = env.options.fix_texture_min_filter && level == 0;
+    let parameter_target = crate::gles::util::tex_parameter_target(target);
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         let bound_texture = current_bound_texture(gles, target);
         let storage_size = texture_level_bytes(width, height, format, type_);
@@ -3260,8 +4272,9 @@ fn glTexImage2D(
                 storage_size,
             );
         }
-        if crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
-            static TEX_DUMP_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if trace_debug_draw_enabled() {
+            static TEX_DUMP_COUNT: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
             let n = TEX_DUMP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 8 && !pixels.is_null() && level == 0 {
                 let tex_id = {
@@ -3281,28 +4294,20 @@ fn glTexImage2D(
                     let buf: Vec<u8> = mem
                         .bytes_at(guest_pixels.cast::<u8>(), byte_size as u32)
                         .to_vec();
-                    let path = format!(
-                        "/tmp/a8run/tex{}_id{}_{}x{}.ppm", n, tex_id, width, height
-                    );
-                    dump_rgb_ppm(&buf, width as u32, height as u32, format, type_, &path);
+                    let name = format!("tex{}_id{}_{}x{}.ppm", n, tex_id, width, height);
+                    if let Some(path) = crate::paths::diagnostic_dump_path(&name) {
+                        dump_rgb_ppm(&buf, width as u32, height as u32, format, type_, &path);
+                    }
                 }
             }
         }
         if fix_filter {
-            // Set GL_TEXTURE_MIN_FILTER to GL_LINEAR for the bound
-            // texture so it isn't sampled as opaque black on strict
-            // ES 1.1 drivers (notably Qualcomm Adreno) just because
-            // the guest never bothered to override the default
-            // GL_NEAREST_MIPMAP_LINEAR. The guest's own
-            // glTexParameteri(GL_TEXTURE_MIN_FILTER, …) will override
-            // this on subsequent calls — see Options::fix_texture_min_filter.
-            static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                log!(
-                    "First fix_texture_min_filter override: forcing GL_TEXTURE_MIN_FILTER=GL_LINEAR after glTexImage2D(level=0) [this log will only be shown once]"
-                );
-            }
-            gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+            // The guest asked for mipmap minification and iOS sampled the
+            // chain, so supply one instead of losing all minification
+            // filtering. Replacing the filter made a shrunken atlas sample
+            // single texels (Blockheads' white blocks).
+            // See Options::fix_texture_min_filter.
+            supply_min_filter_after_upload(gles, shadow, parameter_target, bound_texture);
         }
     })
 }
@@ -3318,13 +4323,46 @@ fn glTexSubImage2D(
     type_: GLenum,
     pixels: ConstVoidPtr,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
+    super::draw_stats::record_texture_upload();
+    let fix_filter = env.options.fix_texture_min_filter && level == 0;
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         let pixel_count: GuestUSize = width.checked_mul(height).unwrap().try_into().unwrap();
         let size = image_size_estimate(pixel_count, format, type_);
-        let pixels = mem.ptr_at(pixels.cast::<u8>(), size).cast::<GLvoid>();
+        let pixels = if pixels.is_null() {
+            std::ptr::null()
+        } else {
+            mem.ptr_at(pixels.cast::<u8>(), size).cast::<GLvoid>()
+        };
         gles.TexSubImage2D(
             target, level, xoffset, yoffset, width, height, format, type_, pixels,
-        )
+        );
+        if !fix_filter {
+            return;
+        }
+        // Level 0 changed, so any mip chain built from the old texels is stale.
+        // Rebuild it from the new texels; if the host refuses, drop the
+        // mipmap filter rather than leave an incomplete texture sampling black.
+        let Some(texture) = current_bound_texture(gles, target) else {
+            return;
+        };
+        let parameter_target = crate::gles::util::tex_parameter_target(target);
+        shadow.forget_generated_mipmaps(parameter_target, texture);
+        let mut current_filter: GLint = 0;
+        gles.GetTexParameteriv(
+            parameter_target,
+            gles11::TEXTURE_MIN_FILTER,
+            &mut current_filter,
+        );
+        if !is_mipmap_min_filter(current_filter) {
+            return;
+        }
+        if !generate_mipmaps(gles, shadow, target) {
+            gles.TexParameteri(
+                parameter_target,
+                gles11::TEXTURE_MIN_FILTER,
+                gles11::LINEAR as GLint,
+            );
+        }
     })
 }
 fn glCompressedTexImage2D(
@@ -3338,6 +4376,7 @@ fn glCompressedTexImage2D(
     image_size: GLsizei,
     data: ConstVoidPtr,
 ) {
+    super::draw_stats::record_texture_upload();
     {
         use std::sync::atomic::{AtomicBool, Ordering};
         static SEEN: AtomicBool = AtomicBool::new(false);
@@ -3355,6 +4394,7 @@ fn glCompressedTexImage2D(
         );
     }
     let fix_filter = env.options.fix_texture_min_filter && level == 0;
+    let parameter_target = crate::gles::util::tex_parameter_target(target);
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         let bound_texture = current_bound_texture(gles, target);
         if let Some(texture) = bound_texture {
@@ -3367,7 +4407,7 @@ fn glCompressedTexImage2D(
         // paletted upload that follows a failed glTexImage2D would report
         // a misleading "compressed upload failed" on the very first call —
         // that's exactly what was happening on Mali-G57 with Temple Run
-        // (HyperHLE log: 1024x1024 RGBA8 upload immediately followed by
+        // (AppleJuiceHLE log: 1024x1024 RGBA8 upload immediately followed by
         // 256x256 PVRTC upload, both blamed on the PVRTC path).
         let mut drained = 0u32;
         loop {
@@ -3462,7 +4502,9 @@ fn glCompressedTexImage2D(
                 }
             }
             if fix_filter {
-                gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+                // Storage came from glTexImage2D(RGBA), so the chain can be
+                // generated just like an uncompressed upload.
+                supply_min_filter_after_upload(gles, shadow, parameter_target, bound_texture);
             }
             return;
         }
@@ -3507,7 +4549,8 @@ fn glCompressedTexImage2D(
                     }
                 }
                 if fix_filter {
-                    gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+                    // PVRTC was decoded to RGBA, so the chain can exist.
+                    supply_min_filter_after_upload(gles, shadow, parameter_target, bound_texture);
                 }
                 return;
             }
@@ -3537,12 +4580,7 @@ fn glCompressedTexImage2D(
                     target,
                     texture,
                     level,
-                    compressed_texture_level_bytes(
-                        internalformat,
-                        width,
-                        height,
-                        image_size_usize,
-                    ),
+                    compressed_texture_level_bytes(internalformat, width, height, image_size_usize),
                 );
             }
         }
@@ -3590,7 +4628,9 @@ fn glCompressedTexImage2D(
         }
 
         if fix_filter {
-            gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+            // Some hosts keep the guest's compressed texels and cannot build
+            // a chain for them; supply_min_filter_after_upload falls back.
+            supply_min_filter_after_upload(gles, shadow, parameter_target, bound_texture);
         }
     })
 }
@@ -3801,8 +4841,17 @@ fn glBindFramebufferOES(env: &mut Environment, target: GLenum, framebuffer: GLui
         .framework_state
         .opengles
         .scale_hack_applies_to_viewport(thread);
+    // `GL_DEPTH_TEST` is global state whose meaning depends on what is bound:
+    // a framebuffer with no depth attachment of the guest's own must behave as
+    // if depth testing were disabled.
+    let host_depth_test = env.framework_state.opengles.host_depth_test(thread);
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.BindFramebufferOES(target, framebuffer);
+        if host_depth_test {
+            gles.Enable(gles11::DEPTH_TEST)
+        } else {
+            gles.Disable(gles11::DEPTH_TEST)
+        }
         if let Some((x, y, width, height)) = viewport {
             if apply_scale_hack {
                 gles.Viewport(x * factor, y * factor, width * factor, height * factor)
@@ -3813,6 +4862,17 @@ fn glBindFramebufferOES(env: &mut Environment, target: GLenum, framebuffer: GLui
     })
 }
 fn glBindRenderbufferOES(env: &mut Environment, target: GLenum, renderbuffer: GLuint) {
+    if crate::env_flag_cached!("TOUCHHLE_TRACE_NATIVE_GL_STATE") {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static BINDS: AtomicU32 = AtomicU32::new(0);
+        if BINDS.fetch_add(1, Ordering::Relaxed) < 16 {
+            log!(
+                "Guest glBindRenderbufferOES(target={:#x}, rb={:#x})",
+                target,
+                renderbuffer
+            );
+        }
+    }
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.BindRenderbufferOES(target, renderbuffer)
     })
@@ -3826,10 +4886,68 @@ fn glRenderbufferStorageOES(
 ) {
     let factor = env.options.scale_hack.get() as GLsizei;
     let (width, height) = (width * factor, height * factor);
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.RenderbufferStorageOES(target, internalformat, width, height)
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        gles.RenderbufferStorageOES(target, internalformat, width, height);
+        // An auto-attached depth renderbuffer was sized from the colour
+        // renderbuffer it was attached for. When the app re-specifies that
+        // colour buffer at a new size (Blockheads grows its drawable from
+        // 320x460 to 320x480), the depth attachment keeps the old size, the
+        // framebuffer goes incomplete and every draw into it is discarded.
+        // Follow the colour size, as the app would have if it had attached a
+        // depth buffer itself.
+        while gles.GetError() != 0 {}
+        let mut colour_rb: GLint = 0;
+        gles.GetIntegerv(gles11::RENDERBUFFER_BINDING_OES, &mut colour_rb);
+        let mut framebuffer: GLint = 0;
+        gles.GetIntegerv(gles11::FRAMEBUFFER_BINDING_OES, &mut framebuffer);
+        if colour_rb == 0 || framebuffer == 0 {
+            return;
+        }
+        let mut colour_attachment: GLint = 0;
+        gles.GetFramebufferAttachmentParameterivOES(
+            gles11::FRAMEBUFFER_OES,
+            gles11::COLOR_ATTACHMENT0_OES,
+            gles11::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME_OES,
+            &mut colour_attachment,
+        );
+        let mut depth_rb: GLint = 0;
+        gles.GetFramebufferAttachmentParameterivOES(
+            gles11::FRAMEBUFFER_OES,
+            gles11::DEPTH_ATTACHMENT_OES,
+            gles11::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME_OES,
+            &mut depth_rb,
+        );
+        while gles.GetError() != 0 {}
+        if colour_attachment != colour_rb
+            || depth_rb == 0
+            || !shadow.is_auto_depth_renderbuffer(depth_rb as GLuint)
+        {
+            return;
+        }
+        gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, depth_rb as GLuint);
+        gles.RenderbufferStorageOES(
+            gles11::RENDERBUFFER_OES,
+            gles11::DEPTH_COMPONENT16_OES,
+            width,
+            height,
+        );
+        gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, colour_rb as GLuint);
     })
 }
+
+/// Whether the auto-attached-depth-renderbuffer workaround in
+/// [glFramebufferRenderbufferOES] is switched off.
+///
+/// Setting `TOUCHHLE_DISABLE_AUTO_DEPTH_ATTACH` restores strict behaviour: no
+/// depth buffer is synthesised, so the guest gets whatever the host driver does
+/// with a framebuffer that has no depth attachment (which, per the OpenGL ES
+/// rule quoted in `State::depthless_framebuffers`, is supposed to be "depth
+/// testing behaves as disabled"). That is the first thing to try when bisecting
+/// a scene that renders *worse* with the workaround than without it.
+fn auto_depth_attach_disabled() -> bool {
+    crate::env_flag_cached!("TOUCHHLE_DISABLE_AUTO_DEPTH_ATTACH")
+}
+
 fn glFramebufferRenderbufferOES(
     env: &mut Environment,
     target: GLenum,
@@ -3845,17 +4963,49 @@ fn glFramebufferRenderbufferOES(
             .opengles
             .set_colour_attachment_is_texture(thread, false);
     }
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
+    if attachment == gles11::DEPTH_ATTACHMENT_OES {
+        // The guest attached (or detached) a depth buffer itself, so this
+        // framebuffer is no longer one of ours to pretend is depth-less.
+        let thread = env.current_thread;
+        let framebuffer = env.framework_state.opengles.bound_framebuffer(thread);
+        let depthless = renderbuffer == 0;
+        env.framework_state
+            .opengles
+            .set_framebuffer_depthless(framebuffer, depthless);
+    }
+    // Whether this call made us synthesise a depth buffer for the target. The
+    // framebuffer's new state is recorded after the GL closure because that
+    // closure only has the GLES wrapper, not the framework state.
+    let auto_attached: bool = with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        let mut auto_attached = false;
         gles.FramebufferRenderbufferOES(target, attachment, renderbuffertarget, renderbuffer);
         // When an iOS app attaches its drawable color renderbuffer to an FBO,
         // it commonly forgets to also attach a depth renderbuffer. On real iOS
         // GPUs / desktop GL the missing depth attachment is treated leniently,
-        // but a strict OpenGL ES 2.0 driver (e.g. Mesa or Mali) will then
-        // discard every drawn fragment when the app enables GL_DEPTH_TEST.
-        // To match the lenient behaviour we auto-create and attach a matching
+        // but a strict driver (Mesa, Mali, and ANGLE on any backend) will then
+        // discard every drawn fragment when the app enables GL_DEPTH_TEST. To
+        // match the lenient behaviour we auto-create and attach a matching
         // depth renderbuffer the first time a color attachment is set up on a
         // user-managed framebuffer.
-        if gles.is_es2()
+        //
+        // This applies to ES 1.1 contexts as well as ES 2.0 ones. It used to be
+        // ES 2.0-only, which meant an ES 1.1 game (the native-GLES1.1 renderer,
+        // which is what iOS titles of the SGX era usually run on) that enables
+        // depth testing with a colour-only FBO had every fragment rejected:
+        // the scene's geometry disappears and the background shows through,
+        // which reads as "x-ray" or black objects while the HUD and anything
+        // drawn without depth testing still look fine.
+        //
+        // The attachment alone is not enough. An app that never attached a
+        // depth buffer has no reason to clear one, so the buffer still holds
+        // whatever it was allocated with, and a guest drawing in painter order
+        // then has its later fragments rejected by GL_LESS against those stale
+        // values — the same "x-ray"/black look, from the opposite direction.
+        // OpenGL ES says a framebuffer with no depth attachment behaves as if
+        // depth testing were disabled, so `sync_depth_test` keeps the host's
+        // depth test off while this framebuffer is bound (see
+        // `State::depthless_framebuffers`).
+        if !auto_depth_attach_disabled()
             && attachment == gles11::COLOR_ATTACHMENT0_OES
             && renderbuffertarget == gles11::RENDERBUFFER_OES
             && renderbuffer != 0
@@ -3903,19 +5053,102 @@ fn glFramebufferRenderbufferOES(
                         gles11::RENDERBUFFER_OES,
                         depth_rb,
                     );
-                    log_dbg!(
-                        "Auto-attached depth renderbuffer ({}x{}) to FBO target={:#x} attach={:#x}",
-                        w,
-                        h,
-                        target,
-                        attachment
+                    static FIRST: std::sync::Once = std::sync::Once::new();
+                    // `attachment` here is the *colour* attachment that
+                    // triggered the workaround (0x8ce0), not the one the depth
+                    // buffer went to; naming both avoids the reading that the
+                    // depth buffer was attached in place of the colour one.
+                    let message = format!(
+                        "Auto-attached depth renderbuffer ({w}x{h}) to FBO \
+                         target={target:#x} (triggered by colour attachment \
+                         {attachment:#x}; the depth buffer is at \
+                         GL_DEPTH_ATTACHMENT_OES 0x8d00)"
                     );
+                    // A framebuffer goes incomplete if the new attachment does
+                    // not match the colour buffer's dimensions or format, and
+                    // every draw into an incomplete framebuffer is discarded:
+                    // the window then shows through the layer, which presents
+                    // as an x-ray scene rather than as a black one. That would
+                    // be our workaround's fault, so check it (the guest has
+                    // this framebuffer bound, or we would be asking about a
+                    // different one) and undo the attachment if it went wrong.
+                    // `target` is the target *enum* (`GL_FRAMEBUFFER_OES`), not
+                    // a framebuffer name: the FBO this call modified is
+                    // whichever one the guest has bound. Comparing the binding
+                    // against the enum never matched, so this check never ran
+                    // and the revert below was dead code.
+                    let mut bound_framebuffer: GLint = 0;
+                    gles.GetIntegerv(gles11::FRAMEBUFFER_BINDING_OES, &mut bound_framebuffer);
+                    let status = if bound_framebuffer != 0 {
+                        gles.CheckFramebufferStatusOES(target)
+                    } else {
+                        gles11::FRAMEBUFFER_COMPLETE_OES
+                    };
+                    if status != gles11::FRAMEBUFFER_COMPLETE_OES {
+                        // Undo the workaround: an incomplete framebuffer
+                        // discards every draw, so leaving our attachment in
+                        // place would be worse than the missing depth buffer
+                        // it was meant to compensate for. The app is back to
+                        // the behaviour it had before this workaround existed.
+                        gles.FramebufferRenderbufferOES(
+                            target,
+                            gles11::DEPTH_ATTACHMENT_OES,
+                            gles11::RENDERBUFFER_OES,
+                            0,
+                        );
+                        gles.DeleteRenderbuffersOES(1, &depth_rb);
+                        static INCOMPLETE_LOGGED: std::sync::Once = std::sync::Once::new();
+                        INCOMPLETE_LOGGED.call_once(|| {
+                            log!(
+                                "The auto-attached depth renderbuffer made FBO \
+                                 {target:#x} INCOMPLETE (status {status:#x}), so \
+                                 it has been detached and deleted again: every \
+                                 draw into an incomplete framebuffer is \
+                                 discarded, which would show the window \
+                                 through the layer instead of the scene. The \
+                                 app now runs without the missing-depth-buffer \
+                                 workaround on this framebuffer, so depth-tested \
+                                 geometry may show through. Please report this \
+                                 log line. [this log will only be shown once]"
+                            );
+                        });
+                    }
+                    // Log the first one at normal level: it is the sentinel for
+                    // "the guest relied on a depth buffer it never attached",
+                    // which is exactly the shape of a black/see-through-scene
+                    // bug report. The rest go to the debug log so an engine
+                    // that recreates FBOs every frame can't flood the file.
+                    // Don't claim success when the attachment was reverted.
+                    if status == gles11::FRAMEBUFFER_COMPLETE_OES {
+                        auto_attached = true;
+                        shadow.record_auto_depth_renderbuffer(depth_rb);
+                        FIRST.call_once(|| log!("{message}"));
+                    }
+                    log_dbg!("{message} (framebuffer status {status:#x})");
                 }
                 gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, prev_rb as GLuint);
             }
             while gles.GetError() != 0 {}
         }
-    })
+        auto_attached
+    });
+    if auto_attached {
+        // The guest never gave this framebuffer a depth buffer, so depth
+        // testing must behave as disabled while it is bound — see
+        // `State::depthless_framebuffers`. `target` is the target enum, so the
+        // framebuffer to record is the one the guest had bound (the call
+        // modifies that one).
+        let thread = env.current_thread;
+        let framebuffer = env.framework_state.opengles.bound_framebuffer(thread);
+        env.framework_state
+            .opengles
+            .set_framebuffer_depthless(framebuffer, true);
+        sync_depth_test(env);
+    } else if attachment == gles11::DEPTH_ATTACHMENT_OES {
+        // A depth attachment change can turn the override on or off for the
+        // framebuffer that is bound right now.
+        sync_depth_test(env);
+    }
 }
 fn glFramebufferTexture2DOES(
     env: &mut Environment,
@@ -3931,9 +5164,22 @@ fn glFramebufferTexture2DOES(
             .opengles
             .set_colour_attachment_is_texture(thread, texture != 0);
     }
+    let depth_attachment = attachment == gles11::DEPTH_ATTACHMENT_OES;
+    if depth_attachment {
+        // Same bookkeeping as the renderbuffer path: attaching a depth texture
+        // means the guest is depth-testing against a buffer of its own.
+        let thread = env.current_thread;
+        let framebuffer = env.framework_state.opengles.bound_framebuffer(thread);
+        env.framework_state
+            .opengles
+            .set_framebuffer_depthless(framebuffer, texture == 0);
+    }
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.FramebufferTexture2DOES(target, attachment, textarget, texture, level)
-    })
+    });
+    if depth_attachment {
+        sync_depth_test(env);
+    }
 }
 fn glGetFramebufferAttachmentParameterivOES(
     env: &mut Environment,
@@ -3968,18 +5214,44 @@ fn glCheckFramebufferStatusOES(env: &mut Environment, target: GLenum) -> GLenum 
     })
 }
 fn glDeleteFramebuffersOES(env: &mut Environment, n: GLsizei, framebuffers: ConstPtr<GLuint>) {
-    with_ctx_and_mem(env, |gles, mem| {
+    let deleted: Vec<GLuint> = with_ctx_and_mem(env, |gles, mem| {
         let n_usize: GuestUSize = n.try_into().unwrap();
         let framebuffers = mem.ptr_at(framebuffers, n_usize);
-        unsafe { gles.DeleteFramebuffersOES(n, framebuffers) }
-    })
+        let deleted =
+            unsafe { std::slice::from_raw_parts(framebuffers, n_usize as usize) }.to_vec();
+        unsafe { gles.DeleteFramebuffersOES(n, framebuffers) };
+        deleted
+    });
+    // Framebuffer names can be handed out again, so the per-framebuffer
+    // bookkeeping has to go with them.
+    for framebuffer in deleted {
+        env.framework_state
+            .opengles
+            .set_framebuffer_depthless(framebuffer, false);
+    }
 }
 fn glDeleteRenderbuffersOES(env: &mut Environment, n: GLsizei, renderbuffers: ConstPtr<GLuint>) {
-    with_ctx_and_mem(env, |gles, mem| {
+    if n < 0 {
+        with_ctx_and_mem(env, |gles, _| unsafe {
+            gles.DeleteRenderbuffersOES(n, std::ptr::null())
+        });
+        return;
+    }
+    let deleted = (0..n as GuestUSize)
+        .map(|i| env.mem.read(renderbuffers + i))
+        .collect::<Vec<_>>();
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| {
         let n_usize: GuestUSize = n.try_into().unwrap();
         let renderbuffers = mem.ptr_at(renderbuffers, n_usize);
+        if !renderbuffers.is_null() {
+            for i in 0..n_usize {
+                let name: GLuint = unsafe { *renderbuffers.offset(i as isize) };
+                shadow.forget_auto_depth_renderbuffer(name);
+            }
+        }
         unsafe { gles.DeleteRenderbuffersOES(n, renderbuffers) }
-    })
+    });
+    super::eagl::forget_renderbuffer_drawables(env, &deleted);
 }
 fn glGenerateMipmapOES(env: &mut Environment, target: GLenum) {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.GenerateMipmapOES(target) })
@@ -3999,7 +5271,14 @@ fn glIsRenderbuffer(env: &mut Environment, renderbuffer: GLuint) -> GLboolean {
 }
 /// Dump raw pixel data (RGB) to a PPM file for diagnosis. Supports the
 /// formats Geometry Dash / cocos2d-x use (RGBA8, RGBA4444, RGB565).
-pub fn dump_rgb_ppm(pix: &[u8], width: u32, height: u32, format: u32, type_: u32, path: &str) {
+pub fn dump_rgb_ppm(
+    pix: &[u8],
+    width: u32,
+    height: u32,
+    format: u32,
+    type_: u32,
+    path: &std::path::Path,
+) {
     let mut rgb = Vec::with_capacity((width * height * 3) as usize);
     match (format, type_) {
         (0x1908, 0x1401) => {
@@ -4026,7 +5305,11 @@ pub fn dump_rgb_ppm(pix: &[u8], width: u32, height: u32, format: u32, type_: u32
             }
         }
         _ => {
-            log!("dump_rgb_ppm: unsupported format=0x{:x} type=0x{:x}", format, type_);
+            log!(
+                "dump_rgb_ppm: unsupported format=0x{:x} type=0x{:x}",
+                format,
+                type_
+            );
             return;
         }
     }
@@ -4034,12 +5317,12 @@ pub fn dump_rgb_ppm(pix: &[u8], width: u32, height: u32, format: u32, type_: u32
     let mut out = header.into_bytes();
     out.extend_from_slice(&rgb);
     match std::fs::write(path, &out) {
-        Ok(()) => log!("Dumped {}x{} pixels to {}", width, height, path),
-        Err(e) => log!("Failed to dump pixels to {}: {}", path, e),
+        Ok(()) => log!("Dumped {}x{} pixels to {}", width, height, path.display()),
+        Err(e) => log!("Failed to dump pixels to {}: {}", path.display(), e),
     }
 }
 
-fn glBindFramebuffer(env: &mut Environment, target: GLenum, framebuffer: GLuint) {
+pub(crate) fn glBindFramebuffer(env: &mut Environment, target: GLenum, framebuffer: GLuint) {
     glBindFramebufferOES(env, target, framebuffer)
 }
 fn glBindRenderbuffer(env: &mut Environment, target: GLenum, renderbuffer: GLuint) {
@@ -4103,243 +5386,46 @@ fn glGenerateMipmap(env: &mut Environment, target: GLenum) {
     glGenerateMipmapOES(env, target)
 }
 
-fn _get_currently_bound_buffer_object_name(env: &mut Environment, target: GLenum) -> GLuint {
-    let binding = match target {
-        ARRAY_BUFFER => gles11::ARRAY_BUFFER_BINDING,
-        ELEMENT_ARRAY_BUFFER => ELEMENT_ARRAY_BUFFER_BINDING,
-        other => {
-            // Anything else is a malformed call from the guest. Real GL
-            // would set GL_INVALID_ENUM; we have nothing sensible to bind
-            // against so just report "no object bound" and continue.
-            log!(
-                "Warning: _get_currently_bound_buffer_object_name(): unsupported buffer target {:#x}; returning 0.",
-                other
-            );
-            return 0;
-        }
-    };
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        let mut name: GLint = 0;
-        gles.GetIntegerv(binding, &mut name);
-        name as GLuint
-    })
-}
-
-fn _get_buffer_size(env: &mut Environment, target: GLenum) -> GLint {
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        let mut size: GLint = 0;
-        gles.GetBufferParameteriv(target, gles11::BUFFER_SIZE, &mut size);
-        size
-    })
-}
-
 fn glGetBufferParameteriv(
     env: &mut Environment,
     target: GLenum,
     pname: GLenum,
     params: MutPtr<GLint>,
 ) {
-    let params = env.mem.ptr_at_mut(params, 1);
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.GetBufferParameteriv(target, pname, params)
+    with_ctx_mem_and_buffers(env, |gles, mem, shadow, objects| {
+        let buffer = buffer_mapping::binding(gles, target)?;
+        if let Some(value) = objects.parameter(buffer, pname) {
+            mem.write(params, value as GLint);
+        } else {
+            let params = mem.ptr_at_mut(params, 1);
+            unsafe { gles.GetBufferParameteriv(target, pname, params) };
+        }
+        Ok(())
+    });
+}
+
+fn glMapBufferOES(env: &mut Environment, target: GLenum, access: GLenum) -> MutPtr<GLvoid> {
+    with_ctx_mem_and_buffers(env, |gles, mem, shadow, objects| {
+        objects.map_oes(gles, mem, target, access)
     })
 }
-fn glMapBufferOES(env: &mut Environment, target: GLenum, access: GLenum) -> MutPtr<GLvoid> {
-    // Real drivers accept the three buffer-access modes; only the target and
-    // the access value have to be legal. Returning nil for anything else (the
-    // previous behaviour) made the caller write vertex/index data through a
-    // NULL pointer, which is exactly the silent nil-page write flood seen in
-    // Asphalt 8's drift events. Accept the full set instead of WRITE_ONLY.
-    const READ_ONLY: GLenum = 0x88B8;
-    const READ_WRITE: GLenum = 0x88BA;
-    if !matches!(target, ARRAY_BUFFER | ELEMENT_ARRAY_BUFFER)
-        || !matches!(access, WRITE_ONLY_OES | READ_ONLY | READ_WRITE)
-    {
-        log!(
-            "Warning: glMapBufferOES(target={:#x}, access={:#x}) is not a supported \
-             combination; returning NULL. If the app then writes through it, expect \
-             nil-page writes.",
-            target,
-            access
-        );
-        return nil.cast();
-    }
-    // glMapBufferOES requires a current context (Apple: "An EAGLContext must
-    // be current on the thread before any GL calls"). Without one the call
-    // fails and glMapBufferOES returns NULL.
-    let Some(current_ctx) = *env
-        .framework_state
-        .opengles
-        .current_ctx_for_thread(env.current_thread)
-    else {
-        log!(
-            "Warning: glMapBufferOES on thread {} with no current EAGLContext; \
-             returning NULL.",
-            env.current_thread
-        );
-        return nil.cast();
-    };
-    let buffer_object_name = _get_currently_bound_buffer_object_name(env, target);
-    let buffer_size = match usize::try_from(_get_buffer_size(env, target)) {
-        Ok(size) if size > 0 => size,
-        _ => {
-            // GL_OES_mapbuffer: mapping succeeds only if the buffer has a
-            // data store; a buffer created with size 0 has none.
-            log!(
-                "Warning: glMapBufferOES(target={:#x}, access={:#x}) on buffer {} whose \
-                 data store is empty or unreadable; returning NULL.",
-                target,
-                access,
-                buffer_object_name
-            );
-            return nil.cast();
-        }
-    };
-    // The mapping the guest sees is a mirror in guest memory, uploaded to the
-    // buffer object by glUnmapBufferOES. The driver's own mapping is never
-    // held across a guest call, because the driver is free to invalidate it
-    // whenever the buffer is re-specified, re-mapped or deleted, and writing
-    // through the stale pointer afterwards corrupted the heap and killed the
-    // emulator with a SIGSEGV at a garbage address (Republique, Unity 4.5).
-    let guest_buffer: MutVoidPtr = env.mem.alloc(buffer_size as GuestUSize).cast();
-    // Mirror the buffer's current contents only when the app is allowed to
-    // read them. With GL_WRITE_ONLY_OES the contents are undefined until the
-    // app writes them, so the read would be pure overhead. Either way the
-    // map/copy/unmap happens here, with no guest code in between, so the
-    // driver pointer cannot outlive this function.
-    if access != WRITE_ONLY_OES {
-        let host_buffer = with_ctx_and_mem(env, |gles, _mem| unsafe {
-            gles.MapBufferOES(target, access)
-        });
-        if !host_buffer.is_null() {
-            unsafe {
-                env.mem
-                    .bytes_at_mut(guest_buffer.cast(), buffer_size as GuestUSize)
-                    .copy_from_slice(from_raw_parts(host_buffer as *const u8, buffer_size));
+
+fn unmap_buffer(env: &mut Environment, target: GLenum, _oes: bool) -> GLboolean {
+    with_ctx_mem_and_buffers(env, |gles, mem, shadow, objects| {
+        let buffer = buffer_mapping::binding(gles, target)?;
+        if trace_draw_enabled() && target == ARRAY_BUFFER {
+            if let Some(mapping) = objects.mapping(buffer) {
+                if mapping.offset + mapping.length <= 4_194_304 {
+                    let mut cache = diag_buffer_cache().lock().unwrap();
+                    let bytes = cache.entry((shadow.resource_group_token,buffer)).or_default();
+                    bytes.resize(bytes.len().max(mapping.offset + mapping.length), 0);
+                    bytes[mapping.offset..mapping.offset + mapping.length].copy_from_slice(
+                        mem.bytes_at(mapping.guest.cast(), mapping.length as GuestUSize),
+                    );
+                }
             }
-            with_ctx_and_mem(env, |gles, _mem| unsafe {
-                gles.UnmapBufferOES(target);
-            });
         }
-    }
-    let host_object = env.objc.borrow_mut::<EAGLContextHostObject>(current_ctx);
-    // Per the GL_OES_mapbuffer spec, calling glMapBufferOES while a buffer is
-    // already mapped is a GL_INVALID_OPERATION and returns NULL. Some apps
-    // (e.g. ZAS) accidentally re-map without unmapping first; the previous
-    // guest mirror is still owned by the guest, so we drop it and install the
-    // new one so the app can continue uploading data instead of crashing.
-    if let Some((stale_guest_buffer, _stale_host_ptr, _stale_size)) = host_object
-        .mapped_buffers
-        .remove(&(target, buffer_object_name))
-    {
-        log!(
-            "Warning: glMapBufferOES called on buffer {} that was already mapped; \
-             discarding the previous mapping (the previous pointer is no longer valid).",
-            buffer_object_name
-        );
-        env.mem.free(stale_guest_buffer);
-    }
-    host_object
-        .mapped_buffers
-        .insert((target, buffer_object_name), (guest_buffer, None, buffer_size));
-    guest_buffer
-}
-fn unmap_buffer(env: &mut Environment, target: GLenum, oes: bool) -> GLboolean {
-    let buffer_object_name = _get_currently_bound_buffer_object_name(env, target);
-    let Some(current_ctx) = env
-        .framework_state
-        .opengles
-        .current_ctx_for_thread(env.current_thread)
-        .as_ref()
-        .copied()
-    else {
-        return gles11::FALSE;
-    };
-    let mapping = env
-        .objc
-        .borrow_mut::<EAGLContextHostObject>(current_ctx)
-        .mapped_buffers
-        .remove(&(target, buffer_object_name));
-    let Some((guest_buffer, host_ptr, buffer_size)) = mapping else {
-        // An unbalanced unmap (no guest mapping recorded for this buffer):
-        // every driver-side mapping is owned by a recorded guest mapping, so
-        // the buffer cannot be driver-mapped here. Forwarding the call would
-        // only raise a spurious GL_INVALID_OPERATION (seen with Asphalt 8's
-        // Jet engine, which unmaps buffers it failed to map). Treat it as a
-        // no-op reporting success, matching Apple's lenient behaviour.
-        log_dbg!(
-            "glUnmapBuffer{} on buffer {} with no matching mapping; ignoring",
-            if oes { "OES" } else { "" },
-            buffer_object_name
-        );
-        return gles11::TRUE;
-    };
-    // Upload the guest's mirror to the buffer object. A mapping recorded by
-    // glMapBufferRange still owns a real driver mapping, so it is filled and
-    // then unmapped; a mapping recorded by glMapBufferOES has no driver
-    // pointer (see the comment there) and is uploaded with glBufferSubData.
-    // Either way the guest never gets to see, or write through, a driver
-    // pointer that may have been invalidated in the meantime.
-    match host_ptr {
-        Some(host_ptr) => unsafe {
-            host_ptr.copy_from(
-                env.mem
-                    .bytes_at(guest_buffer.cast(), buffer_size as GuestUSize)
-                    .as_ptr() as *mut GLvoid,
-                buffer_size,
-            );
-        },
-        None => {
-            with_ctx_and_mem(env, |gles, mem| unsafe {
-                let data = mem
-                    .bytes_at(guest_buffer.cast(), buffer_size as GuestUSize)
-                    .as_ptr() as *const GLvoid;
-                gles.BufferSubData(target, 0, buffer_size as HostGLsizeiptr, data);
-            });
-        }
-    }
-    // DIAG: cache the unmapped buffer content so TOUCHHLE_TRACE_DRAW can read
-    // texcoords at draw time (the game streams its vertex data via map/unmap,
-    // not glBufferData, so it was otherwise invisible to the cache).
-    if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") && target == ARRAY_BUFFER {
-        let bytes = env
-            .mem
-            .bytes_at(guest_buffer.cast(), buffer_size as GuestUSize)
-            .to_vec();
-        if bytes.len() <= 4_194_304 {
-            diag_buffer_cache()
-                .lock()
-                .unwrap()
-                .insert(buffer_object_name, bytes);
-        }
-    }
-    env.mem.free(guest_buffer);
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        let result = if host_ptr.is_none() {
-            // The data was already uploaded with glBufferSubData above and no
-            // driver mapping is open, so there is nothing left to unmap.
-            gles11::TRUE
-        } else if oes {
-            gles.UnmapBufferOES(target)
-        } else {
-            gles.UnmapBuffer(target)
-        };
-        // Strict drivers (e.g. Qualcomm Adreno) can raise GL_INVALID_OPERATION
-        // here even for mappings we believe are balanced, poisoning the error
-        // queue for the app's own glGetError() polling. Apple's unmap never
-        // surfaces such phantom errors, so purge whatever this call raised and
-        // keep reporting success (same lenient philosophy as the unbalanced
-        // unmap path above).
-        let raised = gles.GetError();
-        if raised != 0 {
-            log_dbg!(
-                "glUnmapBuffer{}: driver raised error {:#x} on unmap of target {:#x}; purging (treated as benign)",
-                if oes { "OES" } else { "" },
-                raised,
-                target
-            );
-        }
-        result
+        objects.unmap(gles, mem, target)
     })
 }
 
@@ -4406,13 +5492,15 @@ fn glGetUniformLocation(env: &mut Environment, program: GLuint, name: ConstPtr<G
     with_ctx_and_mem_no_skip(env, |gles, mem| unsafe {
         let cstr = read_guest_cstring(mem, name);
         let loc = gles.GetUniformLocation(program, cstr.as_ptr());
-        if crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
+        if trace_debug_draw_enabled() || crate::env_flag_cached!("TOUCHHLE_TRACE_UNIFORMS") {
             static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 64 {
+            if n < 4096 {
                 log!(
                     "[ES2DIAG] glGetUniformLocation(program={}, \"{}\") = {}",
-                    program,  String::from_utf8_lossy(cstr.as_bytes()).to_string(), loc
+                    program,
+                    String::from_utf8_lossy(cstr.as_bytes()).to_string(),
+                    loc
                 );
             }
         }
@@ -4455,7 +5543,7 @@ fn glUniformMatrix4fv(
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let n = (count as usize) * 16;
         let ptr = mem.ptr_at(value, n.try_into().unwrap_or(0));
-        if crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") && location >= 0 {
+        if trace_debug_draw_enabled() && location >= 0 {
             static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let seen = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if seen < 8 {
@@ -4463,7 +5551,10 @@ fn glUniformMatrix4fv(
                 std::ptr::copy_nonoverlapping(ptr, m.as_mut_ptr(), 16);
                 log!(
                     "[ES2DIAG] glUniformMatrix4fv(loc={}, count={}, transpose={}, m0={:?})",
-                    location, count, transpose, m
+                    location,
+                    count,
+                    transpose,
+                    m
                 );
             }
         }
@@ -4538,6 +5629,9 @@ fn glAttachShader(env: &mut Environment, program: GLuint, shader: GLuint) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.AttachShader(program, shader);
         record_shader_attach(program, shader);
+        if crate::env_flag_cached!("TOUCHHLE_DUMP_SHADER_SOURCE") {
+            log!("SHADER-DIAG attach program={} shader={}", program, shader);
+        }
     });
 }
 fn glDetachShader(env: &mut Environment, program: GLuint, shader: GLuint) {
@@ -4650,13 +5744,17 @@ fn glLinkProgram(env: &mut Environment, program: GLuint) {
                     1,
                     &["normal", "a_normal", "aNormal", "inNormal", "rm_Normal"][..],
                 ),
-                (
-                    1,
-                    &["a_color"][..],
-                ),
+                (1, &["a_color"][..]),
                 (
                     2,
-                    &["color", "aColor", "inColor", "inVtxColor", "rm_Color", "a_texCoord"][..],
+                    &[
+                        "color",
+                        "aColor",
+                        "inColor",
+                        "inVtxColor",
+                        "rm_Color",
+                        "a_texCoord",
+                    ][..],
                 ),
                 (
                     3,
@@ -4890,11 +5988,9 @@ fn glGetActiveUniform(
     type_: MutPtr<GLenum>,
     name: MutPtr<GLubyte>,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        if bufSize <= 0 {
-            if !length.is_null() {
-                mem.write(length, 0);
-            }
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        if bufSize < 0 {
+            shadow.record_error(gles11::INVALID_VALUE);
             return;
         }
         let mut host_length: GLsizei = 0;
@@ -4908,8 +6004,26 @@ fn glGetActiveUniform(
             &mut host_length,
             &mut host_size,
             &mut host_type,
-            buf.as_mut_ptr().cast(),
+            if bufSize == 0 {
+                std::ptr::null_mut()
+            } else {
+                buf.as_mut_ptr().cast()
+            },
         );
+        if crate::env_flag_cached!("TOUCHHLE_TRACE_UNIFORMS") {
+            static QUERIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if QUERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4096 {
+                log!(
+                    "ACTIVE-UNIFORM program={} index={} buf_size={} size={} type={:#x} name={:?}",
+                    program,
+                    index,
+                    bufSize,
+                    host_size,
+                    host_type,
+                    String::from_utf8_lossy(&buf[..host_length.clamp(0, bufSize) as usize])
+                );
+            }
+        }
         if !length.is_null() {
             mem.write(length, host_length);
         }
@@ -4937,11 +6051,9 @@ fn glGetActiveAttrib(
     type_: MutPtr<GLenum>,
     name: MutPtr<GLubyte>,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        if bufSize <= 0 {
-            if !length.is_null() {
-                mem.write(length, 0);
-            }
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        if bufSize < 0 {
+            shadow.record_error(gles11::INVALID_VALUE);
             return;
         }
         let mut host_length: GLsizei = 0;
@@ -4955,8 +6067,26 @@ fn glGetActiveAttrib(
             &mut host_length,
             &mut host_size,
             &mut host_type,
-            buf.as_mut_ptr().cast(),
+            if bufSize == 0 {
+                std::ptr::null_mut()
+            } else {
+                buf.as_mut_ptr().cast()
+            },
         );
+        if crate::env_flag_cached!("TOUCHHLE_TRACE_UNIFORMS") {
+            static QUERIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if QUERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 1024 {
+                log!(
+                    "ACTIVE-ATTRIB program={} index={} buf_size={} size={} type={:#x} name={:?}",
+                    program,
+                    index,
+                    bufSize,
+                    host_size,
+                    host_type,
+                    String::from_utf8_lossy(&buf[..host_length.clamp(0, bufSize) as usize])
+                );
+            }
+        }
         if !length.is_null() {
             mem.write(length, host_length);
         }
@@ -5163,6 +6293,446 @@ fn hoist_shader_extension_directives(source: &str) -> String {
     }
     if source.ends_with('\n') {
         out.push('\n');
+    }
+    out
+}
+
+/// Replace the contents of comments and preprocessor directives with spaces
+/// while preserving every newline, so the result has exactly the same byte
+/// length as the input. Structure-sensitive scans for the global-initializer
+/// rewrite can then run on the masked text while edits are spliced into the
+/// original source using the same indices.
+fn mask_glsl_for_analysis(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = bytes.to_vec();
+    let mut i = 0usize;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_line_comment {
+            if c == b'\n' {
+                in_line_comment = false;
+            } else {
+                out[i] = b' ';
+            }
+            i += 1;
+            continue;
+        }
+        if in_block_comment {
+            if c == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                out[i] = b' ';
+                out[i + 1] = b' ';
+                in_block_comment = false;
+                i += 2;
+                continue;
+            }
+            if c != b'\n' {
+                out[i] = b' ';
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'/' && i + 1 < bytes.len() {
+            if bytes[i + 1] == b'/' {
+                out[i] = b' ';
+                out[i + 1] = b' ';
+                in_line_comment = true;
+                i += 2;
+                continue;
+            }
+            if bytes[i + 1] == b'*' {
+                out[i] = b' ';
+                out[i + 1] = b' ';
+                in_block_comment = true;
+                i += 2;
+                continue;
+            }
+        }
+        if c == b'#' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                out[i] = b' ';
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| source.to_string())
+}
+
+fn is_glsl_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+}
+
+/// Split `text` on `sep`, ignoring separators nested inside parentheses or
+/// square brackets.
+fn split_top_level<'a>(text: &'a str, sep: char) -> Vec<&'a str> {
+    let bytes = text.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    for (i, &c) in bytes.iter().enumerate() {
+        match c {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            _ if c as char == sep && depth == 0 => {
+                parts.push(&text[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&text[start..]);
+    parts
+}
+
+/// GLSL ES type names that can act as constant-expression constructors.
+const GLSL_TYPE_CONSTRUCTORS: &[&str] = &[
+    "float", "int", "bool", "vec2", "vec3", "vec4", "ivec2", "ivec3", "ivec4", "bvec2", "bvec3",
+    "bvec4", "mat2", "mat3", "mat4", "mat2x2", "mat2x3", "mat2x4", "mat3x2", "mat3x3", "mat3x4",
+    "mat4x2", "mat4x3", "mat4x4",
+];
+
+/// Conservative constant-expression check for a GLSL initializer: an
+/// expression built purely from literals, operators and type constructors
+/// whose arguments are themselves constant. Any other identifier (uniform,
+/// varying, another global, a function call) makes the expression
+/// non-constant. Being over-conservative is safe here: rewriting a legal
+/// initializer into an assignment at the top of `main()` preserves its
+/// semantics.
+fn is_constant_glsl_expr(expr: &str) -> bool {
+    let text = expr.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == b'_' {
+            let start = i;
+            while i < bytes.len() && is_glsl_ident_byte(bytes[i]) {
+                i += 1;
+            }
+            let ident = &text[start..i];
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'(' {
+                if !GLSL_TYPE_CONSTRUCTORS.contains(&ident) {
+                    return false;
+                }
+                let mut depth = 0i32;
+                let mut k = j;
+                while k < bytes.len() {
+                    match bytes[k] {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                if k >= bytes.len() {
+                    return false;
+                }
+                let args = &text[j + 1..k];
+                if args.trim().is_empty() {
+                    return false;
+                }
+                for arg in split_top_level(args, ',') {
+                    if !is_constant_glsl_expr(arg) {
+                        return false;
+                    }
+                }
+                i = k + 1;
+            } else {
+                return false;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    true
+}
+
+/// Find the byte index just after the opening `{` of `main`'s definition
+/// (`void main(...) {`). Returns `None` when `main` has no body.
+fn find_main_body_open(masked: &str) -> Option<usize> {
+    let bytes = masked.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        while i < bytes.len() && !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return None;
+        }
+        let start = i;
+        while i < bytes.len() && is_glsl_ident_byte(bytes[i]) {
+            i += 1;
+        }
+        if &masked[start..i] != "main" {
+            continue;
+        }
+        if start > 0 && is_glsl_ident_byte(bytes[start - 1]) {
+            continue;
+        }
+        let mut j = i;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'(' {
+            continue;
+        }
+        let mut depth = 0i32;
+        let mut k = j;
+        while k < bytes.len() {
+            match bytes[k] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        if k >= bytes.len() {
+            return None;
+        }
+        let mut m = k + 1;
+        while m < bytes.len() && bytes[m].is_ascii_whitespace() {
+            m += 1;
+        }
+        if m < bytes.len() && bytes[m] == b'{' {
+            return Some(m + 1);
+        }
+    }
+    None
+}
+
+/// Parse one top-level declaration statement (`masked[s..e]`, including the
+/// trailing `;`). If any declarator has a non-constant initializer, return
+/// the statement rewritten without initializers plus the assignment
+/// statements that reproduce them. Returns `None` for anything that should
+/// be left untouched (function prototypes, struct definitions, qualified
+/// declarations like `uniform`/`const`, array initializers, statements with
+/// no non-constant initializer).
+fn rewrite_global_declaration(
+    source: &str,
+    masked: &str,
+    start: usize,
+    end: usize,
+) -> Option<(String, Vec<String>)> {
+    const SKIP_QUALIFIERS: &[&str] = &[
+        "uniform",
+        "attribute",
+        "varying",
+        "const",
+        "in",
+        "out",
+        "centroid",
+        "flat",
+        "invariant",
+        "layout",
+        "struct",
+        "void",
+        "precision",
+    ];
+    const PRECISION_QUALIFIERS: &[&str] = &["lowp", "mediump", "highp"];
+
+    let stmt = &masked[start..end];
+    let bytes = stmt.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let mut skip = false;
+    loop {
+        let tok_start = i;
+        while i < bytes.len() && is_glsl_ident_byte(bytes[i]) {
+            i += 1;
+        }
+        if i == tok_start {
+            skip = true;
+            break;
+        }
+        let tok = &stmt[tok_start..i];
+        if SKIP_QUALIFIERS.contains(&tok) {
+            skip = true;
+            break;
+        }
+        if PRECISION_QUALIFIERS.contains(&tok) {
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            continue;
+        }
+        break;
+    }
+    if skip {
+        return None;
+    }
+    // Take the qualifier/type prefix from the original source so any
+    // comments between the qualifiers and the type survive the rewrite.
+    let prefix = source[start..start + i].trim_end();
+    let trimmed = stmt.trim_end();
+    if !trimmed.ends_with(';') {
+        return None;
+    }
+    let decls_text = &stmt[i..trimmed.len() - 1];
+
+    let mut new_parts: Vec<String> = Vec::new();
+    let mut assignments: Vec<String> = Vec::new();
+    let mut changed = false;
+    for part in split_top_level(decls_text, ',') {
+        let p = part.trim();
+        let mut depth = 0i32;
+        let mut eq: Option<usize> = None;
+        let mut function = false;
+        for (j, &c) in p.as_bytes().iter().enumerate() {
+            match c {
+                b'(' | b'[' => depth += 1,
+                b')' | b']' => depth -= 1,
+                b'=' if depth == 0 => {
+                    eq = Some(j);
+                    break;
+                }
+                b'(' if depth == 0 => {
+                    function = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if function {
+            return None;
+        }
+        match eq {
+            None => new_parts.push(p.to_string()),
+            Some(k) => {
+                let name = p[..k].trim();
+                let init = p[k + 1..].trim();
+                if name.is_empty() || init.is_empty() || name.contains('[') {
+                    return None;
+                }
+                if is_constant_glsl_expr(init) {
+                    new_parts.push(p.to_string());
+                } else {
+                    new_parts.push(name.to_string());
+                    assignments.push(format!("{} = {};", name, init));
+                    changed = true;
+                }
+            }
+        }
+    }
+    if !changed {
+        return None;
+    }
+    Some((format!("{} {};", prefix, new_parts.join(", ")), assignments))
+}
+
+/// Move non-constant global variable initializers into `main()`.
+///
+/// GLSL ES requires global variable initializers to be constant expressions,
+/// but the lenient PowerVR drivers on real iPhone-era hardware accepted them
+/// anyway, so games (e.g. Modern Combat 4) ship shaders that violate the
+/// rule. Strict compilers (ANGLE, modern Mesa/Adreno) reject such shaders
+/// with "global variable initializers must be constant expressions".
+/// GLSL global initializers are evaluated exactly once when the program is
+/// first used, so replacing them with assignments at the top of `main()` is
+/// semantically equivalent. Only default-qualified global declarations are
+/// touched (`const`/`uniform`/`attribute`/`varying`/arrays and anything
+/// ambiguous are left alone); if nothing needs rewriting, the source is
+/// returned unchanged.
+fn rewrite_nonconstant_global_initializers(source: &str) -> String {
+    let masked = mask_glsl_for_analysis(source);
+    let main_open = match find_main_body_open(&masked) {
+        Some(i) => i,
+        None => return source.to_string(),
+    };
+
+    let bytes = masked.as_bytes();
+    let mut statements: Vec<(usize, usize)> = Vec::new();
+    let mut brace = 0i32;
+    let mut paren = 0i32;
+    let mut stmt_start: Option<usize> = None;
+    for (i, &c) in bytes.iter().enumerate() {
+        match c {
+            b'{' => brace += 1,
+            b'}' => {
+                brace = (brace - 1).max(0);
+                if brace == 0 {
+                    stmt_start = None;
+                }
+            }
+            b'(' => paren += 1,
+            b')' => paren = (paren - 1).max(0),
+            b';' if brace == 0 && paren == 0 => {
+                if let Some(s) = stmt_start.take() {
+                    statements.push((s, i + 1));
+                }
+            }
+            _ => {}
+        }
+        if brace == 0 && stmt_start.is_none() && !c.is_ascii_whitespace() && c != b';' {
+            stmt_start = Some(i);
+        }
+    }
+
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut assignments: Vec<String> = Vec::new();
+    for (s, e) in statements {
+        // Declarations after `main` can never be referenced from `main`, so
+        // moving their initializers there would produce out-of-order
+        // declarations; leave them alone.
+        if s >= main_open {
+            continue;
+        }
+        if let Some((replacement, assigns)) = rewrite_global_declaration(source, &masked, s, e) {
+            edits.push((s, e, replacement));
+            assignments.extend(assigns);
+        }
+    }
+    if assignments.is_empty() {
+        return source.to_string();
+    }
+
+    let mut out = String::with_capacity(source.len() + 64);
+    let mut last = 0usize;
+    for (s, e, replacement) in &edits {
+        out.push_str(&source[last..*s]);
+        out.push_str(replacement);
+        last = *e;
+    }
+    out.push_str(&source[last..]);
+
+    let masked_out = mask_glsl_for_analysis(&out);
+    if let Some(open) = find_main_body_open(&masked_out) {
+        let mut insert = String::new();
+        for a in &assignments {
+            insert.push_str("\n    ");
+            insert.push_str(a);
+        }
+        let trailing = match masked_out.as_bytes().get(open) {
+            Some(&b'\n') => "",
+            _ => "\n",
+        };
+        insert.push_str(trailing);
+        out.insert_str(open, &insert);
     }
     out
 }
@@ -5525,10 +7095,7 @@ fn collect_int_defines(source: &str) -> std::collections::HashMap<String, u32> {
             continue;
         }
         let Some(name) = tokens.next() else { continue };
-        if !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             continue;
         }
         let Some(value) = tokens.next() else { continue };
@@ -5586,7 +7153,10 @@ fn parse_uniform_array_declarations(
             None
         } else if let Ok(n) = trimmed.parse::<u32>() {
             Some(n)
-        } else if trimmed.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        } else if trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
             defines.get(trimmed).copied()
         } else {
             None
@@ -5643,7 +7213,7 @@ fn rewrite_uniform_array_sizes(
                 .map(|(_, size)| (d.digits_span, *size))
         })
         .collect();
-    spans.sort_by(|a, b| b.0.0.cmp(&a.0.0));
+    spans.sort_by(|a, b| b.0 .0.cmp(&a.0 .0));
     let mut out = source.to_string();
     for ((s, e), size) in spans {
         out.replace_range(s..e, &size.to_string());
@@ -5718,8 +7288,7 @@ unsafe fn reconcile_uniform_array_sizes(gles: &mut dyn GLES, program: GLuint) {
     let vertex_defines = collect_int_defines(&vertex_stripped);
     let fragment_defines = collect_int_defines(&fragment_stripped);
     let vertex_uniforms = parse_uniform_array_declarations(&vertex_stripped, &vertex_defines);
-    let fragment_uniforms =
-        parse_uniform_array_declarations(&fragment_stripped, &fragment_defines);
+    let fragment_uniforms = parse_uniform_array_declarations(&fragment_stripped, &fragment_defines);
     if vertex_uniforms.is_empty() || fragment_uniforms.is_empty() {
         return;
     }
@@ -5858,8 +7427,8 @@ fn parse_struct_definitions(source: &str) -> Vec<StructDefinition> {
         let prev_ok =
             idx == 0 || !(bytes[idx - 1].is_ascii_alphanumeric() || bytes[idx - 1] == b'_');
         let next = idx + "struct".len();
-        let next_ok = next >= bytes.len()
-            || !(bytes[next].is_ascii_alphanumeric() || bytes[next] == b'_');
+        let next_ok =
+            next >= bytes.len() || !(bytes[next].is_ascii_alphanumeric() || bytes[next] == b'_');
         if !prev_ok || !next_ok {
             continue;
         }
@@ -6251,7 +7820,12 @@ fn glShaderSource(
     // 3. Hoist `#extension` directives to the top — strict compilers (ANGLE
     //    etc.) reject them after non-preprocessor tokens; see
     //    `hoist_shader_extension_directives`.
-    let src = hoist_shader_extension_directives(&src);
+    let src = hoist_shader_extension_directives(&src); // 4. Move non-constant global variable initializers into `main()` —
+                                                       //    strict GLES compilers (ANGLE) reject them with "global variable
+                                                       //    initializers must be constant expressions" (e.g. Modern Combat 4's
+                                                       //    shaders), which the lenient PowerVR drivers on real iPhone-era
+                                                       //    hardware accepted; see `rewrite_nonconstant_global_initializers`.
+    let src = rewrite_nonconstant_global_initializers(&src);
     let bytes_vec = strip_captain_tomato_shader_precision(&src).into_bytes();
 
     let cs = std::ffi::CString::new(bytes_vec).unwrap_or_default();
@@ -6260,10 +7834,7 @@ fn glShaderSource(
     // the vertex shader at link time without depending on optional backend
     // entry points (GetShaderSource / GetAttachedShaders are unimplemented
     // on some backends, e.g. GLES2Native's GetAttachedShaders panics).
-    record_shader_source(
-        shader,
-        String::from_utf8_lossy(cs.as_bytes()).into_owned(),
-    );
+    record_shader_source(shader, String::from_utf8_lossy(cs.as_bytes()).into_owned());
     if crate::env_flag_cached!("TOUCHHLE_DUMP_SHADER_SOURCE") {
         let _ = std::fs::write(format!("shader_dump_{}.glsl", shader), cs.as_bytes());
     }
@@ -6322,9 +7893,8 @@ fn glVertexAttrib1f(env: &mut Environment, index: GLuint, x: GLfloat) {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.VertexAttrib1f(index, x) });
 }
 fn glVertexAttrib1fv(env: &mut Environment, index: GLuint, values: ConstPtr<GLfloat>) {
-    let value = env.mem.read(values);
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.VertexAttrib1fv(index, &value)
+    with_ctx_and_mem(env, |gles, mem| unsafe {
+        gles.VertexAttrib1fv(index, mem.ptr_at(values, 1))
     });
 }
 fn glVertexAttrib2f(env: &mut Environment, index: GLuint, x: GLfloat, y: GLfloat) {
@@ -6349,22 +7919,39 @@ fn glVertexAttrib4f(
         gles.VertexAttrib4f(index, x, y, z, w)
     });
 }
+/// Vector attribute setters consume every component from guest memory.
+/// https://registry.khronos.org/OpenGL-Refpages/es2.0/xhtml/glVertexAttrib.xml
+unsafe fn dispatch_vertex_attrib_fv(
+    gles: &mut dyn GLES,
+    mem: &Mem,
+    index: GLuint,
+    values: ConstPtr<GLfloat>,
+    components: usize,
+) {
+    let source = mem.ptr_at(values, components as GuestUSize);
+    let mut vector = [0.0f32; 4];
+    vector[..components].copy_from_slice(from_raw_parts(source, components));
+    match components {
+        2 => gles.VertexAttrib2fv(index, vector.as_ptr()),
+        3 => gles.VertexAttrib3fv(index, vector.as_ptr()),
+        4 => gles.VertexAttrib4fv(index, vector.as_ptr()),
+        _ => unreachable!(),
+    }
+}
+
 fn glVertexAttrib2fv(env: &mut Environment, index: GLuint, values: ConstPtr<GLfloat>) {
-    let value = env.mem.read(values);
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.VertexAttrib2fv(index, &value)
+    with_ctx_and_mem(env, |gles, mem| unsafe {
+        dispatch_vertex_attrib_fv(gles, mem, index, values, 2);
     });
 }
 fn glVertexAttrib3fv(env: &mut Environment, index: GLuint, values: ConstPtr<GLfloat>) {
-    let value = env.mem.read(values);
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.VertexAttrib3fv(index, &value)
+    with_ctx_and_mem(env, |gles, mem| unsafe {
+        dispatch_vertex_attrib_fv(gles, mem, index, values, 3);
     });
 }
 fn glVertexAttrib4fv(env: &mut Environment, index: GLuint, values: ConstPtr<GLfloat>) {
-    let value = env.mem.read(values);
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.VertexAttrib4fv(index, &value)
+    with_ctx_and_mem(env, |gles, mem| unsafe {
+        dispatch_vertex_attrib_fv(gles, mem, index, values, 4);
     });
 }
 fn glUniform1i(env: &mut Environment, location: GLint, v0: GLint) {
@@ -6406,13 +7993,21 @@ fn glUniform4f(
     v2: GLfloat,
     v3: GLfloat,
 ) {
+    let trace_draws = trace_gl_draws_enabled(env);
     with_ctx_and_mem(env, |gles, _mem| unsafe {
-        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") && location >= 0 {
+        if trace_draws && location >= 0 {
             use std::sync::atomic::{AtomicU32, Ordering};
             static UN: AtomicU32 = AtomicU32::new(0);
             let un = UN.fetch_add(1, Ordering::Relaxed);
-            if un < 40 {
-                log!("UNIFORM4F loc={} vals=[{},{},{},{}]", location, v0, v1, v2, v3);
+            if un < 256 {
+                log!(
+                    "UNIFORM4F loc={} vals=[{},{},{},{}]",
+                    location,
+                    v0,
+                    v1,
+                    v2,
+                    v3
+                );
             }
         }
         gles.Uniform4f(location, v0, v1, v2, v3)
@@ -6468,17 +8063,26 @@ fn glUniform3fv(env: &mut Environment, location: GLint, count: GLsizei, value: C
     });
 }
 fn glUniform4fv(env: &mut Environment, location: GLint, count: GLsizei, value: ConstPtr<GLfloat>) {
+    let trace_draws = trace_gl_draws_enabled(env);
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let n = (count as usize) * 4;
         let ptr = mem.ptr_at(value, n.try_into().unwrap_or(0));
-        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") && location >= 0 {
+        if trace_draws && location >= 0 {
             use std::sync::atomic::{AtomicU32, Ordering};
             static UN: AtomicU32 = AtomicU32::new(0);
             let un = UN.fetch_add(1, Ordering::Relaxed);
             if un < 40 {
                 let mut v = vec![0.0f32; n.min(16)];
                 std::ptr::copy_nonoverlapping(ptr, v.as_mut_ptr(), v.len());
-                log!("UNIFORM4FV loc={} count={} vals={:?}", location, count, v);
+                let mut program = 0;
+                gles.GetIntegerv(0x8B8D, &mut program);
+                log!(
+                    "UNIFORM4FV program={} loc={} count={} vals={:?}",
+                    program,
+                    location,
+                    count,
+                    v
+                );
             }
         }
         // EXPERIMENT (TOUCHHLE_FORCE_IDENTITY_TC): rewrite a shear-looking
@@ -6821,6 +8425,8 @@ fn glUnmapBuffer(env: &mut Environment, target: GLenum) -> GLboolean {
 // the host driver sees host addresses.
 
 // -- Buffer object operations --
+/// GL_EXT_map_buffer_range is available to ES 2.0 apps as well as ES 3.0.
+/// All mappings expose guest memory, never an untranslated driver pointer.
 fn glMapBufferRange(
     env: &mut Environment,
     target: GLenum,
@@ -6828,73 +8434,9 @@ fn glMapBufferRange(
     length: GuestGLsizeiptr,
     access: GLbitfield,
 ) -> MutVoidPtr {
-    let host_ptr: *mut GLvoid = with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.MapBufferRange(
-            target,
-            offset as HostGLintptr,
-            length as HostGLsizeiptr,
-            access,
-        )
-    });
-    // The host pointer cannot be observed by the guest directly. EAGL
-    // tracks pending mappings in `EAGLContextHostObject::mapped_buffers`;
-    // the matching `glUnmapBuffer` consults that table. Allocate a guest
-    // buffer of `length` bytes, copy the contents from the host pointer,
-    // and remember the pairing.
-    if host_ptr.is_null() || length == 0 {
-        log!(
-            "Warning: glMapBufferRange(target={:#x}, offset={}, length={}, access={:#x}) \
-             produced a NULL host pointer or zero length; returning NULL.",
-            target,
-            offset,
-            length,
-            access
-        );
-        return Ptr::null();
-    }
-    let length_usize = match usize::try_from(length) {
-        Ok(size) => size,
-        Err(_) => {
-            log!(
-                "Warning: glMapBufferRange with negative/overflowing length {}; returning NULL.",
-                length
-            );
-            return Ptr::null();
-        }
-    };
-    let guest_buf: MutPtr<GLvoid> = env.mem.alloc(length_usize as GuestUSize).cast();
-    unsafe {
-        let host_slice = from_raw_parts(host_ptr as *const u8, length_usize);
-        let guest_slice = env
-            .mem
-            .bytes_at_mut(guest_buf.cast(), length_usize as GuestUSize);
-        guest_slice.copy_from_slice(host_slice);
-    }
-    let current_ctx: Option<crate::objc::id> = *env
-        .framework_state
-        .opengles
-        .current_ctx_for_thread(env.current_thread);
-    let Some(ctx) = current_ctx else {
-        log!(
-            "Warning: glMapBufferRange on thread {} with no current EAGLContext; \
-             returning NULL.",
-            env.current_thread
-        );
-        env.mem.free(guest_buf);
-        with_ctx_and_mem(env, |gles, _mem| unsafe {
-            gles.UnmapBuffer(target);
-        });
-        return Ptr::null();
-    };
-    let buffer_object_name = _get_currently_bound_buffer_object_name(env, target);
-    let host_obj = env.objc.borrow_mut::<EAGLContextHostObject>(ctx);
-    if let Some((old_guest_buf, _, _)) = host_obj.mapped_buffers.insert(
-        (target, buffer_object_name),
-        (guest_buf, Some(host_ptr), length_usize),
-    ) {
-        env.mem.free(old_guest_buf);
-    }
-    guest_buf.cast()
+    with_ctx_mem_and_buffers(env, |gles, mem, shadow, objects| {
+        objects.map(gles, mem, target, offset, length, access)
+    })
 }
 
 fn glFlushMappedBufferRange(
@@ -6903,66 +8445,8 @@ fn glFlushMappedBufferRange(
     offset: GuestGLintptr,
     length: GuestGLsizeiptr,
 ) {
-    // Copy the relevant slice of the guest-visible buffer back to the
-    // host-mapped buffer so the driver sees the writes.
-    let current_ctx: Option<crate::objc::id> = *env
-        .framework_state
-        .opengles
-        .current_ctx_for_thread(env.current_thread);
-    if let Some(ctx) = current_ctx {
-        let buffer_object_name = _get_currently_bound_buffer_object_name(env, target);
-        let mapping = env
-            .objc
-            .borrow::<EAGLContextHostObject>(ctx)
-            .mapped_buffers
-            .get(&(target, buffer_object_name))
-            .copied();
-        if let Some((guest_buf, host_ptr, mapped_size)) = mapping {
-            let offset_usize = match usize::try_from(offset) {
-                Ok(value) => value,
-                Err(_) => return,
-            };
-            let length_usize = match usize::try_from(length) {
-                Ok(value) => value,
-                Err(_) => return,
-            };
-            let end = match offset_usize.checked_add(length_usize) {
-                Some(value) if value <= mapped_size => value,
-                _ => return,
-            };
-            match host_ptr {
-                Some(host_ptr) => {
-                    let guest_slice = env.mem.bytes_at(guest_buf.cast(), end as GuestUSize);
-                    unsafe {
-                        let host_slice = std::slice::from_raw_parts_mut(
-                            (host_ptr as *mut u8).add(offset_usize),
-                            length_usize,
-                        );
-                        host_slice.copy_from_slice(&guest_slice[offset_usize..end]);
-                    }
-                }
-                None => {
-                    // A glMapBufferOES mapping has no driver pointer; flushing
-                    // it means uploading the requested range. No driver-side
-                    // mapping exists, so there is nothing to forward the flush
-                    // to either.
-                    with_ctx_and_mem(env, |gles, mem| unsafe {
-                        let data = mem.bytes_at(guest_buf.cast(), end as GuestUSize).as_ptr()
-                            .add(offset_usize) as *const GLvoid;
-                        gles.BufferSubData(
-                            target,
-                            offset as HostGLintptr,
-                            length_usize as HostGLsizeiptr,
-                            data,
-                        );
-                    });
-                    return;
-                }
-            }
-        }
-    }
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.FlushMappedBufferRange(target, offset as HostGLintptr, length as HostGLsizeiptr)
+    with_ctx_mem_and_buffers(env, |gles, mem, shadow, objects| {
+        objects.flush(gles, mem, target, offset, length)
     });
 }
 
@@ -7048,6 +8532,7 @@ fn glDrawArraysInstanced(
     count: GLsizei,
     instance_count: GLsizei,
 ) {
+    super::draw_stats::record_draw((count.max(0) as u64) * (instance_count.max(0) as u64));
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         crate::gles::perf_overlay::record_draw();
         gles.DrawArraysInstanced(mode, first, count, instance_count)
@@ -7062,6 +8547,7 @@ fn glDrawElementsInstanced(
     indices: ConstVoidPtr,
     instance_count: GLsizei,
 ) {
+    super::draw_stats::record_draw((count.max(0) as u64) * (instance_count.max(0) as u64));
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let mut buf: GLint = 0;
         gles.GetIntegerv(ELEMENT_ARRAY_BUFFER_BINDING, &mut buf);
@@ -7357,6 +8843,10 @@ fn glTexStorage2D(
 ) {
     with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
         let bound_texture = current_bound_texture(gles, target);
+        // Distinguish this allocation's errors from old sticky error flags
+        // without consuming either from the guest's point of view. A failed
+        // allocation must leave the previous format/dimension mirror intact.
+        preserve_driver_errors(gles, shadow);
         // Apps that moved to the ES 3.0 API (Gameloft games such as Asphalt 8
         // v1.2.0+) allocate their PVRTC texture atlases via immutable storage:
         // `glTexStorage2D` with a PVRTC internalformat, then per-level
@@ -7374,6 +8864,16 @@ fn glTexStorage2D(
         if crate::gles::util::pvrtc_format_properties(internalformat).is_some()
             && !gles.pvrtc_native()
         {
+            if width <= 0
+                || height <= 0
+                || !(width as u32).is_power_of_two()
+                || !(height as u32).is_power_of_two()
+            {
+                if !shadow.pending_guest_errors.contains(&gles11::INVALID_VALUE) {
+                    shadow.pending_guest_errors.push_back(gles11::INVALID_VALUE);
+                }
+                return;
+            }
             if let Some(texture) = bound_texture {
                 for level in 0..levels.max(0) {
                     let level_width = (width >> level).max(1);
@@ -7393,6 +8893,9 @@ fn glTexStorage2D(
             return;
         }
         gles.TexStorage2D(target, levels, internalformat, width, height);
+        if preserve_driver_errors(gles, shadow) {
+            return;
+        }
         if let Some(texture) = bound_texture {
             shadow.forget_pvrtc_texture(texture);
             crate::gles::perf_overlay::clear_gl_image_allocations(
@@ -7825,9 +9328,15 @@ fn glGetBufferParameteri64v(
     pname: GLenum,
     params: MutPtr<i64>,
 ) {
-    let params = env.mem.ptr_at_mut(params, 1);
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.GetBufferParameteri64v(target, pname, params)
+    with_ctx_mem_and_buffers(env, |gles, mem, shadow, objects| {
+        let buffer = buffer_mapping::binding(gles, target)?;
+        if let Some(value) = objects.parameter(buffer, pname) {
+            mem.write(params, value);
+        } else {
+            let params = mem.ptr_at_mut(params, 1);
+            unsafe { gles.GetBufferParameteri64v(target, pname, params) };
+        }
+        Ok(())
     });
 }
 
@@ -8063,26 +9572,16 @@ fn glGetTransformFeedbackVarying(
     }
 }
 
-/// `void glGetBufferPointerv(GLenum target, GLenum pname, void **params)` —
-/// ES 3.0 §6.1.15. The only valid `pname` is `GL_BUFFER_MAP_POINTER`, which
-/// is NULL unless the buffer is currently mapped. touchHLE exposes buffer
-/// mappings to the guest via glMapBufferOES (which hands the app a *guest*
-/// pointer and keeps its own host<->guest mirror), so the raw host pointer
-/// the driver returns is not meaningful in the guest address space. We still
-/// forward the real query, and report the guest-visible result, which is NULL
-/// when no guest-visible mapping is active — the GL default and common case.
+/// Return the guest address belonging to the current buffer's mapping.
+/// The core and OES queries share this state; a host driver pointer cannot
+/// be represented directly in the 32-bit guest address space.
 fn glGetBufferPointerv(
     env: &mut Environment,
     target: GLenum,
     pname: GLenum,
     params: MutPtr<MutVoidPtr>,
 ) {
-    let mut host_ptr: *mut GLvoid = std::ptr::null_mut();
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.GetBufferPointerv(target, pname, &mut host_ptr);
-    });
-    let _ = host_ptr;
-    env.mem.write(params, Ptr::null());
+    glGetBufferPointervOES(env, target, pname, params.cast());
 }
 
 // -- Integer uniforms --
@@ -8305,7 +9804,11 @@ fn has_current_ctx(env: &mut Environment) -> bool {
 }
 
 fn lookup_sync(env: &Environment, sync: GuestGLsync) -> Option<GuestSyncObject> {
-    env.framework_state.opengles.sync_objects.get(&sync).copied()
+    env.framework_state
+        .opengles
+        .sync_objects
+        .get(&sync)
+        .copied()
 }
 
 /// Observe an emulated (`host == None`) fence, returning whether it is now
@@ -8601,10 +10104,7 @@ fn glGetInteger64vAPPLE(env: &mut Environment, pname: GLenum, params: MutPtr<i64
         return;
     }
     let count = get_integer_value_count(pname);
-    let tmp: MutPtr<GLint> = env
-        .mem
-        .alloc((count.max(16) * 4) as GuestUSize)
-        .cast();
+    let tmp: MutPtr<GLint> = env.mem.alloc((count.max(16) * 4) as GuestUSize).cast();
     glGetIntegerv(env, pname, tmp);
     for i in 0..count {
         let value: GLint = env.mem.read(tmp + i as GuestUSize);
@@ -8637,20 +10137,55 @@ fn get_integer_value_count(pname: GLenum) -> u32 {
 }
 
 // -- Misc --
+// ES3 extension enumeration must describe the same HLE capabilities as
+// glGetString, rather than expose unrelated host-only extensions.
+// https://registry.khronos.org/OpenGL-Refpages/es3.0/html/glGetString.xhtml
 fn glGetStringi(env: &mut Environment, name: GLenum, index: GLuint) -> ConstPtr<u8> {
-    let host_ptr: *const GLubyte =
-        with_ctx_and_mem(env, |gles, _mem| unsafe { gles.GetStringi(name, index) });
-    if host_ptr.is_null() {
+    let Some(context) = *env
+        .framework_state
+        .opengles
+        .current_ctx_for_thread(env.current_thread)
+    else {
+        return Ptr::null();
+    };
+    let api = env.objc.borrow::<EAGLContextHostObject>(context).api;
+    if api < 3 || name != gles11::EXTENSIONS {
+        with_ctx_mem_and_shadow(env, |_gles, _mem, shadow| {
+            shadow.record_error(gles11::INVALID_ENUM)
+        });
         return Ptr::null();
     }
-    // Copy the C string into guest memory once and intern the pointer in
-    // EAGL's per-context string cache.
-    let bytes = unsafe { std::ffi::CStr::from_ptr(host_ptr as *const _) }.to_bytes_with_nul();
-    let guest_buf: MutPtr<u8> = env.mem.alloc(bytes.len() as GuestUSize).cast();
-    env.mem
-        .bytes_at_mut(guest_buf, bytes.len() as GuestUSize)
-        .copy_from_slice(bytes);
-    guest_buf.cast_const()
+    if let Some(&pointer) = env
+        .framework_state
+        .opengles
+        .indexed_strings_cache
+        .get(&(api, index))
+    {
+        return pointer;
+    }
+    let extensions = glGetString(env, name);
+    let extension = env
+        .mem
+        .cstr_at_utf8(extensions)
+        .unwrap()
+        .split_whitespace()
+        .nth(index as usize)
+        .map(str::to_owned);
+    let Some(extension) = extension else {
+        with_ctx_mem_and_shadow(env, |_gles, _mem, shadow| {
+            shadow.record_error(gles11::INVALID_VALUE)
+        });
+        return Ptr::null();
+    };
+    let pointer = env
+        .mem
+        .alloc_and_write_cstr(extension.as_bytes())
+        .cast_const();
+    env.framework_state
+        .opengles
+        .indexed_strings_cache
+        .insert((api, index), pointer);
+    pointer
 }
 
 fn glGetFragDataLocation(env: &mut Environment, program: GLuint, name: ConstPtr<u8>) -> GLint {
@@ -9203,7 +10738,90 @@ mod pvrtc_subimage_matching_tests {
 
 #[cfg(test)]
 mod shader_preprocessor_normalization_tests {
-    use super::{normalize_asphalt8_shader_source, normalize_shader_preprocessor_whitespace};
+    use super::{
+        normalize_asphalt8_shader_source, normalize_shader_preprocessor_whitespace,
+        rewrite_nonconstant_global_initializers,
+    };
+
+    #[test]
+    fn moves_nonconstant_global_initializer_into_main() {
+        let src = "uniform vec4 u_fog;\nvec4 fog = u_fog;\nvoid main() { gl_FragColor = fog; }";
+        let out = rewrite_nonconstant_global_initializers(src);
+        assert!(out.contains("vec4 fog;"));
+        let main_at = out.find("void main()").unwrap();
+        let assign_at = out.find("fog = u_fog;").unwrap();
+        let use_at = out.find("gl_FragColor = fog;").unwrap();
+        assert!(main_at < assign_at && assign_at < use_at);
+    }
+
+    #[test]
+    fn leaves_constant_global_initializers_untouched() {
+        let src = "vec4 c = vec4(1.0, 2.0, 3.0, 4.0);\nfloat s = 2.0 * 3.0;\nvoid main() { gl_FragColor = c; }";
+        assert_eq!(rewrite_nonconstant_global_initializers(src), src);
+    }
+
+    #[test]
+    fn leaves_qualified_declarations_untouched() {
+        let src = "uniform vec4 u_fog;\nconst float k = 1.0;\nvarying float v;\nattribute vec4 a_pos;\nvoid main() { gl_FragColor = u_fog; }";
+        assert_eq!(rewrite_nonconstant_global_initializers(src), src);
+    }
+
+    #[test]
+    fn handles_multiline_constructor_initializer() {
+        let src =
+            "uniform float u_s;\nvec4 col =\n    vec4(u_s);\nvoid main() { gl_FragColor = col; }";
+        let out = rewrite_nonconstant_global_initializers(src);
+        assert!(out.contains("vec4 col;"));
+        assert!(out.contains("col = vec4(u_s);"));
+    }
+
+    #[test]
+    fn moves_function_call_initializer_into_main() {
+        let src = "float s = sin(1.0);\nvoid main() { gl_FragColor = vec4(s); }";
+        let out = rewrite_nonconstant_global_initializers(src);
+        assert!(out.contains("float s;"));
+        assert!(out.contains("s = sin(1.0);"));
+    }
+
+    #[test]
+    fn splits_declarator_lists_preserving_uninitialized_names() {
+        let src = "uniform vec2 u_v;\nvec2 uv = u_v, st;\nvoid main() { gl_FragColor = vec4(uv + st, 0.0, 1.0); }";
+        let out = rewrite_nonconstant_global_initializers(src);
+        assert!(out.contains("vec2 uv, st;"));
+        assert!(out.contains("uv = u_v;"));
+    }
+
+    #[test]
+    fn returns_original_without_main() {
+        let src = "vec4 x = y;";
+        assert_eq!(rewrite_nonconstant_global_initializers(src), src);
+    }
+
+    #[test]
+    fn leaves_declarations_after_main_untouched() {
+        let src = "void main() { gl_FragColor = vec4(1.0); }\nvec4 x = u_fog;";
+        assert_eq!(rewrite_nonconstant_global_initializers(src), src);
+    }
+
+    #[test]
+    fn preserves_comments_and_directives() {
+        let src = "// leading comment\nuniform float u_s;\n/* block */ vec4 c = vec4(u_s);\n#ifdef FOO\n#endif\nvoid main() { gl_FragColor = c; }";
+        let out = rewrite_nonconstant_global_initializers(src);
+        assert!(out.contains("// leading comment"));
+        assert!(out.contains("/* block */"));
+        assert!(out.contains("#ifdef FOO"));
+        assert!(out.contains("vec4 c;"));
+        assert!(out.contains("c = vec4(u_s);"));
+    }
+
+    #[test]
+    fn orders_multiple_assignments_in_declaration_order() {
+        let src = "uniform float u_a;\nfloat b = u_a * 2.0;\nfloat c = b + 1.0;\nvoid main() { gl_FragColor = vec4(c); }";
+        let out = rewrite_nonconstant_global_initializers(src);
+        let b_at = out.find("b = u_a * 2.0;").unwrap();
+        let c_at = out.find("c = b + 1.0;").unwrap();
+        assert!(b_at < c_at);
+    }
 
     #[test]
     fn normalizes_asphalt8_multiline_and_numeric_shader_tokens() {
@@ -9297,7 +10915,8 @@ mod shader_extension_hoisting_tests {
 
     #[test]
     fn keeps_version_first_and_normalizes_whitespace() {
-        let src = "#version 100\nvoid main() {}\n#  extension GL_OES_standard_derivatives : enable\n";
+        let src =
+            "#version 100\nvoid main() {}\n#  extension GL_OES_standard_derivatives : enable\n";
         let out = hoist_shader_extension_directives(src);
         assert!(
             out.starts_with("#version 100\n#extension GL_OES_standard_derivatives : enable\n"),
@@ -9337,7 +10956,8 @@ mod varying_declaration_parsing_tests {
     fn fragment_only_varyings_detected_as_missing() {
         // The Gangstar case: fragment declares vAlpha, vertex does not.
         let vert = parse_varying_declarations("varying vec2 vUV;\nvoid main() {}\n");
-        let frag = parse_varying_declarations("varying vec4 vAlpha;\nvarying vec2 vUV;\nvoid main() {}\n");
+        let frag =
+            parse_varying_declarations("varying vec4 vAlpha;\nvarying vec2 vUV;\nvoid main() {}\n");
         let missing: Vec<_> = frag
             .into_iter()
             .filter(|(_, n)| !vert.iter().any(|(_, vn)| vn == n))
@@ -9377,8 +10997,7 @@ mod uniform_array_reconciliation_tests {
     #[test]
     fn parses_array_sizes_and_rewrites_both_stages_to_max() {
         let vertex = "uniform vec4 light[4];\nuniform float pad;\nvoid main() {}\n";
-        let fragment =
-            "precision mediump float;\nuniform highp vec4 light[2];\nvoid main() {}\n";
+        let fragment = "precision mediump float;\nuniform highp vec4 light[2];\nvoid main() {}\n";
         let defines = std::collections::HashMap::new();
         let vd = parse_uniform_array_declarations(vertex, &defines);
         let fd = parse_uniform_array_declarations(fragment, &defines);
@@ -9509,12 +11128,267 @@ mod performance_texture_size_tests {
             400
         );
         assert_eq!(texture_storage_level_bytes(16, 8, 0x8058), 512);
-        assert_eq!(
-            texture_storage_level_bytes(16, 8, gles11::RGB565_OES),
-            256
-        );
+        assert_eq!(texture_storage_level_bytes(16, 8, gles11::RGB565_OES), 256);
         assert_eq!(texture_storage_volume_bytes(8, 4, 2, 0x8058), 256);
         assert_eq!(texture_storage_level_bytes(0, 8, 0x8058), 0);
         assert_eq!(texture_storage_level_bytes(16, 8, 0x83F1), 0);
+    }
+}
+
+#[cfg(test)]
+mod native_client_array_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct NativeArrays {
+        client_unit: usize,
+        disabled: Vec<(GLenum, usize)>,
+    }
+    #[allow(non_snake_case)]
+    impl GLES for NativeArrays {
+        fn is_native_es1(&self) -> bool {
+            true
+        }
+        unsafe fn ClientActiveTexture(&mut self, unit: GLenum) {
+            self.client_unit = (unit - gles11::TEXTURE0) as usize;
+        }
+        unsafe fn DisableClientState(&mut self, array: GLenum) {
+            self.disabled.push((
+                array,
+                if array == gles11::TEXTURE_COORD_ARRAY {
+                    self.client_unit
+                } else {
+                    0
+                },
+            ));
+        }
+        unsafe fn EnableClientState(&mut self, array: GLenum) {
+            let unit = if array == gles11::TEXTURE_COORD_ARRAY {
+                self.client_unit
+            } else {
+                0
+            };
+            let index = self
+                .disabled
+                .iter()
+                .position(|&entry| entry == (array, unit))
+                .unwrap();
+            self.disabled.remove(index);
+        }
+    }
+
+    #[test]
+    fn null_array_guard_restores_enables_and_client_texture_unit() {
+        let mut shadow = GLShadowState::default();
+        shadow.client_active_texture = 3;
+        shadow
+            .vertex_array_state
+            .set_client_state(gles11::COLOR_ARRAY, 0, true);
+        shadow
+            .vertex_array_state
+            .set_client_state(gles11::TEXTURE_COORD_ARRAY, 1, true);
+        shadow
+            .vertex_array_state
+            .set_client_state(gles11::TEXTURE_COORD_ARRAY, 3, true);
+        let original = shadow.vertex_array_state.clone();
+        let mut host = NativeArrays {
+            client_unit: 3,
+            ..Default::default()
+        };
+        unsafe {
+            let guard = guard_native_client_arrays(&mut host, &shadow).unwrap();
+            assert_eq!(
+                host.disabled,
+                [
+                    (gles11::COLOR_ARRAY, 0),
+                    (gles11::TEXTURE_COORD_ARRAY, 1),
+                    (gles11::TEXTURE_COORD_ARRAY, 3)
+                ]
+            );
+            assert_eq!(host.client_unit, 3);
+            guard.restore(&mut host);
+        }
+        assert!(host.disabled.is_empty());
+        assert_eq!(host.client_unit, 3);
+        assert_eq!(shadow.vertex_array_state, original);
+    }
+
+    // NULL denotes offset zero when a buffer was bound at pointer setup.
+    // https://registry.khronos.org/OpenGL-Refpages/es1.1/xhtml/glVertexPointer.xml
+    #[test]
+    fn buffer_offset_zero_and_valid_client_pointers_are_not_disabled() {
+        let mut shadow = GLShadowState::default();
+        for array in [FixedArray::Vertex, FixedArray::Color] {
+            shadow
+                .vertex_array_state
+                .set_client_state(array.client_state(), 0, true);
+            shadow.vertex_array_state.set_fixed_pointer(
+                array,
+                software_vao::ArrayPointer {
+                    buffer: 7,
+                    ..Default::default()
+                },
+            );
+        }
+        shadow
+            .vertex_array_state
+            .set_client_state(gles11::NORMAL_ARRAY, 0, true);
+        shadow.vertex_array_state.set_fixed_pointer(
+            FixedArray::Normal,
+            software_vao::ArrayPointer {
+                pointer: 0x1000,
+                ..Default::default()
+            },
+        );
+        // The current binding does not replace the buffer captured by Pointer.
+        shadow.array_buffer = 0;
+        let mut host = NativeArrays::default();
+        unsafe {
+            guard_native_client_arrays(&mut host, &shadow)
+                .unwrap()
+                .restore(&mut host);
+        }
+        assert!(host.disabled.is_empty());
+    }
+
+    #[test]
+    fn enabled_vertex_array_without_storage_skips_draw_before_mutating_host() {
+        let mut shadow = GLShadowState::default();
+        shadow
+            .vertex_array_state
+            .set_client_state(gles11::VERTEX_ARRAY, 0, true);
+        shadow
+            .vertex_array_state
+            .set_client_state(gles11::COLOR_ARRAY, 0, true);
+        let mut host = NativeArrays::default();
+        assert!(unsafe { guard_native_client_arrays(&mut host, &shadow) }.is_none());
+        assert!(host.disabled.is_empty());
+    }
+}
+#[cfg(test)]
+mod entry_point_tests {
+    use super::*;
+    #[derive(Default)]
+    struct Capture {
+        calls: Vec<(GLenum, GLenum, Vec<f64>)>,
+        attribs: Vec<(GLuint, Vec<f32>)>,
+    }
+    impl GLES for Capture {
+        unsafe fn TexParameteriv(&mut self, target: GLenum, pname: GLenum, values: *const GLint) {
+            self.calls.push((
+                target,
+                pname,
+                from_raw_parts(values, 4)
+                    .iter()
+                    .map(|v| *v as f64)
+                    .collect(),
+            ));
+        }
+        unsafe fn TexParameterfv(&mut self, target: GLenum, pname: GLenum, values: *const GLfloat) {
+            self.calls.push((
+                target,
+                pname,
+                from_raw_parts(values, 4)
+                    .iter()
+                    .map(|v| *v as f64)
+                    .collect(),
+            ));
+        }
+        unsafe fn TexParameterxv(&mut self, target: GLenum, pname: GLenum, values: *const GLfixed) {
+            self.calls.push((
+                target,
+                pname,
+                from_raw_parts(values, 4)
+                    .iter()
+                    .map(|v| *v as f64)
+                    .collect(),
+            ));
+        }
+        unsafe fn VertexAttrib2fv(&mut self, index: GLuint, values: *const GLfloat) {
+            self.attribs
+                .push((index, from_raw_parts(values, 2).to_vec()));
+        }
+        unsafe fn VertexAttrib3fv(&mut self, index: GLuint, values: *const GLfloat) {
+            self.attribs
+                .push((index, from_raw_parts(values, 3).to_vec()));
+        }
+        unsafe fn VertexAttrib4fv(&mut self, index: GLuint, values: *const GLfloat) {
+            self.attribs
+                .push((index, from_raw_parts(values, 4).to_vec()));
+        }
+    }
+    // A sprite atlas crop and a vertically flipped crop must both reach the
+    // host. No opt-in environment variable is required by OES_draw_texture.
+    #[test]
+    fn integer_and_fixed_crops_preserve_offsets_and_signed_dimensions() {
+        let mut mem = Mem::new();
+        let ptr = mem.alloc(16).cast::<GLint>();
+        let mut driver = Capture::default();
+        for expected in [[17, 29, 128, 64], [0, 256, 256, -256]] {
+            for (i, value) in expected.iter().enumerate() {
+                mem.write(ptr + i as u32, *value);
+            }
+            unsafe {
+                dispatch_texture_crop_rect(
+                    &mut driver,
+                    &mem,
+                    gles11::TEXTURE_2D,
+                    TextureCropVector::Integer(ptr.cast_const()),
+                );
+                dispatch_texture_crop_rect(
+                    &mut driver,
+                    &mem,
+                    gles11::TEXTURE_2D,
+                    TextureCropVector::Fixed(ptr.cast_const()),
+                );
+            }
+            for call in &driver.calls[driver.calls.len() - 2..] {
+                assert_eq!(call.0, gles11::TEXTURE_2D);
+                assert_eq!(call.1, gles11::TEXTURE_CROP_RECT_OES);
+                assert_eq!(call.2, expected.map(|v| v as f64));
+            }
+        }
+        assert_eq!(driver.calls.len(), 4);
+    }
+    #[test]
+    fn float_crop_reaches_host_without_scalar_enum_conversion() {
+        let mut mem = Mem::new();
+        let ptr = mem.alloc(16).cast::<GLfloat>();
+        let expected = [-12.5f32, 128.0, 64.0, -80.0];
+        for (i, value) in expected.iter().enumerate() {
+            mem.write(ptr + i as u32, *value);
+        }
+        let mut driver = Capture::default();
+        unsafe {
+            dispatch_texture_crop_rect(
+                &mut driver,
+                &mem,
+                gles11::TEXTURE_2D,
+                TextureCropVector::Float(ptr.cast_const()),
+            );
+        }
+        assert_eq!(driver.calls.len(), 1);
+        assert_eq!(driver.calls[0].2, expected.map(|v| v as f64));
+    }
+    // The driver reads as many floats as the entry point names, so a
+    // two-component call must not hand it a pointer to a single value.
+    #[test]
+    fn vertex_attrib_reads_every_named_component() {
+        let mut mem = Mem::new();
+        let ptr = mem.alloc(16).cast::<GLfloat>();
+        let values = [1.5f32, -2.0, 3.25, 4.0];
+        for (i, value) in values.iter().enumerate() {
+            mem.write(ptr + i as u32, *value);
+        }
+        let mut driver = Capture::default();
+        unsafe {
+            dispatch_vertex_attrib_fv(&mut driver, &mem, 7, ptr.cast_const(), 2);
+            dispatch_vertex_attrib_fv(&mut driver, &mem, 7, ptr.cast_const(), 3);
+            dispatch_vertex_attrib_fv(&mut driver, &mem, 7, ptr.cast_const(), 4);
+        }
+        assert_eq!(driver.attribs.len(), 3);
+        assert_eq!(driver.attribs[0], (7, vec![1.5, -2.0]));
+        assert_eq!(driver.attribs[1], (7, vec![1.5, -2.0, 3.25]));
+        assert_eq!(driver.attribs[2], (7, vec![1.5, -2.0, 3.25, 4.0]));
     }
 }

@@ -1,12 +1,12 @@
 name: Request an app fix (IPA + logs)
-description: Request that a specific app/game be fixed in HyperHLE, requires an IPA link and a description of the bug/crash, a log file is optional
+description: Request that a specific app/game be fixed in AppleJuiceHLE, requires an IPA link and a description of the bug/crash, a log file is optional
 labels: ["app fix request"]
 body:
   - type: markdown
     attributes:
       value: |
         Use this form to request that a specific app or game be fixed in
-        HyperHLE, this is the same request the Telegram bot files on your behalf
+        AppleJuiceHLE, this is the same request the Telegram bot files on your behalf
 
         **Two things are required** for a fix to be investigated:
         1. A direct **IPA link** (or zipped `.app`) so the app can be downloaded and run
@@ -15,7 +15,7 @@ body:
         A **log file** from the run that shows the failure is optional, but it
         makes the problem much easier to fix
 
-        Please make sure you are testing against the **latest HyperHLE build from
+        Please make sure you are testing against the **latest AppleJuiceHLE build from
         [Actions](https://github.com/HyperHLE/HyperHLE/actions)** (or the latest
         [release](https://github.com/HyperHLE/HyperHLE/releases)) before filing
 
@@ -48,9 +48,9 @@ body:
       required: true
   - type: input
     attributes:
-      label: HyperHLE version tested (latest from Actions)
+      label: AppleJuiceHLE version tested (latest from Actions)
       description: |
-        The version or commit of the latest HyperHLE build from
+        The version or commit of the latest AppleJuiceHLE build from
         https://github.com/HyperHLE/HyperHLE/actions that you tested against
       placeholder: 'v1.0.2 / commit abcdef0'
     validations:
@@ -98,7 +98,7 @@ body:
       options:
         - label: I have searched existing issues and this is not a duplicate
           required: true
-        - label: I tested against the latest HyperHLE build from Actions / the latest release
+        - label: I tested against the latest AppleJuiceHLE build from Actions / the latest release
           required: true
         - label: I legally own the app / game I am asking about
           required: true

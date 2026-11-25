@@ -25,10 +25,27 @@ mod desktop_texture_format_tests {
     use super::*;
     #[test]
     fn bgra_uploads_use_rgba_storage_without_overwriting_sized_formats() {
-        assert_eq!(desktop_texture_internal_format(gles11::BGRA_EXT as _), gles11::RGBA as GLint);
+        assert_eq!(
+            desktop_texture_internal_format(gles11::BGRA_EXT as _),
+            gles11::RGBA as GLint
+        );
         for internal in [gles11::RGBA, gles11::RGB, gles11::ALPHA, 0x8058] {
-            assert_eq!(desktop_texture_internal_format(internal as _), internal as GLint);
+            assert_eq!(
+                desktop_texture_internal_format(internal as _),
+                internal as GLint
+            );
         }
+    }
+}
+/// ES 2.0's OES half-float token differs from the ES 3.0/desktop token.
+/// Preserve the OES value on ES 2.0 drivers and translate it only where
+/// the host API uses the core enum.
+/// <https://registry.khronos.org/OpenGL/extensions/OES/OES_vertex_half_float.txt>
+pub(crate) fn core_vertex_attrib_type(type_: GLenum) -> GLenum {
+    if type_ == 0x8d61 {
+        0x140b
+    } else {
+        type_
     }
 }
 
@@ -71,6 +88,73 @@ mod pvrtc_payload_size_tests {
     }
 }
 
+#[cfg(test)]
+mod npot_workaround_tests {
+    use super::{
+        base_min_filter, is_npot_upload, npot_upload_workaround_enabled, tex_parameter_target,
+        TEXTURE_CUBE_MAP, TEXTURE_CUBE_MAP_NEGATIVE_Z, TEXTURE_CUBE_MAP_POSITIVE_X,
+    };
+    use crate::gles::gles11_raw as gles11;
+
+    #[test]
+    fn detects_non_power_of_two_uploads() {
+        assert!(!is_npot_upload(64, 64));
+        assert!(!is_npot_upload(1, 1));
+        assert!(!is_npot_upload(1024, 512));
+        assert!(is_npot_upload(320, 480));
+        assert!(is_npot_upload(64, 65));
+        // Storage probes and malformed calls still get the workarounds.
+        assert!(is_npot_upload(0, 0));
+        assert!(is_npot_upload(-4, 16));
+    }
+
+    #[test]
+    fn enables_workaround_only_for_level_zero_npot_uploads_when_option_is_enabled() {
+        assert!(npot_upload_workaround_enabled(0, 320, 480, true));
+        assert!(!npot_upload_workaround_enabled(1, 320, 480, true));
+        assert!(!npot_upload_workaround_enabled(0, 64, 64, true));
+        assert!(!npot_upload_workaround_enabled(0, 320, 480, false));
+    }
+
+    #[test]
+    fn degrades_only_mipmapped_filters() {
+        use crate::gles::gles11_raw::types::GLint;
+        let near = gles11::NEAREST as GLint;
+        let linear = gles11::LINEAR as GLint;
+        assert_eq!(
+            base_min_filter(gles11::NEAREST_MIPMAP_NEAREST as GLint),
+            Some(near)
+        );
+        assert_eq!(
+            base_min_filter(gles11::NEAREST_MIPMAP_LINEAR as GLint),
+            Some(near)
+        );
+        assert_eq!(
+            base_min_filter(gles11::LINEAR_MIPMAP_NEAREST as GLint),
+            Some(linear)
+        );
+        assert_eq!(
+            base_min_filter(gles11::LINEAR_MIPMAP_LINEAR as GLint),
+            Some(linear)
+        );
+        assert_eq!(base_min_filter(gles11::LINEAR as GLint), None);
+        assert_eq!(base_min_filter(gles11::NEAREST as GLint), None);
+    }
+
+    #[test]
+    fn cube_map_faces_share_the_cube_map_target() {
+        assert_eq!(
+            tex_parameter_target(TEXTURE_CUBE_MAP_POSITIVE_X),
+            TEXTURE_CUBE_MAP
+        );
+        assert_eq!(
+            tex_parameter_target(TEXTURE_CUBE_MAP_NEGATIVE_Z),
+            TEXTURE_CUBE_MAP
+        );
+        assert_eq!(tex_parameter_target(gles11::TEXTURE_2D), gles11::TEXTURE_2D);
+    }
+}
+
 /// Return `(is_2bit, is_opaque)` for a PVRTC v1 internal format.
 pub fn pvrtc_format_properties(internalformat: GLenum) -> Option<(bool, bool)> {
     match internalformat {
@@ -99,6 +183,72 @@ pub fn pvrtc_payload_size(
         .map(|bits| bits / 8)
 }
 
+/// Vertex array state overwritten by an internal ES2 draw. Each attribute
+/// captures its own buffer binding when VertexAttribPointer is called.
+/// <https://registry.khronos.org/OpenGL-Refpages/es2.0/xhtml/glVertexAttribPointer.xml>
+#[derive(Debug, PartialEq)]
+pub(crate) struct VertexAttribState {
+    index: u32,
+    enabled: i32,
+    buffer: i32,
+    size: i32,
+    stride: i32,
+    type_: i32,
+    normalized: i32,
+    pointer: *mut std::ffi::c_void,
+}
+
+impl VertexAttribState {
+    pub(crate) unsafe fn capture(gles: &mut dyn GLES, index: u32) -> Self {
+        use super::gles2_raw as gl;
+        let mut state = Self {
+            index,
+            enabled: 0,
+            buffer: 0,
+            size: 0,
+            stride: 0,
+            type_: 0,
+            normalized: 0,
+            pointer: std::ptr::null_mut(),
+        };
+        gles.GetVertexAttribiv(index, gl::VERTEX_ATTRIB_ARRAY_ENABLED, &mut state.enabled);
+        gles.GetVertexAttribiv(
+            index,
+            gl::VERTEX_ATTRIB_ARRAY_BUFFER_BINDING,
+            &mut state.buffer,
+        );
+        gles.GetVertexAttribiv(index, gl::VERTEX_ATTRIB_ARRAY_SIZE, &mut state.size);
+        gles.GetVertexAttribiv(index, gl::VERTEX_ATTRIB_ARRAY_STRIDE, &mut state.stride);
+        gles.GetVertexAttribiv(index, gl::VERTEX_ATTRIB_ARRAY_TYPE, &mut state.type_);
+        gles.GetVertexAttribiv(
+            index,
+            gl::VERTEX_ATTRIB_ARRAY_NORMALIZED,
+            &mut state.normalized,
+        );
+        gles.GetVertexAttribPointerv(index, gl::VERTEX_ATTRIB_ARRAY_POINTER, &mut state.pointer);
+        state
+    }
+
+    /// The caller restores the global ARRAY_BUFFER binding after all attributes.
+    pub(crate) unsafe fn restore(&self, gles: &mut dyn GLES) {
+        use super::gles2_raw as gl;
+        gles.BindBuffer(gl::ARRAY_BUFFER, self.buffer as _);
+        gles.VertexAttribPointer(
+            self.index,
+            self.size,
+            self.type_ as _,
+            self.normalized as _,
+            self.stride,
+            self.pointer.cast_const(),
+        );
+        if self.enabled != 0 {
+            gles.EnableVertexAttribArray(self.index);
+        } else {
+            gles.DisableVertexAttribArray(self.index);
+        }
+    }
+}
+
 /// Convert a fixed-point scalar to a floating-point scalar.
 ///
 /// Beware: Rust's type checker won't complain if you mix up [GLfixed] with
@@ -120,6 +270,102 @@ pub fn float_to_fixed(float: GLfloat) -> GLfixed {
         0
     } else {
         scaled.round() as GLfixed
+    }
+}
+
+/// Whether the non-power-of-two / mipmap texture workarounds are enabled.
+///
+/// Strict OpenGL ES 1.1 and ES 2.0 drivers (ANGLE, Adreno's ES 1.1 surface,
+/// Mesa) reject or mis-sample non-power-of-two textures that use `GL_REPEAT`
+/// or a mipmapped `TEXTURE_MIN_FILTER`, while the iPhone OS drivers most apps
+/// were written against (PowerVR) tolerated both. The workaround is described
+/// at the call sites: `gles1_native`'s `tex_image_2d_inner` /
+/// `fix_mipmap_min_filter`, and `gles1_on_gles2`'s equivalents.
+///
+/// This mirrors [crate::options::Options::fix_texture_min_filter], which
+/// defaults to on for Android. The GL call paths have no `Options` access, so
+/// `--fix-texture-min-filter` / `--no-fix-texture-min-filter` mirror their
+/// choice into `TOUCHHLE_FIX_TEXTURE_MIN_FILTER`, and this function reads that.
+pub fn fix_texture_min_filter_enabled() -> bool {
+    match crate::env_var_cached!("TOUCHHLE_FIX_TEXTURE_MIN_FILTER") {
+        Some("0") => false,
+        Some("1") => true,
+        _ => cfg!(target_os = "android"),
+    }
+}
+
+/// Whether the NPOT upload workaround applies to this level-0 upload.
+///
+/// Callers use this before changing texture wrap parameters and after uploads
+/// to repair minification filters. Keep the shared eligibility check in one
+/// place so the pre- and post-upload paths remain in sync.
+pub fn npot_upload_workaround_enabled(
+    level: GLint,
+    width: GLsizei,
+    height: GLsizei,
+    workaround_enabled: bool,
+) -> bool {
+    level == 0 && workaround_enabled && is_npot_upload(width, height)
+}
+
+/// Whether an upload of `width` x `height` needs the non-power-of-two texture
+/// workarounds: force `GL_CLAMP_TO_EDGE` on the binding before the pixel store,
+/// and degrade a mipmapped `TEXTURE_MIN_FILTER` afterwards.
+///
+/// Zero and negative dimensions count as "needs the workarounds". A call with
+/// those dimensions is either a texture-storage probe (where the wrap and
+/// filter writes are harmless) or a malformed guest call that the driver will
+/// reject anyway, and treating them as power-of-two would let a later
+/// `glTexSubImage2D` fill in a texture whose filters were never fixed up.
+pub fn is_npot_upload(width: GLsizei, height: GLsizei) -> bool {
+    fn is_pot(value: GLsizei) -> bool {
+        value > 0 && value & (value - 1) == 0
+    }
+    !(is_pot(width) && is_pot(height))
+}
+
+/// Map a mipmapped `TEXTURE_MIN_FILTER` to the base filter with the same
+/// nearest/linear intent, or `None` if `min_filter` is not mipmapped.
+///
+/// Used by the non-power-of-two workaround: a mipmapped filter on a texture
+/// whose levels were never supplied makes the texture incomplete, and strict
+/// drivers then sample undefined texels (pink/black garbage) instead of
+/// falling back to the base level the way lenient iOS-era drivers did.
+pub fn base_min_filter(min_filter: GLint) -> Option<GLint> {
+    // Compare in `GLenum` space: the filter enums are unsigned, but callers
+    // hold them as `GLint` (that is what `glGetTexParameteriv` returns).
+    let filter = min_filter as GLenum;
+    match filter {
+        gles11::NEAREST_MIPMAP_NEAREST | gles11::NEAREST_MIPMAP_LINEAR => {
+            Some(gles11::NEAREST as GLint)
+        }
+        gles11::LINEAR_MIPMAP_NEAREST | gles11::LINEAR_MIPMAP_LINEAR => {
+            Some(gles11::LINEAR as GLint)
+        }
+        _ => None,
+    }
+}
+
+// `GL_TEXTURE_CUBE_MAP` and its faces. The generated ES 1.1 bindings module
+// does not export them (the registry entry they come from is not part of the
+// ES 1.1 core set), so spell the values out, as `gles_guest` already does.
+const TEXTURE_CUBE_MAP: GLenum = 0x8513;
+const TEXTURE_CUBE_MAP_POSITIVE_X: GLenum = 0x8515;
+const TEXTURE_CUBE_MAP_NEGATIVE_Z: GLenum = 0x851A;
+
+/// The texture target whose object carries the parameters for `target`.
+///
+/// Cube-map faces are separate targets for state purposes but share one
+/// texture object, and ES 1.1 has no way to set per-face parameters, so
+/// parameters requested for `GL_TEXTURE_CUBE_MAP_POSITIVE_X` and friends have
+/// to be applied to `GL_TEXTURE_CUBE_MAP` itself.
+pub fn tex_parameter_target(target: GLenum) -> GLenum {
+    let is_cube_face =
+        (TEXTURE_CUBE_MAP_POSITIVE_X..=TEXTURE_CUBE_MAP_NEGATIVE_Z).contains(&target);
+    if is_cube_face {
+        TEXTURE_CUBE_MAP
+    } else {
+        target
     }
 }
 
@@ -347,13 +593,8 @@ pub fn try_decode_pvrtc(
 
     let upload_format = gles11::RGBA;
 
-    let pixels = crate::image::decode_pvrtc_with_alpha(
-        pvrtc_data,
-        is_2bit,
-        width_u,
-        height_u,
-        is_opaque,
-    );
+    let pixels =
+        crate::image::decode_pvrtc_with_alpha(pvrtc_data, is_2bit, width_u, height_u, is_opaque);
     unsafe {
         gles.TexImage2D(
             target,
@@ -619,6 +860,116 @@ impl PalettedTextureFormat {
                 palette_entry_type: gles11::UNSIGNED_SHORT_5_5_5_1,
             }),
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod vertex_attrib_state_tests {
+    use super::VertexAttribState;
+    use crate::gles::gles11_raw::types::*;
+    use crate::gles::gles2_raw as gl;
+    use crate::gles::GLES;
+
+    // Models GL's per-attribute buffer capture, rather than treating the
+    // global ARRAY_BUFFER binding as the source for every attribute.
+    struct ArrayDriver {
+        buffer: GLuint,
+        arrays: [VertexAttribState; 2],
+    }
+
+    impl GLES for ArrayDriver {
+        unsafe fn GetVertexAttribiv(&mut self, index: GLuint, pname: GLenum, value: *mut GLint) {
+            let a = &self.arrays[index as usize];
+            *value = match pname {
+                gl::VERTEX_ATTRIB_ARRAY_ENABLED => a.enabled,
+                gl::VERTEX_ATTRIB_ARRAY_BUFFER_BINDING => a.buffer,
+                gl::VERTEX_ATTRIB_ARRAY_SIZE => a.size,
+                gl::VERTEX_ATTRIB_ARRAY_STRIDE => a.stride,
+                gl::VERTEX_ATTRIB_ARRAY_TYPE => a.type_,
+                gl::VERTEX_ATTRIB_ARRAY_NORMALIZED => a.normalized,
+                _ => panic!("unexpected attribute query"),
+            };
+        }
+        unsafe fn GetVertexAttribPointerv(
+            &mut self,
+            index: GLuint,
+            pname: GLenum,
+            pointer: *mut *mut GLvoid,
+        ) {
+            assert_eq!(pname, gl::VERTEX_ATTRIB_ARRAY_POINTER);
+            *pointer = self.arrays[index as usize].pointer;
+        }
+        unsafe fn BindBuffer(&mut self, target: GLenum, buffer: GLuint) {
+            assert_eq!(target, gl::ARRAY_BUFFER);
+            self.buffer = buffer;
+        }
+        unsafe fn VertexAttribPointer(
+            &mut self,
+            index: GLuint,
+            size: GLint,
+            type_: GLenum,
+            normalized: GLboolean,
+            stride: GLsizei,
+            pointer: *const GLvoid,
+        ) {
+            let a = &mut self.arrays[index as usize];
+            a.buffer = self.buffer as GLint;
+            a.size = size;
+            a.type_ = type_ as GLint;
+            a.normalized = normalized as GLint;
+            a.stride = stride;
+            a.pointer = pointer.cast_mut();
+        }
+        unsafe fn EnableVertexAttribArray(&mut self, index: GLuint) {
+            self.arrays[index as usize].enabled = 1;
+        }
+        unsafe fn DisableVertexAttribArray(&mut self, index: GLuint) {
+            self.arrays[index as usize].enabled = 0;
+        }
+    }
+
+    #[test]
+    fn internal_quad_preserves_cached_mesh_and_uv_arrays() {
+        let mut driver = ArrayDriver {
+            buffer: 99,
+            arrays: [
+                VertexAttribState {
+                    index: 0,
+                    enabled: 1,
+                    buffer: 7,
+                    size: 3,
+                    stride: 32,
+                    type_: gl::FLOAT as _,
+                    normalized: 0,
+                    pointer: 12usize as _,
+                },
+                VertexAttribState {
+                    index: 1,
+                    enabled: 0,
+                    buffer: 0,
+                    size: 2,
+                    stride: 8,
+                    type_: gl::UNSIGNED_SHORT as _,
+                    normalized: 1,
+                    pointer: 0x1234usize as _,
+                },
+            ],
+        };
+        unsafe {
+            let saved = [0, 1].map(|index| VertexAttribState::capture(&mut driver, index));
+            driver.BindBuffer(gl::ARRAY_BUFFER, 55);
+            for index in [0, 1] {
+                driver.EnableVertexAttribArray(index);
+                driver.VertexAttribPointer(index, 2, gl::FLOAT, gl::FALSE, 16, std::ptr::null());
+            }
+            assert_ne!(driver.arrays, saved);
+            for array in &saved {
+                array.restore(&mut driver);
+            }
+            driver.BindBuffer(gl::ARRAY_BUFFER, 99);
+            assert_eq!(driver.arrays, saved);
+            assert_eq!(driver.buffer, 99);
         }
     }
 }

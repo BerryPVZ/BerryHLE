@@ -309,6 +309,47 @@ type Bytes = [u8; GUEST_MEMORY_SIZE];
 pub const PAGE_SIZE: GuestUSize = 4096;
 pub const PAGE_SIZE_ALIGN_MASK: GuestUSize = 0xfff;
 
+/// Freed chunks at least this large hand their page-aligned part back to the
+/// host; below it the system call costs more than the pages are worth.
+const RELEASE_PAGES_SIZE: GuestUSize = 1024 * 1024;
+
+/// The page-aligned part of a freed chunk that can be released to the host.
+///
+/// The ends are rounded inwards so the released range never overlaps a
+/// neighbour that is still allocated.
+fn released_page_range(
+    addr: GuestUSize,
+    size: GuestUSize,
+) -> Option<(usize, usize)> {
+    let start = addr.saturating_add(PAGE_SIZE - 1) & !PAGE_SIZE_ALIGN_MASK;
+    let end = addr.saturating_add(size) & !PAGE_SIZE_ALIGN_MASK;
+    let len = end.saturating_sub(start);
+    (len >= RELEASE_PAGES_SIZE).then_some((start as usize, len as usize))
+}
+
+#[cfg(test)]
+mod released_page_range_tests {
+    use super::{released_page_range, PAGE_SIZE};
+
+    #[test]
+    fn keeps_only_the_pages_fully_inside_the_chunk() {
+        // Starting one byte into a page and ending just short of one leaves
+        // the interior alone, and that interior is a whole number of pages.
+        let addr = 8 * PAGE_SIZE + 1;
+        let size = 1024 * 1024 + 2 * PAGE_SIZE;
+        assert_eq!(
+            released_page_range(addr, size),
+            Some((9 * PAGE_SIZE as usize, 1024 * 1024 + PAGE_SIZE as usize))
+        );
+    }
+
+    #[test]
+    fn leaves_small_chunks_alone() {
+        assert_eq!(released_page_range(16 * PAGE_SIZE, 16 * PAGE_SIZE), None);
+        assert_eq!(released_page_range(16 * PAGE_SIZE, 0), None);
+    }
+}
+
 /// The type that owns the guest memory and provides accessors for it.
 /// One-shot diagnostic probe. The first guest store into the null segment is
 /// turned into a memory abort so `Environment::debug_cpu_error` can report the
@@ -316,33 +357,327 @@ pub const PAGE_SIZE_ALIGN_MASK: GuestUSize = 0xfff;
 /// instruction wrote through NULL: the `LAST_GUEST_PC` snapshot is taken at
 /// host-call boundaries, so for a store made while dynarmic is running it is
 /// stale (Asphalt 8's drift event reports the previous call, `_atan2f`).
-static NULL_WRITE_PROBE_FIRED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-static NULL_WRITE_PROBE_PENDING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub(crate) const NULL_WRITE_PROBE_LIMIT: usize = 64;
+static NULL_WRITE_PROBE_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static NULL_WRITE_PROBE_PENDING: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static NULL_WRITE_PROBE_ADDRESS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+/// First null-page access of this run, packed as
+/// `pc << 32 | lr << 1 | is_write`. Zero means none seen yet.
+static FIRST_NULL_ACCESS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
-/// Claim the one-shot null-write probe. Returns `true` for exactly one caller
-/// in the whole process, which must arrange for the resulting memory abort to
-/// be reported. Two flags rather than one: reusing a single flag let the
-/// reporting side clear it, so every later nil write re-armed the probe and
-/// the full register dump was printed again.
-pub fn null_write_probe_claim() -> bool {
-    use std::sync::atomic::Ordering;
-    if NULL_WRITE_PROBE_FIRED.swap(true, Ordering::Relaxed) {
-        return false;
-    }
-    NULL_WRITE_PROBE_PENDING.store(true, Ordering::Relaxed);
-    true
+/// Total size of the live guest heap allocations, in bytes, mirrored for the
+/// performance overlay's VMEM counter. The authoritative bookkeeping lives in
+/// [`allocator::Allocator`]; this copy exists because the overlay runs on the
+/// GL thread and must not lock the guest allocator.
+static GUEST_HEAP_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The RAM limiter's cap in bytes, or zero when the heap is uncapped. Mirrored
+/// like [`GUEST_HEAP_BYTES`] so the overlay can show `VMEM used/limit`.
+/// Zero can't be a real cap: `--memory-limit=0` is rejected and the graphical
+/// settings screen doesn't offer it.
+static GUEST_HEAP_LIMIT_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Publishes the allocator's heap total to [`GUEST_HEAP_BYTES`]. Called by
+/// [`allocator::Allocator`] whenever the total changes.
+pub(super) fn publish_guest_heap_bytes(bytes: GuestUSize) {
+    GUEST_HEAP_BYTES.store(bytes as u64, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Whether a claimed null-write probe is still waiting to be reported.
-pub fn null_write_probe_pending() -> bool {
-    NULL_WRITE_PROBE_PENDING.load(std::sync::atomic::Ordering::Relaxed)
+/// How much RAM the emulated app's heap currently uses, in bytes.
+///
+/// This is everything allocated in guest memory through the guest's own
+/// `malloc` and friends, including the objects the emulator allocates on the
+/// app's behalf. It is what the emulated process is holding, not the host
+/// process's whole working set, which also includes the emulator's own
+/// memory, the lazily-committed guest address space and the per-allocation
+/// overhead the allocator doesn't model.
+pub fn guest_heap_bytes() -> u64 {
+    GUEST_HEAP_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The RAM limiter's cap in bytes, or zero when the guest heap is uncapped.
+pub fn guest_heap_limit_bytes() -> u64 {
+    GUEST_HEAP_LIMIT_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A cheap, signal-safe summary of the most recent allocation at least 8 MiB.
+pub(crate) fn last_large_allocation() -> (VAddr, u64) {
+    let allocation = LAST_ALLOCATION.load(std::sync::atomic::Ordering::Relaxed);
+    ((allocation >> 32) as VAddr, allocation & u64::from(u32::MAX))
+}
+
+/// How many out-of-memory warnings have been printed since the last reset.
+///
+/// A guest app that has run out of memory usually retries the same failing
+/// allocation on every frame, so every allocation path shares this one small
+/// budget instead of each flooding the log with identical lines.
+static OUT_OF_MEMORY_LOG_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+const OUT_OF_MEMORY_LOG_LIMIT: usize = 8;
+
+/// Reports that `site` could not allocate `requested` bytes because the guest
+/// heap is full or has hit the RAM limiter's cap.
+///
+/// The first `OUT_OF_MEMORY_LOG_LIMIT` refusals are reported together with
+/// the heap's current usage, then a single notice says the rest are silenced,
+/// so a game that keeps retrying can't drown the log (the same approach
+/// `Mem::warn_wild_host_ptr` and the nil-isa warnings use).
+pub(crate) fn log_out_of_memory(site: &str, requested: GuestUSize) {
+    let count = OUT_OF_MEMORY_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let used = guest_heap_bytes();
+    let limit = guest_heap_limit_bytes();
+    if count < OUT_OF_MEMORY_LOG_LIMIT {
+        if limit > 0 {
+            log!(
+                "Warning: {}: can't allocate {:#x} bytes; the guest heap is using \
+                 {:#x} of its {:#x}-byte RAM limiter cap",
+                site,
+                requested,
+                used,
+                limit
+            );
+        } else {
+            log!(
+                "Warning: {}: can't allocate {:#x} bytes; the guest heap is using \
+                 {:#x} bytes and has no room left",
+                site,
+                requested,
+                used
+            );
+        }
+    } else if count == OUT_OF_MEMORY_LOG_LIMIT {
+        log!(
+            "Warning: out-of-memory warnings are silenced from now on ({} already \
+             logged)",
+            OUT_OF_MEMORY_LOG_LIMIT
+        );
+    }
+}
+
+/// Re-arms `log_out_of_memory`, e.g. for a new run or after the RAM limiter's
+/// cap changed, so the new situation gets its own few lines of diagnostics.
+pub(crate) fn reset_out_of_memory_log_budget() {
+    OUT_OF_MEMORY_LOG_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Allocation size at which a request is attributed to a guest call site.
+const ALLOCATION_SITE_MIN_SIZE: GuestUSize = 4096;
+/// Allocations of this size or more are also logged one by one: a heap that
+/// jumps by hundreds of megabytes comes from a handful of huge requests, and a
+/// warning per request names them directly.
+const LARGE_ALLOCATION_LOG_BYTES: u64 = 8 * 1024 * 1024;
+const LARGE_ALLOCATION_LOG_LIMIT: usize = 24;
+static LARGE_ALLOCATION_LOGS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+const LARGE_RELEASE_LOG_LIMIT: usize = 24;
+static LARGE_RELEASE_LOGS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Logs a release of at least [`LARGE_ALLOCATION_LOG_BYTES`], so the log shows
+/// whether the huge blocks behind a heap spike ever go back to the allocator.
+fn note_large_release(size: GuestUSize) {
+    if u64::from(size) < LARGE_ALLOCATION_LOG_BYTES {
+        return;
+    }
+    let logged = LARGE_RELEASE_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if logged < LARGE_RELEASE_LOG_LIMIT {
+        log!(
+            "Warning: {} MiB released; the guest heap now holds {} MiB",
+            u64::from(size) / (1024 * 1024),
+            guest_heap_bytes() / (1024 * 1024)
+        );
+    } else if logged == LARGE_RELEASE_LOG_LIMIT {
+        log!("Warning: further large-release warnings are silenced");
+    }
+}
+/// How many call sites the attribution table keeps.
+const ALLOCATION_SITE_SLOTS: usize = 8;
+/// Bytes of attributed allocations between reports; doubles each time.
+const ALLOCATION_SITE_FIRST_REPORT: u64 = 256 * 1024 * 1024;
+
+/// Who asks for the guest heap's large allocations, keyed by the guest return
+/// address of the host call `(site, bytes, allocations)`.
+///
+/// The guest heap is one address space shared by the app and everything it
+/// embeds (Mono's Boehm GC, PhysX, Unity's own pools), so an app whose heap
+/// balloons can't be diagnosed from the total alone: Unity's own accounting
+/// can report a few tens of megabytes while the heap is gigabytes. Blaming the
+/// call sites turns that into an answer, and it costs nothing on the `malloc`
+/// fast path because only requests of at least
+/// `ALLOCATION_SITE_MIN_SIZE` are recorded.
+static ALLOCATION_SITES: std::sync::Mutex<Vec<(VAddr, u64, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+static ALLOCATION_SITE_NEXT_REPORT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(ALLOCATION_SITE_FIRST_REPORT);
+static LAST_ALLOCATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Records that `size` bytes were allocated on the guest's behalf from the
+/// host call that returns to `site`.
+///
+/// Once the attributed total passes a threshold (256 MiB, then 512 MiB, then
+/// 1 GiB and so on) the biggest sites are logged, so a leak shows its caller
+/// instead of just filling the heap.
+pub(crate) fn note_allocation_site(site: VAddr, size: GuestUSize) {
+    if u64::from(size) >= LARGE_ALLOCATION_LOG_BYTES {
+        LAST_ALLOCATION.store(
+            (u64::from(site) << 32) | u64::from(size),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let logged = LARGE_ALLOCATION_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if logged < LARGE_ALLOCATION_LOG_LIMIT {
+            log!(
+                "Warning: {} MiB requested by guest code returning to {:#010x}; \
+                 the guest heap now holds {} MiB",
+                u64::from(size) / (1024 * 1024),
+                site,
+                guest_heap_bytes() / (1024 * 1024)
+            );
+        } else if logged == LARGE_ALLOCATION_LOG_LIMIT {
+            log!("Warning: further large-allocation warnings are silenced");
+        }
+    }
+    if size < ALLOCATION_SITE_MIN_SIZE {
+        return;
+    }
+    let Ok(mut sites) = ALLOCATION_SITES.lock() else {
+        return;
+    };
+    match sites.iter_mut().find(|entry| entry.0 == site) {
+        Some(entry) => {
+            entry.1 += u64::from(size);
+            entry.2 += 1;
+        }
+        None => sites.push((site, u64::from(size), 1)),
+    }
+    if sites.len() > ALLOCATION_SITE_SLOTS {
+        sites.sort_by(|a, b| b.1.cmp(&a.1));
+        sites.truncate(ALLOCATION_SITE_SLOTS);
+    }
+    let total: u64 = sites.iter().map(|entry| entry.1).sum();
+    let threshold = ALLOCATION_SITE_NEXT_REPORT.load(std::sync::atomic::Ordering::Relaxed);
+    if total < threshold
+        || ALLOCATION_SITE_NEXT_REPORT
+            .compare_exchange(
+                threshold,
+                threshold.saturating_mul(2),
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+    {
+        return;
+    }
+    log!(
+        "Warning: guest heap attribution: {} MiB in large allocations ({} MiB live in the heap)",
+        total / (1024 * 1024),
+        guest_heap_bytes() / (1024 * 1024)
+    );
+    let mut biggest: Vec<(VAddr, u64, u64)> = sites.clone();
+    biggest.sort_by(|a, b| b.1.cmp(&a.1));
+    for (site, bytes, allocations) in biggest {
+        log!(
+            "Warning:   returns to {:#010x}: {} KiB in {} allocations",
+            site,
+            bytes / 1024,
+            allocations
+        );
+    }
+}
+
+/// Claim one of the bounded null-write diagnostics for this app run.
+pub fn null_write_probe_claim(address: VAddr) -> Option<usize> {
+    use std::sync::atomic::Ordering;
+    let number = NULL_WRITE_PROBE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    NULL_WRITE_PROBE_ADDRESS.store(address, Ordering::Relaxed);
+    NULL_WRITE_PROBE_PENDING.store(number, Ordering::Relaxed);
+    // Every store aborts, however many there have been: the caller decides how
+    // many it can report, and past the budget a store is a real fault, the way
+    // Darwin would raise SIGSEGV, instead of a silent discard forever.
+    Some(number)
+}
+
+/// The claimed null-write diagnostic awaiting reporting, if any.
+pub fn null_write_probe_pending() -> Option<(usize, VAddr)> {
+    use std::sync::atomic::Ordering;
+    let number = NULL_WRITE_PROBE_PENDING.load(Ordering::Relaxed);
+    (number != 0).then(|| {
+        (
+            number,
+            NULL_WRITE_PROBE_ADDRESS.load(Ordering::Relaxed),
+        )
+    })
 }
 
 /// Mark the claimed probe as reported.
 pub fn null_write_probe_clear() {
-    NULL_WRITE_PROBE_PENDING.store(false, std::sync::atomic::Ordering::Relaxed);
+    NULL_WRITE_PROBE_PENDING.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Start a fresh bounded diagnostic budget for a newly launched app.
+pub fn reset_null_write_probes() {
+    use std::sync::atomic::Ordering;
+    NULL_WRITE_PROBE_PENDING.store(0, Ordering::Relaxed);
+    NULL_WRITE_PROBE_COUNT.store(0, Ordering::Relaxed);
+    FIRST_NULL_ACCESS.store(0, Ordering::Relaxed);
+}
+
+/// Record the first null-page fault site of this app run, so a later fatal
+/// report can name where the guest first used the bad pointer. Only the first
+/// site is kept: it is the one that explains the failure.
+pub fn note_null_fault_site(pc: u32, lr: u32, is_write: bool) {
+    use std::sync::atomic::Ordering;
+    let packed =
+        ((pc as u64) << 32) | ((lr as u64 & 0xffff_fffe) | is_write as u64);
+    let _ = FIRST_NULL_ACCESS.compare_exchange(
+        0,
+        packed,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+}
+
+/// The first null-page fault site of this app run: `(pc, lr, is_write)`.
+pub(crate) fn first_null_access() -> Option<(u32, u32, bool)> {
+    use std::sync::atomic::Ordering;
+    let packed = FIRST_NULL_ACCESS.load(Ordering::Relaxed);
+    (packed != 0).then(|| {
+        (
+            (packed >> 32) as u32,
+            (packed as u32) & 0xffff_fffe,
+            packed as u32 & 1 != 0,
+        )
+    })
+}
+
+#[cfg(test)]
+mod null_write_probe_tests {
+    use super::*;
+
+    #[test]
+    fn reports_each_null_write_up_to_the_run_limit() {
+        reset_null_write_probes();
+        for number in 1..=NULL_WRITE_PROBE_LIMIT {
+            assert_eq!(null_write_probe_claim(number as VAddr), Some(number));
+            assert_eq!(null_write_probe_pending(), Some((number, number as VAddr)));
+            null_write_probe_clear();
+        }
+        // Past the reporting budget the store still aborts, so the caller can
+        // stop the guest instead of discarding writes forever.
+        let past_limit = NULL_WRITE_PROBE_LIMIT + 1;
+        assert_eq!(null_write_probe_claim(0), Some(past_limit));
+        assert_eq!(null_write_probe_pending(), Some((past_limit, 0)));
+        null_write_probe_clear();
+        reset_null_write_probes();
+        assert_eq!(null_write_probe_claim(7), Some(1));
+        null_write_probe_clear();
+    }
 }
 
 pub struct Mem {
@@ -382,22 +717,18 @@ pub struct Mem {
     /// The flag to control if memory is zeroed out on free (`true`, default)
     /// or on alloc (`false`).
     ///
-    /// Right now only one game, Spore Origin, is setting this value to `false`
-    /// via a game-specific hack.
+    /// Selected legacy apps and `--zero-memory-on-alloc` set this to `false`.
+    /// Allocations are still reclaimed immediately; only scrubbing moves.
     /// See [crate::Environment] for more info.
     pub(super) zero_memory_on_free: bool,
 
-    /// HACK: 64 KiB backing region for null-page / OOB stub accesses, shared
-    /// by reads and writes. Zero-filled, so reading `*(void**)NULL` returns
-    /// NULL, and large enough that page-straddling `read<T>` / `write<T>` /
-    /// `bytes_at` calls near `0xfff` never truncate or overrun the buffer.
+    /// HACK: 64 KiB backing region for null-page / OOB stub accesses. Zero-
+    /// filled, so reading `*(void**)NULL` returns NULL, and large enough that
+    /// page-straddling scalar accesses near `0xfff` never overrun the buffer.
     null_page: *mut u8,
-    /// Pinned read-only fallback buffers `(ptr_addr, len)` for rare null/OOB
-    /// slices larger than `NULL_STUB_SIZE`. Once allocated, each buffer is
-    /// immutable until `Drop for Mem`, avoiding any aliasing or retag hazard.
+    /// Pinned fallback buffers for slices larger than the fixed null stub.
     oversize_null_reads: std::sync::Mutex<Vec<(usize, usize)>>,
-    /// Exclusive fallback buffer for mutable null/OOB slices larger than
-    /// `NULL_STUB_SIZE`.
+    /// Reusable contiguous backing for oversized null/OOB writes.
     oversize_null_write: Vec<u8>,
 }
 
@@ -482,6 +813,18 @@ impl Mem {
         };
 
         let allocator = allocator::Allocator::new();
+        publish_guest_heap_bytes(0);
+        GUEST_HEAP_LIMIT_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
+        reset_out_of_memory_log_budget();
+        if let Ok(mut sites) = ALLOCATION_SITES.lock() {
+            sites.clear();
+        }
+        ALLOCATION_SITE_NEXT_REPORT.store(
+            ALLOCATION_SITE_FIRST_REPORT,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        LARGE_ALLOCATION_LOGS.store(0, std::sync::atomic::Ordering::Relaxed);
+        LARGE_RELEASE_LOGS.store(0, std::sync::atomic::Ordering::Relaxed);
         Mem {
             bytes,
             null_segment_size: 0,
@@ -595,7 +938,7 @@ impl Mem {
                 // Insert a sentinel to emit the notice only once.
                 set.insert(0xFFFF_FFFE);
                 log!(
-                    "touchHLE::mem: further NULL-PAGE {} warnings silenced \
+                    "further NULL-PAGE {} warnings silenced \
                      after {} unique sites",
                     if is_write { "WRITE" } else { "READ" },
                     MAX_UNIQUE_LOGS
@@ -608,7 +951,7 @@ impl Mem {
             // Huge size is almost always a corrupted/-1 length; capture a
             // backtrace to identify the offending host function.
             log!(
-                "touchHLE::mem: backtrace for huge-size NULL-PAGE/OOB access:\n{}",
+                "backtrace for huge-size NULL-PAGE/OOB access:\n{}",
                 std::backtrace::Backtrace::force_capture()
             );
         }
@@ -635,6 +978,21 @@ impl Mem {
             set.len(),
             MAX_UNIQUE_LOGS
         );
+        // Show the calls that led here. This matters for reads too: a nil read
+        // is the usual black-screen signature, and the call that produced the
+        // bad pointer is often a few calls back.
+        {
+            use std::sync::atomic::Ordering;
+            static LAST_RING_GUEST_PC: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(u32::MAX);
+            let guest_pc = crate::environment::LAST_GUEST_PC.load(Ordering::Relaxed);
+            if LAST_RING_GUEST_PC.swap(guest_pc, Ordering::Relaxed) != guest_pc {
+                log!(
+                    "recent host calls (oldest first):{}",
+                    Self::host_call_ring_dump()
+                );
+            }
+        }
         if !is_write {
             return;
         }
@@ -660,7 +1018,7 @@ impl Mem {
         let thread = crate::environment::LAST_HOST_CALL_THREAD.load(Ordering::Relaxed);
         let symbol = Self::last_host_call_symbol();
         log!(
-            "touchHLE::mem:   guest PC={:#x} LR={:#x} (thread {}); host fn \
+            "  guest PC={:#x} LR={:#x} (thread {}); host fn \
              {} called with:{}; code at PC: [{}]; code at LR: [{}]",
             guest_pc,
             guest_lr,
@@ -671,7 +1029,7 @@ impl Mem {
             Self::guest_code_dump(mem, guest_lr)
         );
         log!(
-            "touchHLE::mem:   host backtrace:\n{}",
+            "  host backtrace:\n{}",
             std::backtrace::Backtrace::force_capture()
         );
     }
@@ -682,8 +1040,17 @@ impl Mem {
     /// concurrent dispatch can leave them mismatched.
     fn last_host_call_symbol() -> String {
         use std::sync::atomic::Ordering;
-        let ptr = crate::environment::LAST_HOST_CALL_SYMBOL_PTR.load(Ordering::Relaxed);
-        let len = crate::environment::LAST_HOST_CALL_SYMBOL_LEN.load(Ordering::Relaxed);
+        Self::host_call_symbol_at(
+            crate::environment::LAST_HOST_CALL_SYMBOL_PTR.load(Ordering::Relaxed),
+            crate::environment::LAST_HOST_CALL_SYMBOL_LEN.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Recover a symbol name recorded as a (pointer, length) pair. The length
+    /// is clamped and the bytes validated because the pointer and length are
+    /// stored by two separate relaxed stores, so a concurrent dispatch can
+    /// leave them mismatched.
+    fn host_call_symbol_at(ptr: usize, len: usize) -> String {
         const MAX_SYMBOL_LEN: usize = 512;
         if ptr == 0 || len == 0 || len > MAX_SYMBOL_LEN {
             return "<unknown>".to_string();
@@ -693,6 +1060,35 @@ impl Mem {
             Ok(s) => s.to_string(),
             Err(_) => "<unparsable>".to_string(),
         }
+    }
+
+    /// Format the recent host-function dispatches, oldest first.
+    pub(crate) fn host_call_ring_dump() -> String {
+        use std::sync::atomic::Ordering;
+        let idx = crate::environment::HOST_CALL_RING_IDX.load(Ordering::Relaxed);
+        let ring = &crate::environment::HOST_CALL_RING;
+        let mut out = String::new();
+        for offset in 0..ring.len() {
+            let record = &ring[idx.wrapping_add(offset) % ring.len()];
+            let ptr = record.symbol_ptr.load(Ordering::Relaxed);
+            if ptr == 0 {
+                // Not filled yet: the ring starts empty.
+                continue;
+            }
+            out.push_str(&format!(
+                "\n  {} pc={:#x} r0={:#x} r1={:#x} r2={:#x} r3={:#x}",
+                Self::host_call_symbol_at(ptr, record.symbol_len.load(Ordering::Relaxed)),
+                record.guest_pc.load(Ordering::Relaxed),
+                record.args[0].load(Ordering::Relaxed),
+                record.args[1].load(Ordering::Relaxed),
+                record.args[2].load(Ordering::Relaxed),
+                record.args[3].load(Ordering::Relaxed),
+            ));
+        }
+        if out.is_empty() {
+            out.push_str("\n  (none yet)");
+        }
+        out
     }
 
     /// Dump 8 words of guest memory at `addr` as little-endian hex words, for
@@ -796,6 +1192,13 @@ impl Mem {
         })
     }
 
+    /// Host address backing `addr`. Guest memory is one host mapping, so
+    /// `mmap` can alias a file straight into it.
+    #[inline]
+    pub fn host_ptr(&self, addr: MutVoidPtr) -> *mut u8 {
+        unsafe { self.bytes.cast::<u8>().add(addr.to_bits() as usize) }
+    }
+
     /// Get a slice for reading `count` bytes.
     /// This is the basic primitive for
     /// safe read-only memory access.
@@ -850,6 +1253,20 @@ impl Mem {
             return self.null_stub_slice_mut(ptr.to_bits(), count);
         }
         unsafe { std::slice::from_raw_parts_mut(self.bytes.cast::<u8>().add(addr), count as usize) }
+    }
+
+    /// A guest buffer readable by host kernel I/O, including untouched pages.
+    pub fn bytes_at_for_io<const MUT: bool>(&self, ptr: Ptr<u8, MUT>, count: GuestUSize) -> &[u8] {
+        let bytes = self.bytes_at(ptr, count);
+        host::prepare_for_host_io(bytes);
+        bytes
+    }
+
+    /// A guest buffer writable by host kernel I/O, including untouched pages.
+    pub fn bytes_at_mut_for_io(&mut self, ptr: MutPtr<u8>, count: GuestUSize) -> &mut [u8] {
+        let bytes = self.bytes_at_mut(ptr, count);
+        host::prepare_for_host_io(bytes);
+        bytes
     }
 
     /// Get a pointer for reading an array of `count` elements of type `T`.
@@ -949,14 +1366,14 @@ impl Mem {
         let n = LOGGED.fetch_add(1, Ordering::Relaxed);
         if n < MAX_LOGS {
             log!(
-                "touchHLE::mem: ignoring wild host pointer {:#x} handed to a GL array \
+                "ignoring wild host pointer {:#x} handed to a GL array \
                  binding (guest memory is {:#x}..{:#x}); using NULL instead",
                 host_ptr,
                 guest_mem_start,
                 guest_mem_end
             );
         } else if n == MAX_LOGS {
-            log!("touchHLE::mem: further wild host pointer warnings silenced");
+            log!("further wild host pointer warnings silenced");
         }
     }
 
@@ -1150,10 +1567,32 @@ impl Mem {
         }
     }
 
+    /// Caps the total size of the app's heap, in bytes.
+    ///
+    /// `None` (the default) leaves the heap uncapped. See `Options`'
+    /// `memory_limit_mb` field: the graphical settings screen's "RAM Limiter"
+    /// and `--memory-limit=` both end up here. Reserved segments (Mach-O
+    /// segments, the null segment, threads' stacks) are not part of the heap,
+    /// so they don't count against the cap.
+    pub fn set_memory_limit(&mut self, limit: Option<GuestUSize>) {
+        self.allocator.set_memory_limit(limit);
+        GUEST_HEAP_LIMIT_BYTES.store(
+            limit.unwrap_or(0) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        reset_out_of_memory_log_budget();
+    }
+
     /// Allocate `size` bytes.
+    ///
+    /// Returns NULL if the heap is full, including when the RAM limiter's cap
+    /// has been reached, just like `malloc` on a real device that ran out of
+    /// memory.
     pub fn alloc(&mut self, size: GuestUSize) -> MutVoidPtr {
         let ptr = Ptr::from_bits(self.allocator.alloc(size));
-        if !self.zero_memory_on_free {
+        // Do not touch guest memory when the allocation failed: the null page
+        // stub is only 64KiB and the request may be far larger.
+        if !self.zero_memory_on_free && !ptr.is_null() {
             self.bytes_at_mut(ptr.cast(), size).fill(0);
         }
 
@@ -1161,10 +1600,34 @@ impl Mem {
         ptr
     }
 
+    /// Claim an exact, page-aligned range for Mach fixed mappings. Unlike
+    /// permanent reservations, this counts toward the guest heap limit.
+    pub fn alloc_fixed(&mut self, base: VAddr, size: GuestUSize) -> bool {
+        if !self.allocator.alloc_fixed(base, size) {
+            return false;
+        }
+        if !self.zero_memory_on_free {
+            self.bytes_at_mut(Ptr::from_bits(base), size).fill(0);
+        }
+        true
+    }
+
+    /// Allocate pages satisfying an alignment mask and minimum address.
+    pub fn alloc_aligned(&mut self, size: GuestUSize, mask: VAddr, minimum: VAddr) -> MutVoidPtr {
+        let minimum = minimum.max(self.null_segment_size());
+        let ptr = Ptr::from_bits(self.allocator.alloc_aligned(size, mask, minimum));
+        if !self.zero_memory_on_free && !ptr.is_null() {
+            self.bytes_at_mut(ptr.cast(), size).fill(0);
+        }
+        ptr
+    }
+
     /// Allocate `size` bytes initialized to 0.
     pub fn calloc(&mut self, size: GuestUSize) -> MutVoidPtr {
         let ptr = self.alloc(size);
-        self.bytes_at_mut(ptr.cast(), size).fill(0);
+        if !ptr.is_null() {
+            self.bytes_at_mut(ptr.cast(), size).fill(0);
+        }
         ptr
     }
 
@@ -1197,6 +1660,20 @@ impl Mem {
     /// inspect guest heap memory.
     pub fn live_allocations(&self) -> Vec<(GuestUSize, GuestUSize)> {
         self.allocator.live_allocations()
+    }
+
+    /// Replace a byte in a live guest allocation and return its previous value.
+    /// Returns `None` if `addr` is not inside a live allocation.
+    pub fn corrupt_byte(&mut self, addr: GuestUSize, value: u8) -> Option<u8> {
+        self.allocator
+            .live_allocations()
+            .into_iter()
+            .find(|(base, size)| addr >= *base && addr.wrapping_sub(*base) < *size)?;
+        let ptr: MutPtr<u8> = Ptr::from_bits(addr);
+        let byte = &mut self.bytes_at_mut(ptr, 1)[0];
+        let previous = *byte;
+        *byte = value;
+        Some(previous)
     }
 
     pub fn realloc(&mut self, old_ptr: MutVoidPtr, size: GuestUSize) -> MutVoidPtr {
@@ -1233,6 +1710,11 @@ impl Mem {
         }
 
         let new_ptr = self.alloc(size);
+        if new_ptr.is_null() {
+            // Like C's realloc(), leave the old block untouched: the caller
+            // still owns it, and there is nothing to copy into.
+            return new_ptr;
+        }
         self.memmove(new_ptr, old_ptr.cast_const(), old_size);
         self.free(old_ptr);
         new_ptr
@@ -1256,8 +1738,17 @@ impl Mem {
             return;
         }
         let size = self.allocator.free(addr);
+        note_large_release(size);
         if self.zero_memory_on_free {
             self.bytes_at_mut(ptr.cast(), size).fill(0);
+        }
+        // Only zero-on-free allocations can be discarded without changing
+        // the contents observed when the allocator reuses them.
+        if self.zero_memory_on_free {
+            if let Some((start, len)) = released_page_range(addr, size) {
+                let host_ptr = unsafe { self.bytes.cast::<u8>().add(start) };
+                let _ = unsafe { host::release_guest_pages(host_ptr.cast(), len) };
+            }
         }
 
         log_dbg!("Freed {:?} ({:#x} bytes)", ptr, size);
@@ -1332,7 +1823,10 @@ impl Mem {
     /// POSIX paths and most guest C strings are byte strings, so callers that
     /// must accept arbitrary bytes (e.g. `open(2)`, which the kernel never
     /// validates as UTF-8) use this instead of [Self::cstr_at_utf8].
-    pub fn cstr_at_utf8_lossy<const MUT: bool>(&self, ptr: Ptr<u8, MUT>) -> std::borrow::Cow<'_, str> {
+    pub fn cstr_at_utf8_lossy<const MUT: bool>(
+        &self,
+        ptr: Ptr<u8, MUT>,
+    ) -> std::borrow::Cow<'_, str> {
         match self.cstr_at_utf8(ptr) {
             Ok(s) => std::borrow::Cow::Borrowed(s),
             Err(bytes) => String::from_utf8_lossy(bytes),
@@ -1416,6 +1910,42 @@ impl Mem {
 #[cfg(test)]
 mod mem_tests {
     use super::{Mem, MutPtr, Ptr};
+
+    // Host file I/O must work before any guest instruction has touched these
+    // pages. On Windows ReadFile/WriteFile probe buffers in kernel mode and
+    // cannot enter the guest mapping's user-mode commit handler.
+    // https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/read.2.html
+    #[test]
+    fn kernel_io_accesses_untouched_guest_pages() {
+        use std::io::{Read, Write};
+        let mut mem = Mem::new();
+        mem.set_null_segment_size(super::PAGE_SIZE);
+        let base = 0x7000_0000;
+        mem.reserve(base, 6 * super::PAGE_SIZE);
+        let buffer: MutPtr<u8> = Ptr::from_bits(base + super::PAGE_SIZE - 3);
+        let expected = vec![0x5a; super::PAGE_SIZE as usize + 32];
+        let path =
+            std::env::temp_dir().join(format!("hyperhle-guest-io-{}.bin", std::process::id()));
+        let result = (|| -> std::io::Result<()> {
+            std::fs::write(&path, &expected)?;
+            let mut file = std::fs::File::open(&path)?;
+            let actual = mem.bytes_at_mut_for_io(buffer, expected.len() as u32);
+            assert_eq!(file.read(actual)?, expected.len());
+            assert_eq!(actual, expected);
+            // Writing untouched pages must transfer their zero contents,
+            // including a last partial page, without altering those pages.
+            let zeros: MutPtr<u8> = Ptr::from_bits(base + 4 * super::PAGE_SIZE + 3);
+            let bytes = mem.bytes_at_for_io(zeros, super::PAGE_SIZE + 16);
+            let mut output = std::fs::File::create(&path)?;
+            assert_eq!(output.write(bytes)?, bytes.len());
+            drop(output);
+            assert_eq!(std::fs::read(&path)?, vec![0; bytes.len()]);
+            Ok(())
+        })();
+        let cleanup = std::fs::remove_file(path);
+        result.unwrap();
+        cleanup.unwrap();
+    }
 
     #[test]
     fn lazy_commit_far_addresses() {
@@ -1566,6 +2096,33 @@ mod mem_tests {
     }
 
     #[test]
+    fn corrupt_byte_only_writes_inside_live_allocations() {
+        let mut mem = Mem::new();
+        mem.set_null_segment_size(super::PAGE_SIZE);
+        let allocation = mem.alloc(4);
+        let base = allocation.to_bits();
+        mem.bytes_at_mut(allocation.cast(), 4)
+            .copy_from_slice(&[1, 2, 3, 4]);
+
+        assert_eq!(mem.corrupt_byte(base + 2, 99), Some(3));
+        assert_eq!(
+            mem.bytes_at(allocation.cast::<u8>().cast_const(), 4),
+            &[1, 2, 99, 4]
+        );
+
+        mem.free(allocation);
+        assert!(
+            !mem.live_allocations().iter().any(|(live_base, size)| {
+                base + 2 >= *live_base && base + 2 - *live_base < *size
+            }),
+            "base {base:#x}; live {:?}",
+            mem.live_allocations()
+        );
+        assert_eq!(mem.corrupt_byte(base + 2, 100), None);
+        assert_eq!(mem.corrupt_byte(base + 16, 100), None);
+    }
+
+    #[test]
     fn cstr_at_utf8_lossy_keeps_non_utf8_paths_usable() {
         // Unity's shader cache opens paths whose name ends in uninitialised
         // bytes. POSIX paths are byte strings, so the helper must return a
@@ -1576,10 +2133,7 @@ mod mem_tests {
             .copy_from_slice(&[b'/', b'a', 0xA5, b'b', 0xAA, 0]);
 
         assert!(mem.cstr_at_utf8(p).is_err());
-        assert_eq!(
-            mem.cstr_at_utf8_lossy(p).as_ref(),
-            "/a\u{FFFD}b\u{FFFD}"
-        );
+        assert_eq!(mem.cstr_at_utf8_lossy(p).as_ref(), "/a\u{FFFD}b\u{FFFD}");
         // '/', 'a', U+FFFD, 'b', U+FFFD: each bad byte becomes one
         // replacement character, and the name stays stable across calls so
         // repeated opens of one cache entry still hit the same file.

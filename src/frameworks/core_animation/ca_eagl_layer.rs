@@ -292,7 +292,10 @@ fn fullscreen_frame_matches_screen(frame: CGRect, screen: CGRect) -> bool {
 /// If there is an opaque `CAEAGLLayer` that covers the entire screen, this
 /// returns a pointer to it. Otherwise, it returns [nil].
 pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
-    if env.options.force_composition {
+    if env.options.force_composition || super::view_transition::has_active(env) {
+        log_once!(
+            "Bypassing fullscreen EAGL fast path (forced composition or active transition)."
+        );
         return nil;
     }
 
@@ -338,6 +341,8 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
             anchor_point,
             hidden,
             opacity,
+            mask,
+            clipped,
         ) = {
             let host = env.objc.borrow::<CALayerHostObject>(layer);
             (
@@ -347,6 +352,8 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
                 host.anchor_point,
                 host.hidden,
                 host.opacity,
+                host.mask,
+                host.masks_to_bounds && host.corner_radius > 0.0,
             )
         };
         let transform_kind = classify_fullscreen_layer_transform(affine_transform, orientation);
@@ -380,10 +387,12 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
             || hidden
             || opacity != 1.0
             || !transform_is_usable
+            || mask != nil
+            || clipped
         {
             if crate::env_flag_cached!("TOUCHHLE_TRACE_PRESENT") {
                 log!(
-                    "FULLSCREEN-DIAG layer {:?} rejected: frame={:?} screen={:?} frame_match={} bounds={:?} bounds_origin={:?} anchor={:?} hidden={} opacity={} transform={:?} sl2l={:?} orientation={:?} transform_kind={:?} transform_usable={}",
+                    "FULLSCREEN-DIAG layer {:?} rejected: frame={:?} screen={:?} frame_match={} bounds={:?} bounds_origin={:?} anchor={:?} hidden={} opacity={} transform={:?} sl2l={:?} orientation={:?} transform_kind={:?} transform_usable={} mask={:?} clipped={}",
                     layer,
                     layer_frame,
                     screen_bounds,
@@ -397,7 +406,9 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
                     superlayer_to_layer_transform,
                     orientation,
                     transform_kind,
-                    transform_is_usable
+                    transform_is_usable,
+                    mask,
+                    clipped,
                 );
             }
             return nil;
@@ -738,9 +749,12 @@ pub fn clear_presented_pixels(env: &mut Environment, layer: id) {
 /// Records that `EAGLContext presentRenderbuffer:` presented this layer's
 /// drawable directly to the window, bypassing `presented_pixels`.
 pub fn mark_presented_directly(env: &mut Environment, layer: id) {
-    env.objc
-        .borrow_mut::<CALayerHostObject>(layer)
-        .presented_directly = true;
+    let host = env.objc.borrow_mut::<CALayerHostObject>(layer);
+    host.presented_directly = true;
+    // Retire the old readback when presentation changes back to the GPU.
+    // Otherwise run-loop composition keeps swapping the cached frame over
+    // the newer direct frames, including stale text and control state.
+    host.presented_pixels = None;
 }
 
 /// Stores the new rendered frame in the layer and marks the GLES texture as

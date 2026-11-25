@@ -17,7 +17,7 @@
 use super::ns_string;
 use super::NSUInteger;
 use crate::libc::posix_io;
-use crate::mem::{ConstPtr, ConstVoidPtr};
+use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr};
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
     NSZonePtr,
@@ -25,6 +25,43 @@ use crate::objc::{
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
+
+#[cfg(test)]
+mod file_handle_error_tests {
+    use super::*;
+
+    #[test]
+    fn missing_file_returns_error_and_accepts_null_error_pointer() {
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let path = ns_string::get_static_str(env, "/no-such-directory/file");
+        let url: id = msg_class![env; NSURL fileURLWithPath:path];
+        let error = env.mem.alloc_and_write(nil);
+        let handle: id = msg_class![env; NSFileHandle
+            fileHandleForWritingToURL:url error:error];
+        assert_eq!(handle, nil);
+        let failure: id = env.mem.read(error);
+        assert_ne!(failure, nil);
+        let code: i32 = msg![env; failure code];
+        assert_eq!(code, super::super::ns_error::NSFileWriteUnknownError);
+        let domain: id = msg![env; failure domain];
+        assert_eq!(ns_string::to_rust_string(env, domain), "NSCocoaErrorDomain");
+        let no_error = MutPtr::<id>::null();
+        let handle: id = msg_class![env; NSFileHandle
+            fileHandleForWritingToURL:url error:no_error];
+        assert_eq!(handle, nil);
+        let sentinel = ns_string::get_static_str(env, "old error");
+        env.mem.write(error, sentinel);
+        let handle: id = msg_class![env; NSFileHandle
+            fileHandleForWritingToURL:nil error:error];
+        assert_eq!(handle, nil);
+        assert_ne!(env.mem.read(error), sentinel);
+        assert_ne!(env.mem.read(error), nil);
+        env.mem.free(error.cast());
+        let _: () = msg![env; pool drain];
+    }
+}
 
 /// One in-process pipe — shared between the reading and writing
 /// `NSFileHandle`s vended by an `NSPipe`.
@@ -169,6 +206,29 @@ pub const CLASSES: ClassExports = objc_classes! {
             autorelease(env, new)
         },
     }
+}
+
+// iOS 7+ URL-based factory. Crashlytics uses it to open its log file;
+// without it the SDK gets a nil handle and keeps retrying.
++ (id)fileHandleForWritingToURL:(id)url error:(MutPtr<id>)error {
+    let path: id = if url == nil { nil } else { msg![env; url path] };
+    let handle: id = if path == nil {
+        nil
+    } else {
+        msg![env; this fileHandleForWritingAtPath:path]
+    };
+    if handle == nil && !error.is_null() {
+        // shortcut: generic error until the filesystem preserves open failures.
+        // https://developer.apple.com/documentation/foundation/cocoaerror/code/filewriteunknown
+        let domain = ns_string::get_static_str(
+            env, super::ns_error::NSCocoaErrorDomain,
+        );
+        let code = super::ns_error::NSFileWriteUnknownError;
+        let failure: id = msg_class![env; NSError errorWithDomain:domain
+            code:code userInfo:nil];
+        env.mem.write(error, failure);
+    }
+    handle
 }
 
 + (id)fileHandleForUpdatingAtPath:(id)path { // NSString*

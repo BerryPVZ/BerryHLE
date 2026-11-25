@@ -1,18 +1,18 @@
-# HyperHLE for iOS
+# AppleJuiceHLE for iOS
 
-A native iOS app that runs the HyperHLE core on modern iPhones and iPads. It
+A native iOS app that runs the AppleJuiceHLE core on modern iPhones and iPads. It
 plays supported 32-bit iPhone OS games through high-level emulation and the
 Dynarmic JIT. No games or Apple software are included.
 
 The iOS app, its build scripts and its packaging come from
 [Applesauce](https://github.com/johnny901901901/Applesauce), an unaffiliated
-iOS port of touchHLE and HyperHLE. This directory is that host app, rebranded
+iOS port of touchHLE and AppleJuiceHLE. This directory is that host app, rebranded
 and built against this repository's core. Applesauce is not connected to this
 fork, so report problems here rather than there.
 
 ## Downloads
 
-Every run of the [HyperHLE CI workflow](https://github.com/KlugKlugTG/HyperHLE-Reborn/actions/workflows/HyperHLE_release.yml)
+Every run of the [AppleJuiceHLE CI workflow](https://github.com/KlugKlugTG/HyperHLE-Reborn/actions/workflows/HyperHLE_release.yml)
 uploads the three IPAs below as separate artifacts, and
 [releases](https://github.com/KlugKlugTG/HyperHLE-Reborn/releases) attach them
 too:
@@ -43,10 +43,10 @@ Dynarmic needs executable memory, so JIT has to be enabled whenever the app
 starts as a new process:
 
 - **StikDebug (iOS 17.4+):** pair StikDebug with your device, connect its
-  loopback VPN, then tap the bolt button in the HyperHLE library.
-- **TrollStore (iOS 15.0–17.0):** use TrollStore's **Enable JIT** on HyperHLE
+  loopback VPN, then tap the bolt button in the AppleJuiceHLE library.
+- **TrollStore (iOS 15.0–17.0):** use TrollStore's **Enable JIT** on AppleJuiceHLE
   before starting a game.
-- **AltJIT:** in AltStore, long-press HyperHLE under **My Apps** and choose
+- **AltJIT:** in AltStore, long-press AppleJuiceHLE under **My Apps** and choose
   **Enable JIT**.
 
 ## Importing games
@@ -108,5 +108,5 @@ the `ios-core-dylib` branch of johnny901901901/touchHLE) when running
 
 ## License
 
-MPL-2.0, like the rest of HyperHLE, subject to the third-party licences of the
+MPL-2.0, like the rest of AppleJuiceHLE, subject to the third-party licences of the
 bundled components.

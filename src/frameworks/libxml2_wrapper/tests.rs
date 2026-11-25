@@ -36,8 +36,12 @@ fn user_defaults_dump_and_free_round_trip() {
         assert!(!root.is_null());
         assert!(xmlDocSetRootElement(doc, root).is_null());
         assert!(!xmlNewChild(
-            root, ptr::null_mut(), b"coins\0".as_ptr(), b"135\0".as_ptr(),
-        ).is_null());
+            root,
+            ptr::null_mut(),
+            b"coins\0".as_ptr(),
+            b"135\0".as_ptr(),
+        )
+        .is_null());
 
         for format in 0..2 {
             let mut buffer = ptr::null_mut();
@@ -52,17 +56,24 @@ fn user_defaults_dump_and_free_round_trip() {
             let bytes = read_xml_str(buffer);
             assert_eq!(bytes.len(), size as usize);
             xmlFree(buffer.cast());
-            assert!(bytes.windows(b"<coins>135</coins>".len())
+            assert!(bytes
+                .windows(b"<coins>135</coins>".len())
                 .any(|w| w == b"<coins>135</coins>"));
 
             let parsed = xmlReadMemory(
-                bytes.as_ptr().cast(), bytes.len() as c_int,
-                ptr::null(), ptr::null(), 0,
+                bytes.as_ptr().cast(),
+                bytes.len() as c_int,
+                ptr::null(),
+                ptr::null(),
+                0,
             );
             assert!(!parsed.is_null());
             let content = xmlNodeGetContent(xmlDocGetRootElement(parsed));
             assert!(!content.is_null());
-            assert_eq!(String::from_utf8(read_xml_str(content)).unwrap().trim(), "135");
+            assert_eq!(
+                String::from_utf8(read_xml_str(content)).unwrap().trim(),
+                "135"
+            );
             xmlFree(content.cast());
             xmlFreeDoc(parsed);
         }

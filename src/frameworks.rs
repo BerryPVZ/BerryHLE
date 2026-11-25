@@ -40,6 +40,7 @@ pub mod core_audio_types;
 pub mod core_bluetooth;
 pub mod core_foundation;
 pub mod core_graphics;
+pub mod core_haptics;
 pub mod core_image;
 pub mod core_location;
 pub mod core_media;
@@ -62,6 +63,7 @@ pub mod media_player;
 pub mod media_toolbox;
 pub mod message_ui;
 pub mod metal;
+pub mod metric_kit;
 pub mod mobile_core_services;
 pub mod mopub;
 pub mod openal;
@@ -90,6 +92,8 @@ pub struct State {
     avfoundation: avfoundation::State,
     core_animation: core_animation::State,
     core_foundation: core_foundation::State,
+    core_graphics: core_graphics::State,
+    core_motion: core_motion::State,
     foundation: foundation::State,
     pub game_kit: game_kit::State,
     pub store_kit: store_kit::State,

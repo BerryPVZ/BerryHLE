@@ -126,7 +126,7 @@ fn thread_get_state(
         return KERN_INVALID_ARGUMENT;
     };
     if flavor != MACHINE_THREAD_STATE || thread_id >= env.threads.len()
-        || !env.threads[thread_id].active || old_state.is_null() || old_state_count.is_null()
+        || !env.threads[thread_id].is_alive() || old_state.is_null() || old_state_count.is_null()
     {
         return KERN_INVALID_ARGUMENT;
     }

@@ -289,7 +289,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     if title != nil {
         retain(env, title);
     }
-    retain(env, target);
 
     if target != nil {
         () = msg![env; this addTarget:target action:action forControlEvents:UIControlEventTouchUpInside];
@@ -350,7 +349,6 @@ pub const CLASSES: ClassExports = objc_classes! {
         retain(env, image_view);
     }
     if target != nil {
-        retain(env, target);
         () = msg![env; this addTarget:target action:action forControlEvents:UIControlEventTouchUpInside];
     }
 
@@ -414,7 +412,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     host.label = label;
 
     if target != nil {
-        retain(env, target);
         () = msg![env; this addTarget:target action:action forControlEvents:UIControlEventTouchUpInside];
     }
 
@@ -507,11 +504,6 @@ pub const CLASSES: ClassExports = objc_classes! {
          action:(SEL)action
 forControlEvents:(UIControlEvents)events {
     let events = if events == 0 {
-        if target != nil {
-            retain(env, target);
-        }
-        let old_target = env.objc.borrow::<UIBarButtonItemHostObject>(this).target;
-        release(env, old_target);
         let host = env.objc.borrow_mut::<UIBarButtonItemHostObject>(this);
         host.target = target;
         host.action = Some(action);
@@ -724,7 +716,7 @@ forControlEvents:(UIControlEvents)events {
         title,
         image,
         style: _,
-        target,
+        target: _,
         action: _,
         system_item: _,
         label,
@@ -732,11 +724,10 @@ forControlEvents:(UIControlEvents)events {
         width: _,
     } = std::mem::take(env.objc.borrow_mut(this));
 
-    log_dbg!("dealloc [(UIBarButtonItem*){:?} title {:?}, target {:?}, label {:?}, custom_view {:?}]", this, title, target, label, custom_view);
+    log_dbg!("dealloc [(UIBarButtonItem*){:?} title {:?}, label {:?}, custom_view {:?}]", this, title, label, custom_view);
 
     release(env, title);
     release(env, image);
-    release(env, target);
     release(env, label);
     // Не забываем очистить кастомный виджет
     release(env, custom_view);

@@ -106,16 +106,16 @@ pub const CONSTANTS: ConstantExports = &[
     ),
 ];
 
-struct CAAnimationHostObject {
+pub(crate) struct CAAnimationHostObject {
     removed_on_completion: bool,
     timing_function: id, // CAMediaTimingFunction*
     delegate: id,        // CAAnimationDelegate*
     autoreverses: bool,
     repeat_count: f32,
-    begin_time: CFTimeInterval,
-    duration: CFTimeInterval,
+    pub(crate) begin_time: CFTimeInterval,
+    pub(crate) duration: CFTimeInterval,
     fill_mode: &'static str,
-    started_at: Option<CFTimeInterval>,
+    pub(crate) started_at: Option<CFTimeInterval>,
     completion_reported: bool,
     implicit: bool,
 }
@@ -177,8 +177,8 @@ impl_HostObject_with_superclass!(CAAnimationGroupHostObject);
 /// transition via key-value coding). Apple's runtime silently stores those
 /// values via the generic KVC machinery, so we mirror that here by giving
 /// `CATransition` its own backing storage for them.
-struct CATransitionHostObject {
-    superclass: CAAnimationHostObject,
+pub(crate) struct CATransitionHostObject {
+    pub(crate) superclass: CAAnimationHostObject,
     // `CATransition` properties.
     type_value: &'static str,
     subtype: Option<&'static str>,
@@ -707,6 +707,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 };
 
+/// Record that `animation` has begun, so it is not restarted.
+pub fn set_animation_start_time(env: &mut Environment, animation: id, time: CFTimeInterval) {
+    env.objc
+        .borrow_mut::<CAAnimationHostObject>(animation)
+        .started_at = Some(time);
+}
+
 pub fn get_animation_start_time(
     env: &mut Environment,
     animation: id,
@@ -740,7 +747,9 @@ pub fn has_animation_state(env: &mut Environment, animation: id) -> bool {
 }
 
 pub fn mark_implicit(env: &mut Environment, animation: id) {
-    env.objc.borrow_mut::<CAAnimationHostObject>(animation).implicit = true;
+    env.objc
+        .borrow_mut::<CAAnimationHostObject>(animation)
+        .implicit = true;
 }
 
 pub fn is_implicit(env: &mut Environment, animation: id) -> bool {

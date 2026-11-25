@@ -21,12 +21,15 @@ use crate::frameworks::foundation::ns_run_loop::run_run_loop_single_iteration;
 use crate::frameworks::foundation::ns_string;
 use crate::frameworks::foundation::NSInteger;
 use crate::frameworks::uikit::ui_font::{
-    UITextAlignmentCenter, UITextAlignmentLeft, UITextAlignmentRight,
+    UILineBreakModeWordWrap, UITextAlignmentCenter, UITextAlignmentLeft,
 };
 use crate::frameworks::uikit::ui_gesture_recognizer::{
     UISwipeGestureRecognizerDirectionLeft, UISwipeGestureRecognizerDirectionRight,
 };
 use crate::frameworks::uikit::ui_graphics::{UIGraphicsPopContext, UIGraphicsPushContext};
+use crate::frameworks::uikit::ui_keyboard::{
+    UIKeyboardTypeDefault, UIKeyboardTypeNumbersAndPunctuation, UIReturnKeyDone,
+};
 use crate::frameworks::uikit::ui_view::ui_control::ui_button::UIButtonTypeCustom;
 use crate::frameworks::uikit::ui_view::ui_control::{
     UIControlEventTouchCancel, UIControlEventTouchDown, UIControlEventTouchDragExit,
@@ -34,19 +37,84 @@ use crate::frameworks::uikit::ui_view::ui_control::{
     UIControlEventTouchUpOutside, UIControlEventValueChanged, UIControlStateNormal,
 };
 use crate::fs::BundleData;
-use crate::image::Image;
+use crate::image::{load_image_cached, Image};
 use crate::mem::Ptr;
 use crate::objc::{id, msg, msg_class, nil, objc_classes, release, ClassExports, HostObject};
-use crate::options::{Options, PerformanceOverlayCorner, PerformanceOverlayMode};
+use crate::options::{
+    Button, Options, PerformanceOverlayCorner, PerformanceOverlayMode, PresentMode, RendererMode,
+    VsyncMode,
+};
 use crate::paths;
-use crate::window::DeviceOrientation;
+use crate::window::{DeviceFamily, DeviceOrientation};
 use crate::Environment;
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, AtomicI8, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Cached information about a scanned app, stored on disk so the app picker
+/// doesn't have to open and parse every `.ipa`/`.app` bundle on every launch.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct CachedApp {
+    path: String,
+    /// File modification time in nanoseconds since the Unix epoch.
+    mtime_ns: u64,
+    /// File size in bytes.
+    size: u64,
+    /// Raw PNG bytes of the app's icon, so it can be re-decoded from the
+    /// image cache without re-opening the bundle.
+    icon_bytes: Vec<u8>,
+    /// Whether iOS would apply the pre-iOS 7 sheen effect to this icon
+    /// (`UIPrerenderedIcon` is absent or NO). Needed because the picked icon
+    /// bytes are cached before the corners are rounded.
+    icon_adds_sheen: bool,
+    display_name: String,
+    bundle_id: String,
+}
+
+/// Path of the app scan cache file, inside the user data directory.
+fn app_scan_cache_path() -> PathBuf {
+    paths::user_data_base_path().join("app_scan_cache.json")
+}
+
+/// Reads the app scan cache from disk. Returns an empty map on any error.
+fn read_app_scan_cache() -> HashMap<String, CachedApp> {
+    let Ok(text) = std::fs::read_to_string(&app_scan_cache_path()) else {
+        return HashMap::new();
+    };
+    let Ok(list) = serde_json::from_str::<Vec<CachedApp>>(&text) else {
+        return HashMap::new();
+    };
+    list.into_iter()
+        .map(|app| (app.path.clone(), app))
+        .collect()
+}
+
+/// Writes the app scan cache to disk. Errors are ignored: a failed write just
+/// means re-scanning next time.
+fn write_app_scan_cache(apps: &[CachedApp]) {
+    let Ok(json) = serde_json::to_string(apps) else {
+        return;
+    };
+    if let Err(error) = std::fs::write(&app_scan_cache_path(), json) {
+        log!("Warning: couldn't write app scan cache: {error}");
+    }
+}
+
+/// File metadata used to decide whether a cached app entry is still valid.
+fn file_signature(path: &Path) -> Option<(u64, u64)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let mtime = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as u64;
+    Some((mtime, metadata.len()))
+}
 
 /// Pending left (-1) or right (+1) arrow key press, 0 if none. Written by the
 /// window event handler and consumed by the picker loop.
@@ -74,10 +142,8 @@ struct AppInfo {
     icon_ui_image: Option<id>,
 }
 
-const LAST_APP_FILE: &str = "touchHLE_last_app.txt";
-
 fn last_app_record_path() -> PathBuf {
-    paths::user_data_base_path().join(LAST_APP_FILE)
+    paths::user_data_base_path().join(paths::LAST_APP_FILE)
 }
 
 fn read_last_app_path() -> Option<PathBuf> {
@@ -91,11 +157,14 @@ fn remember_last_app_path(path: &Path) {
     }
 }
 
-pub fn app_picker(options: Options, show_lock_screen: bool) -> Result<(PathBuf, Vec<String>), String> {
+pub fn app_picker(
+    options: Options,
+    show_lock_screen: bool,
+) -> Result<(PathBuf, Vec<String>), String> {
     let apps_dir = paths::user_data_base_path().join(paths::APPS_DIR);
 
     let apps: Result<Vec<AppInfo>, String> = if !apps_dir.is_dir() {
-        Err(format!("The {} directory couldn't be found. Check you're running touchHLE from the right directory.", apps_dir.display()))
+        Err(format!("The {} directory couldn't be found. Check you're running AppleJuiceHLE from the right directory.", apps_dir.display()))
     } else {
         enumerate_apps(&apps_dir).map_err(|err| {
             format!(
@@ -109,54 +178,141 @@ pub fn app_picker(options: Options, show_lock_screen: bool) -> Result<(PathBuf, 
     show_app_picker_gui(options, apps, show_lock_screen)
 }
 
+/// Result of scanning one app bundle: metadata plus the icon's raw bytes
+/// (so the icon can be re-decoded from cache without re-opening the bundle).
+struct ScanResult {
+    path: PathBuf,
+    display_name: String,
+    bundle_id: String,
+    icon_bytes: Option<Vec<u8>>,
+    /// See `CachedApp::icon_adds_sheen`.
+    icon_adds_sheen: bool,
+}
+
+/// Scan a single `.app`/`.ipa` bundle, returning its metadata and icon bytes.
+fn scan_one_app(app_path: &Path) -> Option<ScanResult> {
+    let (bundle, fs) = BundleData::open_any(app_path)
+        .and_then(|bundle_data| {
+            Bundle::new_bundle_and_fs_from_host_path(bundle_data, /* read_only_mode: */ true)
+        })
+        .ok()?;
+
+    let display_name = bundle.display_name().to_owned();
+    let bundle_id = bundle.bundle_identifier().to_owned();
+
+    // Pick the icon exactly like `Bundle::load_icon` does (highest decoded
+    // resolution, UIPrerenderedIcon for the sheen), but keep the raw bytes so
+    // the scan cache can store them.
+    let (icon_bytes, icon_adds_sheen) = match bundle.best_icon_data(&fs) {
+        Ok((bytes, add_sheen)) => (Some(bytes), add_sheen),
+        Err(e) => {
+            log!(
+                "Warning: couldn't load icon for app bundle {}: {} (displaying placeholder instead)",
+                app_path.display(),
+                e
+            );
+            (None, true)
+        }
+    };
+
+    Some(ScanResult {
+        path: app_path.to_path_buf(),
+        display_name,
+        bundle_id,
+        icon_bytes,
+        icon_adds_sheen,
+    })
+}
+
 fn enumerate_apps(apps_dir: &Path) -> Result<Vec<AppInfo>, std::io::Error> {
+    let cache = read_app_scan_cache();
     let mut apps = Vec::new();
+    let mut refreshed_cache = Vec::new();
     let mut directories = vec![apps_dir.to_path_buf()];
+
     while let Some(directory) = directories.pop() {
         for entry in std::fs::read_dir(directory)? {
             let app_path = entry?.path();
             let extension = app_path.extension();
             if extension == Some(OsStr::new("app")) || extension == Some(OsStr::new("ipa")) {
-                let (bundle, fs) = match BundleData::open_any(&app_path).and_then(|bundle_data| {
-                    Bundle::new_bundle_and_fs_from_host_path(
-                        bundle_data,
-                        /* read_only_mode: */ true,
-                    )
-                }) {
-                    Ok(ok) => ok,
-                    Err(e) => {
-                        log!(
-                            "Warning: couldn't open app bundle {}: {} (skipping)",
-                            app_path.display(),
-                            e
-                        );
-                        continue;
-                    }
+                let signature = file_signature(&app_path);
+                let cached = signature.and_then(|(mtime, size)| {
+                    cache
+                        .get(app_path.to_str()?)
+                        .filter(|c| c.mtime_ns == mtime && c.size == size)
+                });
+
+                if let Some(cached_app) = cached {
+                    // Cache hit: reuse display_name and bundle_id, re-decode the
+                    // icon from the image cache (raw RGBA, no PNG decode).
+                    let icon = if cached_app.icon_bytes.is_empty() {
+                        None
+                    } else {
+                        load_image_cached(&cached_app.icon_bytes)
+                            .ok()
+                            .map(|mut image| {
+                                image.round_icon_corners(cached_app.icon_adds_sheen);
+                                image
+                            })
+                    };
+                    apps.push(AppInfo {
+                        path: app_path,
+                        display_name: cached_app.display_name.clone(),
+                        bundle_id: cached_app.bundle_id.clone(),
+                        icon,
+                        display_name_ns_string: None,
+                        icon_ui_image: None,
+                    });
+                    refreshed_cache.push(cached_app.clone());
+                    continue;
+                }
+
+                // Cache miss (or first run): scan the bundle fully.
+                let Some(scan) = scan_one_app(&app_path) else {
+                    log!(
+                        "Warning: couldn't open app bundle {} (skipping)",
+                        app_path.display()
+                    );
+                    continue;
                 };
 
-                let display_name = bundle.display_name().to_owned();
-                let bundle_id = bundle.bundle_identifier().to_owned();
-                let icon = match bundle.load_icon(&fs) {
-                    Ok(icon) => Some(icon),
-                    Err(e) => {
-                        log!("Warning: couldn't load icon for app bundle {}: {} (displaying placeholder instead)", app_path.display(), e);
-                        None
-                    }
-                };
+                let icon = scan
+                    .icon_bytes
+                    .as_ref()
+                    .and_then(|bytes| load_image_cached(bytes).ok())
+                    .map(|mut image| {
+                        image.round_icon_corners(scan.icon_adds_sheen);
+                        image
+                    });
 
                 apps.push(AppInfo {
-                    path: app_path,
-                    display_name,
-                    bundle_id,
+                    path: scan.path.clone(),
+                    display_name: scan.display_name.clone(),
+                    bundle_id: scan.bundle_id.clone(),
                     icon,
                     display_name_ns_string: None,
                     icon_ui_image: None,
                 });
+
+                if let Some((mtime, size)) = signature {
+                    refreshed_cache.push(CachedApp {
+                        path: scan.path.to_string_lossy().to_string(),
+                        mtime_ns: mtime,
+                        size,
+                        icon_bytes: scan.icon_bytes.clone().unwrap_or_default(),
+                        icon_adds_sheen: scan.icon_adds_sheen,
+                        display_name: scan.display_name.clone(),
+                        bundle_id: scan.bundle_id.clone(),
+                    });
+                }
             } else if app_path.is_dir() {
                 directories.push(app_path);
             }
         }
     }
+
+    // Persist the updated cache so the next launch can skip re-scanning.
+    write_app_scan_cache(&refreshed_cache);
 
     apps.sort_by_key(|app| app.display_name.to_uppercase());
     Ok(apps)
@@ -277,7 +433,10 @@ mod delete_app_tests {
     #[test]
     fn sqlite_namespace_matches_libsqlite3() {
         assert_eq!(sqlite_namespace("com.example.game"), "com.example.game");
-        assert_eq!(sqlite_namespace("com.example.my game"), "com.example.my_game");
+        assert_eq!(
+            sqlite_namespace("com.example.my game"),
+            "com.example.my_game"
+        );
     }
 
     #[test]
@@ -385,31 +544,72 @@ struct AppPickerDelegateHostObject {
     network: Option<bool>,
     game_center_authenticated: Option<bool>,
     show_fps: Option<bool>,
+    trace_gl_errors: Option<bool>,
+    trace_gl_draws: Option<bool>,
+    vsync: Option<VsyncMode>,
+    present_mode: Option<PresentMode>,
+    fix_texture_min_filter: Option<Option<bool>>,
+    present_rotate: Option<Option<u32>>,
+    print_fps: Option<bool>,
+    popup_errors: Option<bool>,
+    controller_to_touch: Option<Option<bool>>,
+    manual_value: Option<(NSInteger, String)>,
     overlay_mode: Option<PerformanceOverlayMode>,
     overlay_corner: Option<PerformanceOverlayCorner>,
     cheat_engine: Option<bool>,
+    quick_menu: Option<bool>,
+    dladdr: Option<bool>,
     /// `Some(..)` only when the user just flipped the switch: `None` means no
     /// change is pending. The saved state is tri-state (see `PickerSettings`).
     rotation_fix: Option<bool>,
     /// `Some(..)` only when the user just flipped the switch.
     fix_movie_player: Option<bool>,
+    /// `Some(..)` only when the user just flipped the switch.
+    manual_ui_rotation: Option<bool>,
+    preserve_dyld_stubs: Option<bool>,
+    corruption_mode: Option<CorruptionMode>,
+    corruption_mode_changed: bool,
+    corruption_startup_delay: Option<StartupDelayPreset>,
+    corruption_cooldown: Option<CooldownPreset>,
+    memory_limit_tag: Option<i32>,
+    memory_limit_toggle: bool,
+    memory_limit_scroll_to: Option<CGFloat>,
+    /// `Some(..)` when a key of the custom-size keypad was tapped: a digit
+    /// `0`-`9`, or [CUSTOM_LIMIT_BACKSPACE_KEY].
+    memory_limit_custom_key: Option<i32>,
+    memory_limit_custom_confirm: bool,
+    memory_limit_custom_cancel: bool,
     preserve_aspect_ratio: Option<bool>,
     show_lock_screen: Option<bool>,
     force_composition: Option<bool>,
-    gles_native: Option<bool>,
+    no_gles3: Option<bool>,
+    renderer_mode_tag: Option<i32>,
     fullscreen: Option<bool>,
     device_model_tag: Option<i32>,
     device_model_toggle: bool,
     device_model_scroll_to: Option<CGFloat>,
+    /// Progress along the settings scrollbar track while it is being dragged.
+    settings_scroll_to: Option<CGFloat>,
     language_tag: Option<i32>,
     language_toggle: bool,
     language_scroll_to: Option<CGFloat>,
+    renderer_mode_toggle: bool,
+    renderer_mode_scroll_to: Option<CGFloat>,
+    gles2_mode: Option<Gles2Mode>,
     /// Set when a finger goes down on an app icon (`UIControlEventTouchDown`).
     icon_touch_down: id,
     /// Set when a touch that started on an icon stops being a tap.
     icon_touch_cancelled: bool,
     delete_cancel: bool,
     delete_confirm: bool,
+    /// Set when the user taps the reset row in Settings.
+    settings_reset: bool,
+    /// Set when the user confirms resetting the settings to their defaults.
+    reset_confirm: bool,
+    /// Set when the user backs out of resetting the settings to their defaults.
+    reset_cancel: bool,
+    /// Set when the "settings couldn't be saved" notice is dismissed.
+    save_error_dismiss: bool,
     /// Set when the horizontal swipe recognizers fire (old-iOS page change).
     swipe_left: bool,
     swipe_right: bool,
@@ -418,16 +618,130 @@ struct AppPickerDelegateHostObject {
 }
 impl HostObject for AppPickerDelegateHostObject {}
 
+/// The choices offered by the "RAM Limiter" dropdown, in display order:
+/// `None` is "Default" (the Device model decides), otherwise the cap in MiB.
+/// The "Custom…" entry that opens the size keypad is appended by
+/// [memory_limit_dropdown_spec] and tagged [MEMORY_LIMIT_CUSTOM_TAG].
+const MEMORY_LIMIT_CHOICES: &[Option<u32>] = &[
+    None,
+    Some(32),
+    Some(64),
+    Some(128),
+    Some(256),
+    Some(512),
+    Some(1024),
+    Some(2048),
+];
+
+/// The dropdown tag of the "Custom…" entry, which is not a size of its own.
+const MEMORY_LIMIT_CUSTOM_TAG: i32 = MEMORY_LIMIT_CHOICES.len() as i32;
+
+/// The button title of the "RAM Limiter" dropdown for a choice.
+fn memory_limit_label(choice: Option<u32>) -> String {
+    match choice {
+        None => "Default".to_string(),
+        Some(mb) if mb >= 1024 && mb % 1024 == 0 => format!("{} GB", mb / 1024),
+        Some(mb) => format!("{mb} MB"),
+    }
+}
+
+/// The dropdown tag of a RAM limiter choice (`0` is "Default").
+///
+/// A size that isn't one of the presets is a custom one: it keeps the
+/// "Custom…" row ticked, so reopening the settings screen still shows where
+/// the current value came from.
+fn memory_limit_tag(choice: Option<u32>) -> i32 {
+    MEMORY_LIMIT_CHOICES
+        .iter()
+        .position(|candidate| *candidate == choice)
+        .map_or(MEMORY_LIMIT_CUSTOM_TAG, |index| index as i32)
+}
+
+/// The RAM limiter choice of a dropdown tag.
+///
+/// The "Custom…" tag has no size of its own (it opens the keypad), so it maps
+/// to `None` like any other tag that names no preset.
+fn memory_limit_choice(tag: Option<i32>) -> Option<u32> {
+    tag.and_then(|tag| MEMORY_LIMIT_CHOICES.get(tag as usize).copied().flatten())
+}
+
+/// Digits a custom size may have. Four allows "3072" and still refuses
+/// nonsense like a pasted phone number.
+const CUSTOM_LIMIT_MAX_DIGITS: usize = 4;
+/// Smallest and largest custom sizes, in MiB. The upper bound leaves room for
+/// the app's segments, stacks and the null segment inside the guest's 4 GiB
+/// address space.
+const CUSTOM_LIMIT_MIN_MB: u32 = 1;
+const CUSTOM_LIMIT_MAX_MB: u32 = 3072;
+/// Keypad tag of the backspace key (`0`-`9` are the digits).
+const CUSTOM_LIMIT_BACKSPACE_KEY: i32 = 10;
+
+/// The size a custom-limit keypad input means, in MiB.
+///
+/// This is the whole point of the keypad: the digits are mebibytes, so "10" is
+/// 10 MB and "3000" is about 3 GB. `None` for an empty, non-numeric or
+/// zero input, which leaves the previous cap alone; anything above the
+/// ceiling is clamped rather than refused, since typing one digit too many
+/// shouldn't lose the value.
+fn custom_memory_limit_mb(input: &str) -> Option<u32> {
+    if input.is_empty()
+        || input.len() > CUSTOM_LIMIT_MAX_DIGITS
+        || !input.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let mb: u32 = input.parse().ok()?;
+    if mb < CUSTOM_LIMIT_MIN_MB {
+        return None;
+    }
+    Some(mb.min(CUSTOM_LIMIT_MAX_MB))
+}
+
+/// What the keypad shows above the digits: the size as the dropdown would
+/// label it, so "3000" reads as "3000 MB" and "3072" as "3 GB".
+fn custom_memory_limit_display(input: &str) -> String {
+    if input.is_empty() {
+        return "—".to_string();
+    }
+    match custom_memory_limit_mb(input) {
+        Some(mb) => memory_limit_label(Some(mb)),
+        // Only reachable for "0": show what was typed so the keypad still
+        // echoes the finger presses.
+        None => format!("{input} MB"),
+    }
+}
+
 #[derive(Clone, PartialEq)]
 struct PickerSettings {
     scale_hack: Option<NonZeroU32>,
     orientation: Option<DeviceOrientation>,
     fullscreen: bool,
     preserve_aspect_ratio: bool,
+    renderer_mode: RendererMode,
     show_lock_screen: bool,
-    gles_native: bool,
     force_composition: bool,
     show_fps: bool,
+    trace_gl_errors: bool,
+    trace_gl_draws: bool,
+    vsync: VsyncMode,
+    present_mode: PresentMode,
+    fix_texture_min_filter: Option<bool>,
+    present_rotate: Option<u32>,
+    print_fps: bool,
+    popup_errors: bool,
+    deadzone: f32,
+    x_tilt_range: f32,
+    y_tilt_range: f32,
+    x_tilt_offset: f32,
+    y_tilt_offset: f32,
+    /// `None` lets per-app option profiles provide controller mappings.
+    controller_to_touch: Option<bool>,
+    /// Manual fields only override profiles after the user commits an edit.
+    manual_value_overrides: BTreeSet<NSInteger>,
+    button_to_touch: HashMap<Button, (f32, f32)>,
+    dpad_to_touch: Option<(f32, f32, f32, f32)>,
+    stick_to_touch: Option<(f32, f32, f32, f32)>,
+    fps_limit: Option<f64>,
     overlay_mode: PerformanceOverlayMode,
     overlay_corner: PerformanceOverlayCorner,
     /// `None` leaves these compatibility fixes to the command line and the
@@ -436,7 +750,24 @@ struct PickerSettings {
     /// an options file which enables the fix (e.g. GTA III defaults).
     rotation_fix: Option<bool>,
     fix_movie_player: Option<bool>,
+    no_gles3: Option<bool>,
+    manual_ui_rotation: Option<bool>,
+    preserve_dyld_stubs: Option<bool>,
+    dladdr: Option<bool>,
+    corruption_mode: CorruptionMode,
+    corruption_startup_delay: StartupDelayPreset,
+    corruption_cooldown: CooldownPreset,
+    corruption_bytes_per_burst: u32,
+    corruption_max_offset: Option<u32>,
+    corruption_seed: u64,
+    gles2_mode: Gles2Mode,
+    /// `None` is "Default" (the Device model decides, unless an options file
+    /// sets the cap).
+    /// `Some(..)` is an explicit "RAM Limiter" choice, in MiB.
+    memory_limit_mb: Option<u32>,
     cheat_engine: bool,
+    /// Show the in-game quick menu (the pause button in the top-left corner).
+    quick_menu: bool,
     network: bool,
     game_center_authenticated: bool,
     analog_stick_tilt_controls: bool,
@@ -444,36 +775,213 @@ struct PickerSettings {
     language_tag: Option<i32>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Gles2Mode {
+    #[default]
+    Off,
+    PreferContext,
+    Compatibility,
+}
+
+impl Gles2Mode {
+    fn selected_index(self) -> i32 {
+        match self {
+            Self::Off => 0,
+            Self::PreferContext => 1,
+            Self::Compatibility => 2,
+        }
+    }
+
+    fn short_name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::PreferContext => "prefer-context",
+            Self::Compatibility => "compatibility",
+        }
+    }
+
+    fn from_short_name(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(Self::Off),
+            "prefer-context" => Some(Self::PreferContext),
+            "compatibility" => Some(Self::Compatibility),
+            _ => None,
+        }
+    }
+
+    fn arguments(self) -> Vec<String> {
+        match self {
+            Self::Off => Vec::new(),
+            Self::PreferContext => vec!["--prefer-gles2-context".to_string()],
+            Self::Compatibility => vec!["--gles2-compat".to_string()],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CorruptionMode {
+    Off,
+    Corrupt,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum StartupDelayPreset {
+    #[default]
+    Immediate,
+    FiveSeconds,
+    FifteenSeconds,
+    ThirtySeconds,
+}
+
+impl StartupDelayPreset {
+    const ALL: [Self; 4] = [
+        Self::Immediate,
+        Self::FiveSeconds,
+        Self::FifteenSeconds,
+        Self::ThirtySeconds,
+    ];
+
+    fn short_name(self) -> &'static str {
+        match self {
+            Self::Immediate => "0",
+            Self::FiveSeconds => "5",
+            Self::FifteenSeconds => "15",
+            Self::ThirtySeconds => "30",
+        }
+    }
+
+    fn from_short_name(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|preset| preset.short_name() == value)
+    }
+
+    fn selected_index(self) -> usize {
+        Self::ALL.iter().position(|preset| *preset == self).unwrap()
+    }
+
+    fn duration(self) -> std::time::Duration {
+        std::time::Duration::from_secs(match self {
+            Self::Immediate => 0,
+            Self::FiveSeconds => 5,
+            Self::FifteenSeconds => 15,
+            Self::ThirtySeconds => 30,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CooldownPreset {
+    #[default]
+    HalfSecond,
+    OneSecond,
+    FiveSeconds,
+    TenSeconds,
+}
+
+impl CooldownPreset {
+    const ALL: [Self; 4] = [
+        Self::HalfSecond,
+        Self::OneSecond,
+        Self::FiveSeconds,
+        Self::TenSeconds,
+    ];
+
+    fn short_name(self) -> &'static str {
+        match self {
+            Self::HalfSecond => "0.5",
+            Self::OneSecond => "1",
+            Self::FiveSeconds => "5",
+            Self::TenSeconds => "10",
+        }
+    }
+
+    fn from_short_name(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|preset| preset.short_name() == value)
+    }
+
+    fn selected_index(self) -> usize {
+        Self::ALL.iter().position(|preset| *preset == self).unwrap()
+    }
+
+    fn duration(self) -> std::time::Duration {
+        match self {
+            Self::HalfSecond => std::time::Duration::from_millis(500),
+            Self::OneSecond => std::time::Duration::from_secs(1),
+            Self::FiveSeconds => std::time::Duration::from_secs(5),
+            Self::TenSeconds => std::time::Duration::from_secs(10),
+        }
+    }
+}
+
+impl CorruptionMode {
+    fn short_name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Corrupt => "corrupt",
+        }
+    }
+
+    fn from_short_name(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(Self::Off),
+            "corrupt" => Some(Self::Corrupt),
+            _ => None,
+        }
+    }
+
+    fn option(self) -> Option<bool> {
+        match self {
+            Self::Off => None,
+            Self::Corrupt => Some(true),
+        }
+    }
+
+    fn selected_index(self) -> i32 {
+        match self {
+            Self::Off => 0,
+            Self::Corrupt => 1,
+        }
+    }
+}
+
+fn saved_renderer_mode(contents: &str) -> Option<RendererMode> {
+    let mut renderer_mode = None;
+    let mut legacy_mode = None;
+    for line in contents.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "renderer_mode" => {
+                if let Ok(mode) = RendererMode::from_short_name(value) {
+                    renderer_mode = Some(mode);
+                }
+            }
+            "gles_native" => match value {
+                "true" => legacy_mode = Some(RendererMode::NativeGles),
+                "false" => legacy_mode = Some(RendererMode::Angle),
+                _ => (),
+            },
+            _ => (),
+        }
+    }
+    renderer_mode.or(legacy_mode)
+}
+
 impl PickerSettings {
     fn load(options: &Options, angle_backend_available: bool) -> Self {
-        let (gles_native, _) = quick_options_gles_native_state(options, angle_backend_available);
-        let mut settings = Self {
-            scale_hack: None,
-            orientation: None,
-            fullscreen: options.fullscreen,
-            preserve_aspect_ratio: options.preserve_aspect_ratio,
-            show_lock_screen: true,
-            gles_native,
-            force_composition: options.force_composition,
-            show_fps: options.performance_overlay_enabled,
-            overlay_mode: options.performance_overlay_mode.for_current_platform(),
-            overlay_corner: options.performance_overlay_corner,
-            // A flag passed on the command line is already an explicit choice;
-            // show it as such. Without one, the fixes stay "unset" so the
-            // app-specific defaults in the options files still apply.
-            rotation_fix: options.rotation_fix.then_some(true),
-            fix_movie_player: options.fix_movie_player.then_some(true),
-            cheat_engine: quick_options_trainer_enabled(options),
-            network: options.network_access,
-            game_center_authenticated: options.game_center_authenticated,
-            analog_stick_tilt_controls: options.analog_stick_tilt_controls,
-            device_model_tag: None,
-            language_tag: None,
-        };
+        let mut settings = Self::from_options(options, angle_backend_available);
         let path = paths::user_data_base_path().join(paths::PICKER_SETTINGS_FILE);
         let Ok(contents) = std::fs::read_to_string(path) else {
             return settings;
         };
+        if let Some(mode) = saved_renderer_mode(&contents) {
+            settings.renderer_mode = mode;
+        }
         for line in contents.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
@@ -498,9 +1006,94 @@ impl PickerSettings {
                 "fullscreen" => set_bool(value, &mut settings.fullscreen),
                 "preserve_aspect_ratio" => set_bool(value, &mut settings.preserve_aspect_ratio),
                 "show_lock_screen" => set_bool(value, &mut settings.show_lock_screen),
-                "gles_native" => set_bool(value, &mut settings.gles_native),
                 "force_composition" => set_bool(value, &mut settings.force_composition),
                 "show_fps" => set_bool(value, &mut settings.show_fps),
+                "trace_gl_errors" => set_bool(value, &mut settings.trace_gl_errors),
+                "trace_gl_draws" => set_bool(value, &mut settings.trace_gl_draws),
+                "vsync" => {
+                    if let Ok(mode) = VsyncMode::from_short_name(value) {
+                        settings.vsync = mode;
+                    }
+                }
+                "present_mode" => {
+                    if let Ok(mode) = PresentMode::from_short_name(value) {
+                        settings.present_mode = mode;
+                    }
+                }
+                "fix_texture_min_filter" => {
+                    set_bool_override(value, &mut settings.fix_texture_min_filter)
+                }
+                "present_rotate" => {
+                    settings.present_rotate = match value {
+                        "default" => None,
+                        _ => value
+                            .parse::<u32>()
+                            .ok()
+                            .filter(|degree| matches!(degree, 0 | 90 | 180 | 270))
+                            .or(settings.present_rotate),
+                    }
+                }
+                "print_fps" => set_bool(value, &mut settings.print_fps),
+                "popup_errors" => set_bool(value, &mut settings.popup_errors),
+                "deadzone" => {
+                    settings.deadzone =
+                        parse_clamped_f32(value, 0.0, 0.95).unwrap_or(settings.deadzone)
+                }
+                "x_tilt_range" => {
+                    settings.x_tilt_range =
+                        parse_clamped_f32(value, -360.0, 360.0).unwrap_or(settings.x_tilt_range)
+                }
+                "y_tilt_range" => {
+                    settings.y_tilt_range =
+                        parse_clamped_f32(value, -360.0, 360.0).unwrap_or(settings.y_tilt_range)
+                }
+                "x_tilt_offset" => {
+                    settings.x_tilt_offset =
+                        parse_clamped_f32(value, -360.0, 360.0).unwrap_or(settings.x_tilt_offset)
+                }
+                "y_tilt_offset" => {
+                    settings.y_tilt_offset =
+                        parse_clamped_f32(value, -360.0, 360.0).unwrap_or(settings.y_tilt_offset)
+                }
+                "controller_to_touch" => {
+                    set_bool_override(value, &mut settings.controller_to_touch)
+                }
+                "manual_value_overrides" => {
+                    settings.manual_value_overrides = parse_manual_value_overrides(value);
+                }
+                "button_to_touch" => {
+                    if let Some(mappings) = parse_button_mappings(value) {
+                        settings.button_to_touch = mappings;
+                    }
+                }
+                "dpad_to_touch" => {
+                    if let Some(mapping) = parse_touch_region(value) {
+                        settings.dpad_to_touch = mapping;
+                    }
+                }
+                "stick_to_touch" => {
+                    if let Some(mapping) = parse_touch_region(value) {
+                        settings.stick_to_touch = mapping;
+                    }
+                }
+                "fps_limit" => {
+                    if let Some(limit) = parse_fps_limit(value) {
+                        settings.fps_limit = limit;
+                    }
+                }
+                "corruption_bytes_per_burst" => {
+                    settings.corruption_bytes_per_burst = parse_clamped_u32(value, 1, 64)
+                        .unwrap_or(settings.corruption_bytes_per_burst)
+                }
+                "corruption_max_offset" => {
+                    if let Some(max_offset) = parse_max_offset(value) {
+                        settings.corruption_max_offset = max_offset;
+                    }
+                }
+                "corruption_seed" => {
+                    settings.corruption_seed =
+                        parse_clamped_u64(value, 0, u64::MAX).unwrap_or(settings.corruption_seed)
+                }
                 "overlay_mode" => {
                     if let Some(mode) = PerformanceOverlayMode::from_short_name(value) {
                         settings.overlay_mode = mode;
@@ -513,7 +1106,43 @@ impl PickerSettings {
                 }
                 "rotation_fix" => set_bool_override(value, &mut settings.rotation_fix),
                 "fix_movie_player" => set_bool_override(value, &mut settings.fix_movie_player),
+                "no_gles3" => set_bool_override(value, &mut settings.no_gles3),
+                "manual_ui_rotation" => set_bool_override(value, &mut settings.manual_ui_rotation),
+                "preserve_dyld_stubs" => {
+                    set_bool_override(value, &mut settings.preserve_dyld_stubs)
+                }
+                "dladdr" => set_bool_override(value, &mut settings.dladdr),
+                "corruption_mode" => {
+                    if let Some(mode) = CorruptionMode::from_short_name(value) {
+                        settings.corruption_mode = mode;
+                    }
+                }
+                "corruption_startup_delay" => {
+                    if let Some(preset) = StartupDelayPreset::from_short_name(value) {
+                        settings.corruption_startup_delay = preset;
+                    }
+                }
+                "corruption_cooldown" => {
+                    if let Some(preset) = CooldownPreset::from_short_name(value) {
+                        settings.corruption_cooldown = preset;
+                    }
+                }
+                "gles2_mode" => {
+                    if let Some(mode) = Gles2Mode::from_short_name(value) {
+                        settings.gles2_mode = mode;
+                    } else if value == "native" {
+                        // Older builds wrote `native` for the driver path; keep reading it.
+                        settings.gles2_mode = Gles2Mode::Off;
+                    }
+                }
+                "memory_limit_mb" => {
+                    settings.memory_limit_mb = match value {
+                        "default" => None,
+                        _ => value.parse().ok().filter(|mb| *mb > 0),
+                    };
+                }
                 "cheat_engine" => set_bool(value, &mut settings.cheat_engine),
+                "quick_menu" => set_bool(value, &mut settings.quick_menu),
                 "network" => set_bool(value, &mut settings.network),
                 "game_center_authenticated" => {
                     set_bool(value, &mut settings.game_center_authenticated)
@@ -526,11 +1155,88 @@ impl PickerSettings {
                 _ => (),
             }
         }
+        settings.renderer_mode =
+            quick_options_renderer_mode_state(settings.renderer_mode, angle_backend_available).0;
         settings.overlay_mode = settings.overlay_mode.for_current_platform();
+        let (width, height) = picker_touch_screen_size(options, &settings);
+        clamp_touch_mappings(&mut settings, width, height);
         settings
     }
 
-    fn save(&self) {
+    /// The settings a fresh install starts with, and the settings that
+    /// "Reset all settings" restores. Both must match, or a reset would leave
+    /// the picker looking different from a first launch.
+    ///
+    /// Only the emulator's own factory values are used; command-line flags and
+    /// app-specific options files are deliberately ignored here, because the
+    /// picker's saved values are layered on top of them at launch.
+    fn factory_defaults(angle_backend_available: bool) -> Self {
+        Self::from_options(&Options::default(), angle_backend_available)
+    }
+
+    fn from_options(options: &Options, angle_backend_available: bool) -> Self {
+        let (renderer_mode, _) =
+            quick_options_renderer_mode_state(options.renderer_mode, angle_backend_available);
+        Self {
+            no_gles3: options.no_gles3.then_some(true),
+            scale_hack: None,
+            orientation: None,
+            fullscreen: options.fullscreen,
+            preserve_aspect_ratio: options.preserve_aspect_ratio,
+            renderer_mode,
+            show_lock_screen: true,
+            force_composition: options.force_composition,
+            show_fps: options.performance_overlay_enabled,
+            trace_gl_errors: options.trace_gl_errors,
+            trace_gl_draws: options.trace_gl_draws,
+            vsync: options.vsync,
+            present_mode: options.present_mode,
+            fix_texture_min_filter: None,
+            present_rotate: options.present_rotate,
+            print_fps: options.print_fps,
+            popup_errors: options.popup_errors,
+            deadzone: options.deadzone.clamp(0.0, 0.95),
+            x_tilt_range: options.x_tilt_range.clamp(-360.0, 360.0),
+            y_tilt_range: options.y_tilt_range.clamp(-360.0, 360.0),
+            x_tilt_offset: options.x_tilt_offset.clamp(-360.0, 360.0),
+            y_tilt_offset: options.y_tilt_offset.clamp(-360.0, 360.0),
+            controller_to_touch: None,
+            manual_value_overrides: BTreeSet::new(),
+            button_to_touch: options.button_to_touch.clone(),
+            dpad_to_touch: options.dpad_to_touch,
+            stick_to_touch: options.stick_to_touch,
+            fps_limit: options.fps_limit,
+            quick_menu: options.quick_menu,
+            memory_limit_mb: options.memory_limit_mb,
+            overlay_mode: options.performance_overlay_mode.for_current_platform(),
+            overlay_corner: options.performance_overlay_corner,
+            // An explicit CLI choice is preserved; otherwise app profiles can
+            // continue to supply their compatibility defaults at launch.
+            rotation_fix: options.rotation_fix.then_some(true),
+            fix_movie_player: options.fix_movie_player.then_some(true),
+            manual_ui_rotation: options.manual_ui_rotation.then_some(true),
+            preserve_dyld_stubs: options.preserve_dyld_stubs.then_some(true),
+            dladdr: options.dladdr.then_some(true),
+            corruption_mode: CorruptionMode::Off,
+            corruption_startup_delay: StartupDelayPreset::default(),
+            corruption_cooldown: CooldownPreset::default(),
+            corruption_bytes_per_burst: options.corruption.bytes_per_burst.clamp(1, 64),
+            corruption_max_offset: options
+                .corruption
+                .max_offset
+                .map(|value| value.clamp(1, 1_048_576)),
+            corruption_seed: options.corruption.seed,
+            gles2_mode: Gles2Mode::Off,
+            cheat_engine: quick_options_trainer_enabled(options),
+            network: options.network_access,
+            game_center_authenticated: options.game_center_authenticated,
+            analog_stick_tilt_controls: options.analog_stick_tilt_controls,
+            device_model_tag: None,
+            language_tag: None,
+        }
+    }
+
+    fn save(&self) -> std::io::Result<()> {
         let path = paths::user_data_base_path().join(paths::PICKER_SETTINGS_FILE);
         let orientation = match self.orientation {
             None => "default",
@@ -545,15 +1251,48 @@ impl PickerSettings {
              orientation={orientation}\n\
              fullscreen={}\n\
              preserve_aspect_ratio={}\n\
+             renderer_mode={}\n\
              show_lock_screen={}\n\
-             gles_native={}\n\
              force_composition={}\n\
              show_fps={}\n\
+             trace_gl_errors={}\n\
+             trace_gl_draws={}\n\
+             vsync={}\n\
+             present_mode={}\n\
+             fix_texture_min_filter={}\n\
+             present_rotate={}\n\
+             print_fps={}\n\
+             popup_errors={}\n\
+             deadzone={}\n\
+             x_tilt_range={}\n\
+             y_tilt_range={}\n\
+             x_tilt_offset={}\n\
+             y_tilt_offset={}\n\
+             controller_to_touch={}\n\
+             manual_value_overrides={}\n\
+             button_to_touch={}\n\
+             dpad_to_touch={}\n\
+             stick_to_touch={}\n\
+             fps_limit={}\n\
              overlay_mode={}\n\
              overlay_corner={}\n\
              rotation_fix={}\n\
              fix_movie_player={}\n\
+             no_gles3={}\n\
+             manual_ui_rotation={}\n\
+             preserve_dyld_stubs={}\n\
+             dladdr={}\n\
+             corruption_mode={}\n\
+             corruption_startup_delay={}\n\
+             corruption_cooldown={}\n\
+             corruption_bytes_per_burst={}\n\
+             corruption_max_offset={}\n\
+             corruption_seed={}\n\
+             gles2_mode={}\n\
+             fps_limit={}\n\
+             memory_limit_mb={}\n\
              cheat_engine={}\n\
+             quick_menu={}\n\
              network={}\n\
              game_center_authenticated={}\n\
              analog_stick_tilt_controls={}\n\
@@ -563,24 +1302,95 @@ impl PickerSettings {
                 .map_or_else(|| "default".to_string(), |n| n.to_string()),
             self.fullscreen,
             self.preserve_aspect_ratio,
+            self.renderer_mode.short_name(),
             self.show_lock_screen,
-            self.gles_native,
             self.force_composition,
             self.show_fps,
+            self.trace_gl_errors,
+            self.trace_gl_draws,
+            vsync_short_name(self.vsync),
+            present_mode_short_name(self.present_mode),
+            optional_bool(self.fix_texture_min_filter),
+            self.present_rotate
+                .map_or_else(|| "default".to_string(), |value| value.to_string()),
+            self.print_fps,
+            self.popup_errors,
+            self.deadzone,
+            self.x_tilt_range,
+            self.y_tilt_range,
+            self.x_tilt_offset,
+            self.y_tilt_offset,
+            optional_bool(self.controller_to_touch),
+            self.manual_value_overrides
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            format_button_mappings(&self.button_to_touch),
+            format_touch_region(self.dpad_to_touch),
+            format_touch_region(self.stick_to_touch),
+            self.fps_limit
+                .map_or_else(|| "off".to_string(), |value| value.to_string()),
             self.overlay_mode.short_name(),
             self.overlay_corner.short_name(),
             optional_bool(self.rotation_fix),
             optional_bool(self.fix_movie_player),
+            optional_bool(self.no_gles3),
+            optional_bool(self.manual_ui_rotation),
+            optional_bool(self.preserve_dyld_stubs),
+            optional_bool(self.dladdr),
+            self.corruption_mode.short_name(),
+            self.corruption_startup_delay.short_name(),
+            self.corruption_cooldown.short_name(),
+            self.corruption_bytes_per_burst,
+            self.corruption_max_offset
+                .map_or_else(|| "unbounded".to_string(), |value| value.to_string()),
+            self.corruption_seed,
+            self.gles2_mode.short_name(),
+            self.fps_limit
+                .map_or_else(|| "off".to_string(), |value| value.to_string()),
+            self.memory_limit_mb
+                .map_or_else(|| "default".to_string(), |mb| mb.to_string()),
             self.cheat_engine,
+            self.quick_menu,
             self.network,
             self.game_center_authenticated,
             self.analog_stick_tilt_controls,
             optional_tag(self.device_model_tag),
             optional_tag(self.language_tag),
         );
-        if let Err(error) = std::fs::write(path, contents) {
-            log!("Warning: couldn't save app picker settings: {error}");
+        atomic_write_picker_settings(&path, contents.as_bytes())
+    }
+}
+
+fn atomic_write_picker_settings(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    loop {
+        let number = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let temp = parent.join(format!(
+            ".picker-settings-{}-{number}.tmp",
+            std::process::id()
+        ));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        let result = file.write_all(contents).and_then(|()| file.sync_all());
+        drop(file);
+        let result = result.and_then(|()| std::fs::rename(&temp, path));
+        if result.is_err() {
+            let _ = std::fs::remove_file(temp);
         }
+        return result;
     }
 }
 
@@ -617,6 +1427,507 @@ fn parse_optional_tag(value: &str) -> Option<i32> {
         None
     } else {
         value.parse().ok()
+    }
+}
+
+fn vsync_short_name(mode: VsyncMode) -> &'static str {
+    match mode {
+        VsyncMode::Auto => "auto",
+        VsyncMode::On => "on",
+        VsyncMode::Off => "off",
+    }
+}
+
+fn present_mode_short_name(mode: PresentMode) -> &'static str {
+    match mode {
+        PresentMode::Auto => "auto",
+        PresentMode::Direct => "direct",
+        PresentMode::Readback => "readback",
+    }
+}
+
+fn vsync_selected_index(mode: VsyncMode) -> usize {
+    match mode {
+        VsyncMode::Auto => 0,
+        VsyncMode::On => 1,
+        VsyncMode::Off => 2,
+    }
+}
+
+fn present_mode_selected_index(mode: PresentMode) -> usize {
+    match mode {
+        PresentMode::Auto => 0,
+        PresentMode::Direct => 1,
+        PresentMode::Readback => 2,
+    }
+}
+
+fn texture_filter_selected_index(value: Option<bool>) -> usize {
+    match value {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    }
+}
+
+fn present_rotate_selected_index(value: Option<u32>) -> usize {
+    match value {
+        None => 0,
+        Some(0) => 1,
+        Some(90) => 2,
+        Some(180) => 3,
+        Some(270) => 4,
+        Some(_) => 0,
+    }
+}
+
+fn controller_to_touch_selected_index(value: Option<bool>) -> usize {
+    match value {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    }
+}
+
+fn parse_button(value: &str) -> Option<Button> {
+    match value.trim() {
+        "DPadLeft" => Some(Button::DPadLeft),
+        "DPadUp" => Some(Button::DPadUp),
+        "DPadRight" => Some(Button::DPadRight),
+        "DPadDown" => Some(Button::DPadDown),
+        "Start" => Some(Button::Start),
+        "A" => Some(Button::A),
+        "B" => Some(Button::B),
+        "X" => Some(Button::X),
+        "Y" => Some(Button::Y),
+        "LeftShoulder" => Some(Button::LeftShoulder),
+        _ => None,
+    }
+}
+
+fn button_name(button: Button) -> &'static str {
+    match button {
+        Button::DPadLeft => "DPadLeft",
+        Button::DPadUp => "DPadUp",
+        Button::DPadRight => "DPadRight",
+        Button::DPadDown => "DPadDown",
+        Button::Start => "Start",
+        Button::A => "A",
+        Button::B => "B",
+        Button::X => "X",
+        Button::Y => "Y",
+        Button::LeftShoulder => "LeftShoulder",
+    }
+}
+
+const CONTROLLER_BUTTONS: [Button; 10] = [
+    Button::DPadLeft,
+    Button::DPadUp,
+    Button::DPadRight,
+    Button::DPadDown,
+    Button::Start,
+    Button::A,
+    Button::B,
+    Button::X,
+    Button::Y,
+    Button::LeftShoulder,
+];
+
+fn format_button_mappings(mappings: &HashMap<Button, (f32, f32)>) -> String {
+    CONTROLLER_BUTTONS
+        .iter()
+        .filter_map(|button| {
+            mappings
+                .get(button)
+                .map(|(x, y)| format!("{},{x},{y}", button_name(*button)))
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn parse_button_mappings(value: &str) -> Option<HashMap<Button, (f32, f32)>> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("none") {
+        return Some(HashMap::new());
+    }
+    let mut mappings = HashMap::new();
+    for entry in value.split(';') {
+        let mut fields = entry.split(',');
+        let button = parse_button(fields.next()?)?;
+        let x = parse_finite_f32(fields.next()?)?;
+        let y = parse_finite_f32(fields.next()?)?;
+        if fields.next().is_some() {
+            return None;
+        }
+        mappings.insert(button, (x, y));
+    }
+    Some(mappings)
+}
+
+fn parse_touch_region(value: &str) -> Option<Option<(f32, f32, f32, f32)>> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("none") {
+        return Some(None);
+    }
+    let values: Vec<f32> = value
+        .split(',')
+        .map(parse_finite_f32)
+        .collect::<Option<_>>()?;
+    let [x, y, width, height]: [f32; 4] = values.try_into().ok()?;
+    Some(Some((x, y, width, height)))
+}
+
+fn format_touch_region(region: Option<(f32, f32, f32, f32)>) -> String {
+    region.map_or_else(
+        || "off".to_string(),
+        |(x, y, width, height)| format!("{x},{y},{width},{height}"),
+    )
+}
+
+fn parse_finite_f32(value: &str) -> Option<f32> {
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| !value.is_nan())
+        .map(|value| value.clamp(-(f32::MAX as f64), f32::MAX as f64) as f32)
+}
+
+fn parse_clamped_f32(value: &str, minimum: f32, maximum: f32) -> Option<f32> {
+    Some(parse_finite_f32(value)?.clamp(minimum, maximum))
+}
+
+fn parse_clamped_u32(value: &str, minimum: u32, maximum: u32) -> Option<u32> {
+    Some(parse_clamped_unsigned(value, u64::from(minimum), u64::from(maximum))? as u32)
+}
+
+fn parse_clamped_u64(value: &str, minimum: u64, maximum: u64) -> Option<u64> {
+    parse_clamped_unsigned(value, minimum, maximum)
+}
+
+fn parse_clamped_unsigned(value: &str, minimum: u64, maximum: u64) -> Option<u64> {
+    let value = value.trim();
+    if let Some(digits) = value.strip_prefix('-') {
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        return Some(minimum);
+    }
+    let digits = value.strip_prefix('+').unwrap_or(value);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let value = digits.parse::<u128>().unwrap_or(u128::MAX);
+    Some(value.clamp(u128::from(minimum), u128::from(maximum)) as u64)
+}
+
+fn parse_fps_limit(value: &str) -> Option<Option<f64>> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("unlimited") {
+        return Some(None);
+    }
+    let value = value.parse::<f64>().ok().filter(|value| !value.is_nan())?;
+    Some(Some(value.clamp(1.0, 240.0)))
+}
+
+fn parse_max_offset(value: &str) -> Option<Option<u32>> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("unbounded") {
+        return Some(None);
+    }
+    Some(Some(parse_clamped_u32(value, 1, 1_048_576)?))
+}
+
+fn format_optional_float(value: Option<f64>) -> String {
+    value.map_or_else(|| "off".to_string(), |value| value.to_string())
+}
+
+fn picker_touch_screen_size(options: &Options, settings: &PickerSettings) -> (f32, f32) {
+    let family = settings
+        .device_model_tag
+        .filter(|tag| *tag != DEVICE_TAG_DEFAULT && *tag != DEVICE_TAG_AUTO)
+        .and_then(|tag| usize::try_from(tag).ok())
+        .and_then(DeviceFamily::for_tag)
+        .or(options.device_family)
+        .unwrap_or(DeviceFamily::iPhone);
+    let (mut width, mut height) = options
+        .host_screen_size
+        .unwrap_or_else(|| family.portrait_size());
+    let orientation = settings.orientation.unwrap_or(options.initial_orientation);
+    if matches!(
+        orientation,
+        DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight
+    ) {
+        std::mem::swap(&mut width, &mut height);
+    }
+    (width as f32, height as f32)
+}
+
+fn clamp_touch_mappings(settings: &mut PickerSettings, width: f32, height: f32) {
+    for (x, y) in settings.button_to_touch.values_mut() {
+        *x = clamp_screen_coordinate(*x, width);
+        *y = clamp_screen_coordinate(*y, height);
+    }
+    for mapping in [&mut settings.dpad_to_touch, &mut settings.stick_to_touch] {
+        if let Some((x, y, region_width, region_height)) = mapping {
+            *x = clamp_screen_coordinate(*x, width);
+            *y = clamp_screen_coordinate(*y, height);
+            *region_width = clamp_screen_coordinate(*region_width, width - *x);
+            *region_height = clamp_screen_coordinate(*region_height, height - *y);
+        }
+    }
+}
+
+fn clamp_screen_coordinate(value: f32, maximum: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, maximum)
+    } else {
+        0.0
+    }
+}
+
+fn manual_button_tag(button: Button) -> NSInteger {
+    MANUAL_BUTTON_TOUCH_BASE
+        + CONTROLLER_BUTTONS
+            .iter()
+            .position(|candidate| *candidate == button)
+            .unwrap() as NSInteger
+}
+
+fn manual_button_for_tag(tag: NSInteger) -> Option<Button> {
+    let index = usize::try_from(tag.checked_sub(MANUAL_BUTTON_TOUCH_BASE)?).ok()?;
+    CONTROLLER_BUTTONS.get(index).copied()
+}
+
+fn is_manual_value_tag(tag: NSInteger) -> bool {
+    matches!(
+        tag,
+        MANUAL_DEADZONE
+            | MANUAL_X_TILT_RANGE
+            | MANUAL_Y_TILT_RANGE
+            | MANUAL_X_TILT_OFFSET
+            | MANUAL_Y_TILT_OFFSET
+            | MANUAL_DPAD_TOUCH
+            | MANUAL_STICK_TOUCH
+            | MANUAL_FPS_LIMIT
+            | MANUAL_CORRUPTION_INTENSITY
+            | MANUAL_CORRUPTION_MAX_OFFSET
+            | MANUAL_CORRUPTION_SEED
+    ) || manual_button_for_tag(tag).is_some()
+}
+
+fn parse_manual_value_overrides(value: &str) -> BTreeSet<NSInteger> {
+    value
+        .split(',')
+        .filter_map(|tag| tag.parse::<NSInteger>().ok())
+        .filter(|tag| is_manual_value_tag(*tag))
+        .collect()
+}
+
+fn is_controller_mapping_tag(tag: NSInteger) -> bool {
+    matches!(tag, MANUAL_DPAD_TOUCH | MANUAL_STICK_TOUCH) || manual_button_for_tag(tag).is_some()
+}
+
+fn manual_value_text(settings: &PickerSettings, tag: NSInteger) -> Option<String> {
+    if is_controller_mapping_tag(tag) && settings.controller_to_touch.is_none() {
+        return Some("App default".to_string());
+    }
+    if matches!(
+        tag,
+        MANUAL_X_TILT_RANGE | MANUAL_Y_TILT_RANGE | MANUAL_X_TILT_OFFSET | MANUAL_Y_TILT_OFFSET
+    ) && !settings.manual_value_overrides.contains(&tag)
+    {
+        return Some("App default".to_string());
+    }
+    Some(match tag {
+        MANUAL_DEADZONE => settings.deadzone.to_string(),
+        MANUAL_X_TILT_RANGE => settings.x_tilt_range.to_string(),
+        MANUAL_Y_TILT_RANGE => settings.y_tilt_range.to_string(),
+        MANUAL_X_TILT_OFFSET => settings.x_tilt_offset.to_string(),
+        MANUAL_Y_TILT_OFFSET => settings.y_tilt_offset.to_string(),
+        MANUAL_DPAD_TOUCH => format_touch_region(settings.dpad_to_touch),
+        MANUAL_STICK_TOUCH => format_touch_region(settings.stick_to_touch),
+        MANUAL_FPS_LIMIT => settings
+            .fps_limit
+            .map_or_else(|| "Unlimited".to_string(), |value| value.to_string()),
+        MANUAL_CORRUPTION_INTENSITY => settings.corruption_bytes_per_burst.to_string(),
+        MANUAL_CORRUPTION_MAX_OFFSET => settings
+            .corruption_max_offset
+            .map_or_else(|| "Unbounded".to_string(), |value| value.to_string()),
+        MANUAL_CORRUPTION_SEED => settings.corruption_seed.to_string(),
+        _ => {
+            let button = manual_button_for_tag(tag)?;
+            settings
+                .button_to_touch
+                .get(&button)
+                .map_or_else(|| "off".to_string(), |(x, y)| format!("{x},{y}"))
+        }
+    })
+}
+
+fn manual_value_description(tag: NSInteger, width: f32, height: f32) -> String {
+    match tag {
+        MANUAL_DEADZONE => "Default: 0.10; range: 0–0.95.".to_string(),
+        MANUAL_X_TILT_RANGE | MANUAL_Y_TILT_RANGE => {
+            "Default: 60°; range: −360° to 360°. Type App default to use profile values.".to_string()
+        }
+        MANUAL_X_TILT_OFFSET | MANUAL_Y_TILT_OFFSET => {
+            "Default: 0°; range: −360° to 360°. Type App default to use profile values.".to_string()
+        }
+        MANUAL_DPAD_TOUCH | MANUAL_STICK_TOUCH => format!(
+            "Default: App default; type off or x,y,w,h; region must stay inside 0–{width:.0} × 0–{height:.0} points."
+        ),
+        MANUAL_FPS_LIMIT => "Default: 60; enter 1–240 or Unlimited.".to_string(),
+        MANUAL_CORRUPTION_INTENSITY => "Default: 8 bytes per burst; range: 1–64.".to_string(),
+        MANUAL_CORRUPTION_MAX_OFFSET => {
+            "Default: Unbounded; enter 1–1,048,576 or Unbounded.".to_string()
+        }
+        MANUAL_CORRUPTION_SEED => format!("Default: 0; range: 0–{}.", u64::MAX),
+        _ => format!(
+            "Default: App default; type off or x,y in points (x 0–{width:.0}, y 0–{height:.0})."
+        ),
+    }
+}
+
+fn apply_manual_value(
+    settings: &mut PickerSettings,
+    tag: NSInteger,
+    text: &str,
+    screen_width: f32,
+    screen_height: f32,
+) -> Option<String> {
+    if text.trim().eq_ignore_ascii_case("app default") {
+        if !is_controller_mapping_tag(tag)
+            && !matches!(
+                tag,
+                MANUAL_X_TILT_RANGE
+                    | MANUAL_Y_TILT_RANGE
+                    | MANUAL_X_TILT_OFFSET
+                    | MANUAL_Y_TILT_OFFSET
+            )
+        {
+            return None;
+        }
+        settings.manual_value_overrides.remove(&tag);
+        if is_controller_mapping_tag(tag) {
+            for button in CONTROLLER_BUTTONS {
+                settings
+                    .manual_value_overrides
+                    .remove(&manual_button_tag(button));
+            }
+            settings.manual_value_overrides.remove(&MANUAL_DPAD_TOUCH);
+            settings.manual_value_overrides.remove(&MANUAL_STICK_TOUCH);
+            settings.controller_to_touch = None;
+        }
+        return manual_value_text(settings, tag);
+    }
+    match tag {
+        MANUAL_DEADZONE => settings.deadzone = parse_clamped_f32(text, 0.0, 0.95)?,
+        MANUAL_X_TILT_RANGE => settings.x_tilt_range = parse_clamped_f32(text, -360.0, 360.0)?,
+        MANUAL_Y_TILT_RANGE => settings.y_tilt_range = parse_clamped_f32(text, -360.0, 360.0)?,
+        MANUAL_X_TILT_OFFSET => settings.x_tilt_offset = parse_clamped_f32(text, -360.0, 360.0)?,
+        MANUAL_Y_TILT_OFFSET => settings.y_tilt_offset = parse_clamped_f32(text, -360.0, 360.0)?,
+        MANUAL_DPAD_TOUCH | MANUAL_STICK_TOUCH => {
+            let mapping = parse_touch_region(text)?;
+            let target = if tag == MANUAL_DPAD_TOUCH {
+                &mut settings.dpad_to_touch
+            } else {
+                &mut settings.stick_to_touch
+            };
+            *target = mapping;
+            clamp_touch_mappings(settings, screen_width, screen_height);
+        }
+        MANUAL_FPS_LIMIT => settings.fps_limit = parse_fps_limit(text)?,
+        MANUAL_CORRUPTION_INTENSITY => {
+            settings.corruption_bytes_per_burst = parse_clamped_u32(text, 1, 64)?
+        }
+        MANUAL_CORRUPTION_MAX_OFFSET => settings.corruption_max_offset = parse_max_offset(text)?,
+        MANUAL_CORRUPTION_SEED => settings.corruption_seed = parse_clamped_u64(text, 0, u64::MAX)?,
+        _ => {
+            let button = manual_button_for_tag(tag)?;
+            let value = text.trim();
+            if value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("none") {
+                settings.button_to_touch.remove(&button);
+            } else {
+                let mut values = value.split(',');
+                let x = parse_finite_f32(values.next()?)?.clamp(0.0, screen_width);
+                let y = parse_finite_f32(values.next()?)?.clamp(0.0, screen_height);
+                if values.next().is_some() {
+                    return None;
+                }
+                settings.button_to_touch.insert(button, (x, y));
+            }
+        }
+    }
+    settings.manual_value_overrides.insert(tag);
+    if is_controller_mapping_tag(tag) {
+        settings.controller_to_touch = Some(true);
+    }
+    manual_value_text(settings, tag)
+}
+
+fn manual_value_row(
+    settings: &PickerSettings,
+    tag: NSInteger,
+    title: String,
+    screen_width: f32,
+    screen_height: f32,
+    enabled: bool,
+    text_keyboard: bool,
+) -> SettingsRow {
+    SettingsRow::ManualValue {
+        title,
+        description: manual_value_description(tag, screen_width, screen_height),
+        tag,
+        value: manual_value_text(settings, tag).unwrap(),
+        enabled,
+        text_keyboard,
+    }
+}
+
+fn manual_value_enabled(tag: NSInteger, settings: &PickerSettings) -> bool {
+    if tag == MANUAL_DEADZONE {
+        settings
+            .controller_to_touch
+            .map_or(true, |enabled| enabled && settings.stick_to_touch.is_some())
+    } else if matches!(
+        tag,
+        MANUAL_X_TILT_RANGE | MANUAL_Y_TILT_RANGE | MANUAL_X_TILT_OFFSET | MANUAL_Y_TILT_OFFSET
+    ) {
+        settings.analog_stick_tilt_controls
+    } else if matches!(tag, MANUAL_DPAD_TOUCH | MANUAL_STICK_TOUCH)
+        || manual_button_for_tag(tag).is_some()
+    {
+        settings.controller_to_touch != Some(false)
+    } else if matches!(
+        tag,
+        MANUAL_CORRUPTION_INTENSITY | MANUAL_CORRUPTION_MAX_OFFSET | MANUAL_CORRUPTION_SEED
+    ) {
+        settings.corruption_mode == CorruptionMode::Corrupt
+    } else {
+        true
+    }
+}
+
+fn refresh_manual_value_fields(
+    env: &mut Environment,
+    fields: &[(NSInteger, id, id)],
+    width: f32,
+    height: f32,
+    settings: &mut PickerSettings,
+) {
+    clamp_touch_mappings(settings, width, height);
+    for &(tag, field, description_label) in fields {
+        if let Some(value) = manual_value_text(settings, tag) {
+            let value = ns_string::from_rust_string(env, value);
+            () = msg![env; field setText:value];
+            release(env, value);
+        }
+        () = msg![env; field setEnabled:(manual_value_enabled(tag, settings))];
+        let description =
+            ns_string::from_rust_string(env, manual_value_description(tag, width, height));
+        () = msg![env; description_label setText:description];
+        release(env, description);
     }
 }
 
@@ -715,14 +2026,25 @@ const CLASSES: ClassExports = objc_classes! {
 }
 - (())textFieldShouldReturn:(id)sender {
     let tag: NSInteger = msg![env; sender tag];
-    let host = env.objc.borrow_mut::<AppPickerDelegateHostObject>(this);
-    if tag == access_prompt::FIELD_TAG {
-        host.access_prompt_submit = true;
-    } else {
-        host.archive_store_search = true;
-    }
-    drop(host);
+        {
+            let host = env.objc.borrow_mut::<AppPickerDelegateHostObject>(this);
+            if tag == access_prompt::FIELD_TAG {
+                host.access_prompt_submit = true;
+            } else if !is_manual_value_tag(tag) {
+                host.archive_store_search = true;
+            }
+        }
     let _: bool = msg![env; sender resignFirstResponder];
+}
+- (())textFieldDidEndEditing:(id)sender {
+    let tag: NSInteger = msg![env; sender tag];
+    if is_manual_value_tag(tag) {
+        let text: id = msg![env; sender text];
+        let value = ns_string::to_rust_string(env, text).into_owned();
+        env.objc
+            .borrow_mut::<AppPickerDelegateHostObject>(this)
+            .manual_value = Some((tag, value));
+    }
 }
 
 - (())settingsShow {
@@ -749,6 +2071,47 @@ const CLASSES: ClassExports = objc_classes! {
 - (())scaleHack4 {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).scale_hack4 = true;
 }
+- (())corruptionOff {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_mode = Some(CorruptionMode::Off);
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_mode_changed = true;
+}
+- (())corruptionOn {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_mode = Some(CorruptionMode::Corrupt);
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_mode_changed = true;
+}
+- (())corruptionStartupImmediate {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_startup_delay = Some(StartupDelayPreset::Immediate);
+}
+- (())corruptionStartup5 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_startup_delay = Some(StartupDelayPreset::FiveSeconds);
+}
+- (())corruptionStartup15 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_startup_delay = Some(StartupDelayPreset::FifteenSeconds);
+}
+- (())corruptionStartup30 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_startup_delay = Some(StartupDelayPreset::ThirtySeconds);
+}
+- (())corruptionCooldownHalf {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_cooldown = Some(CooldownPreset::HalfSecond);
+}
+- (())corruptionCooldown1 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_cooldown = Some(CooldownPreset::OneSecond);
+}
+- (())corruptionCooldown5 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_cooldown = Some(CooldownPreset::FiveSeconds);
+}
+- (())corruptionCooldown10 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).corruption_cooldown = Some(CooldownPreset::TenSeconds);
+}
+- (())gles2Off {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).gles2_mode = Some(Gles2Mode::Off);
+}
+- (())gles2Prefer {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).gles2_mode = Some(Gles2Mode::PreferContext);
+}
+- (())gles2Compatibility {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).gles2_mode = Some(Gles2Mode::Compatibility);
+}
 - (())orientationDefault {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).orientation_default = true;
 }
@@ -773,9 +2136,70 @@ const CLASSES: ClassExports = objc_classes! {
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).game_center_authenticated = Some(switch_state);
 }
+- (())traceGLErrors:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc
+        .borrow_mut::<AppPickerDelegateHostObject>(this)
+        .trace_gl_errors = Some(switch_state);
+}
+- (())traceGLDraws:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc
+        .borrow_mut::<AppPickerDelegateHostObject>(this)
+        .trace_gl_draws = Some(switch_state);
+}
+- (())controllerToTouchDefault {
+    env.objc
+        .borrow_mut::<AppPickerDelegateHostObject>(this)
+        .controller_to_touch = Some(None);
+}
+- (())controllerToTouchOn {
+    env.objc
+        .borrow_mut::<AppPickerDelegateHostObject>(this)
+        .controller_to_touch = Some(Some(true));
+}
+- (())controllerToTouchOff {
+    env.objc
+        .borrow_mut::<AppPickerDelegateHostObject>(this)
+        .controller_to_touch = Some(Some(false));
+}
+- (())printFPS:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).print_fps = Some(switch_state);
+}
+- (())popupErrors:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).popup_errors = Some(switch_state);
+}
+- (())vsyncAuto { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).vsync = Some(VsyncMode::Auto); }
+- (())vsyncOn { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).vsync = Some(VsyncMode::On); }
+- (())vsyncOff { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).vsync = Some(VsyncMode::Off); }
+- (())presentModeAuto { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).present_mode = Some(PresentMode::Auto); }
+- (())presentModeDirect { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).present_mode = Some(PresentMode::Direct); }
+- (())presentModeReadback { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).present_mode = Some(PresentMode::Readback); }
+- (())textureFilterDefault { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).fix_texture_min_filter = Some(None); }
+- (())textureFilterOn { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).fix_texture_min_filter = Some(Some(true)); }
+- (())textureFilterOff { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).fix_texture_min_filter = Some(Some(false)); }
+- (())presentRotateDefault { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).present_rotate = Some(None); }
+- (())presentRotate0 { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).present_rotate = Some(Some(0)); }
+- (())presentRotate90 { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).present_rotate = Some(Some(90)); }
+- (())presentRotate180 { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).present_rotate = Some(Some(180)); }
+- (())presentRotate270 { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).present_rotate = Some(Some(270)); }
 - (())rotationFix:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).rotation_fix = Some(switch_state);
+}
+- (())manualUIRotation:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).manual_ui_rotation = Some(switch_state);
+}
+- (())preserveDYLDStubs:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).preserve_dyld_stubs = Some(switch_state);
+}
+- (())dladdr:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).dladdr = Some(switch_state);
 }
 - (())moviePlayerFix:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
@@ -793,9 +2217,21 @@ const CLASSES: ClassExports = objc_classes! {
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).force_composition = Some(switch_state);
 }
-- (())glesNative:(id)switch { // UISwitch*
+- (())rendererMode:(id)sender { // UIButton*
+    let tag: NSInteger = msg![env; sender tag];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).renderer_mode_tag = Some(tag as i32);
+}
+- (())rendererModeToggle {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).renderer_mode_toggle = true;
+}
+- (())rendererModeScroll:(id)sender forEvent:(id)event {
+    if let Some(position) = dropdown_scroll_position(env, sender, event) {
+        env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).renderer_mode_scroll_to = Some(position);
+    }
+}
+- (())noGles3:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).gles_native = Some(switch_state);
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).no_gles3 = Some(switch_state);
 }
 - (())overlayModeFull {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).overlay_mode = Some(PerformanceOverlayMode::Full);
@@ -818,6 +2254,28 @@ const CLASSES: ClassExports = objc_classes! {
 - (())overlayCornerBottomLeft {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).overlay_corner = Some(PerformanceOverlayCorner::BottomLeft);
 }
+- (())memoryLimit:(id)sender { // UIButton*
+    let tag: NSInteger = msg![env; sender tag];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).memory_limit_tag = Some(tag as i32);
+}
+- (())memoryLimitToggle {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).memory_limit_toggle = true;
+}
+- (())memoryLimitScroll:(id)sender forEvent:(id)event {
+    if let Some(position) = dropdown_scroll_position(env, sender, event) {
+        env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).memory_limit_scroll_to = Some(position);
+    }
+}
+- (())memoryLimitCustomKey:(id)sender { // UIButton*
+    let tag: NSInteger = msg![env; sender tag];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).memory_limit_custom_key = Some(tag as i32);
+}
+- (())memoryLimitCustomConfirm {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).memory_limit_custom_confirm = true;
+}
+- (())memoryLimitCustomCancel {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).memory_limit_custom_cancel = true;
+}
 - (())showFPS:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).show_fps = Some(switch_state);
@@ -826,6 +2284,10 @@ const CLASSES: ClassExports = objc_classes! {
 - (())cheatEngine:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).cheat_engine = Some(switch_state);
+}
+- (())quickMenu:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).quick_menu = Some(switch_state);
 }
 - (())fullscreen:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
@@ -864,8 +2326,32 @@ const CLASSES: ClassExports = objc_classes! {
 - (())deleteCancel {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).delete_cancel = true;
 }
+- (())resetSettingsTapped {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).settings_reset = true;
+}
+- (())settingsScroll:(id)sender forEvent:(id)event {
+    // The settings screen keeps its track while it is closed, so ignore drags
+    // on the hidden one.
+    let hidden: bool = msg![env; sender isHidden];
+    if !hidden {
+        if let Some(position) = dropdown_scroll_position(env, sender, event) {
+            let bounds: CGRect = msg![env; sender bounds];
+            let progress = (position / bounds.size.height).clamp(0.0, 1.0);
+            env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).settings_scroll_to = Some(progress);
+        }
+    }
+}
 - (())deleteConfirm {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).delete_confirm = true;
+}
+- (())resetSettingsConfirm {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).reset_confirm = true;
+}
+- (())resetSettingsCancel {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).reset_cancel = true;
+}
+- (())saveErrorDismiss {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).save_error_dismiss = true;
 }
 - (())swipeLeft {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).swipe_left = true;
@@ -917,7 +2403,7 @@ fn configure_picker_display(options: &mut Options, (width, height): (u32, u32)) 
         options.host_screen_size = Some((short, wide));
     }
     options.initial_orientation = DeviceOrientation::LandscapeRight;
-    options.landscape_uiscreen_bounds = true;
+    options.landscape_uiscreen_bounds = Some(true);
     options.present_rotate = Some(0);
 }
 
@@ -932,7 +2418,9 @@ fn show_app_picker_gui(
 
     let icon = {
         let bytes: &[u8] = match crate::branding() {
-            "" | "UNOFFICIAL" => include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/icon.png")),
+            "" | "UNOFFICIAL" => {
+                include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/icon.png"))
+            }
             "PREVIEW" => {
                 include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/icon_preview.png"))
             }
@@ -985,7 +2473,9 @@ fn app_picker_inner(
     // Wallpaper
     let mut found_wallpaper = false;
     let mut wallpaper_view: Option<id> = None;
-    for candidate in std::iter::once(&"BerryHLE_wallpaper.custom").chain(paths::WALLPAPER_FILES.iter()) {
+    for candidate in
+        std::iter::once(&"AppleJuiceHLE_wallpaper.custom").chain(paths::WALLPAPER_FILES.iter())
+    {
         let candidate = paths::user_data_base_path().join(candidate);
         if !candidate.exists() {
             continue;
@@ -1133,99 +2623,136 @@ fn app_picker_inner(
         delegate,
         main_view,
         app_frame.size,
-        recent_app.as_ref().map(|(_, name, image)| (name.as_str(), *image)),
+        recent_app
+            .as_ref()
+            .map(|(_, name, image)| (name.as_str(), *image)),
     );
-    // Build stamp on the page-dot row, right-aligned like the one in the
-    // reference home screen. It is added after the dock so nothing covers it.
-    let version_label = {
-        let label_frame = CGRect {
-            origin: CGPoint {
-                x: 0.0,
-                y: app_picker_dots_top(app_frame.size.height) - 2.0,
-            },
-            size: CGSize {
-                width: app_frame.size.width - 8.0,
-                height: 12.0,
-            },
-        };
-        let label: id = msg_class![env; UILabel alloc];
-        let label: id = msg![env; label initWithFrame:label_frame];
-        let text = ns_string::from_rust_string(
-            env,
-            format!("{} ({})", crate::DISPLAY_NAME, crate::COMMIT_HASH),
-        );
-        () = msg![env; label setText:text];
-        () = msg![env; label setTextAlignment:UITextAlignmentRight];
-        let font_size: CGFloat = 10.0;
-        let font: id = msg_class![env; UIFont systemFontOfSize:font_size];
-        () = msg![env; label setFont:font];
-        let text_color: id = msg_class![env; UIColor lightGrayColor];
-        () = msg![env; label setTextColor:text_color];
-        let bg_color: id = msg_class![env; UIColor clearColor];
-        () = msg![env; label setBackgroundColor:bg_color];
-        let shadow = ui_color(env, 0.0, 0.0, 0.0, 0.7);
-        () = msg![env; label setShadowColor:shadow];
-        () = msg![env; label setShadowOffset:(CGSize {
-            width: 0.0,
-            height: 1.0,
-        })];
-        () = msg![env; main_view addSubview:label];
-        label
-    };
-
     let angle_backend_available = crate::window::angle_backend_available();
     let mut picker_settings = PickerSettings::load(&env.options, angle_backend_available);
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     env.window_mut()
         .set_preserve_aspect_ratio(picker_settings.preserve_aspect_ratio);
-    let quick_options_gles_native_switch_enabled = angle_backend_available;
+    let renderer_mode_dropdown_enabled = renderer_mode_dropdown_enabled();
     let show_fullscreen_row = !crate::window::Window::rotatable_fullscreen();
     let overlay_hidden_by_environment = crate::gles::perf_overlay::hidden_by_environment();
-    let initial_quick_options_show_fps =
-        picker_settings.show_fps && !overlay_hidden_by_environment;
+    let initial_quick_options_show_fps = picker_settings.show_fps && !overlay_hidden_by_environment;
+    env.window_mut().set_performance_overlay_settings(
+        initial_quick_options_show_fps,
+        picker_settings.overlay_mode,
+        picker_settings.overlay_corner,
+    );
     let settings = setup_settings(
         env,
         delegate,
         main_view,
         app_frame,
         &picker_settings,
+        renderer_mode_dropdown_enabled,
         initial_quick_options_show_fps,
-        quick_options_gles_native_switch_enabled,
         show_fullscreen_row,
     );
-    let mut quick_options_scale_hack = picker_settings.scale_hack;
-    let mut quick_options_fullscreen = picker_settings.fullscreen;
-    let mut quick_options_orientation = picker_settings.orientation;
-    let mut quick_options_analog_stick_tilt_controls = picker_settings.analog_stick_tilt_controls;
-    let mut quick_options_network = picker_settings.network;
     let mut quick_options_show_fps = initial_quick_options_show_fps;
     let mut quick_options_overlay_mode = picker_settings.overlay_mode;
     let mut quick_options_overlay_corner = picker_settings.overlay_corner;
     let mut quick_options_rotation_fix = picker_settings.rotation_fix;
     let mut quick_options_fix_movie_player = picker_settings.fix_movie_player;
+    let mut quick_options_fps_limit = picker_settings.fps_limit;
+    let mut quick_options_memory_limit_mb = picker_settings.memory_limit_mb;
     let mut quick_options_preserve_aspect_ratio = picker_settings.preserve_aspect_ratio;
     let mut quick_options_show_lock_screen = picker_settings.show_lock_screen;
     let mut quick_options_force_composition_override = Some(picker_settings.force_composition);
     let mut quick_options_cheat_engine = picker_settings.cheat_engine;
-    let mut quick_options_gles_native = picker_settings.gles_native;
+    let mut quick_options_quick_menu = picker_settings.quick_menu;
     let mut device_state = DropdownState {
         selected: picker_settings.device_model_tag,
+        ..Default::default()
+    };
+    let mut renderer_state = DropdownState {
+        selected: Some(renderer_mode_tag(picker_settings.renderer_mode)),
         ..Default::default()
     };
     let mut language_state = DropdownState {
         selected: picker_settings.language_tag,
         ..Default::default()
     };
+    let mut memory_limit_state = DropdownState {
+        selected: Some(memory_limit_tag(picker_settings.memory_limit_mb)),
+        ..Default::default()
+    };
     let mut last_saved_picker_settings = picker_settings.clone();
 
-    update_scale_hack_buttons(env, &settings.scale_hack_buttons, quick_options_scale_hack);
-    update_orientation_buttons(env, &settings.orientation_buttons, quick_options_orientation);
+    let mut next_settings_save = Instant::now();
+
+    update_scale_hack_buttons(
+        env,
+        &settings.scale_hack_buttons,
+        picker_settings.scale_hack,
+    );
+    update_orientation_buttons(
+        env,
+        &settings.orientation_buttons,
+        picker_settings.orientation,
+    );
     update_performance_overlay_buttons(
         env,
         &settings.overlay_mode_buttons,
         &settings.overlay_corner_buttons,
-        quick_options_overlay_mode,
-        quick_options_overlay_corner,
+        picker_settings.overlay_mode,
+        picker_settings.overlay_corner,
+    );
+    update_segment_buttons(
+        env,
+        &settings.corruption_mode_buttons,
+        picker_settings.corruption_mode.selected_index() as usize,
+    );
+    update_segment_buttons(
+        env,
+        &settings.corruption_startup_delay_buttons,
+        picker_settings.corruption_startup_delay.selected_index(),
+    );
+    update_segment_buttons(
+        env,
+        &settings.corruption_cooldown_buttons,
+        picker_settings.corruption_cooldown.selected_index(),
+    );
+    update_segment_buttons(
+        env,
+        &settings.gles2_mode_buttons,
+        picker_settings.gles2_mode.selected_index() as usize,
+    );
+    update_segment_buttons(
+        env,
+        &settings.vsync_buttons,
+        vsync_selected_index(picker_settings.vsync),
+    );
+    update_segment_buttons(
+        env,
+        &settings.present_mode_buttons,
+        present_mode_selected_index(picker_settings.present_mode),
+    );
+    update_segment_buttons(
+        env,
+        &settings.texture_filter_buttons,
+        texture_filter_selected_index(picker_settings.fix_texture_min_filter),
+    );
+    update_segment_buttons(
+        env,
+        &settings.present_rotate_buttons,
+        present_rotate_selected_index(picker_settings.present_rotate),
+    );
+    update_segment_buttons(
+        env,
+        &settings.controller_to_touch_buttons,
+        controller_to_touch_selected_index(picker_settings.controller_to_touch),
+    );
+    let (touch_screen_width, touch_screen_height) =
+        picker_touch_screen_size(&env.options, &picker_settings);
+    refresh_manual_value_fields(
+        env,
+        &settings.manual_value_fields,
+        touch_screen_width,
+        touch_screen_height,
+        &mut picker_settings,
     );
     refresh_dropdown(
         env,
@@ -1239,10 +2766,51 @@ fn app_picker_inner(
         &language_label_for_tag(language_state.selected),
         &language_state,
     );
+    refresh_dropdown(
+        env,
+        &settings.renderer_dropdown,
+        &renderer_mode_label_for_tag(renderer_state.selected),
+        &renderer_state,
+    );
+    refresh_dropdown(
+        env,
+        &settings.memory_limit_dropdown,
+        &memory_limit_label(picker_settings.memory_limit_mb),
+        &memory_limit_state,
+    );
 
     // Built after the settings screen, so that it is drawn on top of it.
-    let delete_dialog = make_delete_dialog(env, delegate, main_view, app_frame.size);
+    let delete_dialog = make_delete_dialog(
+        env,
+        delegate,
+        main_view,
+        app_frame.size,
+        "deleteCancel",
+        "deleteConfirm",
+    );
+    let save_error_dialog = make_delete_dialog(
+        env,
+        delegate,
+        main_view,
+        app_frame.size,
+        "saveErrorDismiss",
+        "saveErrorDismiss",
+    );
+    // Same for the RAM limiter's "Custom…" keypad.
+    let custom_limit_dialog = make_custom_limit_dialog(env, delegate, main_view, app_frame.size);
+    // What has been typed into the keypad so far, in decimal digits.
+    let mut custom_limit_input = String::new();
 
+    // Same shape as `reset_dialog`, but built after it: the two look alike, and
+    // the one sharing its layout must be on top of its twin's dimmer.
+    let reset_dialog = make_delete_dialog(
+        env,
+        delegate,
+        main_view,
+        app_frame.size,
+        "resetSettingsCancel",
+        "resetSettingsConfirm",
+    );
     () = msg![env; window makeKeyAndVisible];
 
     let apps_dir = paths::user_data_base_path().join(paths::APPS_DIR);
@@ -1267,12 +2835,11 @@ fn app_picker_inner(
     let mut status_time_updated_at = Instant::now();
     let mut status_battery_updated_at = Instant::now();
 
-    let mut chrome_views: Vec<id> = Vec::with_capacity(3 + page_dots.len());
+    let mut chrome_views: Vec<id> = Vec::with_capacity(2 + page_dots.len());
     if let Some(bar) = status_bar {
         chrome_views.push(bar);
     }
     chrome_views.push(dock);
-    chrome_views.push(version_label);
     chrome_views.extend(page_dots.iter().copied());
 
     let main_run_loop: id = msg_class![env; NSRunLoop mainRunLoop];
@@ -1287,7 +2854,6 @@ fn app_picker_inner(
             status_bar,
             status_time_label,
             dock,
-            version_label,
             &page_dots,
         );
         if let Some(ref grid) = icon_grid_stuff {
@@ -1305,24 +2871,32 @@ fn app_picker_inner(
     }
     // If an app is picked, this loop returns. If the user quits touchHLE, the
     // process exits.
-    let custom_wallpaper = paths::user_data_base_path().join("BerryHLE_wallpaper.custom");
-    let mut wallpaper_stamp = std::fs::metadata(&custom_wallpaper).ok().and_then(|m| m.modified().ok());
+    let custom_wallpaper = paths::user_data_base_path().join("AppleJuiceHLE_wallpaper.custom");
+    let mut wallpaper_stamp = std::fs::metadata(&custom_wallpaper)
+        .ok()
+        .and_then(|m| m.modified().ok());
     let mut wallpaper_checked_at = Instant::now();
     let app_path = loop {
         run_run_loop_single_iteration(env, main_run_loop);
         if wallpaper_checked_at.elapsed() >= Duration::from_millis(500) {
             wallpaper_checked_at = Instant::now();
-            let stamp = std::fs::metadata(&custom_wallpaper).ok().and_then(|m| m.modified().ok());
+            let stamp = std::fs::metadata(&custom_wallpaper)
+                .ok()
+                .and_then(|m| m.modified().ok());
             if stamp.is_some() && stamp != wallpaper_stamp {
                 wallpaper_stamp = stamp;
-                match std::fs::read(&custom_wallpaper).map_err(|e| e.to_string())
-                    .and_then(|bytes| Image::from_bytes(&bytes)) {
+                match std::fs::read(&custom_wallpaper)
+                    .map_err(|e| e.to_string())
+                    .and_then(|bytes| Image::from_bytes(&bytes))
+                {
                     Ok(image) => {
                         let frame = fit_wallpaper(image.dimensions(), bounds.size);
                         let cg = cg_image::from_image(env, image);
                         let image: id = msg_class![env; UIImage imageWithCGImage:cg];
                         cg_image::CGImageRelease(env, cg);
-                        let view = if let Some(view) = wallpaper_view { view } else {
+                        let view = if let Some(view) = wallpaper_view {
+                            view
+                        } else {
                             let view: id = msg_class![env; UIImageView alloc];
                             let view: id = msg![env; view initWithImage:image];
                             () = msg![env; window insertSubview:view atIndex:0i32];
@@ -1336,6 +2910,10 @@ fn app_picker_inner(
                 }
             }
         }
+        update_settings_scrollbar(env, &settings);
+        sync_dropdown_scroll(env, &settings.device_dropdown, &mut device_state);
+        sync_dropdown_scroll(env, &settings.language_dropdown, &mut language_state);
+        sync_dropdown_scroll(env, &settings.renderer_dropdown, &mut renderer_state);
 
         if status_time_updated_at.elapsed() >= Duration::from_secs(10) {
             status_time_updated_at = Instant::now();
@@ -1419,20 +2997,22 @@ fn app_picker_inner(
                 } else {
                     current_page.saturating_sub(1)
                 };
-                if !settings_open && pending_delete.is_none() && new_page < grid.pages.len() {
-                    if new_page != current_page {
-                        slide_to_page(
-                            env,
-                            main_run_loop,
-                            delegate,
-                            grid,
-                            apps.as_mut().unwrap(),
-                            new_page,
-                            if swipe_left { 1.0 } else { -1.0 },
-                        );
-                        current_page = new_page;
-                        update_page_dots(env, &page_dots, current_page);
-                    }
+                if !settings_open
+                    && pending_delete.is_none()
+                    && new_page < grid.pages.len()
+                    && new_page != current_page
+                {
+                    slide_to_page(
+                        env,
+                        main_run_loop,
+                        delegate,
+                        grid,
+                        apps.as_mut().unwrap(),
+                        new_page,
+                        if swipe_left { 1.0 } else { -1.0 },
+                    );
+                    current_page = new_page;
+                    update_page_dots(env, &page_dots, current_page);
                 }
             }
             continue;
@@ -1470,13 +3050,14 @@ fn app_picker_inner(
                 if let (Some(app_idx), Some(name)) = (app_idx, name) {
                     long_pressed_icon = Some(button);
                     pending_delete = Some(app_idx);
-                    show_delete_dialog(
+                    set_dialog_content(
                         env,
-                        main_run_loop,
-                        delegate,
                         &delete_dialog,
-                        &name,
+                        &format!("Delete “{name}”?"),
+                        "This will delete the app and all of its saved data.",
+                        Some("Delete"),
                     );
+                    show_delete_dialog(env, main_run_loop, delegate, &delete_dialog);
                 }
             }
         }
@@ -1494,7 +3075,8 @@ fn app_picker_inner(
                 .copied()
             {
                 Some(app_idx) => {
-                    let app_path = apps.as_ref().unwrap()[app_idx].path.clone();
+                    let app = &apps.as_ref().unwrap()[app_idx];
+                    let app_path = app.path.clone();
                     remember_last_app_path(&app_path);
                     echo!("Picked: {}", app_path.display());
                     // iOS-style launch: the icon travels to the middle of the
@@ -1517,14 +3099,10 @@ fn app_picker_inner(
             continue;
         }
         let status_accessory_tapped = {
-            let host = env
-                .objc
-                .borrow_mut::<AppPickerDelegateHostObject>(delegate);
+            let host = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
             std::mem::take(&mut host.status_accessory_tapped)
         };
         if status_accessory_tapped {
-            press = None;
-            long_pressed_icon = None;
             let downloaded = access_prompt::run_access_prompt(
                 env,
                 main_run_loop,
@@ -1542,9 +3120,7 @@ fn app_picker_inner(
             // Both screens use nested event loops. Do not let their touches or
             // swipes leak back into the home screen.
             {
-                let host = env
-                    .objc
-                    .borrow_mut::<AppPickerDelegateHostObject>(delegate);
+                let host = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
                 host.icon_tapped = nil;
                 host.icon_touch_down = nil;
                 host.icon_touch_cancelled = false;
@@ -1558,20 +3134,9 @@ fn app_picker_inner(
             if downloaded {
                 awaited_ipa = None;
                 if let Some(grid) = icon_grid_stuff.as_mut() {
-                    let page_count = reload_app_grid(
-                        env,
-                        grid,
-                        &mut apps,
-                        &mut current_page,
-                        &apps_dir,
-                    );
-                    rebuild_page_dots(
-                        env,
-                        main_view,
-                        app_frame.size,
-                        &mut page_dots,
-                        page_count,
-                    );
+                    let page_count =
+                        reload_app_grid(env, grid, &mut apps, &mut current_page, &apps_dir);
+                    rebuild_page_dots(env, main_view, app_frame.size, &mut page_dots, page_count);
                     update_page_dots(env, &page_dots, current_page);
                 }
             }
@@ -1579,13 +3144,36 @@ fn app_picker_inner(
         }
 
         let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
-        if std::mem::take(&mut host_obj.recent_app_tapped) {
+        let recent_app_tapped = std::mem::take(&mut host_obj.recent_app_tapped);
+        let add_ipa = std::mem::take(&mut host_obj.add_ipa);
+        // Read every flag the settings screen set here, in one go.
+        let reset_request = if std::mem::take(&mut host_obj.reset_cancel) {
+            ResetSettingsRequest::Cancel
+        } else if std::mem::take(&mut host_obj.settings_reset) {
+            ResetSettingsRequest::Ask
+        } else if std::mem::take(&mut host_obj.reset_confirm) {
+            ResetSettingsRequest::Confirm
+        } else if std::mem::take(&mut host_obj.save_error_dismiss) {
+            ResetSettingsRequest::DismissError
+        } else {
+            ResetSettingsRequest::None
+        };
+        // The reset handlers below need `env`, so the borrow ends here and is
+        // taken again for the handlers that still need `host_obj`.
+        let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
+        if recent_app_tapped {
             if let Some((path, _, _)) = recent_app.as_ref() {
                 echo!("Picked last launched app: {}", path.display());
+                if BundleData::open_any(path)
+                    .and_then(|data| Bundle::new_bundle_and_fs_from_host_path(data, true))
+                    .is_err()
+                {
+                    log!("Warning: Couldn't inspect the last app's bundle; some app-specific options may not be applied");
+                }
                 break path.clone();
             }
         }
-        if std::mem::take(&mut host_obj.add_ipa) {
+        if add_ipa {
             // Snapshot the .ipa files that exist right now, so that when the
             // system file picker finishes, we can detect the new file and
             // refresh the app grid.
@@ -1607,6 +3195,35 @@ fn app_picker_inner(
         } else if std::mem::take(&mut host_obj.settings_show) {
             show_settings_screen(env, main_run_loop, delegate, &settings);
         } else if std::mem::take(&mut host_obj.settings_hide) {
+            // Commit an active manual field before leaving Settings; otherwise
+            // tapping Done could hide the field before UIKit ends editing.
+            drop(host_obj);
+            for &(_, field, _) in &settings.manual_value_fields {
+                let _: bool = msg![env; field resignFirstResponder];
+            }
+            if let Some((tag, text)) = {
+                let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
+                std::mem::take(&mut host_obj.manual_value)
+            } {
+                let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
+                apply_manual_value(&mut picker_settings, tag, &text, width, height);
+                refresh_manual_value_fields(
+                    env,
+                    &settings.manual_value_fields,
+                    width,
+                    height,
+                    &mut picker_settings,
+                );
+            }
+            if renderer_state.open {
+                renderer_state.open = false;
+                refresh_dropdown(
+                    env,
+                    &settings.renderer_dropdown,
+                    &renderer_mode_label_for_tag(renderer_state.selected),
+                    &renderer_state,
+                );
+            }
             if device_state.open {
                 device_state.open = false;
                 refresh_dropdown(
@@ -1625,58 +3242,200 @@ fn app_picker_inner(
                     &language_state,
                 );
             }
+            if memory_limit_state.open {
+                memory_limit_state.open = false;
+                refresh_dropdown(
+                    env,
+                    &settings.memory_limit_dropdown,
+                    &memory_limit_label(picker_settings.memory_limit_mb),
+                    &memory_limit_state,
+                );
+            }
             hide_settings_screen(env, main_run_loop, delegate, &settings);
         } else if std::mem::take(&mut host_obj.scale_hack_default) {
-            quick_options_scale_hack = None;
-            update_scale_hack_buttons(env, &settings.scale_hack_buttons, quick_options_scale_hack);
+            picker_settings.scale_hack = None;
+            update_scale_hack_buttons(
+                env,
+                &settings.scale_hack_buttons,
+                picker_settings.scale_hack,
+            );
         } else if std::mem::take(&mut host_obj.scale_hack1) {
-            quick_options_scale_hack = NonZeroU32::new(1);
-            update_scale_hack_buttons(env, &settings.scale_hack_buttons, quick_options_scale_hack);
+            picker_settings.scale_hack = NonZeroU32::new(1);
+            update_scale_hack_buttons(
+                env,
+                &settings.scale_hack_buttons,
+                picker_settings.scale_hack,
+            );
         } else if std::mem::take(&mut host_obj.scale_hack2) {
-            quick_options_scale_hack = NonZeroU32::new(2);
-            update_scale_hack_buttons(env, &settings.scale_hack_buttons, quick_options_scale_hack);
+            picker_settings.scale_hack = NonZeroU32::new(2);
+            update_scale_hack_buttons(
+                env,
+                &settings.scale_hack_buttons,
+                picker_settings.scale_hack,
+            );
         } else if std::mem::take(&mut host_obj.scale_hack3) {
-            quick_options_scale_hack = NonZeroU32::new(3);
-            update_scale_hack_buttons(env, &settings.scale_hack_buttons, quick_options_scale_hack);
+            picker_settings.scale_hack = NonZeroU32::new(3);
+            update_scale_hack_buttons(
+                env,
+                &settings.scale_hack_buttons,
+                picker_settings.scale_hack,
+            );
         } else if std::mem::take(&mut host_obj.scale_hack4) {
-            quick_options_scale_hack = NonZeroU32::new(4);
-            update_scale_hack_buttons(env, &settings.scale_hack_buttons, quick_options_scale_hack);
+            picker_settings.scale_hack = NonZeroU32::new(4);
+            update_scale_hack_buttons(
+                env,
+                &settings.scale_hack_buttons,
+                picker_settings.scale_hack,
+            );
         } else if std::mem::take(&mut host_obj.orientation_default) {
-            quick_options_orientation = None;
+            picker_settings.orientation = None;
             update_orientation_buttons(
                 env,
                 &settings.orientation_buttons,
-                quick_options_orientation,
+                picker_settings.orientation,
+            );
+            let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
+            refresh_manual_value_fields(
+                env,
+                &settings.manual_value_fields,
+                width,
+                height,
+                &mut picker_settings,
             );
         } else if std::mem::take(&mut host_obj.orientation_landscape_left) {
-            quick_options_orientation = Some(DeviceOrientation::LandscapeLeft);
+            picker_settings.orientation = Some(DeviceOrientation::LandscapeLeft);
             update_orientation_buttons(
                 env,
                 &settings.orientation_buttons,
-                quick_options_orientation,
+                picker_settings.orientation,
+            );
+            let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
+            refresh_manual_value_fields(
+                env,
+                &settings.manual_value_fields,
+                width,
+                height,
+                &mut picker_settings,
             );
         } else if std::mem::take(&mut host_obj.orientation_landscape_right) {
-            quick_options_orientation = Some(DeviceOrientation::LandscapeRight);
+            picker_settings.orientation = Some(DeviceOrientation::LandscapeRight);
             update_orientation_buttons(
                 env,
                 &settings.orientation_buttons,
-                quick_options_orientation,
+                picker_settings.orientation,
+            );
+            let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
+            refresh_manual_value_fields(
+                env,
+                &settings.manual_value_fields,
+                width,
+                height,
+                &mut picker_settings,
             );
         } else if std::mem::take(&mut host_obj.orientation_portrait_upside_down) {
-            quick_options_orientation = Some(DeviceOrientation::PortraitUpsideDown);
+            picker_settings.orientation = Some(DeviceOrientation::PortraitUpsideDown);
             update_orientation_buttons(
                 env,
                 &settings.orientation_buttons,
-                quick_options_orientation,
+                picker_settings.orientation,
+            );
+            let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
+            refresh_manual_value_fields(
+                env,
+                &settings.manual_value_fields,
+                width,
+                height,
+                &mut picker_settings,
+            );
+        } else if let Some(tag) = std::mem::take(&mut host_obj.memory_limit_tag) {
+            memory_limit_state.selected = Some(tag);
+            memory_limit_state.open = false;
+            if tag == MEMORY_LIMIT_CUSTOM_TAG {
+                // The "Custom…" row opens a keypad instead of setting a size.
+                // It starts from the current cap, so an existing custom value
+                // is easy to adjust.
+                custom_limit_input = picker_settings
+                    .memory_limit_mb
+                    .map(|mb| mb.to_string())
+                    .unwrap_or_default();
+                show_custom_limit_dialog(env, &custom_limit_dialog, &custom_limit_input);
+            } else {
+                picker_settings.memory_limit_mb = memory_limit_choice(Some(tag));
+                refresh_dropdown(
+                    env,
+                    &settings.memory_limit_dropdown,
+                    &memory_limit_label(picker_settings.memory_limit_mb),
+                    &memory_limit_state,
+                );
+            }
+        } else if let Some(key) = std::mem::take(&mut host_obj.memory_limit_custom_key) {
+            if key == CUSTOM_LIMIT_BACKSPACE_KEY {
+                let _ = custom_limit_input.pop();
+            } else if (0..=9).contains(&key)
+                && custom_limit_input.len() < CUSTOM_LIMIT_MAX_DIGITS
+                // A leading zero would make "010" out of "10".
+                && !(custom_limit_input.is_empty() && key == 0)
+            {
+                custom_limit_input.push(char::from(b'0' + key as u8));
+            }
+            set_custom_limit_dialog_text(env, &custom_limit_dialog, &custom_limit_input);
+        } else if std::mem::take(&mut host_obj.memory_limit_custom_confirm) {
+            if let Some(mb) = custom_memory_limit_mb(&custom_limit_input) {
+                picker_settings.memory_limit_mb = Some(mb);
+                memory_limit_state.selected = Some(MEMORY_LIMIT_CUSTOM_TAG);
+                hide_custom_limit_dialog(env, &custom_limit_dialog);
+                refresh_dropdown(
+                    env,
+                    &settings.memory_limit_dropdown,
+                    &memory_limit_label(picker_settings.memory_limit_mb),
+                    &memory_limit_state,
+                );
+            }
+            // An empty or zero size leaves the dialog open: there is nothing
+            // to apply, and closing it would look like it had been applied.
+        } else if std::mem::take(&mut host_obj.memory_limit_custom_cancel) {
+            hide_custom_limit_dialog(env, &custom_limit_dialog);
+            memory_limit_state.selected = Some(memory_limit_tag(picker_settings.memory_limit_mb));
+            refresh_dropdown(
+                env,
+                &settings.memory_limit_dropdown,
+                &memory_limit_label(picker_settings.memory_limit_mb),
+                &memory_limit_state,
+            );
+        } else if std::mem::take(&mut host_obj.memory_limit_toggle) {
+            memory_limit_state.open = !memory_limit_state.open;
+            refresh_dropdown(
+                env,
+                &settings.memory_limit_dropdown,
+                &memory_limit_label(picker_settings.memory_limit_mb),
+                &memory_limit_state,
+            );
+        } else if let Some(position) = std::mem::take(&mut host_obj.memory_limit_scroll_to) {
+            memory_limit_state.scroll =
+                dropdown_scroll_at(position, settings.memory_limit_dropdown.items.len());
+            refresh_dropdown(
+                env,
+                &settings.memory_limit_dropdown,
+                &memory_limit_label(picker_settings.memory_limit_mb),
+                &memory_limit_state,
             );
         } else if let Some(tag) = std::mem::take(&mut host_obj.device_model_tag) {
             device_state.selected = Some(tag);
+            picker_settings.device_model_tag = device_state.selected;
             device_state.open = false;
             refresh_dropdown(
                 env,
                 &settings.device_dropdown,
                 &device_model_label_for_tag(device_state.selected),
                 &device_state,
+            );
+            let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
+            refresh_manual_value_fields(
+                env,
+                &settings.manual_value_fields,
+                width,
+                height,
+                &mut picker_settings,
             );
         } else if std::mem::take(&mut host_obj.device_model_toggle) {
             device_state.open = !device_state.open;
@@ -1686,13 +3445,46 @@ fn app_picker_inner(
                 &device_model_label_for_tag(device_state.selected),
                 &device_state,
             );
+        } else if let Some(progress) = std::mem::take(&mut host_obj.settings_scroll_to) {
+            let scroll = settings.scroll_view;
+            let offset: CGPoint = msg![env; scroll contentOffset];
+            let new_y = settings_scroll_offset_at(env, &settings, progress);
+            () = msg![env; scroll setContentOffset:(CGPoint { x: offset.x, y: new_y })];
         } else if let Some(position) = std::mem::take(&mut host_obj.device_model_scroll_to) {
-            device_state.scroll = dropdown_scroll_at(position, settings.device_dropdown.items.len());
+            device_state.scroll =
+                dropdown_scroll_at(position, settings.device_dropdown.items.len());
             refresh_dropdown(
                 env,
                 &settings.device_dropdown,
                 &device_model_label_for_tag(device_state.selected),
                 &device_state,
+            );
+        } else if let Some(tag) = std::mem::take(&mut host_obj.renderer_mode_tag) {
+            renderer_state.selected = Some(tag);
+            renderer_state.open = false;
+            picker_settings.renderer_mode = renderer_mode_from_tag(Some(tag));
+            refresh_dropdown(
+                env,
+                &settings.renderer_dropdown,
+                &renderer_mode_label_for_tag(renderer_state.selected),
+                &renderer_state,
+            );
+        } else if std::mem::take(&mut host_obj.renderer_mode_toggle) {
+            renderer_state.open = !renderer_state.open;
+            refresh_dropdown(
+                env,
+                &settings.renderer_dropdown,
+                &renderer_mode_label_for_tag(renderer_state.selected),
+                &renderer_state,
+            );
+        } else if let Some(position) = std::mem::take(&mut host_obj.renderer_mode_scroll_to) {
+            renderer_state.scroll =
+                dropdown_scroll_at(position, settings.renderer_dropdown.items.len());
+            refresh_dropdown(
+                env,
+                &settings.renderer_dropdown,
+                &renderer_mode_label_for_tag(renderer_state.selected),
+                &renderer_state,
             );
         } else if let Some(tag) = std::mem::take(&mut host_obj.language_tag) {
             language_state.selected = Some(tag);
@@ -1712,7 +3504,8 @@ fn app_picker_inner(
                 &language_state,
             );
         } else if let Some(position) = std::mem::take(&mut host_obj.language_scroll_to) {
-            language_state.scroll = dropdown_scroll_at(position, settings.language_dropdown.items.len());
+            language_state.scroll =
+                dropdown_scroll_at(position, settings.language_dropdown.items.len());
             refresh_dropdown(
                 env,
                 &settings.language_dropdown,
@@ -1726,7 +3519,8 @@ fn app_picker_inner(
             if let Some(app_idx) = pending_delete.take() {
                 hide_delete_dialog(env, main_run_loop, delegate, &delete_dialog);
                 let result = match apps.as_ref().ok().and_then(|list| {
-                    list.get(app_idx).map(|app| delete_app(app, list.as_slice()))
+                    list.get(app_idx)
+                        .map(|app| delete_app(app, list.as_slice()))
                 }) {
                     Some(res) => res,
                     None => Err("the app is no longer in the list".to_string()),
@@ -1749,73 +3543,188 @@ fn app_picker_inner(
                     Err(e) => echo!("Couldn't delete app: {}", e),
                 }
             }
+        } else if let Some(mode) = std::mem::take(&mut host_obj.vsync) {
+            picker_settings.vsync = mode;
+            update_segment_buttons(env, &settings.vsync_buttons, vsync_selected_index(mode));
+        } else if let Some(mode) = std::mem::take(&mut host_obj.present_mode) {
+            picker_settings.present_mode = mode;
+            update_segment_buttons(
+                env,
+                &settings.present_mode_buttons,
+                present_mode_selected_index(mode),
+            );
+        } else if let Some(value) = std::mem::take(&mut host_obj.fix_texture_min_filter) {
+            picker_settings.fix_texture_min_filter = value;
+            update_segment_buttons(
+                env,
+                &settings.texture_filter_buttons,
+                texture_filter_selected_index(value),
+            );
+        } else if let Some(value) = std::mem::take(&mut host_obj.present_rotate) {
+            picker_settings.present_rotate = value;
+            update_segment_buttons(
+                env,
+                &settings.present_rotate_buttons,
+                present_rotate_selected_index(value),
+            );
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.print_fps) {
+            picker_settings.print_fps = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.popup_errors) {
+            picker_settings.popup_errors = enabled;
+        } else if let Some(mode) = std::mem::take(&mut host_obj.controller_to_touch) {
+            picker_settings.controller_to_touch = mode;
+            update_segment_buttons(
+                env,
+                &settings.controller_to_touch_buttons,
+                controller_to_touch_selected_index(mode),
+            );
+            let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
+            refresh_manual_value_fields(
+                env,
+                &settings.manual_value_fields,
+                width,
+                height,
+                &mut picker_settings,
+            );
+        } else if let Some((tag, text)) = std::mem::take(&mut host_obj.manual_value) {
+            let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
+            apply_manual_value(&mut picker_settings, tag, &text, width, height);
+            refresh_manual_value_fields(
+                env,
+                &settings.manual_value_fields,
+                width,
+                height,
+                &mut picker_settings,
+            );
         } else if let Some(enabled) = std::mem::take(&mut host_obj.analog_stick_tilt_controls) {
-            quick_options_analog_stick_tilt_controls = enabled;
+            picker_settings.analog_stick_tilt_controls = enabled;
+            let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
+            refresh_manual_value_fields(
+                env,
+                &settings.manual_value_fields,
+                width,
+                height,
+                &mut picker_settings,
+            );
         } else if let Some(enabled) = std::mem::take(&mut host_obj.network) {
-            quick_options_network = enabled;
+            picker_settings.network = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.game_center_authenticated) {
             picker_settings.game_center_authenticated = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.quick_menu) {
+            picker_settings.quick_menu = enabled;
+            quick_options_quick_menu = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.cheat_engine) {
-            quick_options_cheat_engine = enabled;
+            picker_settings.cheat_engine = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.show_fps) {
             quick_options_show_fps = enabled;
             picker_settings.show_fps = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.trace_gl_errors) {
+            picker_settings.trace_gl_errors = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.trace_gl_draws) {
+            picker_settings.trace_gl_draws = enabled;
         } else if let Some(mode) = std::mem::take(&mut host_obj.overlay_mode) {
-            quick_options_overlay_mode = mode;
+            picker_settings.overlay_mode = mode;
             update_performance_overlay_buttons(
                 env,
                 &settings.overlay_mode_buttons,
                 &settings.overlay_corner_buttons,
-                quick_options_overlay_mode,
-                quick_options_overlay_corner,
+                picker_settings.overlay_mode,
+                picker_settings.overlay_corner,
             );
             env.window_mut().set_performance_overlay_settings(
                 quick_options_show_fps,
-                quick_options_overlay_mode,
-                quick_options_overlay_corner,
+                picker_settings.overlay_mode,
+                picker_settings.overlay_corner,
             );
         } else if let Some(corner) = std::mem::take(&mut host_obj.overlay_corner) {
-            quick_options_overlay_corner = corner;
+            picker_settings.overlay_corner = corner;
             update_performance_overlay_buttons(
                 env,
                 &settings.overlay_mode_buttons,
                 &settings.overlay_corner_buttons,
-                quick_options_overlay_mode,
-                quick_options_overlay_corner,
+                picker_settings.overlay_mode,
+                picker_settings.overlay_corner,
             );
             env.window_mut().set_performance_overlay_settings(
                 quick_options_show_fps,
-                quick_options_overlay_mode,
-                quick_options_overlay_corner,
+                picker_settings.overlay_mode,
+                picker_settings.overlay_corner,
             );
         } else if let Some(rotation_fix) = std::mem::take(&mut host_obj.rotation_fix) {
-            quick_options_rotation_fix = Some(rotation_fix);
+            picker_settings.rotation_fix = Some(rotation_fix);
         } else if let Some(fix_movie_player) = std::mem::take(&mut host_obj.fix_movie_player) {
-            quick_options_fix_movie_player = Some(fix_movie_player);
+            picker_settings.fix_movie_player = Some(fix_movie_player);
+        } else if let Some(manual_ui_rotation) = std::mem::take(&mut host_obj.manual_ui_rotation) {
+            picker_settings.manual_ui_rotation = Some(manual_ui_rotation);
+        } else if let Some(preserve_dyld_stubs) = std::mem::take(&mut host_obj.preserve_dyld_stubs)
+        {
+            picker_settings.preserve_dyld_stubs = Some(preserve_dyld_stubs);
+        } else if let Some(dladdr) = std::mem::take(&mut host_obj.dladdr) {
+            picker_settings.dladdr = Some(dladdr);
+        } else if std::mem::take(&mut host_obj.corruption_mode_changed) {
+            picker_settings.corruption_mode =
+                host_obj.corruption_mode.unwrap_or(CorruptionMode::Off);
+            update_segment_buttons(
+                env,
+                &settings.corruption_mode_buttons,
+                picker_settings.corruption_mode.selected_index() as usize,
+            );
+            let (width, height) = picker_touch_screen_size(&env.options, &picker_settings);
+            refresh_manual_value_fields(
+                env,
+                &settings.manual_value_fields,
+                width,
+                height,
+                &mut picker_settings,
+            );
+        } else if let Some(preset) = std::mem::take(&mut host_obj.corruption_startup_delay) {
+            picker_settings.corruption_startup_delay = preset;
+            update_segment_buttons(
+                env,
+                &settings.corruption_startup_delay_buttons,
+                preset.selected_index(),
+            );
+        } else if let Some(preset) = std::mem::take(&mut host_obj.corruption_cooldown) {
+            picker_settings.corruption_cooldown = preset;
+            update_segment_buttons(
+                env,
+                &settings.corruption_cooldown_buttons,
+                preset.selected_index(),
+            );
+        } else if let Some(mode) = std::mem::take(&mut host_obj.gles2_mode) {
+            picker_settings.gles2_mode = mode;
+            update_segment_buttons(
+                env,
+                &settings.gles2_mode_buttons,
+                picker_settings.gles2_mode.selected_index() as usize,
+            );
         } else if let Some(preserve_aspect_ratio) =
             std::mem::take(&mut host_obj.preserve_aspect_ratio)
         {
-            quick_options_preserve_aspect_ratio = preserve_aspect_ratio;
+            picker_settings.preserve_aspect_ratio = preserve_aspect_ratio;
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             env.window_mut()
                 .set_preserve_aspect_ratio(preserve_aspect_ratio);
         } else if let Some(enabled) = std::mem::take(&mut host_obj.show_lock_screen) {
-            quick_options_show_lock_screen = enabled;
+            picker_settings.show_lock_screen = enabled;
         } else if let Some(force_composition) = std::mem::take(&mut host_obj.force_composition) {
-            quick_options_force_composition_override = Some(force_composition);
-        } else if let Some(gles_native) = std::mem::take(&mut host_obj.gles_native) {
-            quick_options_gles_native = gles_native || !crate::window::angle_backend_available();
+            picker_settings.force_composition = force_composition;
+        } else if let Some(no_gles3) = std::mem::take(&mut host_obj.no_gles3) {
+            picker_settings.no_gles3 = Some(no_gles3);
         } else if let Some(fullscreen) = std::mem::take(&mut host_obj.fullscreen) {
-            quick_options_fullscreen = fullscreen;
+            picker_settings.fullscreen = fullscreen;
         }
 
         let wheel = PENDING_MOUSE_WHEEL.swap(0, Ordering::Relaxed);
         if wheel != 0 {
             let language_open = language_state.open;
+            let memory_limit_open = memory_limit_state.open;
             let dropdown = if language_open {
                 Some((&mut language_state, &settings.language_dropdown))
             } else if device_state.open {
                 Some((&mut device_state, &settings.device_dropdown))
+            } else if memory_limit_open {
+                Some((&mut memory_limit_state, &settings.memory_limit_dropdown))
             } else {
                 None
             };
@@ -1824,6 +3733,8 @@ fn app_picker_inner(
                     .clamp(0, dropdown_max_scroll(dropdown.items.len()));
                 let label = if language_open {
                     language_label_for_tag(state.selected)
+                } else if memory_limit_open {
+                    memory_limit_label(memory_limit_choice(state.selected))
                 } else {
                     device_model_label_for_tag(state.selected)
                 };
@@ -1841,26 +3752,44 @@ fn app_picker_inner(
             }
         }
 
-        picker_settings.scale_hack = quick_options_scale_hack;
-        picker_settings.orientation = quick_options_orientation;
-        picker_settings.fullscreen = quick_options_fullscreen;
-        picker_settings.preserve_aspect_ratio = quick_options_preserve_aspect_ratio;
-        picker_settings.show_lock_screen = quick_options_show_lock_screen;
-        picker_settings.gles_native = quick_options_gles_native;
-        picker_settings.force_composition =
-            quick_options_force_composition_override.unwrap_or(env.options.force_composition);
-        picker_settings.overlay_mode = quick_options_overlay_mode;
-        picker_settings.overlay_corner = quick_options_overlay_corner;
-        picker_settings.rotation_fix = quick_options_rotation_fix;
-        picker_settings.fix_movie_player = quick_options_fix_movie_player;
-        picker_settings.cheat_engine = quick_options_cheat_engine;
-        picker_settings.network = quick_options_network;
-        picker_settings.analog_stick_tilt_controls = quick_options_analog_stick_tilt_controls;
         picker_settings.device_model_tag = device_state.selected;
         picker_settings.language_tag = language_state.selected;
-        if picker_settings != last_saved_picker_settings {
-            picker_settings.save();
-            last_saved_picker_settings = picker_settings.clone();
+
+        let mut drafts = SettingsDrafts {
+            picker_settings: picker_settings.clone(),
+            last_saved_picker_settings: last_saved_picker_settings.clone(),
+            device_state: device_state.clone(),
+            language_state: language_state.clone(),
+            renderer_state: renderer_state.clone(),
+            memory_limit_state: memory_limit_state.clone(),
+        };
+        handle_reset_settings_request(
+            env,
+            reset_request,
+            main_run_loop,
+            delegate,
+            (&settings, &reset_dialog, &save_error_dialog, &mut drafts),
+        );
+        picker_settings = drafts.picker_settings;
+        last_saved_picker_settings = drafts.last_saved_picker_settings;
+        device_state = drafts.device_state;
+        language_state = drafts.language_state;
+        renderer_state = drafts.renderer_state;
+        memory_limit_state = drafts.memory_limit_state;
+
+        if is_dialog_visible(env, &reset_dialog) || is_dialog_visible(env, &save_error_dialog) {
+            // While a confirmation or error dialog is up, only the dialog's
+            // own buttons may change the settings.
+        } else if picker_settings != last_saved_picker_settings
+            && Instant::now() >= next_settings_save
+        {
+            match picker_settings.save() {
+                Ok(()) => last_saved_picker_settings = picker_settings.clone(),
+                Err(error) => {
+                    log!("Warning: couldn't save app picker settings: {error}");
+                    next_settings_save = Instant::now() + Duration::from_secs(1);
+                }
+            }
         }
 
         // Detect .ipa files copied in by the "+" tile flow and refresh the
@@ -1881,13 +3810,7 @@ fn app_picker_inner(
                 if let Some(grid) = icon_grid_stuff.as_mut() {
                     let page_count =
                         reload_app_grid(env, grid, &mut apps, &mut current_page, &apps_dir);
-                    rebuild_page_dots(
-                        env,
-                        main_view,
-                        app_frame.size,
-                        &mut page_dots,
-                        page_count,
-                    );
+                    rebuild_page_dots(env, main_view, app_frame.size, &mut page_dots, page_count);
                     update_page_dots(env, &page_dots, current_page);
                 }
             }
@@ -1895,10 +3818,10 @@ fn app_picker_inner(
     };
 
     // Apply user-specified overrides
-    if let Some(scale_hack) = quick_options_scale_hack {
+    if let Some(scale_hack) = picker_settings.scale_hack {
         option_args.push(format!("--scale-hack={}", scale_hack.get()));
     }
-    if let Some(orientation) = quick_options_orientation {
+    if let Some(orientation) = picker_settings.orientation {
         option_args.push(
             match orientation {
                 DeviceOrientation::LandscapeLeft => "--landscape-left",
@@ -1909,14 +3832,14 @@ fn app_picker_inner(
             .to_string(),
         );
     }
-    if quick_options_fullscreen {
+    if picker_settings.fullscreen {
         option_args.push("--fullscreen".to_string());
     } else {
         option_args.push("--no-fullscreen".to_string());
     }
     if show_fullscreen_row {
         option_args.push(
-            if quick_options_preserve_aspect_ratio {
+            if picker_settings.preserve_aspect_ratio {
                 "--preserve-aspect-ratio"
             } else {
                 "--no-preserve-aspect-ratio"
@@ -1924,17 +3847,30 @@ fn app_picker_inner(
             .to_string(),
         );
     }
-    if !quick_options_analog_stick_tilt_controls {
+    if !picker_settings.analog_stick_tilt_controls {
         option_args.push("--disable-analog-stick-tilt-controls".to_string());
     } else {
         option_args.push("--enable-analog-stick-tilt-controls".to_string());
     }
-    if quick_options_network {
+    if picker_settings.network {
         option_args.push("--allow-network-access".to_string());
     } else {
         option_args.push("--no-network-access".to_string());
     }
-    option_args.push(quick_options_trainer_argument(quick_options_cheat_engine).to_string());
+    option_args.push(quick_options_trainer_argument(picker_settings.cheat_engine).to_string());
+    // Saved diagnostic switches override command-line and options-file values.
+    option_args
+        .push(quick_options_trace_gl_errors_argument(picker_settings.trace_gl_errors).to_string());
+    option_args
+        .push(quick_options_trace_gl_draws_argument(picker_settings.trace_gl_draws).to_string());
+    option_args.push(
+        if picker_settings.quick_menu {
+            "--quick-menu"
+        } else {
+            "--no-quick-menu"
+        }
+        .to_string(),
+    );
     option_args.push(
         if picker_settings.game_center_authenticated {
             "--game-center-authenticated"
@@ -1946,8 +3882,8 @@ fn app_picker_inner(
 
     env.window_mut().set_performance_overlay_settings(
         quick_options_show_fps,
-        quick_options_overlay_mode,
-        quick_options_overlay_corner,
+        picker_settings.overlay_mode,
+        picker_settings.overlay_corner,
     );
     option_args.push(format!(
         "--overlay={}",
@@ -1955,28 +3891,43 @@ fn app_picker_inner(
     ));
     option_args.push(format!(
         "--overlay-mode={}",
-        quick_options_overlay_mode.short_name()
+        picker_settings.overlay_mode.short_name()
     ));
     option_args.push(format!(
         "--overlay-corner={}",
-        quick_options_overlay_corner.short_name()
+        picker_settings.overlay_corner.short_name()
     ));
 
-    if let Some(enabled) = quick_options_force_composition_override {
-        option_args.push(quick_options_force_composition_argument(enabled).to_string());
-    }
+    option_args.push(
+        quick_options_force_composition_argument(picker_settings.force_composition).to_string(),
+    );
 
-    // The two compatibility fixes are only emitted when the Settings screen
-    // actually set them (see `quick_options_fix_arguments`).
+    // Always passed explicitly so the picker's renderer choice is applied;
+    // this app's bundled defaults and options files still override it.
+    option_args
+        .push(quick_options_renderer_mode_argument(picker_settings.renderer_mode).to_string());
+    option_args.extend(quick_options_ram_limiter_arguments(
+        picker_settings.memory_limit_mb,
+    ));
+
+    // Compatibility fix switches are only emitted when the Settings screen
+    // actually set them.
     option_args.extend(quick_options_fix_arguments(
-        quick_options_rotation_fix,
-        quick_options_fix_movie_player,
+        picker_settings.rotation_fix,
+        picker_settings.fix_movie_player,
     ));
-    // Always passed explicitly (like `--trainer`/`--no-trainer`): the base
-    // default is now OFF, so the switch has to be able to turn the native
-    // driver back on, and the picker's choice should win over any
-    // `--gles-native`/`--no-gles-native` in the options files.
-    option_args.push(quick_options_gles_native_argument(quick_options_gles_native).to_string());
+    if let Some(enabled) = picker_settings.no_gles3 {
+        option_args.push(quick_options_no_gles3_argument(enabled).to_string());
+    }
+    if let Some(enabled) = picker_settings.manual_ui_rotation {
+        option_args.push(quick_options_manual_ui_rotation_argument(enabled).to_string());
+    }
+    if let Some(enabled) = picker_settings.preserve_dyld_stubs {
+        option_args.push(quick_options_preserve_dyld_stubs_argument(enabled).to_string());
+    }
+    if let Some(enabled) = picker_settings.dladdr {
+        option_args.push(quick_options_dladdr_argument(enabled).to_string());
+    }
 
     if let Some(tag) = device_state.selected {
         let tag = tag as NSInteger;
@@ -1992,6 +3943,9 @@ fn app_picker_inner(
     if let Some(arg) = language_argument(language_state.selected) {
         option_args.push(arg);
     }
+
+    option_args.extend(quick_options_picker_settings_arguments(&picker_settings));
+    option_args.extend(picker_settings.gles2_mode.arguments());
 
     // Return the environment so some parts of it can be salvaged.
     (app_path, option_args)
@@ -2028,7 +3982,7 @@ fn app_picker_dots_top(app_height: CGFloat) -> CGFloat {
     app_picker_grid_bottom(app_height) + (APP_PICKER_DOTS_ROW_HEIGHT - PAGE_DOT_SIZE) / 2.0
 }
 
-/// The bottom edge of the icon grid: the page-dot/version row sits below it.
+/// The bottom edge of the icon grid: the page-dot row sits below it.
 fn app_picker_grid_bottom(app_height: CGFloat) -> CGFloat {
     app_height - APP_PICKER_DOCK_HEIGHT - APP_PICKER_DOTS_ROW_HEIGHT
 }
@@ -2158,7 +4112,7 @@ mod layout_tests {
         let mut o = Options::default();
         configure_picker_display(&mut o, (1920, 1080));
         assert_eq!(o.host_screen_size, Some((540, 960)));
-        assert!(o.landscape_uiscreen_bounds);
+        assert_eq!(o.landscape_uiscreen_bounds,Some(true));
         assert_eq!(o.present_rotate, Some(0));
     }
 
@@ -2280,11 +4234,9 @@ fn make_icon_grid(
             // Rounding is needed here to avoid blurry text.
             let label_frame = CGRect {
                 origin: CGPoint {
-                    x: (icon_frame.origin.x
-                        - (layout.label_size.width - layout.icon_size) / 2.0)
+                    x: (icon_frame.origin.x - (layout.label_size.width - layout.icon_size) / 2.0)
                         .round(),
-                    y: (icon_frame.origin.y + layout.icon_size + APP_PICKER_LABEL_TOP_GAP)
-                        .round(),
+                    y: (icon_frame.origin.y + layout.icon_size + APP_PICKER_LABEL_TOP_GAP).round(),
                 },
                 size: layout.label_size,
             };
@@ -2491,7 +4443,6 @@ fn run_lock_screen(
     status_bar: Option<id>,
     status_time_label: Option<id>,
     dock: id,
-    version_label: id,
     page_dots: &[id],
 ) {
     if let Some(grid) = grid {
@@ -2501,7 +4452,6 @@ fn run_lock_screen(
         }
     }
     () = msg![env; dock setHidden:true];
-    () = msg![env; version_label setHidden:true];
     for &dot in page_dots {
         () = msg![env; dot setHidden:true];
     }
@@ -2529,13 +4479,27 @@ fn run_lock_screen(
     let header_edge = new_view(env, rect(0.0, 137.0, size.width, 1.0), header_edge_color);
     () = msg![env; lock addSubview:header_edge];
     let white: id = msg_class![env; UIColor whiteColor];
-    let clock = new_label(env, rect(0.0, 12.0, size.width, 82.0), &lock_screen_time_string(), 68.0, false, white);
+    let clock = new_label(
+        env,
+        rect(0.0, 12.0, size.width, 82.0),
+        &lock_screen_time_string(),
+        68.0,
+        false,
+        white,
+    );
     () = msg![env; clock setTextAlignment:UITextAlignmentCenter];
     let shadow = ui_color(env, 0.0, 0.0, 0.0, 0.7);
     () = msg![env; clock setShadowColor:shadow];
     () = msg![env; clock setShadowOffset:(CGSize { width: 0.0, height: 2.0 })];
     () = msg![env; lock addSubview:clock];
-    let date = new_label(env, rect(8.0, 91.0, size.width - 16.0, 32.0), &lock_screen_date_string(), 22.0, false, white);
+    let date = new_label(
+        env,
+        rect(8.0, 91.0, size.width - 16.0, 32.0),
+        &lock_screen_date_string(),
+        22.0,
+        false,
+        white,
+    );
     () = msg![env; date setTextAlignment:UITextAlignmentCenter];
     () = msg![env; date setShadowColor:shadow];
     () = msg![env; date setShadowOffset:(CGSize { width: 0.0, height: 1.0 })];
@@ -2555,7 +4519,11 @@ fn run_lock_screen(
     // Raised metal bezel around the black glass slider, like the inset 3D
     // capsule on the reference iPhone OS lock screen.
     let bezel_color = ui_color(env, 0.25, 0.26, 0.28, 1.0);
-    let bezel = new_view(env, rect(17.0, bottom + 10.0, size.width - 34.0, 68.0), bezel_color);
+    let bezel = new_view(
+        env,
+        rect(17.0, bottom + 10.0, size.width - 34.0, 68.0),
+        bezel_color,
+    );
     let bezel_layer: id = msg![env; bezel layer];
     () = msg![env; bezel_layer setCornerRadius:(20.0 as CGFloat)];
     let bezel_edge = ui_color(env, 0.62, 0.64, 0.67, 1.0);
@@ -2565,7 +4533,11 @@ fn run_lock_screen(
     () = msg![env; lock addSubview:bezel];
 
     let track_color = ui_color(env, 0.008, 0.012, 0.02, 0.90);
-    let track = new_view(env, rect(21.0, bottom + 13.0, size.width - 42.0, 62.0), track_color);
+    let track = new_view(
+        env,
+        rect(21.0, bottom + 13.0, size.width - 42.0, 62.0),
+        track_color,
+    );
     let track_layer: id = msg![env; track layer];
     () = msg![env; track_layer setCornerRadius:(18.0 as CGFloat)];
     () = msg![env; track setClipsToBounds:true];
@@ -2577,7 +4549,11 @@ fn run_lock_screen(
     // A single restrained top glint keeps the capsule glossy without visible
     // striping on renderers that do not composite translucent bands smoothly.
     let track_glint_color = ui_color(env, 1.0, 1.0, 1.0, 0.11);
-    let track_glint = new_view(env, rect(14.0, 2.0, size.width - 70.0, 1.0), track_glint_color);
+    let track_glint = new_view(
+        env,
+        rect(14.0, 2.0, size.width - 70.0, 1.0),
+        track_glint_color,
+    );
     () = msg![env; track addSubview:track_glint];
     let track_width = size.width - 42.0;
     let thumb_width = (track_width * 0.245).clamp(76.0, 100.0);
@@ -2682,14 +4658,18 @@ fn run_lock_screen(
             let host = env.objc.borrow::<AppPickerDelegateHostObject>(delegate);
             (host.lock_screen_unlocked, host.lock_slider_progress)
         };
-        if unlocked { break; }
+        if unlocked {
+            break;
+        }
         let tracking: bool = msg![env; slider tracking];
         if !tracking && progress > 0.0 {
             // A partial swipe eases back to the start; a completed one is
             // handled above by the unlock transition.
             progress = (progress - 0.055).max(0.0);
             () = msg![env; slider setValue:progress];
-            env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate).lock_slider_progress = progress;
+            env.objc
+                .borrow_mut::<AppPickerDelegateHostObject>(delegate)
+                .lock_slider_progress = progress;
         }
         if shimmer_updated.elapsed() >= Duration::from_millis(33) {
             shimmer_updated = Instant::now();
@@ -2727,12 +4707,18 @@ fn run_lock_screen(
         host.swipe_right = false;
         host.swipe_left = false;
     }
-    animate_for(env, run_loop, delegate, Duration::from_millis(480), |env, t| {
-        let p = ease_in_out_cubic(t) as CGFloat;
-        let mut frame: CGRect = msg![env; lock frame];
-        frame.origin.y = -size.height * p;
-        () = msg![env; lock setFrame:frame];
-    });
+    animate_for(
+        env,
+        run_loop,
+        delegate,
+        Duration::from_millis(480),
+        |env, t| {
+            let p = ease_in_out_cubic(t) as CGFloat;
+            let mut frame: CGRect = msg![env; lock frame];
+            frame.origin.y = -size.height * p;
+            () = msg![env; lock setFrame:frame];
+        },
+    );
     () = msg![env; lock setHidden:true];
     if let Some(bar) = status_bar {
         () = msg![env; bar setBackgroundColor:clear];
@@ -2742,7 +4728,6 @@ fn run_lock_screen(
         () = msg![env; active_container setHidden:false];
     }
     () = msg![env; dock setHidden:false];
-    () = msg![env; version_label setHidden:false];
     for &dot in page_dots {
         () = msg![env; dot setHidden:false];
     }
@@ -2772,21 +4757,58 @@ fn lock_screen_calendar_parts() -> (i32, i32, i32, i32, i32, i32) {
         let mut now: libc::time_t = 0;
         libc::time(&mut now);
         let mut tm: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&now, &mut tm).is_null() { return (14, 50, 3, 0, 21, 2026); }
-        (tm.tm_hour, tm.tm_min, tm.tm_wday, tm.tm_mon, tm.tm_mday, tm.tm_year + 1900)
+        if libc::localtime_r(&now, &mut tm).is_null() {
+            return (14, 50, 3, 0, 21, 2026);
+        }
+        (
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_wday,
+            tm.tm_mon,
+            tm.tm_mday,
+            tm.tm_year + 1900,
+        )
     }
 }
 #[cfg(not(unix))]
-fn lock_screen_calendar_parts() -> (i32, i32, i32, i32, i32, i32) { (14, 50, 3, 0, 21, 2026) }
+fn lock_screen_calendar_parts() -> (i32, i32, i32, i32, i32, i32) {
+    (14, 50, 3, 0, 21, 2026)
+}
 fn lock_screen_time_string() -> String {
     let (hour, minute, ..) = lock_screen_calendar_parts();
     format!("{:02}:{:02}", hour, minute)
 }
 fn lock_screen_date_string() -> String {
     let (_, _, weekday, month, day, _) = lock_screen_calendar_parts();
-    let weekdays = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-    let months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-    format!("{}, {} {}", weekdays[weekday.clamp(0, 6) as usize], months[month.clamp(0, 11) as usize], day)
+    let weekdays = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
+    let months = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    format!(
+        "{}, {} {}",
+        weekdays[weekday.clamp(0, 6) as usize],
+        months[month.clamp(0, 11) as usize],
+        day
+    )
 }
 
 /// Builds a fake old-iOS status bar: signal bars, carrier, clock and battery.
@@ -2824,7 +4846,7 @@ fn make_status_bar(
     let carrier = new_label(
         env,
         rect(27.0, 1.0, width * 0.35, height - 2.0),
-        "BerryHLE",
+        "AppleJuiceHLE",
         12.0,
         true,
         white,
@@ -2853,7 +4875,11 @@ fn make_status_bar(
     () = msg![env; bar addSubview:time];
 
     // Battery: a white rounded shell with a black inside and a charge bar.
-    let battery = new_view(env, rect(width - BATTERY_RIGHT_INSET, 5.0, 24.0, 11.0), white);
+    let battery = new_view(
+        env,
+        rect(width - BATTERY_RIGHT_INSET, 5.0, 24.0, 11.0),
+        white,
+    );
     let battery_layer: id = msg![env; battery layer];
     () = msg![env; battery_layer setCornerRadius:(2.5 as CGFloat)];
     () = msg![env; bar addSubview:battery];
@@ -2867,11 +4893,20 @@ fn make_status_bar(
     () = msg![env; bar addSubview:battery_inner];
     let charge = new_view(
         env,
-        rect(width - BATTERY_CHARGE_LEFT, 7.5, BATTERY_CHARGE_MAX_WIDTH, 6.0),
+        rect(
+            width - BATTERY_CHARGE_LEFT,
+            7.5,
+            BATTERY_CHARGE_MAX_WIDTH,
+            6.0,
+        ),
         white,
     );
     () = msg![env; bar addSubview:charge];
-    let nub = new_view(env, rect(width - BATTERY_RIGHT_INSET + 24.5, 8.5, 2.0, 4.0), white);
+    let nub = new_view(
+        env,
+        rect(width - BATTERY_RIGHT_INSET + 24.5, 8.5, 2.0, 4.0),
+        white,
+    );
     () = msg![env; bar addSubview:nub];
     access_prompt::add_status_target(env, delegate, bar, width);
 
@@ -2991,7 +5026,11 @@ fn update_page_dots(env: &mut Environment, dots: &[id], current_page: usize) {
     let active: id = msg_class![env; UIColor whiteColor];
     let inactive = ui_color(env, 0.75, 0.75, 0.75, 0.45);
     for (idx, &dot) in dots.iter().enumerate() {
-        let color = if idx == current_page { active } else { inactive };
+        let color = if idx == current_page {
+            active
+        } else {
+            inactive
+        };
         () = msg![env; dot setBackgroundColor:color];
     }
 }
@@ -3029,7 +5068,11 @@ fn make_dock(
     let dock_width = width - dock_inset * 2.0;
     let top = screen_size.height - APP_PICKER_DOCK_HEIGHT + 2.0;
     let background = ui_color(env, 0.035, 0.045, 0.065, 0.62);
-    let dock = new_view(env, rect(dock_inset, top, dock_width, APP_PICKER_DOCK_HEIGHT - 4.0), background);
+    let dock = new_view(
+        env,
+        rect(dock_inset, top, dock_width, APP_PICKER_DOCK_HEIGHT - 4.0),
+        background,
+    );
     let dock_layer: id = msg![env; dock layer];
     () = msg![env; dock_layer setCornerRadius:(12.0 as CGFloat)];
     let hairline_color = ui_color(env, 1.0, 1.0, 1.0, 0.38);
@@ -3038,8 +5081,8 @@ fn make_dock(
 
     let count: CGFloat = 4.0;
     let side_inset: CGFloat = 8.0;
-    let gap = ((dock_width - side_inset * 2.0 - DOCK_ICON_SIZE * count) / (count - 1.0))
-        .clamp(2.0, 18.0);
+    let gap =
+        ((dock_width - side_inset * 2.0 - DOCK_ICON_SIZE * count) / (count - 1.0)).clamp(2.0, 18.0);
     let first_x = (dock_width - (DOCK_ICON_SIZE * count + gap * (count - 1.0))) / 2.0;
 
     let plus_image = make_icon_from_text(env, "+", 50.0, -6.0, (0.25, 0.25, 0.25, 1.0));
@@ -3047,7 +5090,9 @@ fn make_dock(
     let recent_placeholder = make_icon_from_text(env, "↻", 34.0, 0.0, (0.25, 0.25, 0.25, 1.0));
     let browse_image = make_browse_app_icon(env);
     let step = DOCK_ICON_SIZE + gap;
-    make_dock_item(env, delegate, dock, first_x, plus_image, "Add .ipa", "addIpa");
+    make_dock_item(
+        env, delegate, dock, first_x, plus_image, "Add .ipa", "addIpa",
+    );
     make_dock_item(
         env,
         delegate,
@@ -3069,7 +5114,15 @@ fn make_dock(
         recent_label,
         "openRecentApp",
     );
-    make_dock_item(env, delegate, dock, first_x + step * 2.0, browse_image, "Browse", "addIpa");
+    make_dock_item(
+        env,
+        delegate,
+        dock,
+        first_x + step * 2.0,
+        browse_image,
+        "Browse",
+        "addIpa",
+    );
     () = msg![env; main_view addSubview:dock];
     dock
 }
@@ -3171,6 +5224,40 @@ fn new_label(
     () = msg![env; label setTextColor:text_color];
     let clear: id = msg_class![env; UIColor clearColor];
     () = msg![env; label setBackgroundColor:clear];
+    label
+}
+
+fn new_setting_description_label(
+    env: &mut Environment,
+    frame: CGRect,
+    text: &str,
+    text_color: id,
+) -> id {
+    let label = new_label(
+        env,
+        frame,
+        text,
+        SETTINGS_DESCRIPTION_FONT_SIZE,
+        false,
+        text_color,
+    );
+    () = msg![env; label setTextAlignment:UITextAlignmentLeft];
+    () = msg![env; label setLineBreakMode:UILineBreakModeWordWrap];
+    () = msg![env; label setNumberOfLines:0];
+    label
+}
+
+fn new_setting_title_label(
+    env: &mut Environment,
+    frame: CGRect,
+    text: &str,
+    font_size: CGFloat,
+    text_color: id,
+) -> id {
+    let label = new_label(env, frame, text, font_size, false, text_color);
+    () = msg![env; label setTextAlignment:UITextAlignmentLeft];
+    () = msg![env; label setLineBreakMode:UILineBreakModeWordWrap];
+    () = msg![env; label setNumberOfLines:0];
     label
 }
 
@@ -3414,15 +5501,9 @@ fn play_home_screen_unlock_animation(
         host_obj.icon_touch_down = nil;
     }
 
-    animate_for(
-        env,
-        run_loop,
-        delegate,
-        HOME_UNLOCK_DURATION,
-        |env, t| {
-            apply_unlock_step(env, &cells, &targets, wallpaper, chrome_views, t);
-        },
-    );
+    animate_for(env, run_loop, delegate, HOME_UNLOCK_DURATION, |env, t| {
+        apply_unlock_step(env, &cells, &targets, wallpaper, chrome_views, t);
+    });
 
     if let Some(wallpaper) = wallpaper {
         let layer: id = msg![env; wallpaper layer];
@@ -3590,6 +5671,81 @@ fn set_offscreen_scroll_items_hidden(
     }
 }
 
+/// The scroll offset the settings list would have at `progress` from the top
+/// of its scrollbar track (`0.0` at the top, `1.0` at the bottom).
+fn settings_scroll_offset_at(
+    env: &mut Environment,
+    settings: &SettingsStuff,
+    progress: CGFloat,
+) -> CGFloat {
+    let scroll = settings.scroll_view;
+    let bounds: CGRect = msg![env; scroll bounds];
+    let content_size: CGSize = msg![env; scroll contentSize];
+    let (thumb_height, _) = settings_scrollbar_thumb_metrics(settings, bounds, content_size);
+    let travel = (settings.list_height - thumb_height).max(0.0);
+    let max_y = (content_size.height - bounds.size.height).max(0.0);
+    // Keep the thumb under the finger: the finger's position along the track
+    // is read as the position of the middle of the thumb.
+    let finger = progress * settings.list_height;
+    let thumb_top = (finger - thumb_height / 2.0).clamp(0.0, travel);
+    let scrolled = if travel > 0.0 {
+        thumb_top / travel
+    } else {
+        0.0
+    };
+    (scrolled * max_y).clamp(0.0, max_y)
+}
+/// How tall the settings scrollbar thumb is, and whether the list is long
+/// enough to need one.
+fn settings_scrollbar_thumb_metrics(
+    settings: &SettingsStuff,
+    bounds: CGRect,
+    content_size: CGSize,
+) -> (CGFloat, bool) {
+    let list_height = settings.list_height;
+    let content_height = content_size.height.max(bounds.size.height);
+    // A list that fits needs no thumb: the track alone says there is nothing
+    // more to scroll.
+    if content_height - list_height < 1.0 {
+        return (0.0, false);
+    }
+    ((list_height * list_height / content_height).max(48.0), true)
+}
+/// Puts the settings scrollbar in step with `scroll_view`: the thumb spans the
+/// part of the list that is on screen and moves down the track as it scrolls.
+fn update_settings_scrollbar(env: &mut Environment, settings: &SettingsStuff) {
+    let settings_view = settings.main_view;
+    let hidden: bool = msg![env; settings_view isHidden];
+    if hidden {
+        return;
+    }
+    let scroll = settings.scroll_view;
+    let bounds: CGRect = msg![env; scroll bounds];
+    let content_size: CGSize = msg![env; scroll contentSize];
+    let offset: CGPoint = msg![env; scroll contentOffset];
+    let list_height = settings.list_height;
+    let (thumb_height, scrolled_available) =
+        settings_scrollbar_thumb_metrics(settings, bounds, content_size);
+    if !scrolled_available {
+        () = msg![env; (settings.scrollbar_thumb) setHidden:true];
+        return;
+    }
+    () = msg![env; (settings.scrollbar_thumb) setHidden:false];
+    let travel = (list_height - thumb_height).max(0.0);
+    let max_y = (content_size.height - bounds.size.height).max(0.0);
+    let scrolled = (offset.y / max_y).clamp(0.0, 1.0);
+    let thumb_frame = CGRect {
+        origin: CGPoint {
+            x: settings.scrollbar_x,
+            y: settings.list_top + scrolled * travel,
+        },
+        size: CGSize {
+            width: SETTINGS_SCROLLBAR_WIDTH,
+            height: thumb_height,
+        },
+    };
+    () = msg![env; (settings.scrollbar_thumb) setFrame:thumb_frame];
+}
 /// Opens the Settings screen with the same centered pop-in animation as
 /// [show_delete_dialog]: the screen dims while the view grows from the center
 /// and fades in over [DELETE_DIALOG_APPEAR_DURATION].
@@ -3621,6 +5777,7 @@ fn show_settings_screen(
     }
 
     set_offscreen_scroll_items_hidden(env, settings, true);
+    update_settings_scrollbar(env, settings);
     animate_for(
         env,
         run_loop,
@@ -3696,7 +5853,10 @@ fn make_dock_asset_icon(env: &mut Environment, bytes: &[u8]) -> id {
 }
 
 fn make_settings_app_icon(env: &mut Environment) -> id {
-    let bytes: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/settings_icon.png"));
+    let bytes: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/res/settings_icon.png"
+    ));
     make_dock_asset_icon(env, bytes)
 }
 
@@ -3801,6 +5961,9 @@ fn make_segment_buttons(
         let label: id = msg![env; button titleLabel];
         let font: id = msg_class![env; UIFont systemFontOfSize:(13.0 as CGFloat)];
         () = msg![env; label setFont:font];
+        () = msg![env; label setTextAlignment:UITextAlignmentCenter];
+        () = msg![env; label setLineBreakMode:UILineBreakModeWordWrap];
+        () = msg![env; label setNumberOfLines:2];
         let layer: id = msg![env; button layer];
         () = msg![env; layer setCornerRadius:(5.0 as CGFloat)];
         let selector = env.objc.lookup_selector(selector).unwrap();
@@ -3814,34 +5977,153 @@ fn make_segment_buttons(
 }
 
 /// One row of the settings screen.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum SettingsRow {
-    Action(&'static str, &'static str),
-    /// A label with a row of segment buttons below it.
-    Segmented(&'static str, &'static [(&'static str, &'static str)]),
+    /// A title, description, and row of segment buttons.
+    Segmented(
+        &'static str,
+        &'static str,
+        &'static [(&'static str, &'static str)],
+    ),
     /// The "Device model" row (its dropdown is a root-level overlay).
-    DeviceDropdown,
+    DeviceDropdown(&'static str, &'static str),
     /// The "Language" row (its dropdown is a root-level overlay).
-    LanguageDropdown,
-    /// Label and switch: (label, selector, initial state, enabled).
-    Toggle(&'static str, &'static str, bool, bool),
+    LanguageDropdown(&'static str, &'static str),
+    /// Title and description with switch: selector, initial state, enabled.
+    Toggle(&'static str, &'static str, &'static str, bool, bool),
+    /// Renderer mode dropdown.
+    RendererDropdown(&'static str, &'static str),
+    /// The "RAM Limiter" row (its dropdown is a root-level overlay).
+    MemoryLimitDropdown(&'static str, &'static str),
+    /// A full-width action row with centered red text, like the old-iOS
+    /// "Delete Account" cell.
+    Button {
+        title: &'static str,
+        selector: &'static str,
+    },
+    /// A single-line value committed when its text field resigns first responder.
+    ManualValue {
+        title: String,
+        description: String,
+        tag: NSInteger,
+        value: String,
+        enabled: bool,
+        text_keyboard: bool,
+    },
 }
 
 const SETTINGS_NAV_BAR_HEIGHT: CGFloat = 44.0;
 const SETTINGS_TOP_PADDING: CGFloat = 12.0;
 const SETTINGS_GROUP_INSET: CGFloat = 16.0;
 const SETTINGS_ROW_SIDE_INSET: CGFloat = 16.0;
-const SETTINGS_ROW_HEIGHT: CGFloat = 44.0;
-const SETTINGS_SEGMENT_ROW_HEIGHT: CGFloat = 58.0;
+const SETTINGS_DESCRIPTION_FONT_SIZE: CGFloat = 11.0;
 const SETTINGS_HEADER_HEIGHT: CGFloat = 28.0;
 const SETTINGS_SECTION_GAP: CGFloat = 10.0;
 /// Width of the dropdown lists (list plus scrollbar).
 const SETTINGS_DROPDOWN_MENU_WIDTH: CGFloat = 280.0;
+const MANUAL_DEADZONE: NSInteger = 1001;
+const MANUAL_X_TILT_RANGE: NSInteger = 1002;
+const MANUAL_Y_TILT_RANGE: NSInteger = 1003;
+const MANUAL_X_TILT_OFFSET: NSInteger = 1004;
+const MANUAL_Y_TILT_OFFSET: NSInteger = 1005;
+const MANUAL_BUTTON_TOUCH_BASE: NSInteger = 1100;
+const MANUAL_DPAD_TOUCH: NSInteger = 1007;
+const MANUAL_STICK_TOUCH: NSInteger = 1008;
+const MANUAL_FPS_LIMIT: NSInteger = 1009;
+const MANUAL_CORRUPTION_INTENSITY: NSInteger = 1010;
+const MANUAL_CORRUPTION_MAX_OFFSET: NSInteger = 1011;
+const MANUAL_CORRUPTION_SEED: NSInteger = 1012;
 
-fn settings_row_height(row: &SettingsRow) -> CGFloat {
+fn settings_text_height(
+    env: &mut Environment,
+    text: &str,
+    font_size: CGFloat,
+    width: CGFloat,
+) -> CGFloat {
+    let string = ns_string::from_rust_string(env, text.to_string());
+    let font: id = msg_class![env; UIFont systemFontOfSize:font_size];
+    let size: CGSize = msg![env; string sizeWithFont:font
+                                      constrainedToSize:(CGSize { width, height: CGFloat::MAX })
+                                          lineBreakMode:UILineBreakModeWordWrap];
+    release(env, string);
+    size.height
+}
+
+/// Height of a row whose title sits beside a control and whose description
+/// runs the full width underneath both. `setup_settings` lays the same row out
+/// with the same numbers, so the two must stay in step.
+fn control_row_height(
+    env: &mut Environment,
+    title: &str,
+    description: &str,
+    inner_width: CGFloat,
+    title_font_size: CGFloat,
+    control_width: CGFloat,
+    control_height: CGFloat,
+) -> CGFloat {
+    let side = SETTINGS_ROW_SIDE_INSET;
+    let title_width = inner_width - 2.0 * side - control_width - 8.0;
+    let description_width = inner_width - 2.0 * side;
+    settings_text_height(env, title, title_font_size, title_width).max(control_height)
+        + settings_text_height(
+            env,
+            description,
+            SETTINGS_DESCRIPTION_FONT_SIZE,
+            description_width,
+        )
+        + 20.0
+}
+
+fn settings_row_height(env: &mut Environment, row: &SettingsRow, inner_width: CGFloat) -> CGFloat {
+    let side = SETTINGS_ROW_SIDE_INSET;
     match row {
-        SettingsRow::Segmented(..) => SETTINGS_SEGMENT_ROW_HEIGHT,
-        _ => SETTINGS_ROW_HEIGHT,
+        SettingsRow::Segmented(title, description, _) => {
+            let text_width = inner_width - 2.0 * side;
+            8.0 + settings_text_height(env, *title, 15.0, text_width)
+                + 4.0
+                + settings_text_height(
+                    env,
+                    *description,
+                    SETTINGS_DESCRIPTION_FONT_SIZE,
+                    text_width,
+                )
+                + 8.0
+                + 24.0
+                + 8.0
+        }
+        SettingsRow::Toggle(title, description, _, _, _) => {
+            control_row_height(env, title, description, inner_width, 16.0, 94.0, 27.0)
+        }
+        SettingsRow::DeviceDropdown(title, description) => {
+            control_row_height(env, title, description, inner_width, 14.0, 160.0, 30.0)
+        }
+        SettingsRow::LanguageDropdown(title, description) => {
+            control_row_height(env, title, description, inner_width, 16.0, 140.0, 30.0)
+        }
+        SettingsRow::RendererDropdown(title, description) => {
+            control_row_height(env, title, description, inner_width, 14.0, 120.0, 30.0)
+        }
+        SettingsRow::Button { title, .. } => {
+            settings_text_height(env, title, 16.0, inner_width - 2.0 * side) + 24.0
+        }
+        SettingsRow::MemoryLimitDropdown(title, description) => {
+            control_row_height(env, title, description, inner_width, 14.0, 120.0, 30.0)
+        }
+        SettingsRow::ManualValue {
+            title, description, ..
+        } => {
+            let text_width = inner_width - 2.0 * side - 128.0 - 12.0;
+            (settings_text_height(env, title, 15.0, text_width)
+                + settings_text_height(
+                    env,
+                    description,
+                    SETTINGS_DESCRIPTION_FONT_SIZE,
+                    text_width,
+                )
+                + 12.0)
+                .max(42.0)
+                + 16.0
+        }
     }
 }
 
@@ -3860,14 +6142,39 @@ struct SettingsStuff {
     full_height: CGFloat,
     /// Vertical origin of `scroll_view` inside `main_view`.
     scroll_origin_y: CGFloat,
+    /// The thumb of the scrollbar down the right edge of the settings list,
+    /// moved to follow `scroll_view`'s offset.
+    scrollbar_thumb: id,
+    /// Left edge of the scrollbar, which is in `main_view` coordinates.
+    scrollbar_x: CGFloat,
+    /// Top and height of `scroll_view` inside `main_view`.
+    list_top: CGFloat,
+    list_height: CGFloat,
     scale_hack_buttons: [id; 5],
     orientation_buttons: [id; 4],
     overlay_mode_buttons: Vec<id>,
     overlay_corner_buttons: Vec<id>,
+    corruption_mode_buttons: Vec<id>,
+    corruption_startup_delay_buttons: Vec<id>,
+    corruption_cooldown_buttons: Vec<id>,
+    gles2_mode_buttons: Vec<id>,
+    vsync_buttons: Vec<id>,
+    present_mode_buttons: Vec<id>,
+    texture_filter_buttons: Vec<id>,
+    present_rotate_buttons: Vec<id>,
+    controller_to_touch_buttons: Vec<id>,
+    /// `(selector, switch)` for each toggle row, so a reset can put every
+    /// switch back where the new settings say it should be.
+    toggle_switches: Vec<(&'static str, id)>,
+    manual_value_fields: Vec<(NSInteger, id, id)>,
     /// The "Device model" dropdown.
     device_dropdown: SettingsDropdown,
     /// The "Language" dropdown.
     language_dropdown: SettingsDropdown,
+    /// The "Renderer Mode" dropdown.
+    renderer_dropdown: SettingsDropdown,
+    /// The "RAM Limiter" dropdown.
+    memory_limit_dropdown: SettingsDropdown,
 }
 
 /// The views of one settings dropdown: a button in a settings row, and a list
@@ -3877,12 +6184,17 @@ struct SettingsDropdown {
     button: id,
     /// The list (hidden until the button is tapped).
     menu: id,
+    /// Scrollable list content inside `menu`.
+    scroll_view: id,
     /// Dims the screen behind the open list; tapping it closes the list.
     dimmer: id,
     /// One button per choice, in the order of the spec's entries.
     items: Vec<id>,
-    /// The scrollbar thumb shown alongside the list.
+    /// The scrollbar thumb shown alongside the list, or `nil` when all the
+    /// entries fit and the list needs no scrollbar.
     thumb: id,
+    /// Width of the list itself, excluding the scrollbar (if there is one).
+    list_width: CGFloat,
 }
 
 /// What a settings dropdown offers, and which delegate selectors its buttons
@@ -3893,10 +6205,11 @@ struct DropdownSpec {
     toggle_selector: &'static str,
     item_selector: &'static str,
     scroll_selector: &'static str,
+    button_font_size: CGFloat,
 }
 
 /// The state that the picker keeps for one settings dropdown.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct DropdownState {
     /// The tag of the chosen entry, or `None` for the default.
     selected: Option<i32>,
@@ -3920,12 +6233,16 @@ fn refresh_dropdown(
     state: &DropdownState,
 ) {
     set_dropdown_open(env, dropdown.menu, dropdown.dimmer, state.open);
+    let offset = state.scroll as CGFloat * DEVICE_MENU_ITEM_HEIGHT;
+    let content_offset = CGPoint { x: 0.0, y: offset };
+    () = msg![env; (dropdown.scroll_view) setContentOffset:content_offset];
     update_dropdown_menu(
         env,
         &dropdown.items,
         dropdown.thumb,
         state.selected,
         state.scroll,
+        dropdown.list_width,
     );
     let arrow = if state.open { "▲" } else { "▼" };
     let title = ns_string::from_rust_string(env, format!("{label} {arrow}"));
@@ -3954,6 +6271,27 @@ fn dropdown_scroll_at(position: CGFloat, item_count: usize) -> isize {
         .clamp(0.0, dropdown_max_scroll(item_count) as CGFloat) as isize
 }
 
+fn sync_dropdown_scroll(
+    env: &mut Environment,
+    dropdown: &SettingsDropdown,
+    state: &mut DropdownState,
+) {
+    if !state.open {
+        return;
+    }
+    let offset: CGPoint = msg![env; (dropdown.scroll_view) contentOffset];
+    state.scroll = ((offset.y / DEVICE_MENU_ITEM_HEIGHT).round() as isize)
+        .clamp(0, dropdown_max_scroll(dropdown.items.len()));
+    update_dropdown_menu(
+        env,
+        &dropdown.items,
+        dropdown.thumb,
+        state.selected,
+        state.scroll,
+        dropdown.list_width,
+    );
+}
+
 /// Builds the Settings screen: a navigation bar with a "Done" button, and a
 /// scrollable list of grouped sections in the style of the iOS Settings app.
 fn setup_settings(
@@ -3962,12 +6300,14 @@ fn setup_settings(
     super_view: id,
     app_frame: CGRect,
     picker_settings: &PickerSettings,
+    renderer_mode_dropdown_enabled: bool,
     show_fps: bool,
-    gles_native_switch_enabled: bool,
     show_fullscreen_row: bool,
 ) -> SettingsStuff {
     let width = app_frame.size.width;
     let height = app_frame.size.height;
+    let (manual_screen_width, manual_screen_height) =
+        picker_touch_screen_size(&env.options, picker_settings);
     // The Settings screen covers the whole window, including the status bar
     // strip above the application frame. Nothing is clipped by the emulator,
     // so scrolled content must not be able to show up in that strip.
@@ -3987,7 +6327,11 @@ fn setup_settings(
     let stripe = ui_color(env, 0.55, 0.58, 0.62, 0.10);
     let mut stripe_x: CGFloat = 2.0;
     while stripe_x < width {
-        let stripe_view = new_view(env, rect(stripe_x, 0.0, 1.0, height + status_offset), stripe);
+        let stripe_view = new_view(
+            env,
+            rect(stripe_x, 0.0, 1.0, height + status_offset),
+            stripe,
+        );
         () = msg![env; settings_view addSubview:stripe_view];
         stripe_x += 5.0;
     }
@@ -3995,6 +6339,7 @@ fn setup_settings(
     let clear: id = msg_class![env; UIColor clearColor];
     let black: id = msg_class![env; UIColor blackColor];
     let white: id = msg_class![env; UIColor whiteColor];
+    let manual_value_background = ui_color(env, 0.94, 0.94, 0.96, 1.0);
     let gray_text = ui_color(env, 0.43, 0.43, 0.45, 1.0);
     // Navigation bar with the title and a "Done" button.
     let nav_bar_bg = ui_color(env, 0.20, 0.34, 0.52, 1.0);
@@ -4010,20 +6355,19 @@ fn setup_settings(
         let t = step as CGFloat / (NAV_GRADIENT_STEPS - 1) as CGFloat;
         let y = nav_height * t;
         let band_height = nav_height / NAV_GRADIENT_STEPS as CGFloat + 0.5;
-        let color = ui_color(
-            env,
-            0.39 - 0.18 * t,
-            0.56 - 0.25 * t,
-            0.75 - 0.23 * t,
-            1.0,
-        );
+        let color = ui_color(env, 0.39 - 0.18 * t, 0.56 - 0.25 * t, 0.75 - 0.23 * t, 1.0);
         let band = new_view(env, rect(0.0, y, width, band_height), color);
         () = msg![env; nav_bar addSubview:band];
     }
     let nav_separator_color = ui_color(env, 0.12, 0.22, 0.36, 1.0);
     let nav_separator = new_view(
         env,
-        rect(0.0, SETTINGS_NAV_BAR_HEIGHT + status_offset - 1.0, width, 1.0),
+        rect(
+            0.0,
+            SETTINGS_NAV_BAR_HEIGHT + status_offset - 1.0,
+            width,
+            1.0,
+        ),
         nav_separator_color,
     );
     () = msg![env; settings_view addSubview:nav_separator];
@@ -4041,7 +6385,8 @@ fn setup_settings(
     () = msg![env; settings_view addSubview:title];
 
     let done: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
-    () = msg![env; done setFrame:(rect(width - 72.0, status_offset, 64.0, SETTINGS_NAV_BAR_HEIGHT))];
+    () =
+        msg![env; done setFrame:(rect(width - 72.0, status_offset, 64.0, SETTINGS_NAV_BAR_HEIGHT))];
     let done_text = ns_string::get_static_str(env, "Done");
     () = msg![env; done setTitle:done_text forState:UIControlStateNormal];
     // FIXME: manually calling layoutSubviews shouldn't be needed?
@@ -4058,17 +6403,67 @@ fn setup_settings(
 
     // Scrollable content below the navigation bar.
     let scroll: id = msg_class![env; UIScrollView alloc];
+    let list_top = SETTINGS_NAV_BAR_HEIGHT + status_offset;
+    let list_height = height - SETTINGS_NAV_BAR_HEIGHT;
+    let scrollbar_x = width - SETTINGS_SCROLLBAR_WIDTH;
+    // The list stops short of the scrollbar, so rows never draw over it.
     let scroll: id = msg![env; scroll initWithFrame:(rect(
         0.0,
-        SETTINGS_NAV_BAR_HEIGHT + status_offset,
-        width,
-        height - SETTINGS_NAV_BAR_HEIGHT,
+        list_top,
+        width - SETTINGS_SCROLLBAR_WIDTH,
+        list_height,
     ))];
     () = msg![env; scroll setBackgroundColor:clear];
-    // Clip the scrolled content to the scroll view, so it never slides up
-    // over the navigation bar.
+    // Clip the scrolled content so it never slides up over the navigation bar.
     () = msg![env; scroll setClipsToBounds:true];
+    // Rows are laid out for the list's width, so sideways scrolling only
+    // wobbles the list under a diagonal drag. Directional lock keeps a
+    // slightly sideways vertical drag on the vertical axis.
+    () = msg![env; scroll setAlwaysBounceHorizontal:false];
+    () = msg![env; scroll setShowsHorizontalScrollIndicator:false];
+    () = msg![env; scroll setDirectionalLockEnabled:true];
     () = msg![env; settings_view addSubview:scroll];
+    // A scrollbar down the right edge, like the ones beside the dropdown
+    // lists, so a long list of settings shows where you are in it. Dragging
+    // it scrolls the list; `settingsScroll:forEvent:` reports the drag.
+    let track_button: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+    () = msg![env; track_button setFrame:(rect(
+        width - SETTINGS_SCROLLBAR_HIT_WIDTH,
+        list_top,
+        SETTINGS_SCROLLBAR_HIT_WIDTH,
+        list_height,
+    ))];
+    () = msg![env; track_button setBackgroundColor:clear];
+    let scroll_selector = env
+        .objc
+        .lookup_selector("settingsScroll:forEvent:")
+        .unwrap();
+    let scroll_events = UIControlEventTouchDown
+        | UIControlEventTouchDragInside
+        | UIControlEventTouchDragExit
+        | UIControlEventTouchDragOutside;
+    () = msg![env; track_button addTarget:delegate
+                              action:scroll_selector
+                    forControlEvents:scroll_events];
+    () = msg![env; settings_view addSubview:track_button];
+    // Built in locals: `new_view` borrows `env`, so `ui_color` can't be called
+    // in its argument list.
+    let track_color = ui_color(env, 0.55, 0.58, 0.62, 0.18);
+    let thumb_color = ui_color(env, 0.30, 0.32, 0.36, 0.75);
+    let track = new_view(
+        env,
+        rect(scrollbar_x, list_top, SETTINGS_SCROLLBAR_WIDTH, list_height),
+        track_color,
+    );
+    () = msg![env; settings_view addSubview:track];
+    let scrollbar_thumb = new_view(
+        env,
+        rect(scrollbar_x, list_top, SETTINGS_SCROLLBAR_WIDTH, 0.0),
+        thumb_color,
+    );
+    () = msg![env; settings_view addSubview:scrollbar_thumb];
+    () = msg![env; settings_view bringSubviewToFront:scrollbar_thumb];
+    () = msg![env; settings_view bringSubviewToFront:track_button];
     // The navigation bar must stay on top of the scrolled content.
     () = msg![env; settings_view bringSubviewToFront:nav_bar];
     () = msg![env; settings_view bringSubviewToFront:nav_separator];
@@ -4079,6 +6474,7 @@ fn setup_settings(
     let mut display_rows = vec![
         SettingsRow::Segmented(
             "Scale hack",
+            "Renders the game at a larger internal size before scaling it to your screen. This can make edges look sharper, but may slow the game or cause graphics problems.",
             &[
                 ("Default", "scaleHackDefault"),
                 ("Off", "scaleHack1"),
@@ -4089,6 +6485,7 @@ fn setup_settings(
         ),
         SettingsRow::Segmented(
             "Orientation",
+            "Choose how the game screen is turned. Default lets the game choose; the arrows force a direction if the game starts sideways.",
             &[
                 ("Default", "orientationDefault"),
                 ("←", "orientationLandscapeLeft"),
@@ -4096,20 +6493,83 @@ fn setup_settings(
                 ("↓", "orientationPortraitUpsideDown"),
             ],
         ),
+        SettingsRow::Segmented(
+            "VSync",
+            "Wait for the display before showing each frame. Default: Auto (platform default).",
+            &[("Auto", "vsyncAuto"), ("On", "vsyncOn"), ("Off", "vsyncOff")],
+        ),
     ];
     if show_fullscreen_row {
         display_rows.push(SettingsRow::Toggle(
             "Fullscreen (override)",
+            "Choose whether the game fills the screen. This overrides the app’s saved setting.",
             "fullscreen:",
             picker_settings.fullscreen,
             true,
         ));
     }
-    display_rows.push(SettingsRow::Action("Change wallpaper…", "changeWallpaper"));
+    display_rows.push(SettingsRow::Button { title: "Change wallpaper…", selector: "changeWallpaper" });
+    // Both compatibility fixes are opt-in and may be enabled per-app in the
+    // options files. Leaving a switch alone keeps those defaults; flipping it
+    // (either way) is an explicit override for every later launch.
+    display_rows.push(SettingsRow::Toggle(
+        "Rotation fix",
+        "Use measured UIKit layer rotation.",
+        "rotationFix:",
+        picker_settings.rotation_fix.unwrap_or(false),
+        true,
+    ));
     sections.push(("DISPLAY", display_rows));
+    // Compatibility fixes for the app about to launch. A flipped switch is
+    // applied first, so the app's bundled defaults still override it; each
+    // applies on the next launch.
+    let fix_rows = vec![
+        SettingsRow::Toggle(
+            "Preserve DYLD stubs",
+            "Keeps the app's own linker stubs instead of rewriting imports at startup. Needed by engines that checksum their code, such as Earn to Die. Other games can break with this on.",
+            "preserveDYLDStubs:",
+            picker_settings.preserve_dyld_stubs.unwrap_or(false),
+            true,
+        ),
+        SettingsRow::Toggle(
+            "Enable dladdr()",
+            "Answer dladdr() for real instead of returning failure. Some old games hang while resolving their own images, so this helps only those games; no app turns it on by default.",
+            "dladdr:",
+            picker_settings.dladdr.unwrap_or(false),
+            true,
+        ),
+        SettingsRow::Toggle(
+            "Manual UI rotation",
+            "The game rotates its own drawing and touches, so the emulator stops rotating the window and keeps the root view in portrait. Needed by Exploration.",
+            "manualUIRotation:",
+            picker_settings.manual_ui_rotation.unwrap_or(false),
+            true,
+        ),
+        // Opt-in, and may be enabled per-app in the options files. Leaving the
+        // switch alone keeps those defaults; a flipped switch is applied first,
+        // so a bundled default for this app still wins.
+        SettingsRow::Toggle(
+            "Rotation fix",
+            "Turns the game image to match the app's own autorotation instead of the old iPad guess. Turn it on if the image comes out upside down or a quarter turn off.",
+            "rotationFix:",
+            picker_settings.rotation_fix.unwrap_or(false),
+            true,
+        ),
+        SettingsRow::Toggle(
+            "Movie player fix",
+            "Changes how in-game videos are loaded and shown. It may help some games, but can stop videos from appearing in others.",
+            "moviePlayerFix:",
+            picker_settings.fix_movie_player.unwrap_or(false),
+            true,
+        ),
+    ];
+    sections.push(("FIXES", fix_rows));
     let overlay_mode_options: &'static [(&'static str, &'static str)] =
         if cfg!(any(target_os = "android", target_os = "ios")) {
-            &[("Full", "overlayModeFull"), ("Minimal", "overlayModeMinimal")]
+            &[
+                ("Full", "overlayModeFull"),
+                ("Minimal", "overlayModeMinimal"),
+            ]
         } else {
             &[
                 ("Full", "overlayModeFull"),
@@ -4118,47 +6578,119 @@ fn setup_settings(
             ]
         };
     let mut graphics_rows = vec![
-            SettingsRow::Toggle(
-                "GLES Native",
-                "glesNative:",
-            picker_settings.gles_native,
-                gles_native_switch_enabled,
-            ),
-            SettingsRow::Toggle(
-                "May fix graphics issues",
-                "forceComposition:",
-            picker_settings.force_composition,
-                true,
-            ),
-        SettingsRow::Toggle("Performance display", "showFPS:", show_fps, true),
-        SettingsRow::Segmented("Display mode", overlay_mode_options),
+        SettingsRow::RendererDropdown(
+            "Renderer Mode",
+            "Android only. ANGLE translates the game’s graphics calls; Native GLES uses your device’s graphics driver. If one has problems, try the other.",
+        ),
+        SettingsRow::Toggle("No GLES 3", "Hide GLES 3 capabilities from the guest.", "noGles3:", picker_settings.no_gles3.unwrap_or(false), true),
         SettingsRow::Segmented(
-            "Screen corner",
+            "GLES2 compatibility",
+            "Changes how ES 1.1/2.0 graphics are handled. Prefer Context upgrades an app’s ES 1.1 request to ES 2.0; GL2.1 uses an older, incomplete compatibility backend. Either choice can break games.",
             &[
-                ("Top left", "overlayCornerTopLeft"),
-                ("Top right", "overlayCornerTopRight"),
-                ("Bottom right", "overlayCornerBottomRight"),
-                ("Bottom left", "overlayCornerBottomLeft"),
+                ("Off", "gles2Off"),
+                ("Prefer context", "gles2Prefer"),
+                ("GL2.1", "gles2Compatibility"),
             ],
         ),
-        // Both fixes are opt-in and may be enabled per-app in the options
-        // files. Leaving a switch alone keeps those defaults; flipping it
-        // (either way) is an explicit override for every later launch.
         SettingsRow::Toggle(
-            "Rotation fix",
-            "rotationFix:",
-            picker_settings.rotation_fix.unwrap_or(false),
+            "Force Composition",
+            "Sends the game’s image through an extra layer before display. This may help some graphics problems, but can reduce speed.",
+            "forceComposition:",
+            picker_settings.force_composition,
             true,
         ),
         SettingsRow::Toggle(
-            "Movie player fix",
-            "moviePlayerFix:",
-            picker_settings.fix_movie_player.unwrap_or(false),
+            "Performance display",
+            "Shows performance information such as FPS while the game runs.",
+            "showFPS:",
+            show_fps,
             true,
+        ),
+        SettingsRow::Toggle(
+            "Trace GL errors",
+            "Logs where OpenGL errors occur. Diagnostic only: checking errors changes what the game receives from glGetError().",
+            "traceGLErrors:",
+            picker_settings.trace_gl_errors,
+            true,
+        ),
+        SettingsRow::Toggle(
+            "Trace GL draws",
+            "Logs draw state for debugging. May create large logs and cache up to 16 MiB.",
+            "traceGLDraws:",
+            picker_settings.trace_gl_draws,
+            true,
+        ),
+        SettingsRow::Segmented(
+            "Presentation mode",
+            "Auto chooses a compatible path; Direct is faster; Readback is slower but can help broken drivers. Default: Auto.",
+            &[
+                ("Auto", "presentModeAuto"),
+                ("Direct", "presentModeDirect"),
+                ("Readback", "presentModeReadback"),
+            ],
+        ),
+        SettingsRow::Segmented(
+            "Texture min-filter fix",
+            "Overrides incomplete mipmap filtering for level-zero textures. Default: App default.",
+            &[
+                ("App default", "textureFilterDefault"),
+                ("On", "textureFilterOn"),
+                ("Off", "textureFilterOff"),
+            ],
+        ),
+        SettingsRow::Segmented(
+            "Presentation rotation",
+            "Force the displayed image rotation. Default: App default.",
+            &[
+                ("App", "presentRotateDefault"),
+                ("0°", "presentRotate0"),
+                ("90°", "presentRotate90"),
+                ("180°", "presentRotate180"),
+                ("270°", "presentRotate270"),
+            ],
+        ),
+        manual_value_row(
+            picker_settings,
+            MANUAL_FPS_LIMIT,
+            "FPS limit".to_string(),
+            manual_screen_width,
+            manual_screen_height,
+            true,
+            false,
+        ),
+        SettingsRow::Toggle(
+            "Log FPS to console",
+            "Prints the current frame rate once per second. Default: Off.",
+            "printFPS:",
+            picker_settings.print_fps,
+            true,
+        ),
+        SettingsRow::Toggle(
+            "Error popups",
+            "Show error dialogs or log errors only. Default: Show.",
+            "popupErrors:",
+            picker_settings.popup_errors,
+            true,
+        ),
+        SettingsRow::Segmented(
+            "Display mode",
+            "Choose how much performance information appears on screen. Title bar is only useful on desktop.",
+            overlay_mode_options,
+        ),
+        SettingsRow::Segmented(
+            "Screen corner",
+            "Choose where the on-screen performance display appears.",
+            &[
+                ("Top\nLeft", "overlayCornerTopLeft"),
+                ("Top\nRight", "overlayCornerTopRight"),
+                ("Bottom\nRight", "overlayCornerBottomRight"),
+                ("Bottom\nLeft", "overlayCornerBottomLeft"),
+            ],
         ),
     ];
     graphics_rows.push(SettingsRow::Toggle(
         "Show slide to unlock",
+        "Shows the old iPhone lock screen before the game starts.",
         "showLockScreen:",
         picker_settings.show_lock_screen,
         true,
@@ -4166,37 +6698,209 @@ fn setup_settings(
     if show_fullscreen_row {
         graphics_rows.push(SettingsRow::Toggle(
             "Keep aspect ratio on resize",
+            "On desktop, keep the game’s proportions when resizing the window instead of stretching the image.",
             "preserveAspectRatio:",
             picker_settings.preserve_aspect_ratio,
             true,
-    ));
+        ));
     }
     sections.push(("GRAPHICS", graphics_rows));
+    let mut input_rows = vec![
+        SettingsRow::Segmented(
+            "Controller to touch",
+            "Default: App profile (off unless it defines mappings). On uses the settings below; Off disables profile mappings.",
+            &[
+                ("App\ndefault", "controllerToTouchDefault"),
+                ("On", "controllerToTouchOn"),
+                ("Off", "controllerToTouchOff"),
+            ],
+        ),
+        manual_value_row(
+            picker_settings,
+            MANUAL_DEADZONE,
+            "Controller deadzone".to_string(),
+            manual_screen_width,
+            manual_screen_height,
+            manual_value_enabled(MANUAL_DEADZONE, picker_settings),
+            true,
+        ),
+        manual_value_row(
+            picker_settings,
+            MANUAL_X_TILT_RANGE,
+            "Tilt X range".to_string(),
+            manual_screen_width,
+            manual_screen_height,
+            picker_settings.analog_stick_tilt_controls,
+            false,
+        ),
+        manual_value_row(
+            picker_settings,
+            MANUAL_Y_TILT_RANGE,
+            "Tilt Y range".to_string(),
+            manual_screen_width,
+            manual_screen_height,
+            picker_settings.analog_stick_tilt_controls,
+            false,
+        ),
+        manual_value_row(
+            picker_settings,
+            MANUAL_X_TILT_OFFSET,
+            "Tilt X offset".to_string(),
+            manual_screen_width,
+            manual_screen_height,
+            picker_settings.analog_stick_tilt_controls,
+            false,
+        ),
+        manual_value_row(
+            picker_settings,
+            MANUAL_Y_TILT_OFFSET,
+            "Tilt Y offset".to_string(),
+            manual_screen_width,
+            manual_screen_height,
+            picker_settings.analog_stick_tilt_controls,
+            false,
+        ),
+    ];
+    for button in CONTROLLER_BUTTONS {
+        input_rows.push(manual_value_row(
+            picker_settings,
+            manual_button_tag(button),
+            format!("{} touch point", button_name(button)),
+            manual_screen_width,
+            manual_screen_height,
+            manual_value_enabled(manual_button_tag(button), picker_settings),
+            false,
+        ));
+    }
+    input_rows.push(manual_value_row(
+        picker_settings,
+        MANUAL_DPAD_TOUCH,
+        "D-pad touch area".to_string(),
+        manual_screen_width,
+        manual_screen_height,
+        manual_value_enabled(MANUAL_DPAD_TOUCH, picker_settings),
+        false,
+    ));
+    input_rows.push(manual_value_row(
+        picker_settings,
+        MANUAL_STICK_TOUCH,
+        "Stick touch area".to_string(),
+        manual_screen_width,
+        manual_screen_height,
+        manual_value_enabled(MANUAL_STICK_TOUCH, picker_settings),
+        false,
+    ));
+    sections.push(("INPUT", input_rows));
+    sections.push((
+        "CORRUPTION",
+        {
+            let mut rows = vec![
+            SettingsRow::Segmented(
+                "Corruption engine",
+                "Intentionally changes a few bytes in the game’s live memory. This experimental effect can cause glitches or crashes; it is off by default.",
+                &[("Off", "corruptionOff"), ("On", "corruptionOn")],
+            ),
+            SettingsRow::Segmented(
+                "Startup delay",
+                "Wait this long after the game first runs before corruption starts. The timer pauses while the game is not running.",
+                &[("0s", "corruptionStartupImmediate"), ("5s", "corruptionStartup5"), ("15s", "corruptionStartup15"), ("30s", "corruptionStartup30")],
+            ),
+            SettingsRow::Segmented(
+                "Cooldown",
+                "Wait this long between corruption bursts while the game is running.",
+                &[("0.5s", "corruptionCooldownHalf"), ("1s", "corruptionCooldown1"), ("5s", "corruptionCooldown5"), ("10s", "corruptionCooldown10")],
+            ),
+            ];
+            let enabled = picker_settings.corruption_mode == CorruptionMode::Corrupt;
+            rows.extend([
+                manual_value_row(
+                    picker_settings,
+                    MANUAL_CORRUPTION_INTENSITY,
+                    "Bytes per burst".to_string(),
+                    manual_screen_width,
+                    manual_screen_height,
+                    enabled,
+                    true,
+                ),
+                manual_value_row(
+                    picker_settings,
+                    MANUAL_CORRUPTION_MAX_OFFSET,
+                    "Maximum allocation offset".to_string(),
+                    manual_screen_width,
+                    manual_screen_height,
+                    enabled,
+                    false,
+                ),
+                manual_value_row(
+                    picker_settings,
+                    MANUAL_CORRUPTION_SEED,
+                    "Random seed".to_string(),
+                    manual_screen_width,
+                    manual_screen_height,
+                    enabled,
+                    true,
+                ),
+            ]);
+            rows
+        },
+    ));
     sections.push((
         "DEVICE",
         vec![
-            SettingsRow::DeviceDropdown,
-            SettingsRow::LanguageDropdown,
+            SettingsRow::DeviceDropdown(
+                "Device model",
+                "Choose which iPhone, iPad, or iPod touch model the game sees. Some games only support certain models.",
+            ),
+            SettingsRow::LanguageDropdown(
+                "Language",
+                "Choose the language order reported to the game. The game decides which languages it supports.",
+            ),
         ],
     ));
     sections.push((
         "EMULATION",
         vec![
-            SettingsRow::Toggle("Cheat Engine", "cheatEngine:", picker_settings.cheat_engine, true),
-            SettingsRow::Toggle("Network access", "network:", picker_settings.network, true),
+            SettingsRow::MemoryLimitDropdown(
+                "RAM Limiter",
+                "Caps the memory the game can allocate, so it behaves like a device that has run out. Default follows the Device model.",
+            ),
+            SettingsRow::Toggle(
+                "Cheat Engine",
+                "Allows the in-game trainer to be used where a game expects one. Leave off unless a game needs it.",
+                "cheatEngine:",
+                picker_settings.cheat_engine,
+                true,
+            ),
+            SettingsRow::Toggle(
+                "Quick menu",
+                "Shows a pause button in the top-left corner while an app runs. It opens a menu for the settings worth changing mid-game and an Exit button that returns to the picker.",
+                "quickMenu:",
+                picker_settings.quick_menu,
+                true,
+            ),
+            SettingsRow::Toggle(
+                "Network access",
+                "Lets a game reach the network. Most single-player games do not need it, and it can make a game wait on servers that no longer exist.",
+                "network:",
+                picker_settings.network,
+                true,
+            ),
             SettingsRow::Toggle(
                 "Local Game Center sign-in",
+                "Tells the game that a local player is signed in. Online Game Center services are not provided.",
                 "gameCenterAuthenticated:",
                 picker_settings.game_center_authenticated,
                 true,
             ),
-            SettingsRow::Toggle(
-                "Use analog sticks for tilt controls",
-                "analogStickTiltControls:",
-                picker_settings.analog_stick_tilt_controls,
-                true,
-            ),
         ],
+    ));
+    // The actions that undo something sit last, on their own, in red.
+    sections.push((
+        "RESET",
+        vec![SettingsRow::Button {
+            title: "Reset all settings",
+            selector: "resetSettingsTapped",
+        }],
     ));
 
     let inner_width = width - 2.0 * SETTINGS_GROUP_INSET;
@@ -4205,10 +6909,23 @@ fn setup_settings(
     let mut orientation_buttons: Vec<id> = Vec::new();
     let mut device_dropdown: Option<SettingsDropdown> = None;
     let mut language_dropdown: Option<SettingsDropdown> = None;
+    let mut renderer_dropdown: Option<SettingsDropdown> = None;
+    let mut memory_limit_dropdown: Option<SettingsDropdown> = None;
     let mut overlay_mode_buttons = Vec::new();
     let mut overlay_corner_buttons = Vec::new();
+    let mut corruption_mode_buttons = Vec::new();
+    let mut corruption_startup_delay_buttons = Vec::new();
+    let mut corruption_cooldown_buttons = Vec::new();
+    let mut gles2_mode_buttons = Vec::new();
+    let mut vsync_buttons = Vec::new();
+    let mut present_mode_buttons = Vec::new();
+    let mut texture_filter_buttons = Vec::new();
+    let mut present_rotate_buttons = Vec::new();
+    let mut controller_to_touch_buttons = Vec::new();
+    let mut toggle_switches: Vec<(&'static str, id)> = Vec::new();
+    let mut manual_value_fields = Vec::new();
     let mut scroll_items: Vec<(id, CGFloat, CGFloat)> = Vec::new();
-    // Where the lists of both dropdowns open: just under the navigation bar.
+    // Where dropdown menus open: just under the navigation bar.
     let menu_origin = CGPoint {
         x: (width - SETTINGS_DROPDOWN_MENU_WIDTH) / 2.0,
         y: SETTINGS_NAV_BAR_HEIGHT + status_offset + 12.0,
@@ -4228,9 +6945,22 @@ fn setup_settings(
         scroll_items.push((header_label, y, y + 18.0));
         y += SETTINGS_HEADER_HEIGHT;
 
-        let group_height: CGFloat = rows.iter().map(settings_row_height).sum();
+        let row_heights: Vec<CGFloat> = rows
+            .iter()
+            .map(|row| settings_row_height(env, row, inner_width))
+            .collect();
+        let group_height: CGFloat = row_heights.iter().sum();
         let outline_color = ui_color(env, 0.66, 0.67, 0.69, 1.0);
-        let outline = new_view(env, rect(SETTINGS_GROUP_INSET - 1.0, y - 1.0, inner_width + 2.0, group_height + 2.0), outline_color);
+        let outline = new_view(
+            env,
+            rect(
+                SETTINGS_GROUP_INSET - 1.0,
+                y - 1.0,
+                inner_width + 2.0,
+                group_height + 2.0,
+            ),
+            outline_color,
+        );
         let outline_layer: id = msg![env; outline layer];
         () = msg![env; outline_layer setCornerRadius:(11.0 as CGFloat)];
         () = msg![env; scroll addSubview:outline];
@@ -4248,33 +6978,43 @@ fn setup_settings(
         let row_count = rows.len();
         let mut row_y: CGFloat = 0.0;
         for (index, row) in rows.iter().enumerate() {
-            match *row {
-                SettingsRow::Action(label, action) => {
-                    let button: id = msg_class![env; UIButton buttonWithType:1i32];
-                    () = msg![env; button setFrame:(rect(side, row_y, inner_width - 2.0 * side, SETTINGS_ROW_HEIGHT))];
-                    let title = ns_string::from_rust_string(env, label.to_owned());
-                    () = msg![env; button setTitle:title forState:UIControlStateNormal];
-                    () = msg![env; button layoutSubviews];
-                    release(env, title);
-                    let selector = env.objc.lookup_selector(action).unwrap();
-                    () = msg![env; button addTarget:delegate action:selector forControlEvents:UIControlEventTouchUpInside];
-                    () = msg![env; group addSubview:button];
-                }
-                SettingsRow::Segmented(label, buttons) => {
-                    let label_view = new_label(
+            let row_height = row_heights[index];
+            match row.clone() {
+                SettingsRow::Segmented(title, description, buttons) => {
+                    let text_width = inner_width - 2.0 * side;
+                    let title_height = settings_text_height(env, title, 15.0, text_width);
+                    let description_height = settings_text_height(
                         env,
-                        rect(side, row_y + 6.0, inner_width - 2.0 * side, 18.0),
-                        label,
+                        description,
+                        SETTINGS_DESCRIPTION_FONT_SIZE,
+                        text_width,
+                    );
+                    let title_view = new_setting_title_label(
+                        env,
+                        rect(side, row_y + 8.0, text_width, title_height),
+                        title,
                         15.0,
-                        false,
                         black,
                     );
-                    () = msg![env; group addSubview:label_view];
+                    () = msg![env; group addSubview:title_view];
+                    let description_view = new_setting_description_label(
+                        env,
+                        rect(
+                            side,
+                            row_y + 8.0 + title_height + 4.0,
+                            text_width,
+                            description_height,
+                        ),
+                        description,
+                        gray_text,
+                    );
+                    () = msg![env; group addSubview:description_view];
+                    let buttons_y = row_y + 8.0 + title_height + 4.0 + description_height + 8.0;
                     let seg_buttons = make_segment_buttons(
                         env,
                         delegate,
                         group,
-                        rect(side, row_y + 28.0, inner_width - 2.0 * side, 24.0),
+                        rect(side, buttons_y, text_width, 24.0),
                         buttons,
                     );
                     match buttons[0].1 {
@@ -4282,86 +7022,360 @@ fn setup_settings(
                         "orientationDefault" => orientation_buttons = seg_buttons,
                         "overlayModeFull" => overlay_mode_buttons = seg_buttons,
                         "overlayCornerTopLeft" => overlay_corner_buttons = seg_buttons,
+                        "corruptionOff" => corruption_mode_buttons = seg_buttons,
+                        "corruptionStartupImmediate" => {
+                            corruption_startup_delay_buttons = seg_buttons
+                        }
+                        "corruptionCooldownHalf" => corruption_cooldown_buttons = seg_buttons,
+                        "gles2Off" => gles2_mode_buttons = seg_buttons,
+                        "vsyncAuto" => vsync_buttons = seg_buttons,
+                        "presentModeAuto" => present_mode_buttons = seg_buttons,
+                        "textureFilterDefault" => texture_filter_buttons = seg_buttons,
+                        "presentRotateDefault" => present_rotate_buttons = seg_buttons,
+                        "controllerToTouchDefault" => controller_to_touch_buttons = seg_buttons,
                         _ => unreachable!(),
                     }
                 }
-                SettingsRow::DeviceDropdown => {
-                    let label_view = new_label(
+                SettingsRow::DeviceDropdown(title, description) => {
+                    let dropdown_width: CGFloat = 160.0;
+                    let title_width = inner_width - 2.0 * side - dropdown_width - 8.0;
+                    let description_width = inner_width - 2.0 * side;
+                    let title_height = settings_text_height(env, title, 14.0, title_width);
+                    let band_height = title_height.max(30.0);
+                    let description_height = settings_text_height(
                         env,
-                        rect(side, row_y + 11.0, 150.0, 22.0),
-                        "Device model",
-                        16.0,
-                        false,
+                        description,
+                        SETTINGS_DESCRIPTION_FONT_SIZE,
+                        description_width,
+                    );
+                    let title_view = new_setting_title_label(
+                        env,
+                        rect(side, row_y + 8.0, title_width, title_height),
+                        title,
+                        14.0,
                         black,
                     );
-                    () = msg![env; group addSubview:label_view];
+                    () = msg![env; group addSubview:title_view];
+                    let description_view = new_setting_description_label(
+                        env,
+                        rect(
+                            side,
+                            row_y + 8.0 + band_height + 4.0,
+                            description_width,
+                            description_height,
+                        ),
+                        description,
+                        gray_text,
+                    );
+                    () = msg![env; group addSubview:description_view];
                     device_dropdown = Some(make_settings_dropdown(
                         env,
                         delegate,
                         group,
                         settings_view,
-                        rect(inner_width - side - 170.0, row_y + 7.0, 170.0, 30.0),
+                        rect(
+                            inner_width - side - dropdown_width,
+                            row_y + 8.0 + (band_height - 30.0) / 2.0,
+                            dropdown_width,
+                            30.0,
+                        ),
                         menu_origin,
                         device_model_dropdown_spec(),
                     ));
                 }
-                SettingsRow::LanguageDropdown => {
-                    let label_view = new_label(
+                SettingsRow::LanguageDropdown(title, description) => {
+                    let dropdown_width: CGFloat = 140.0;
+                    let title_width = inner_width - 2.0 * side - dropdown_width - 8.0;
+                    let description_width = inner_width - 2.0 * side;
+                    let title_height = settings_text_height(env, title, 16.0, title_width);
+                    let band_height = title_height.max(30.0);
+                    let description_height = settings_text_height(
                         env,
-                        rect(side, row_y + 11.0, 150.0, 22.0),
-                        "Language",
+                        description,
+                        SETTINGS_DESCRIPTION_FONT_SIZE,
+                        description_width,
+                    );
+                    let title_view = new_setting_title_label(
+                        env,
+                        rect(side, row_y + 8.0, title_width, title_height),
+                        title,
                         16.0,
-                        false,
                         black,
                     );
-                    () = msg![env; group addSubview:label_view];
+                    () = msg![env; group addSubview:title_view];
+                    let description_view = new_setting_description_label(
+                        env,
+                        rect(
+                            side,
+                            row_y + 8.0 + band_height + 4.0,
+                            description_width,
+                            description_height,
+                        ),
+                        description,
+                        gray_text,
+                    );
+                    () = msg![env; group addSubview:description_view];
                     language_dropdown = Some(make_settings_dropdown(
                         env,
                         delegate,
                         group,
                         settings_view,
-                        rect(inner_width - side - 170.0, row_y + 7.0, 170.0, 30.0),
+                        rect(
+                            inner_width - side - dropdown_width,
+                            row_y + 8.0 + (band_height - 30.0) / 2.0,
+                            dropdown_width,
+                            30.0,
+                        ),
                         menu_origin,
                         language_dropdown_spec(),
                     ));
                 }
-                SettingsRow::Toggle(label_text, selector, default_state, enabled) => {
-                    let switch_width: CGFloat = 94.0;
-                    let label_view = new_label(
+                SettingsRow::MemoryLimitDropdown(title, description) => {
+                    let dropdown_width: CGFloat = 120.0;
+                    let title_width = inner_width - 2.0 * side - dropdown_width - 8.0;
+                    let description_width = inner_width - 2.0 * side;
+                    let title_height = settings_text_height(env, title, 14.0, title_width);
+                    let band_height = title_height.max(30.0);
+                    let description_height = settings_text_height(
+                        env,
+                        description,
+                        SETTINGS_DESCRIPTION_FONT_SIZE,
+                        description_width,
+                    );
+                    let title_view = new_setting_title_label(
+                        env,
+                        rect(side, row_y + 8.0, title_width, title_height),
+                        title,
+                        14.0,
+                        black,
+                    );
+                    () = msg![env; group addSubview:title_view];
+                    let description_view = new_setting_description_label(
                         env,
                         rect(
                             side,
-                            row_y + 4.0,
-                            inner_width - 2.0 * side - switch_width - 8.0,
-                            36.0,
+                            row_y + 8.0 + band_height + 4.0,
+                            description_width,
+                            description_height,
                         ),
-                        label_text,
-                        16.0,
-                        false,
+                        description,
+                        gray_text,
+                    );
+                    () = msg![env; group addSubview:description_view];
+                    memory_limit_dropdown = Some(make_settings_dropdown(
+                        env,
+                        delegate,
+                        group,
+                        settings_view,
+                        rect(
+                            inner_width - side - dropdown_width,
+                            row_y + 8.0 + (band_height - 30.0) / 2.0,
+                            dropdown_width,
+                            30.0,
+                        ),
+                        menu_origin,
+                        memory_limit_dropdown_spec(),
+                    ));
+                }
+                SettingsRow::RendererDropdown(title, description) => {
+                    let dropdown_width: CGFloat = 120.0;
+                    let title_width = inner_width - 2.0 * side - dropdown_width - 8.0;
+                    let description_width = inner_width - 2.0 * side;
+                    let title_height = settings_text_height(env, title, 14.0, title_width);
+                    let band_height = title_height.max(30.0);
+                    let description_height = settings_text_height(
+                        env,
+                        description,
+                        SETTINGS_DESCRIPTION_FONT_SIZE,
+                        description_width,
+                    );
+                    let title_view = new_setting_title_label(
+                        env,
+                        rect(side, row_y + 8.0, title_width, title_height),
+                        title,
+                        14.0,
                         black,
                     );
-                    () = msg![env; label_view setTextAlignment:UITextAlignmentLeft];
-                    // Long labels wrap onto a second line, as in iOS Settings.
-                    () = msg![env; label_view setNumberOfLines:2];
-                    () = msg![env; group addSubview:label_view];
+                    () = msg![env; group addSubview:title_view];
+                    let description_view = new_setting_description_label(
+                        env,
+                        rect(
+                            side,
+                            row_y + 8.0 + band_height + 4.0,
+                            description_width,
+                            description_height,
+                        ),
+                        description,
+                        gray_text,
+                    );
+                    () = msg![env; group addSubview:description_view];
+                    let dropdown = make_settings_dropdown(
+                        env,
+                        delegate,
+                        group,
+                        settings_view,
+                        rect(
+                            inner_width - side - dropdown_width,
+                            row_y + 8.0 + (band_height - 30.0) / 2.0,
+                            dropdown_width,
+                            30.0,
+                        ),
+                        menu_origin,
+                        renderer_mode_dropdown_spec(),
+                    );
+                    () = msg![env; (dropdown.button) setEnabled:renderer_mode_dropdown_enabled];
+                    renderer_dropdown = Some(dropdown);
+                }
+                SettingsRow::Toggle(title, description, selector_name, default_state, enabled) => {
+                    // Keep every switch the same size; the title gives way to
+                    // it, while the description runs the full width under the
+                    // title instead of being squeezed into a narrow column.
+                    let switch_width: CGFloat = 94.0;
+                    let title_width = inner_width - 2.0 * side - switch_width - 8.0;
+                    let description_width = inner_width - 2.0 * side;
+                    let title_height = settings_text_height(env, title, 16.0, title_width);
+                    let band_height = title_height.max(27.0);
+                    let description_height = settings_text_height(
+                        env,
+                        description,
+                        SETTINGS_DESCRIPTION_FONT_SIZE,
+                        description_width,
+                    );
+                    let title_view = new_setting_title_label(
+                        env,
+                        rect(side, row_y + 8.0, title_width, title_height),
+                        title,
+                        16.0,
+                        black,
+                    );
+                    () = msg![env; group addSubview:title_view];
+                    let description_view = new_setting_description_label(
+                        env,
+                        rect(
+                            side,
+                            row_y + 8.0 + band_height + 4.0,
+                            description_width,
+                            description_height,
+                        ),
+                        description,
+                        gray_text,
+                    );
+                    () = msg![env; group addSubview:description_view];
 
                     let switch: id = msg_class![env; UISwitch alloc];
                     let switch: id = msg![env; switch initWithFrame:(rect(
                         inner_width - side - switch_width,
-                        row_y + 8.5,
+                        row_y + 8.0 + (band_height - 27.0) / 2.0,
                         switch_width,
                         27.0,
                     ))];
                     () = msg![env; switch setOn:default_state];
                     () = msg![env; switch setEnabled:enabled];
-                    let selector = env.objc.lookup_selector(selector).unwrap();
+                    let selector = env.objc.lookup_selector(selector_name).unwrap();
                     () = msg![env; switch addTarget:delegate
-                                             action:selector
-                                   forControlEvents:UIControlEventValueChanged];
+                        action:selector
+                        forControlEvents:UIControlEventValueChanged];
                     () = msg![env; group addSubview:switch];
+                    toggle_switches.push((selector_name, switch));
+                }
+                SettingsRow::Button { title, selector } => {
+                    let button: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+                    () = msg![env; button setFrame:(rect(side, row_y, inner_width - 2.0 * side, row_height))];
+                    let clear: id = msg_class![env; UIColor clearColor];
+                    () = msg![env; button setBackgroundColor:clear];
+                    let text = ns_string::from_rust_string(env, title.to_string());
+                    () = msg![env; button setTitle:text forState:UIControlStateNormal];
+                    release(env, text);
+                    let red = ui_color(env, 0.88, 0.18, 0.20, 1.0);
+                    () = msg![env; button setTitleColor:red forState:UIControlStateNormal];
+                    // FIXME: manually calling layoutSubviews shouldn't be
+                    // needed?
+                    () = msg![env; button layoutSubviews];
+                    let label: id = msg![env; button titleLabel];
+                    let font: id = msg_class![env; UIFont systemFontOfSize:(16.0 as CGFloat)];
+                    () = msg![env; label setFont:font];
+                    () = msg![env; label setTextAlignment:UITextAlignmentCenter];
+                    let selector = env.objc.lookup_selector(selector).unwrap();
+                    () = msg![env; button addTarget:delegate
+                action:selector
+                forControlEvents:UIControlEventTouchUpInside];
+                    () = msg![env; group addSubview:button];
+                }
+                SettingsRow::ManualValue {
+                    title,
+                    description,
+                    tag,
+                    value,
+                    enabled,
+                    text_keyboard,
+                } => {
+                    let field_width: CGFloat = 120.0;
+                    let text_width = inner_width - 2.0 * side - field_width - 20.0;
+                    let title_height = settings_text_height(env, &title, 15.0, text_width);
+                    let description_height = settings_text_height(
+                        env,
+                        &description,
+                        SETTINGS_DESCRIPTION_FONT_SIZE,
+                        text_width,
+                    );
+                    let title_view = new_setting_title_label(
+                        env,
+                        rect(side, row_y + 8.0, text_width, title_height),
+                        &title,
+                        15.0,
+                        black,
+                    );
+                    () = msg![env; group addSubview:title_view];
+                    let description_view = new_setting_description_label(
+                        env,
+                        rect(
+                            side,
+                            row_y + 8.0 + title_height + 4.0,
+                            text_width,
+                            description_height,
+                        ),
+                        &description,
+                        gray_text,
+                    );
+                    () = msg![env; group addSubview:description_view];
+                    let field: id = msg_class![env; UITextField alloc];
+                    let field: id = msg![env; field initWithFrame:(rect(
+                        inner_width - side - field_width,
+                        row_y + (row_height - 32.0) / 2.0,
+                        field_width,
+                        32.0,
+                    ))];
+                    let value = ns_string::from_rust_string(env, value);
+                    () = msg![env; field setText:value];
+                    release(env, value);
+                    () = msg![env; field setTextColor:black];
+                    () = msg![env; field setTextAlignment:UITextAlignmentCenter];
+                    () = msg![env; field setBackgroundColor:manual_value_background];
+                    let field_font_size: CGFloat = if tag == MANUAL_CORRUPTION_SEED {
+                        10.5
+                    } else {
+                        13.0
+                    };
+                    let field_font: id = msg_class![env; UIFont systemFontOfSize:field_font_size];
+                    () = msg![env; field setFont:field_font];
+                    () = msg![env; field setTag:tag];
+                    () = msg![env; field setDelegate:delegate];
+                    () = msg![env; field setEnabled:enabled];
+                    () = msg![env; field setKeyboardType:(
+                        if text_keyboard {
+                            UIKeyboardTypeNumbersAndPunctuation
+                        } else {
+                            UIKeyboardTypeDefault
+                        }
+                    )];
+                    () = msg![env; field setReturnKeyType:UIReturnKeyDone];
+                    // The field's internal label otherwise starts at zero size.
+                    () = msg![env; field layoutSubviews];
+                    () = msg![env; group addSubview:field];
+                    manual_value_fields.push((tag, field, description_view));
                 }
             }
-            row_y += settings_row_height(row);
+            row_y += row_height;
             // Hairline separator between rows, inset from the left like iOS.
             if index + 1 < row_count {
                 let separator_color = ui_color(env, 0.85, 0.85, 0.87, 1.0);
@@ -4379,7 +7393,7 @@ fn setup_settings(
     // Footer with the build identifier.
     let footer = new_label(
         env,
-        rect(0.0, y, width, 18.0),
+        rect(0.0, y, width - SETTINGS_SCROLLBAR_WIDTH, 18.0),
         &format!("{} ({})", crate::DISPLAY_NAME, crate::COMMIT_HASH),
         12.0,
         false,
@@ -4390,7 +7404,9 @@ fn setup_settings(
     scroll_items.push((footer, y, y + 18.0));
     y += 30.0;
 
-    () = msg![env; scroll setContentSize:(CGSize { width, height: y + 24.0 })];
+    // Content width must match the scroll view's width: wider content
+    // would give the list a sideways scroll range.
+    () = msg![env; scroll setContentSize:(CGSize { width: width - SETTINGS_SCROLLBAR_WIDTH, height: y + 24.0 })];
 
     SettingsStuff {
         dimmer,
@@ -4399,14 +7415,33 @@ fn setup_settings(
         scroll_items,
         full_height,
         scroll_origin_y: SETTINGS_NAV_BAR_HEIGHT + status_offset,
+        scrollbar_thumb,
+        scrollbar_x,
+        list_top,
+        list_height,
         scale_hack_buttons: scale_hack_buttons.try_into().unwrap(),
         orientation_buttons: orientation_buttons.try_into().unwrap(),
         overlay_mode_buttons,
         overlay_corner_buttons,
+        corruption_mode_buttons,
+        corruption_startup_delay_buttons,
+        corruption_cooldown_buttons,
+        gles2_mode_buttons,
+        vsync_buttons,
+        present_mode_buttons,
+        texture_filter_buttons,
+        present_rotate_buttons,
+        controller_to_touch_buttons,
+        toggle_switches,
+        manual_value_fields,
         device_dropdown: device_dropdown
             .expect("the settings screen always has a device model row"),
         language_dropdown: language_dropdown
             .expect("the settings screen always has a language row"),
+        renderer_dropdown: renderer_dropdown
+            .expect("the settings screen always has a renderer mode row"),
+        memory_limit_dropdown: memory_limit_dropdown
+            .expect("the settings screen always has a RAM limiter row"),
     }
 }
 
@@ -4421,12 +7456,18 @@ const DEVICE_TAG_AUTO: NSInteger = 1001;
 const DEVICE_MENU_VISIBLE_ITEMS: usize = 6;
 /// Height of a single row in the device-model dropdown.
 const DEVICE_MENU_ITEM_HEIGHT: CGFloat = 30.0;
+/// Width of the scrollbar down the right edge of the settings list.
+const SETTINGS_SCROLLBAR_WIDTH: CGFloat = 10.0;
+/// How wide the scrollbar's touch area is. The visible track stays
+/// narrow, but the strip you can grab is wider so it is easy to hit
+/// on a phone.
+const SETTINGS_SCROLLBAR_HIT_WIDTH: CGFloat = 28.0;
 
 /// The choices shown in the device-model dropdown, in display order, as
 /// `(title, tag)` pairs: "Default" (no override), "Auto" (match host screen),
-/// then one entry per [crate::window::DeviceFamily] in `ALL_SELECTABLE` order,
-/// tagged with the model's own picker tag rather than its position, so that
-/// saved settings survive changes to the display order.
+/// then one entry per [crate::window::DeviceFamily] in `ALL_SELECTABLE` order.
+/// Model titles include portrait pixel resolution and use each model's own
+/// picker tag, so saved settings survive changes to the display order.
 fn device_model_entries() -> Vec<(String, NSInteger)> {
     use crate::window::DeviceFamily;
     let mut entries: Vec<(String, NSInteger)> = Vec::new();
@@ -4436,9 +7477,20 @@ fn device_model_entries() -> Vec<(String, NSInteger)> {
         let Some(tag) = family.tag() else {
             continue;
         };
-        entries.push((family.display_name().to_string(), tag as NSInteger));
+        entries.push((device_model_resolution_label(family), tag as NSInteger));
     }
     entries
+}
+
+fn device_model_resolution_label(family: &crate::window::DeviceFamily) -> String {
+    let (width, height) = family.portrait_size();
+    let scale = family.scale_factor() as u32;
+    format!(
+        "{} ({}x{}px)",
+        family.display_name(),
+        width * scale,
+        height * scale
+    )
 }
 
 /// The spec of the "Device model" dropdown.
@@ -4448,6 +7500,7 @@ fn device_model_dropdown_spec() -> DropdownSpec {
         toggle_selector: "deviceModelToggle",
         item_selector: "deviceModel:",
         scroll_selector: "deviceModelScroll:forEvent:",
+        button_font_size: 14.0,
     }
 }
 
@@ -4475,6 +7528,45 @@ const LANGUAGE_CHOICES: &[(&str, Option<&str>)] = &[
     ("简体中文", Some("zh-Hans,zh,en")),
 ];
 
+const RENDERER_MODE_ANGLE_TAG: NSInteger = 2000;
+const RENDERER_MODE_NATIVE_GLES_TAG: NSInteger = 2001;
+
+fn renderer_mode_dropdown_spec() -> DropdownSpec {
+    DropdownSpec {
+        entries: vec![
+            ("ANGLE".to_string(), RENDERER_MODE_ANGLE_TAG),
+            ("Native GLES".to_string(), RENDERER_MODE_NATIVE_GLES_TAG),
+        ],
+        toggle_selector: "rendererModeToggle",
+        item_selector: "rendererMode:",
+        scroll_selector: "rendererModeScroll:forEvent:",
+        button_font_size: 16.0,
+    }
+}
+
+fn renderer_mode_tag(mode: RendererMode) -> i32 {
+    match mode {
+        RendererMode::Angle => RENDERER_MODE_ANGLE_TAG as i32,
+        RendererMode::NativeGles => RENDERER_MODE_NATIVE_GLES_TAG as i32,
+    }
+}
+
+fn renderer_mode_from_tag(tag: Option<i32>) -> RendererMode {
+    match tag.map(|tag| tag as NSInteger) {
+        Some(RENDERER_MODE_NATIVE_GLES_TAG) => RendererMode::NativeGles,
+        _ => RendererMode::Angle,
+    }
+}
+
+/// Human-readable renderer mode label for the selected dropdown item.
+fn renderer_mode_label_for_tag(tag: Option<i32>) -> String {
+    match renderer_mode_from_tag(tag) {
+        RendererMode::Angle => "ANGLE",
+        RendererMode::NativeGles => "Native GLES",
+    }
+    .to_string()
+}
+
 /// The spec of the "Language" dropdown.
 fn language_dropdown_spec() -> DropdownSpec {
     DropdownSpec {
@@ -4486,6 +7578,27 @@ fn language_dropdown_spec() -> DropdownSpec {
         toggle_selector: "languageToggle",
         item_selector: "language:",
         scroll_selector: "languageScroll:forEvent:",
+        button_font_size: 16.0,
+    }
+}
+
+/// The spec of the "RAM Limiter" dropdown: the presets, then a "Custom…" row
+/// at the bottom that opens the size keypad.
+fn memory_limit_dropdown_spec() -> DropdownSpec {
+    DropdownSpec {
+        entries: MEMORY_LIMIT_CHOICES
+            .iter()
+            .enumerate()
+            .map(|(idx, choice)| (memory_limit_label(*choice), idx as NSInteger))
+            .chain(std::iter::once((
+                "Custom…".to_string(),
+                MEMORY_LIMIT_CUSTOM_TAG as NSInteger,
+            )))
+            .collect(),
+        toggle_selector: "memoryLimitToggle",
+        item_selector: "memoryLimit:",
+        scroll_selector: "memoryLimitScroll:forEvent:",
+        button_font_size: 16.0,
     }
 }
 
@@ -4513,7 +7626,7 @@ fn device_model_label_for_tag(tag: Option<i32>) -> String {
         None | Some(DEVICE_TAG_DEFAULT) => "Default".to_string(),
         Some(DEVICE_TAG_AUTO) => "Auto".to_string(),
         Some(idx) => DeviceFamily::for_tag(idx as usize)
-            .map(|f| f.display_name().to_string())
+            .map(|family| device_model_resolution_label(&family))
             .unwrap_or_else(|| "Default".to_string()),
     }
 }
@@ -4529,9 +7642,9 @@ fn update_dropdown_menu(
     thumb: id,
     selected: Option<i32>,
     scroll: isize,
+    list_width: CGFloat,
 ) {
     let visible_menu_height = (DEVICE_MENU_VISIBLE_ITEMS as CGFloat) * DEVICE_MENU_ITEM_HEIGHT;
-    let list_width: CGFloat = 256.0;
     let max_scroll = (items.len() as isize).saturating_sub(DEVICE_MENU_VISIBLE_ITEMS as isize);
 
     for (j, &item) in items.iter().enumerate() {
@@ -4550,13 +7663,25 @@ fn update_dropdown_menu(
         }
         let tag: NSInteger = msg![env; item tag];
         let is_selected = selected.is_some_and(|v| v as NSInteger == tag);
-        let color = if is_selected { ui_color(env, 0.08, 0.40, 0.78, 1.0) } else { ui_color(env, 1.0, 1.0, 1.0, 1.0) };
-        let text_color: id = if is_selected { msg_class![env; UIColor whiteColor] } else { msg_class![env; UIColor blackColor] };
+        let color = if is_selected {
+            ui_color(env, 0.08, 0.40, 0.78, 1.0)
+        } else {
+            ui_color(env, 1.0, 1.0, 1.0, 1.0)
+        };
+        let text_color: id = if is_selected {
+            msg_class![env; UIColor whiteColor]
+        } else {
+            msg_class![env; UIColor blackColor]
+        };
         () = msg![env; item setBackgroundColor:color];
         () = msg![env; item setTitleColor:text_color forState:UIControlStateNormal];
     }
 
-    // Position the scrollbar thumb proportionally to the scroll offset.
+    // Position the scrollbar thumb proportionally to the scroll offset. A list
+    // that fits has no thumb (and no track).
+    if thumb == nil {
+        return;
+    }
     let thumb_height: CGFloat = 54.0;
     let travel = (visible_menu_height - thumb_height).max(0.0);
     let thumb_y = if max_scroll > 0 {
@@ -4597,9 +7722,17 @@ fn make_settings_dropdown(
         toggle_selector,
         item_selector,
         scroll_selector,
+        button_font_size,
     } = spec;
-    let list_width: CGFloat = 256.0;
+    // Lists whose entries all fit need no scrollbar, so they use the whole
+    // menu width instead of leaving a bare track next to the rows.
+    let scrollable = entries.len() > DEVICE_MENU_VISIBLE_ITEMS;
     let scrollbar_width: CGFloat = 24.0;
+    let list_width: CGFloat = if scrollable {
+        SETTINGS_DROPDOWN_MENU_WIDTH - scrollbar_width
+    } else {
+        SETTINGS_DROPDOWN_MENU_WIDTH
+    };
     let dark_gray: id = msg_class![env; UIColor darkGrayColor];
     let root_size: CGSize = {
         let bounds: CGRect = msg![env; root_view bounds];
@@ -4625,7 +7758,7 @@ fn make_settings_dropdown(
     () = msg![env; button setFrame:button_frame];
     () = msg![env; button layoutSubviews];
     let button_label: id = msg![env; button titleLabel];
-    let button_font: id = msg_class![env; UIFont systemFontOfSize:(16.0 as CGFloat)];
+    let button_font: id = msg_class![env; UIFont systemFontOfSize:button_font_size];
     () = msg![env; button_label setFont:button_font];
     () = msg![env; button addTarget:delegate
                              action:(env.objc.lookup_selector(toggle_selector).unwrap())
@@ -4649,9 +7782,24 @@ fn make_settings_dropdown(
     () = msg![env; menu_view setHidden:true];
     () = msg![env; root_view addSubview:menu_view];
 
-    // List items: one button per choice. Items that fall outside the initially
-    // visible window are hidden; scrolling reveals them (see
-    // `update_dropdown_menu`).
+    let scroll_view: id = msg_class![env; UIScrollView alloc];
+    let scroll_view_frame = rect(0.0, 0.0, list_width, visible_menu_height);
+    let scroll_view: id = msg![env; scroll_view initWithFrame:scroll_view_frame];
+    () = msg![env; scroll_view setClipsToBounds:true];
+    () = msg![env; scroll_view setShowsVerticalScrollIndicator:false];
+    () = msg![env; scroll_view setScrollEnabled:true];
+    let content_size = CGSize {
+        width: list_width,
+        height: entries.len() as CGFloat * DEVICE_MENU_ITEM_HEIGHT,
+    };
+    () = msg![env; scroll_view setContentSize:content_size];
+    () = msg![env; scroll_view setAlwaysBounceHorizontal:false];
+    () = msg![env; scroll_view setShowsHorizontalScrollIndicator:false];
+    () = msg![env; scroll_view setDirectionalLockEnabled:true];
+    () = msg![env; menu_view addSubview:scroll_view];
+
+    // List items stay in content coordinates; UIScrollView moves them during
+    // finger drags. Offscreen rows are also hidden for layer clipping.
     let item_selector = env.objc.lookup_selector(item_selector).unwrap();
     let white: id = msg_class![env; UIColor whiteColor];
     let mut items: Vec<id> = Vec::new();
@@ -4672,65 +7820,71 @@ fn make_settings_dropdown(
         () = msg![env; item_btn setFrame:item_frame];
         () = msg![env; item_btn layoutSubviews];
         () = msg![env; item_btn setTag:tag];
-        if y_pos >= visible_menu_height {
-            () = msg![env; item_btn setHidden:true];
-        }
         () = msg![env; item_btn addTarget:delegate
                                    action:item_selector
                          forControlEvents:UIControlEventTouchUpInside];
-        () = msg![env; menu_view addSubview:item_btn];
+        () = msg![env; scroll_view addSubview:item_btn];
         items.push(item_btn);
     }
 
-    // Scrollbar track (full height) and thumb.
-    let track_view: id = msg_class![env; UIView alloc];
-    let track_frame = CGRect {
-        origin: CGPoint {
-            x: list_width,
-            y: 0.0,
-        },
-        size: CGSize {
-            width: scrollbar_width,
-            height: visible_menu_height,
-        },
-    };
-    let track_view: id = msg![env; track_view initWithFrame:track_frame];
-    let track_color = ui_color(env, 0.87, 0.87, 0.89, 1.0);
-    () = msg![env; track_view setBackgroundColor:track_color];
-    () = msg![env; menu_view addSubview:track_view];
+    // Scrollbar track (full height), thumb, and the control that supports
+    // clicking the track and dragging the thumb. A list that fits gets none of
+    // them: there is nothing to scroll.
+    let thumb_view: id = if scrollable {
+        let track_view: id = msg_class![env; UIView alloc];
+        let track_frame = CGRect {
+            origin: CGPoint {
+                x: list_width,
+                y: 0.0,
+            },
+            size: CGSize {
+                width: scrollbar_width,
+                height: visible_menu_height,
+            },
+        };
+        let track_view: id = msg![env; track_view initWithFrame:track_frame];
+        let track_color = ui_color(env, 0.87, 0.87, 0.89, 1.0);
+        () = msg![env; track_view setBackgroundColor:track_color];
+        () = msg![env; menu_view addSubview:track_view];
 
-    let thumb_view: id = msg_class![env; UIView alloc];
-    let thumb_frame = CGRect {
-        origin: CGPoint {
-            x: list_width,
-            y: 0.0,
-        },
-        size: CGSize {
-            width: scrollbar_width,
-            height: 54.0,
-        },
-    };
-    let thumb_view: id = msg![env; thumb_view initWithFrame:thumb_frame];
-    let thumb_color = ui_color(env, 0.55, 0.55, 0.58, 1.0);
-    () = msg![env; thumb_view setBackgroundColor:thumb_color];
-    () = msg![env; menu_view addSubview:thumb_view];
+        let thumb_view: id = msg_class![env; UIView alloc];
+        let thumb_frame = CGRect {
+            origin: CGPoint {
+                x: list_width,
+                y: 0.0,
+            },
+            size: CGSize {
+                width: scrollbar_width,
+                height: 54.0,
+            },
+        };
+        let thumb_view: id = msg![env; thumb_view initWithFrame:thumb_frame];
+        let thumb_color = ui_color(env, 0.55, 0.55, 0.58, 1.0);
+        () = msg![env; thumb_view setBackgroundColor:thumb_color];
+        () = msg![env; menu_view addSubview:thumb_view];
 
-    // A single control supports clicking the track and dragging the thumb.
-    let clear: id = msg_class![env; UIColor clearColor];
-    let scroll_btn: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
-    () = msg![env; scroll_btn setFrame:track_frame];
-    () = msg![env; scroll_btn setBackgroundColor:clear];
-    () = msg![env; scroll_btn addTarget:delegate
-                               action:(env.objc.lookup_selector(scroll_selector).unwrap())
-                     forControlEvents:(UIControlEventTouchDown | UIControlEventTouchDragInside | UIControlEventTouchDragExit | UIControlEventTouchDragOutside)];
-    () = msg![env; menu_view addSubview:scroll_btn];
+        let clear: id = msg_class![env; UIColor clearColor];
+        let scroll_btn: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+        () = msg![env; scroll_btn setFrame:track_frame];
+        () = msg![env; scroll_btn setBackgroundColor:clear];
+        () = msg![env; scroll_btn addTarget:delegate
+                                   action:(env.objc.lookup_selector(scroll_selector).unwrap())
+                         forControlEvents:(UIControlEventTouchDown | UIControlEventTouchDragInside | UIControlEventTouchDragExit | UIControlEventTouchDragOutside)];
+        () = msg![env; menu_view addSubview:scroll_btn];
+
+        thumb_view
+    } else {
+        nil
+    };
 
     SettingsDropdown {
         button,
         menu: menu_view,
+        scroll_view,
         dimmer,
         items,
         thumb: thumb_view,
+        list_width,
     }
 }
 
@@ -4773,8 +7927,15 @@ struct DeleteDialog {
     dimmer: id,
     /// The alert box, with its title, message and buttons.
     panel: id,
-    /// Names the app being deleted.
+    /// The dialog's title, set each time it opens.
     title: id,
+    /// The explanatory line under the title.
+    message: id,
+    /// The action buttons.
+    cancel: id,
+    confirm: id,
+    /// The separator between the two buttons.
+    vertical_separator: id,
 }
 
 /// Builds one button of an alert box.
@@ -4811,20 +7972,24 @@ fn make_alert_button(
     button
 }
 
-/// Builds the delete dialog to match the old-iOS Settings screen: a white
+/// Builds an alert dialog matching the old-iOS Settings screen: a white
 /// grouped card with a soft gray outline, separators, and blue/red text actions.
-/// It is hidden until [show_delete_dialog].
+/// [set_dialog_content] fills in the text when it opens, so the title, message
+/// and confirm button are deliberately left empty here.
+#[allow(clippy::too_many_arguments)]
 fn make_delete_dialog(
     env: &mut Environment,
     delegate: id,
     main_view: id,
     screen_size: CGSize,
+    cancel_selector: &str,
+    confirm_selector: &str,
 ) -> DeleteDialog {
     let dimmer: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
     () = msg![env; dimmer setFrame:(rect(0.0, 0.0, screen_size.width, screen_size.height))];
     let dim_color = ui_color(env, 0.0, 0.0, 0.0, 0.4);
     () = msg![env; dimmer setBackgroundColor:dim_color];
-    let cancel_sel = env.objc.lookup_selector("deleteCancel").unwrap();
+    let cancel_sel = env.objc.lookup_selector(cancel_selector).unwrap();
     () = msg![env; dimmer addTarget:delegate
                              action:cancel_sel
                    forControlEvents:UIControlEventTouchUpInside];
@@ -4865,7 +8030,7 @@ fn make_delete_dialog(
     let message = new_label(
         env,
         rect(12.0, 58.0, DELETE_DIALOG_WIDTH - 24.0, 52.0),
-        "This will delete the app and all of its saved data.",
+        "",
         14.0,
         false,
         message_color,
@@ -4899,24 +8064,28 @@ fn make_delete_dialog(
         "Cancel",
         blue,
         false,
-        "deleteCancel",
+        cancel_selector,
     );
     () = msg![env; panel addSubview:cancel];
-    let delete = make_alert_button(
+    let confirm = make_alert_button(
         env,
         delegate,
         rect(half, button_y, half, DELETE_DIALOG_BUTTON_HEIGHT),
-        "Delete",
+        "Action",
         red,
         true,
-        "deleteConfirm",
+        confirm_selector,
     );
-    () = msg![env; panel addSubview:delete];
+    () = msg![env; panel addSubview:confirm];
 
     DeleteDialog {
         dimmer,
         panel,
         title,
+        message,
+        cancel,
+        confirm,
+        vertical_separator: v_separator,
     }
 }
 
@@ -4925,18 +8094,10 @@ fn make_delete_dialog(
 const DELETE_DIALOG_APPEAR_DURATION: Duration = Duration::from_millis(200);
 const DELETE_DIALOG_START_SCALE: f64 = 0.8;
 
-/// Opens the delete dialog for the app called `app_name`, with the same
-/// pop-in as an old iOS alert: the screen dims and the box grows and fades in.
-fn show_delete_dialog(
-    env: &mut Environment,
-    run_loop: id,
-    delegate: id,
-    dialog: &DeleteDialog,
-    app_name: &str,
-) {
-    let title = ns_string::from_rust_string(env, format!("Delete “{app_name}”?"));
-    () = msg![env; (dialog.title) setText:title];
-    release(env, title);
+/// Opens `dialog` with the old iOS alert pop-in: the screen dims and the box
+/// grows and fades in. `title`, `message` and the buttons must be set first
+/// (see [set_dialog_content]).
+fn show_delete_dialog(env: &mut Environment, run_loop: id, delegate: id, dialog: &DeleteDialog) {
     () = msg![env; (dialog.dimmer) setAlpha:(0.0 as CGFloat)];
     () = msg![env; (dialog.dimmer) setHidden:false];
     () = msg![env; (dialog.panel) setAlpha:(0.0 as CGFloat)];
@@ -4957,18 +8118,53 @@ fn show_delete_dialog(
     );
 }
 
+/// Fills in a dialog's text and buttons. `confirm` is the title of the red
+/// action button, or `None` for a single-button notice.
+fn set_dialog_content(
+    env: &mut Environment,
+    dialog: &DeleteDialog,
+    title: &str,
+    message: &str,
+    confirm: Option<&str>,
+) {
+    let title_text = ns_string::from_rust_string(env, title.to_string());
+    () = msg![env; (dialog.title) setText:title_text];
+    release(env, title_text);
+    let message_text = ns_string::from_rust_string(env, message.to_string());
+    () = msg![env; (dialog.message) setText:message_text];
+    release(env, message_text);
+    let cancel_width = match confirm {
+        Some(confirm) => {
+            let text = ns_string::from_rust_string(env, confirm.to_string());
+            () = msg![env; (dialog.confirm) setTitle:text forState:UIControlStateNormal];
+            release(env, text);
+            () = msg![env; (dialog.confirm) setHidden:false];
+            () = msg![env; (dialog.vertical_separator) setHidden:false];
+            DELETE_DIALOG_WIDTH / 2.0
+        }
+        None => {
+            () = msg![env; (dialog.confirm) setHidden:true];
+            () = msg![env; (dialog.vertical_separator) setHidden:true];
+            DELETE_DIALOG_WIDTH
+        }
+    };
+    let frame: CGRect = msg![env; (dialog.cancel) frame];
+    () = msg![env; (dialog.cancel) setFrame:(CGRect {
+        origin: frame.origin,
+        size: CGSize {
+            width: cancel_width,
+            height: frame.size.height,
+        },
+    })];
+}
+
 /// How long the delete dialog takes to disappear. It is the reverse of
 /// [show_delete_dialog]: the box shrinks and fades out, and the screen clears.
 const DELETE_DIALOG_DISAPPEAR_DURATION: Duration = Duration::from_millis(150);
 
 /// Closes the delete dialog with the reverse of its pop-in animation. This
 /// returns once the dialog is hidden.
-fn hide_delete_dialog(
-    env: &mut Environment,
-    run_loop: id,
-    delegate: id,
-    dialog: &DeleteDialog,
-) {
+fn hide_delete_dialog(env: &mut Environment, run_loop: id, delegate: id, dialog: &DeleteDialog) {
     animate_for(
         env,
         run_loop,
@@ -4986,6 +8182,487 @@ fn hide_delete_dialog(
     () = msg![env; (dialog.panel) setHidden:true];
 }
 
+/// Whether `dialog` is currently on screen. Used to pause saving while a
+/// dialog is up, so only the dialog's own buttons change the settings.
+fn is_dialog_visible(env: &mut Environment, dialog: &DeleteDialog) -> bool {
+    !msg![env; (dialog.panel) isHidden]
+}
+
+/// The value a settings switch named `selector` must show for `settings`.
+/// Returns `None` for a name that no switch uses.
+fn toggle_value_for_selector(settings: &PickerSettings, selector: &str) -> Option<bool> {
+    Some(match selector {
+        "cheatEngine:" => settings.cheat_engine,
+        "quickMenu:" => settings.quick_menu,
+        "network:" => settings.network,
+        "gameCenterAuthenticated:" => settings.game_center_authenticated,
+        "analogStickTiltControls:" => settings.analog_stick_tilt_controls,
+        "fullscreen:" => settings.fullscreen,
+        "preserveAspectRatio:" => settings.preserve_aspect_ratio,
+        "forceComposition:" => settings.force_composition,
+        "showFPS:" => settings.show_fps,
+        "traceGLErrors:" => settings.trace_gl_errors,
+        "traceGLDraws:" => settings.trace_gl_draws,
+        "printFPS:" => settings.print_fps,
+        "popupErrors:" => settings.popup_errors,
+        "rotationFix:" => settings.rotation_fix.unwrap_or(false),
+        "manualUIRotation:" => settings.manual_ui_rotation.unwrap_or(false),
+        "preserveDYLDStubs:" => settings.preserve_dyld_stubs.unwrap_or(false),
+        "dladdr:" => settings.dladdr.unwrap_or(false),
+        "moviePlayerFix:" => settings.fix_movie_player.unwrap_or(false),
+        "showLockScreen:" => settings.show_lock_screen,
+        _ => return None,
+    })
+}
+
+/// Puts every control on the Settings screen back in step with `settings`.
+/// Needed after a reset, which replaces all the settings at once. The caller
+/// refreshes the device and language dropdowns, because it owns their scroll
+/// state.
+fn refresh_settings_controls(
+    env: &mut Environment,
+    settings: &SettingsStuff,
+    picker_settings: &PickerSettings,
+) {
+    update_scale_hack_buttons(
+        env,
+        &settings.scale_hack_buttons,
+        picker_settings.scale_hack,
+    );
+    update_orientation_buttons(
+        env,
+        &settings.orientation_buttons,
+        picker_settings.orientation,
+    );
+    update_performance_overlay_buttons(
+        env,
+        &settings.overlay_mode_buttons,
+        &settings.overlay_corner_buttons,
+        picker_settings.overlay_mode,
+        picker_settings.overlay_corner,
+    );
+    update_segment_buttons(
+        env,
+        &settings.corruption_mode_buttons,
+        picker_settings.corruption_mode.selected_index() as usize,
+    );
+    update_segment_buttons(
+        env,
+        &settings.corruption_startup_delay_buttons,
+        picker_settings.corruption_startup_delay.selected_index(),
+    );
+    update_segment_buttons(
+        env,
+        &settings.corruption_cooldown_buttons,
+        picker_settings.corruption_cooldown.selected_index(),
+    );
+    update_segment_buttons(
+        env,
+        &settings.gles2_mode_buttons,
+        picker_settings.gles2_mode.selected_index() as usize,
+    );
+    update_segment_buttons(
+        env,
+        &settings.vsync_buttons,
+        vsync_selected_index(picker_settings.vsync),
+    );
+    update_segment_buttons(
+        env,
+        &settings.present_mode_buttons,
+        present_mode_selected_index(picker_settings.present_mode),
+    );
+    update_segment_buttons(
+        env,
+        &settings.texture_filter_buttons,
+        texture_filter_selected_index(picker_settings.fix_texture_min_filter),
+    );
+    update_segment_buttons(
+        env,
+        &settings.present_rotate_buttons,
+        present_rotate_selected_index(picker_settings.present_rotate),
+    );
+    update_segment_buttons(
+        env,
+        &settings.controller_to_touch_buttons,
+        controller_to_touch_selected_index(picker_settings.controller_to_touch),
+    );
+    for &(selector, switch) in &settings.toggle_switches {
+        if let Some(value) = toggle_value_for_selector(picker_settings, selector) {
+            () = msg![env; switch setOn:value];
+        }
+    }
+    let (width, height) = picker_touch_screen_size(&env.options, picker_settings);
+    refresh_manual_value_fields(
+        env,
+        &settings.manual_value_fields,
+        width,
+        height,
+        &mut picker_settings.clone(),
+    );
+    refresh_dropdown(
+        env,
+        &settings.renderer_dropdown,
+        &renderer_mode_label_for_tag(Some(renderer_mode_tag(picker_settings.renderer_mode))),
+        &DropdownState {
+            selected: Some(renderer_mode_tag(picker_settings.renderer_mode)),
+            open: false,
+            scroll: 0,
+        },
+    );
+}
+
+/// Whether the picker can offer a choice of renderer. The reset restores the
+/// default that `PickerSettings::load` starts from, so it needs the same flag.
+fn renderer_mode_dropdown_enabled() -> bool {
+    cfg!(target_os = "android") && crate::window::angle_backend_available()
+}
+/// The settings the reset handler may change. Bundled so that the handler
+/// takes few arguments; the caller copies them in and back out.
+struct SettingsDrafts {
+    picker_settings: PickerSettings,
+    last_saved_picker_settings: PickerSettings,
+    device_state: DropdownState,
+    language_state: DropdownState,
+    renderer_state: DropdownState,
+    memory_limit_state: DropdownState,
+}
+/// Applies the reset settings screen request now that `env` and the
+/// delegate's host object are no longer borrowed at the same time.
+fn handle_reset_settings_request(
+    env: &mut Environment,
+    request: ResetSettingsRequest,
+    main_run_loop: id,
+    delegate: id,
+    screen: (
+        &SettingsStuff,
+        &DeleteDialog,
+        &DeleteDialog,
+        &mut SettingsDrafts,
+    ),
+) {
+    let (settings, reset_dialog, save_error_dialog, drafts) = screen;
+    let picker_settings = &mut drafts.picker_settings;
+    let last_saved_picker_settings = &mut drafts.last_saved_picker_settings;
+    let device_state = &mut drafts.device_state;
+    let language_state = &mut drafts.language_state;
+    let renderer_state = &mut drafts.renderer_state;
+    let memory_limit_state = &mut drafts.memory_limit_state;
+    match request {
+        ResetSettingsRequest::None => {}
+        ResetSettingsRequest::Ask => {
+            set_dialog_content(
+                env,
+                reset_dialog,
+                "Reset all settings?",
+                "This resets every setting to its default. Apps and their saved data are kept.",
+                Some("Reset"),
+            );
+            show_delete_dialog(env, main_run_loop, delegate, reset_dialog);
+        }
+        ResetSettingsRequest::Confirm => {
+            hide_delete_dialog(env, main_run_loop, delegate, reset_dialog);
+            let defaults = PickerSettings::factory_defaults(renderer_mode_dropdown_enabled());
+            // Persist first: if the write fails, the live settings and the
+            // controls must keep showing what is actually on disk.
+            match defaults.save() {
+                Ok(()) => {
+                    *picker_settings = defaults;
+                    *last_saved_picker_settings = picker_settings.clone();
+                    refresh_settings_controls(env, settings, picker_settings);
+                    device_state.selected = picker_settings.device_model_tag;
+                    language_state.selected = picker_settings.language_tag;
+                    renderer_state.selected =
+                        Some(renderer_mode_tag(picker_settings.renderer_mode));
+                    refresh_dropdown(
+                        env,
+                        &settings.renderer_dropdown,
+                        &renderer_mode_label_for_tag(renderer_state.selected),
+                        renderer_state,
+                    );
+                    refresh_dropdown(
+                        env,
+                        &settings.device_dropdown,
+                        &device_model_label_for_tag(device_state.selected),
+                        device_state,
+                    );
+                    refresh_dropdown(
+                        env,
+                        &settings.language_dropdown,
+                        &language_label_for_tag(language_state.selected),
+                        language_state,
+                    );
+                    memory_limit_state.selected =
+                        Some(memory_limit_tag(picker_settings.memory_limit_mb));
+                    refresh_dropdown(
+                        env,
+                        &settings.memory_limit_dropdown,
+                        &memory_limit_label(picker_settings.memory_limit_mb),
+                        memory_limit_state,
+                    );
+                }
+                Err(error) => {
+                    log!("Warning: couldn't save app picker settings: {error}");
+                    set_dialog_content(
+                        env,
+                        save_error_dialog,
+                        "Settings not saved",
+                        "The settings couldn't be saved to disk, so they were kept as they were.",
+                        None,
+                    );
+                    show_delete_dialog(env, main_run_loop, delegate, save_error_dialog);
+                }
+            }
+        }
+        ResetSettingsRequest::Cancel => {
+            hide_delete_dialog(env, main_run_loop, delegate, reset_dialog);
+        }
+        ResetSettingsRequest::DismissError => {
+            hide_delete_dialog(env, main_run_loop, delegate, save_error_dialog);
+        }
+    }
+}
+
+/// What the settings screen asked for this frame.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResetSettingsRequest {
+    None,
+    Ask,
+    Confirm,
+    Cancel,
+    DismissError,
+}
+
+/// Size of the custom-size keypad card, before it is shrunk to fit the screen.
+const CUSTOM_LIMIT_DIALOG_WIDTH: CGFloat = 300.0;
+const CUSTOM_LIMIT_DIALOG_HEIGHT: CGFloat = 320.0;
+/// Height of the Cancel/Set row at the bottom of the card.
+const CUSTOM_LIMIT_ACTION_HEIGHT: CGFloat = 40.0;
+/// Where the keypad starts inside the card: below the title, hint and value.
+const CUSTOM_LIMIT_KEYPAD_TOP: CGFloat = 84.0;
+
+/// The "Custom…" size keypad: a dimmed screen and a white card showing the
+/// size being typed above a tray of digit keys, in the style of the delete
+/// dialog below. It is hidden until [show_custom_limit_dialog].
+struct CustomLimitDialog {
+    /// Covers the picker. Tapping it cancels.
+    dimmer: id,
+    /// The card with the digits and the value.
+    panel: id,
+    /// Shows what the typed digits currently mean ("10 MB", "3 GB").
+    value: id,
+}
+
+/// Builds one key of the custom-size keypad.
+fn make_custom_limit_key(
+    env: &mut Environment,
+    delegate: id,
+    frame: CGRect,
+    title: &str,
+    tag: NSInteger,
+    color: id,
+) -> id {
+    let button: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+    () = msg![env; button setFrame:frame];
+    let clear: id = msg_class![env; UIColor clearColor];
+    () = msg![env; button setBackgroundColor:clear];
+    let text = ns_string::from_rust_string(env, title.to_string());
+    () = msg![env; button setTitle:text forState:UIControlStateNormal];
+    release(env, text);
+    () = msg![env; button setTitleColor:color forState:UIControlStateNormal];
+    // FIXME: manually calling layoutSubviews shouldn't be needed?
+    () = msg![env; button layoutSubviews];
+    let label: id = msg![env; button titleLabel];
+    let font: id = msg_class![env; UIFont boldSystemFontOfSize:(20.0 as CGFloat)];
+    () = msg![env; label setFont:font];
+    // The key's meaning travels as the button's tag, so one delegate method
+    // handles every digit plus Delete.
+    () = msg![env; button setTag:tag];
+    let sel = env.objc.lookup_selector("memoryLimitCustomKey:").unwrap();
+    () = msg![env; button addTarget:delegate
+                             action:sel
+                   forControlEvents:UIControlEventTouchUpInside];
+    button
+}
+
+/// Builds the custom-size keypad (see [CustomLimitDialog]).
+fn make_custom_limit_dialog(
+    env: &mut Environment,
+    delegate: id,
+    main_view: id,
+    screen_size: CGSize,
+) -> CustomLimitDialog {
+    let dimmer: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+    () = msg![env; dimmer setFrame:(rect(0.0, 0.0, screen_size.width, screen_size.height))];
+    let dim_color = ui_color(env, 0.0, 0.0, 0.0, 0.4);
+    () = msg![env; dimmer setBackgroundColor:dim_color];
+    let cancel_sel = env.objc.lookup_selector("memoryLimitCustomCancel").unwrap();
+    () = msg![env; dimmer addTarget:delegate
+                             action:cancel_sel
+                   forControlEvents:UIControlEventTouchUpInside];
+    () = msg![env; dimmer setHidden:true];
+    () = msg![env; main_view addSubview:dimmer];
+
+    // Like the delete dialog, but the card shrinks to fit: the keypad has to
+    // work on a 480x320 screen as well as on a tall one.
+    let width = (screen_size.width - 24.0)
+        .min(CUSTOM_LIMIT_DIALOG_WIDTH)
+        .max(190.0);
+    let height = (screen_size.height - 24.0)
+        .min(CUSTOM_LIMIT_DIALOG_HEIGHT)
+        .max(220.0);
+    let white: id = msg_class![env; UIColor whiteColor];
+    let panel = new_view(
+        env,
+        rect(
+            (screen_size.width - width) / 2.0,
+            (screen_size.height - height) / 2.0,
+            width,
+            height,
+        ),
+        white,
+    );
+    let panel_layer: id = msg![env; panel layer];
+    () = msg![env; panel_layer setCornerRadius:(12.0 as CGFloat)];
+    let border = ui_color(env, 0.70, 0.72, 0.75, 1.0);
+    let border_cg: id = msg![env; border CGColor];
+    () = msg![env; panel_layer setBorderColor:border_cg];
+    () = msg![env; panel_layer setBorderWidth:(1.0 as CGFloat)];
+    () = msg![env; panel setHidden:true];
+    () = msg![env; main_view addSubview:panel];
+
+    let black: id = msg_class![env; UIColor blackColor];
+    let title = new_label(
+        env,
+        rect(10.0, 8.0, width - 20.0, 22.0),
+        "RAM Limiter",
+        16.0,
+        true,
+        black,
+    );
+    () = msg![env; title setTextAlignment:UITextAlignmentCenter];
+    () = msg![env; panel addSubview:title];
+
+    let hint_color = ui_color(env, 0.25, 0.25, 0.25, 1.0);
+    let hint = new_label(
+        env,
+        rect(10.0, 30.0, width - 20.0, 16.0),
+        "Size in MB: 10 = 10 MB, 3000 = 3 GB",
+        11.0,
+        false,
+        hint_color,
+    );
+    () = msg![env; hint setTextAlignment:UITextAlignmentCenter];
+    () = msg![env; panel addSubview:hint];
+
+    let blue = ui_color(env, 0.0, 0.478, 1.0, 1.0);
+    let value = new_label(
+        env,
+        rect(10.0, 48.0, width - 20.0, 30.0),
+        "—",
+        22.0,
+        true,
+        blue,
+    );
+    () = msg![env; value setTextAlignment:UITextAlignmentCenter];
+    () = msg![env; panel addSubview:value];
+
+    // 1-9, then Delete and 0, so the layout matches a phone keypad.
+    let keys = [
+        ["1", "2", "3"],
+        ["4", "5", "6"],
+        ["7", "8", "9"],
+        ["Del", "0", ""],
+    ];
+    let keypad_height =
+        (height - CUSTOM_LIMIT_ACTION_HEIGHT - CUSTOM_LIMIT_KEYPAD_TOP).max(4.0 * 28.0);
+    let key_height = keypad_height / 4.0;
+    let key_width = width / 3.0;
+    for (row, row_keys) in keys.iter().enumerate() {
+        for (column, key) in row_keys.iter().enumerate() {
+            if key.is_empty() {
+                continue;
+            }
+            let tag = if *key == "Del" {
+                CUSTOM_LIMIT_BACKSPACE_KEY as NSInteger
+            } else {
+                key.parse::<NSInteger>().unwrap_or(0)
+            };
+            let button = make_custom_limit_key(
+                env,
+                delegate,
+                rect(
+                    column as CGFloat * key_width,
+                    CUSTOM_LIMIT_KEYPAD_TOP + row as CGFloat * key_height,
+                    key_width,
+                    key_height,
+                ),
+                key,
+                tag,
+                blue,
+            );
+            () = msg![env; panel addSubview:button];
+        }
+    }
+
+    let separator_color = ui_color(env, 0.82, 0.83, 0.85, 1.0);
+    let actions_top = height - CUSTOM_LIMIT_ACTION_HEIGHT;
+    let separator = new_view(env, rect(0.0, actions_top, width, 1.0), separator_color);
+    () = msg![env; panel addSubview:separator];
+    let half = width / 2.0;
+    let v_separator = new_view(
+        env,
+        rect(half, actions_top, 1.0, CUSTOM_LIMIT_ACTION_HEIGHT),
+        separator_color,
+    );
+    () = msg![env; panel addSubview:v_separator];
+    let cancel = make_alert_button(
+        env,
+        delegate,
+        rect(0.0, actions_top, half, CUSTOM_LIMIT_ACTION_HEIGHT),
+        "Cancel",
+        blue,
+        false,
+        "memoryLimitCustomCancel",
+    );
+    () = msg![env; panel addSubview:cancel];
+    let set = make_alert_button(
+        env,
+        delegate,
+        rect(half, actions_top, half, CUSTOM_LIMIT_ACTION_HEIGHT),
+        "Set",
+        blue,
+        true,
+        "memoryLimitCustomConfirm",
+    );
+    () = msg![env; panel addSubview:set];
+
+    CustomLimitDialog {
+        dimmer,
+        panel,
+        value,
+    }
+}
+
+/// Shows the keypad with `input` already in it.
+fn show_custom_limit_dialog(env: &mut Environment, dialog: &CustomLimitDialog, input: &str) {
+    set_custom_limit_dialog_text(env, dialog, input);
+    () = msg![env; (dialog.dimmer) setHidden:false];
+    () = msg![env; (dialog.panel) setHidden:false];
+}
+
+/// Hides the keypad without changing the cap.
+fn hide_custom_limit_dialog(env: &mut Environment, dialog: &CustomLimitDialog) {
+    () = msg![env; (dialog.dimmer) setHidden:true];
+    () = msg![env; (dialog.panel) setHidden:true];
+}
+
+/// Updates the value line of the keypad to match `input`.
+fn set_custom_limit_dialog_text(env: &mut Environment, dialog: &CustomLimitDialog, input: &str) {
+    let text = ns_string::from_rust_string(env, custom_memory_limit_display(input));
+    () = msg![env; (dialog.value) setText:text];
+    release(env, text);
+}
+
 fn quick_options_trainer_enabled(options: &Options) -> bool {
     !options.trainer_disabled
 }
@@ -4998,6 +8675,22 @@ fn quick_options_trainer_argument(enabled: bool) -> &'static str {
     }
 }
 
+fn quick_options_trace_gl_errors_argument(enabled: bool) -> &'static str {
+    if enabled {
+        "--trace-gl-errors"
+    } else {
+        "--no-trace-gl-errors"
+    }
+}
+
+fn quick_options_trace_gl_draws_argument(enabled: bool) -> &'static str {
+    if enabled {
+        "--trace-gl-draws"
+    } else {
+        "--no-trace-gl-draws"
+    }
+}
+
 fn quick_options_force_composition_argument(enabled: bool) -> &'static str {
     if enabled {
         "--force-composition"
@@ -5006,11 +8699,34 @@ fn quick_options_force_composition_argument(enabled: bool) -> &'static str {
     }
 }
 
+/// Returns the effective renderer mode and whether it can be changed in the picker.
+fn quick_options_renderer_mode_state(
+    renderer_mode: RendererMode,
+    angle_available: bool,
+) -> (RendererMode, bool) {
+    let mode = if renderer_mode == RendererMode::Angle && !angle_available {
+        RendererMode::NativeGles
+    } else {
+        renderer_mode
+    };
+    (mode, angle_available)
+}
+
 fn quick_options_rotation_fix_argument(enabled: bool) -> &'static str {
     if enabled {
         "--rotation-fix"
     } else {
         "--no-rotation-fix"
+    }
+}
+
+/// `--no-gles3` pretends the GPU has no OpenGL ES 3.0 support; `--gles3`
+/// (the explicit "off" of the switch) restores the default.
+fn quick_options_no_gles3_argument(enabled: bool) -> &'static str {
+    if enabled {
+        "--no-gles3"
+    } else {
+        "--gles3"
     }
 }
 
@@ -5022,10 +8738,32 @@ fn quick_options_fix_movie_player_argument(enabled: bool) -> &'static str {
     }
 }
 
+fn quick_options_manual_ui_rotation_argument(enabled: bool) -> &'static str {
+    if enabled {
+        "--manual-ui-rotation"
+    } else {
+        "--no-manual-ui-rotation"
+    }
+}
+fn quick_options_preserve_dyld_stubs_argument(enabled: bool) -> &'static str {
+    if enabled {
+        "--preserve-dyld-stubs"
+    } else {
+        "--no-preserve-dyld-stubs"
+    }
+}
+fn quick_options_dladdr_argument(enabled: bool) -> &'static str {
+    if enabled {
+        "--dladdr"
+    } else {
+        "--no-dladdr"
+    }
+}
 /// Launch arguments for the two compatibility fix switches. An untouched
-/// switch (`None`) emits nothing: `--no-rotation-fix` / `--no-fix-movie-player`
-/// are explicit overrides that would cancel the app-specific defaults in
-/// touchHLE_default_options.txt (GTA III needs both fixes).
+/// switch (`None`) emits nothing; a flipped switch emits an explicit
+/// `--rotation-fix` / `--no-rotation-fix` or `--fix-movie-player` /
+/// `--no-fix-movie-player`. The app's bundled defaults in
+/// touchHLE_default_options.txt are still applied afterwards and win.
 fn quick_options_fix_arguments(
     rotation_fix: Option<bool>,
     fix_movie_player: Option<bool>,
@@ -5040,18 +8778,131 @@ fn quick_options_fix_arguments(
     args
 }
 
-/// Returns `(native_enabled, switch_enabled)` for the probed ANGLE state.
-fn quick_options_gles_native_state(options: &Options, angle_available: bool) -> (bool, bool) {
-    (options.gles_native || !angle_available, angle_available)
+fn quick_options_picker_settings_arguments(settings: &PickerSettings) -> Vec<String> {
+    let mut args = vec![
+        format!("--vsync={}", vsync_short_name(settings.vsync)),
+        format!(
+            "--present-mode={}",
+            present_mode_short_name(settings.present_mode)
+        ),
+        if settings.print_fps {
+            "--print-fps".to_string()
+        } else {
+            "--no-print-fps".to_string()
+        },
+        if settings.popup_errors {
+            "--error-popup".to_string()
+        } else {
+            "--no-error-popup".to_string()
+        },
+    ];
+    for (tag, name, value) in [
+        (MANUAL_DEADZONE, "deadzone", settings.deadzone),
+        (MANUAL_X_TILT_RANGE, "x-tilt-range", settings.x_tilt_range),
+        (MANUAL_Y_TILT_RANGE, "y-tilt-range", settings.y_tilt_range),
+        (
+            MANUAL_X_TILT_OFFSET,
+            "x-tilt-offset",
+            settings.x_tilt_offset,
+        ),
+        (
+            MANUAL_Y_TILT_OFFSET,
+            "y-tilt-offset",
+            settings.y_tilt_offset,
+        ),
+    ] {
+        if settings.manual_value_overrides.contains(&tag) {
+            args.push(format!("--{name}={value}"));
+        }
+    }
+    if settings.manual_value_overrides.contains(&MANUAL_FPS_LIMIT) {
+        args.push(format!(
+            "--fps-limit={}",
+            format_optional_float(settings.fps_limit)
+        ));
+    }
+    if let Some(enabled) = settings.fix_texture_min_filter {
+        args.push(if enabled {
+            "--fix-texture-min-filter".to_string()
+        } else {
+            "--no-fix-texture-min-filter".to_string()
+        });
+    }
+    if let Some(degrees) = settings.present_rotate {
+        args.push(format!("--present-rotate={degrees}"));
+    }
+    if let Some(enabled) = settings.controller_to_touch {
+        args.push("--no-controller-to-touch".to_string());
+        if enabled {
+            for button in CONTROLLER_BUTTONS {
+                if let Some((x, y)) = settings.button_to_touch.get(&button) {
+                    args.push(format!("--button-to-touch={},{x},{y}", button_name(button)));
+                }
+            }
+            if let Some((x, y, width, height)) = settings.dpad_to_touch {
+                args.push(format!("--dpad-to-touch={x},{y},{width},{height}"));
+            }
+            if let Some((x, y, width, height)) = settings.stick_to_touch {
+                args.push(format!("--stick-to-touch={x},{y},{width},{height}"));
+            }
+        }
+    }
+    args.extend(quick_options_corruption_arguments(
+        settings.corruption_mode,
+        settings.corruption_startup_delay,
+        settings.corruption_cooldown,
+        settings.corruption_bytes_per_burst,
+        settings.corruption_max_offset,
+        settings.corruption_seed,
+    ));
+    args
 }
 
-/// Launch argument matching the "GLES Native" switch. Always emitted so that
-/// the switch's choice overrides the base default and the options files.
-fn quick_options_gles_native_argument(enabled: bool) -> &'static str {
-    if enabled {
-        "--gles-native"
-    } else {
-        "--no-gles-native"
+/// Launch argument for the Emulation section's RAM limiter. `None` means
+/// "Default": nothing is emitted, so the command line and the app-specific
+/// options files stay in charge.
+fn quick_options_ram_limiter_arguments(memory_limit_mb: Option<u32>) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(mb) = memory_limit_mb {
+        args.push(format!("--memory-limit={mb}"));
+    }
+    args
+}
+
+fn quick_options_corruption_arguments(
+    mode: CorruptionMode,
+    startup_delay: StartupDelayPreset,
+    cooldown: CooldownPreset,
+    bytes_per_burst: u32,
+    max_offset: Option<u32>,
+    seed: u64,
+) -> Vec<String> {
+    if mode == CorruptionMode::Off {
+        return vec!["--no-corrupt-game".to_string()];
+    }
+    let mut args = vec!["--corrupt-game".to_string()];
+    args.push(format!("--corrupt-intensity={bytes_per_burst}"));
+    args.push(format!(
+        "--corrupt-start-delay={}",
+        startup_delay.duration().as_secs_f64()
+    ));
+    args.push(format!(
+        "--corrupt-cooldown={}",
+        cooldown.duration().as_secs_f64()
+    ));
+    args.push(format!("--corrupt-seed={seed}"));
+    args.push(max_offset.map_or_else(
+        || "--no-corrupt-max-offset".to_string(),
+        |offset| format!("--corrupt-max-offset={offset}"),
+    ));
+    args
+}
+
+/// Explicit launch argument so the picker choice overrides option-file values.
+fn quick_options_renderer_mode_argument(mode: RendererMode) -> &'static str {
+    match mode {
+        RendererMode::Angle => "--renderer-mode=angle",
+        RendererMode::NativeGles => "--renderer-mode=native-gles",
     }
 }
 
@@ -5080,43 +8931,153 @@ mod quick_options_trainer_tests {
 }
 
 #[cfg(test)]
-mod quick_options_gles_native_tests {
+mod device_model_resolution_tests {
+    use super::*;
+    use crate::window::DeviceFamily;
+
+    #[test]
+    fn device_model_labels_show_portrait_pixel_resolution() {
+        let entries = device_model_entries();
+        for family in DeviceFamily::ALL_SELECTABLE {
+            let tag = family.tag().unwrap() as NSInteger;
+            let (label, _) = entries
+                .iter()
+                .find(|(_, entry_tag)| *entry_tag == tag)
+                .unwrap();
+            assert!(label.ends_with("px)"));
+            assert_eq!(&device_model_label_for_tag(Some(tag as i32)), label);
+        }
+
+        for (family, expected) in [
+            (DeviceFamily::iPhone3GS, "iPhone 3GS (320x480px)"),
+            (DeviceFamily::iPhone4, "iPhone 4 (640x960px)"),
+            (DeviceFamily::iPad3, "iPad 3 (1536x2048px)"),
+        ] {
+            assert_eq!(device_model_resolution_label(&family), expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod saved_renderer_mode_tests {
     use super::*;
 
     #[test]
-    fn gles_native_switch_follows_backend_availability_and_option_state() {
+    fn migrates_legacy_values_and_prefers_current_setting() {
+        assert_eq!(
+            saved_renderer_mode("gles_native=true"),
+            Some(RendererMode::NativeGles)
+        );
+        assert_eq!(
+            saved_renderer_mode("gles_native=false"),
+            Some(RendererMode::Angle)
+        );
+        assert_eq!(
+            saved_renderer_mode("renderer_mode=native-gles\ngles_native=false"),
+            Some(RendererMode::NativeGles)
+        );
+        assert_eq!(
+            saved_renderer_mode("gles_native=false\nrenderer_mode=native-gles"),
+            Some(RendererMode::NativeGles)
+        );
+    }
+}
+
+#[cfg(test)]
+mod quick_options_renderer_mode_tests {
+    use super::*;
+
+    #[test]
+    fn renderer_mode_dropdown_tags_round_trip() {
+        let angle_tag = renderer_mode_tag(RendererMode::Angle);
+        let native_tag = renderer_mode_tag(RendererMode::NativeGles);
+        assert_eq!(renderer_mode_from_tag(Some(angle_tag)), RendererMode::Angle);
+        assert_eq!(
+            renderer_mode_from_tag(Some(native_tag)),
+            RendererMode::NativeGles
+        );
+        assert_eq!(renderer_mode_label_for_tag(Some(angle_tag)), "ANGLE");
+        assert_eq!(renderer_mode_label_for_tag(Some(native_tag)), "Native GLES");
+        assert_eq!(
+            renderer_mode_dropdown_spec().entries,
+            vec![
+                ("ANGLE".to_string(), RENDERER_MODE_ANGLE_TAG),
+                ("Native GLES".to_string(), RENDERER_MODE_NATIVE_GLES_TAG),
+            ]
+        );
+    }
+
+    #[test]
+    fn renderer_mode_follows_backend_availability_and_option_state() {
         let mut options = Options::default();
 
-        let (mut enabled, mut switch_enabled) = quick_options_gles_native_state(&options, true);
-        assert!(!enabled);
-        assert!(switch_enabled);
+        let (mut mode, mut dropdown_enabled) =
+            quick_options_renderer_mode_state(options.renderer_mode, true);
+        assert_eq!(mode, RendererMode::Angle);
+        assert!(dropdown_enabled);
         assert_eq!(
-            quick_options_gles_native_argument(enabled),
-            "--no-gles-native"
+            quick_options_renderer_mode_argument(mode),
+            "--renderer-mode=angle"
         );
 
-        (enabled, switch_enabled) = quick_options_gles_native_state(&options, false);
-        assert!(enabled);
-        assert!(!switch_enabled);
-        assert_eq!(quick_options_gles_native_argument(enabled), "--gles-native");
+        (mode, dropdown_enabled) = quick_options_renderer_mode_state(options.renderer_mode, false);
+        assert_eq!(mode, RendererMode::NativeGles);
+        assert!(!dropdown_enabled);
+        assert_eq!(
+            quick_options_renderer_mode_argument(mode),
+            "--renderer-mode=native-gles"
+        );
 
         options.parse_argument("--gles-native").unwrap();
-        (enabled, switch_enabled) = quick_options_gles_native_state(&options, true);
-        assert!(enabled);
-        assert!(switch_enabled);
-        assert_eq!(quick_options_gles_native_argument(enabled), "--gles-native");
-
-        (enabled, switch_enabled) = quick_options_gles_native_state(&options, false);
-        assert!(enabled);
-        assert!(!switch_enabled);
+        (mode, dropdown_enabled) = quick_options_renderer_mode_state(options.renderer_mode, true);
+        assert_eq!(mode, RendererMode::NativeGles);
+        assert!(dropdown_enabled);
+        assert_eq!(
+            quick_options_renderer_mode_argument(mode),
+            "--renderer-mode=native-gles"
+        );
 
         options.parse_argument("--no-gles-native").unwrap();
-        (enabled, switch_enabled) = quick_options_gles_native_state(&options, true);
-        assert!(!enabled);
-        assert!(switch_enabled);
+        (mode, dropdown_enabled) = quick_options_renderer_mode_state(options.renderer_mode, true);
+        assert_eq!(mode, RendererMode::Angle);
+        assert!(dropdown_enabled);
         assert_eq!(
-            quick_options_gles_native_argument(enabled),
-            "--no-gles-native"
+            quick_options_renderer_mode_argument(mode),
+            "--renderer-mode=angle"
+        );
+    }
+}
+
+#[cfg(test)]
+mod quick_options_trace_gl_errors_tests {
+    use super::*;
+
+    #[test]
+    fn switch_emits_explicit_arguments_both_ways() {
+        assert_eq!(
+            quick_options_trace_gl_errors_argument(true),
+            "--trace-gl-errors"
+        );
+        assert_eq!(
+            quick_options_trace_gl_errors_argument(false),
+            "--no-trace-gl-errors"
+        );
+    }
+}
+
+#[cfg(test)]
+mod quick_options_trace_gl_draws_tests {
+    use super::*;
+
+    #[test]
+    fn switch_emits_explicit_arguments_both_ways() {
+        assert_eq!(
+            quick_options_trace_gl_draws_argument(true),
+            "--trace-gl-draws"
+        );
+        assert_eq!(
+            quick_options_trace_gl_draws_argument(false),
+            "--no-trace-gl-draws"
         );
     }
 }
@@ -5135,6 +9096,32 @@ mod quick_options_force_composition_tests {
             quick_options_force_composition_argument(false),
             "--no-force-composition"
         );
+    }
+}
+
+#[cfg(test)]
+mod quick_options_no_gles3_tests {
+    use super::*;
+
+    #[test]
+    fn switch_emits_explicit_arguments_both_ways() {
+        assert_eq!(quick_options_no_gles3_argument(true), "--no-gles3");
+        assert_eq!(quick_options_no_gles3_argument(false), "--gles3");
+    }
+
+    #[test]
+    fn an_untouched_switch_keeps_options_file_defaults() {
+        // "default" (what a never-flipped switch is saved as) must not emit
+        // anything, so an app-specific --no-gles3 in the options files still
+        // applies; flipping the switch either way is an explicit override.
+        let mut setting = None;
+        set_bool_override(optional_bool(setting), &mut setting);
+        assert_eq!(setting, None);
+
+        set_bool_override("true", &mut setting);
+        assert_eq!(setting, Some(true));
+        set_bool_override("false", &mut setting);
+        assert_eq!(setting, Some(false));
     }
 }
 
@@ -5158,6 +9145,24 @@ mod quick_options_fix_tests {
             "--no-fix-movie-player"
         );
 
+        assert_eq!(
+            quick_options_manual_ui_rotation_argument(true),
+            "--manual-ui-rotation"
+        );
+        assert_eq!(
+            quick_options_manual_ui_rotation_argument(false),
+            "--no-manual-ui-rotation"
+        );
+        assert_eq!(
+            quick_options_preserve_dyld_stubs_argument(true),
+            "--preserve-dyld-stubs"
+        );
+        assert_eq!(
+            quick_options_preserve_dyld_stubs_argument(false),
+            "--no-preserve-dyld-stubs"
+        );
+        assert_eq!(quick_options_dladdr_argument(true), "--dladdr");
+        assert_eq!(quick_options_dladdr_argument(false), "--no-dladdr");
         assert!(quick_options_fix_arguments(None, None).is_empty());
         assert_eq!(
             quick_options_fix_arguments(Some(true), None),
@@ -5170,6 +9175,74 @@ mod quick_options_fix_tests {
         assert_eq!(
             quick_options_fix_arguments(Some(false), Some(true)),
             vec!["--no-rotation-fix", "--fix-movie-player"]
+        );
+    }
+
+    #[test]
+    fn saved_gles2_and_corruption_modes_round_trip() {
+        for mode in [CorruptionMode::Off, CorruptionMode::Corrupt] {
+            assert_eq!(
+                CorruptionMode::from_short_name(mode.short_name()),
+                Some(mode)
+            );
+        }
+        for mode in [
+            Gles2Mode::Off,
+            Gles2Mode::PreferContext,
+            Gles2Mode::Compatibility,
+        ] {
+            assert_eq!(Gles2Mode::from_short_name(mode.short_name()), Some(mode));
+        }
+    }
+
+    #[test]
+    fn corruption_mode_arguments_override_profiles_and_include_manual_values() {
+        assert_eq!(
+            quick_options_corruption_arguments(
+                CorruptionMode::Off,
+                StartupDelayPreset::default(),
+                CooldownPreset::default(),
+                8,
+                None,
+                0,
+            ),
+            vec!["--no-corrupt-game"]
+        );
+        assert_eq!(
+            quick_options_corruption_arguments(
+                CorruptionMode::Corrupt,
+                StartupDelayPreset::FiveSeconds,
+                CooldownPreset::OneSecond,
+                12,
+                Some(4096),
+                23,
+            ),
+            vec![
+                "--corrupt-game",
+                "--corrupt-intensity=12",
+                "--corrupt-start-delay=5",
+                "--corrupt-cooldown=1",
+                "--corrupt-seed=23",
+                "--corrupt-max-offset=4096",
+            ]
+        );
+        assert_eq!(
+            quick_options_corruption_arguments(
+                CorruptionMode::Corrupt,
+                StartupDelayPreset::default(),
+                CooldownPreset::default(),
+                8,
+                None,
+                0,
+            ),
+            vec![
+                "--corrupt-game",
+                "--corrupt-intensity=8",
+                "--corrupt-start-delay=0",
+                "--corrupt-cooldown=0.5",
+                "--corrupt-seed=0",
+                "--no-corrupt-max-offset",
+            ]
         );
     }
 
@@ -5197,6 +9270,365 @@ mod quick_options_fix_tests {
         // (or the other way round).
         set_bool_override("garbage", &mut setting);
         assert_eq!(setting, Some(true));
+    }
+
+    #[test]
+    fn gles2_modes_emit_their_distinct_arguments() {
+        assert!(Gles2Mode::Off.arguments().is_empty());
+        assert_eq!(
+            Gles2Mode::PreferContext.arguments(),
+            ["--prefer-gles2-context"]
+        );
+        assert_eq!(Gles2Mode::Compatibility.arguments(), ["--gles2-compat"]);
+    }
+
+    #[test]
+    fn compatibility_mode_does_not_emit_prefer_context() {
+        let args = Gles2Mode::Compatibility.arguments();
+        assert!(args.contains(&"--gles2-compat".to_string()));
+        assert!(!args.contains(&"--prefer-gles2-context".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod manual_settings_tests {
+    use super::*;
+
+    #[test]
+    fn atomic_settings_write_keeps_other_data_and_cleans_up_after_failure() {
+        let dir = std::env::temp_dir().join(format!("picker-write-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings_path = dir.join("settings.txt");
+        let app_data = dir.join("app-data.txt");
+        std::fs::write(&settings_path, "old").unwrap();
+        std::fs::write(&app_data, "saved game").unwrap();
+
+        atomic_write_picker_settings(&settings_path, b"new").unwrap();
+        assert_eq!(std::fs::read(&settings_path).unwrap(), b"new");
+        assert!(atomic_write_picker_settings(&dir, b"failure").is_err());
+        assert_eq!(std::fs::read(&settings_path).unwrap(), b"new");
+        assert_eq!(std::fs::read(&app_data).unwrap(), b"saved game");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+
+        std::fs::remove_file(settings_path).unwrap();
+        std::fs::remove_file(app_data).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    fn settings() -> PickerSettings {
+        PickerSettings::from_options(&Options::default(), true)
+    }
+
+    #[test]
+    fn manual_values_clamp_and_invalid_text_preserves_previous_value() {
+        let mut settings = settings();
+        let oversized_integer = "9".repeat(200);
+        assert_eq!(
+            apply_manual_value(&mut settings, MANUAL_DEADZONE, "2", 320.0, 480.0),
+            Some("0.95".to_string())
+        );
+        assert_eq!(settings.deadzone, 0.95);
+        assert_eq!(
+            apply_manual_value(&mut settings, MANUAL_DEADZONE, "not a number", 320.0, 480.0),
+            None
+        );
+        assert_eq!(settings.deadzone, 0.95);
+        assert_eq!(
+            apply_manual_value(&mut settings, MANUAL_DEADZONE, "App default", 320.0, 480.0),
+            None
+        );
+        assert_eq!(settings.deadzone, 0.95);
+        assert_eq!(
+            apply_manual_value(&mut settings, MANUAL_FPS_LIMIT, "999", 320.0, 480.0),
+            Some("240".to_string())
+        );
+        assert_eq!(
+            apply_manual_value(&mut settings, MANUAL_FPS_LIMIT, "1e1000", 320.0, 480.0),
+            Some("240".to_string())
+        );
+        assert_eq!(
+            apply_manual_value(&mut settings, MANUAL_FPS_LIMIT, "Unlimited", 320.0, 480.0),
+            Some("Unlimited".to_string())
+        );
+        assert_eq!(
+            apply_manual_value(
+                &mut settings,
+                MANUAL_CORRUPTION_MAX_OFFSET,
+                "unbounded",
+                320.0,
+                480.0
+            ),
+            Some("Unbounded".to_string())
+        );
+        assert_eq!(
+            apply_manual_value(
+                &mut settings,
+                MANUAL_CORRUPTION_INTENSITY,
+                &oversized_integer,
+                320.0,
+                480.0,
+            ),
+            Some("64".to_string())
+        );
+        assert_eq!(
+            apply_manual_value(
+                &mut settings,
+                MANUAL_CORRUPTION_SEED,
+                &oversized_integer,
+                320.0,
+                480.0,
+            ),
+            Some(u64::MAX.to_string())
+        );
+        assert_eq!(
+            apply_manual_value(&mut settings, MANUAL_CORRUPTION_SEED, "-1", 320.0, 480.0),
+            Some("0".to_string())
+        );
+    }
+
+    #[test]
+    fn touch_manual_values_stay_within_current_screen() {
+        let mut settings = settings();
+        let button_tag = manual_button_tag(Button::A);
+        assert_eq!(
+            apply_manual_value(&mut settings, button_tag, "999,-1", 320.0, 480.0),
+            Some("320,0".to_string())
+        );
+        assert_eq!(settings.button_to_touch[&Button::A], (320.0, 0.0));
+        assert_eq!(settings.controller_to_touch, Some(true));
+        assert!(settings.manual_value_overrides.contains(&button_tag));
+        assert_eq!(
+            apply_manual_value(&mut settings, button_tag, "App default", 320.0, 480.0,),
+            Some("App default".to_string())
+        );
+        assert_eq!(settings.controller_to_touch, None);
+        assert!(!settings.manual_value_overrides.contains(&button_tag));
+        assert_eq!(
+            apply_manual_value(
+                &mut settings,
+                MANUAL_DPAD_TOUCH,
+                "300,470,50,50",
+                320.0,
+                480.0
+            ),
+            Some("300,470,20,10".to_string())
+        );
+        assert_eq!(settings.dpad_to_touch, Some((300.0, 470.0, 20.0, 10.0)));
+    }
+
+    #[test]
+    fn controller_deadzone_enablement_tracks_stick_mapping_not_tilt() {
+        let mut settings = settings();
+        settings.analog_stick_tilt_controls = false;
+        settings.controller_to_touch = Some(true);
+        settings.stick_to_touch = Some((0.0, 0.0, 100.0, 100.0));
+        assert!(manual_value_enabled(MANUAL_DEADZONE, &settings));
+        settings.stick_to_touch = None;
+        assert!(!manual_value_enabled(MANUAL_DEADZONE, &settings));
+        assert!(!manual_value_enabled(MANUAL_X_TILT_RANGE, &settings));
+        settings.controller_to_touch = None;
+        assert!(manual_value_enabled(MANUAL_DEADZONE, &settings));
+    }
+
+    #[test]
+    fn manual_override_persistence_ignores_unknown_tags() {
+        let saved = format!("{MANUAL_DEADZONE},999999,{MANUAL_X_TILT_OFFSET}");
+        assert_eq!(
+            parse_manual_value_overrides(&saved),
+            BTreeSet::from([MANUAL_DEADZONE, MANUAL_X_TILT_OFFSET])
+        );
+    }
+
+    #[test]
+    fn reset_restores_factory_defaults_not_the_command_line() {
+        // "Reset all settings" must land on the same baseline as a first
+        // launch, whatever the command line said when this picker started.
+        let defaults = PickerSettings::factory_defaults(false);
+        assert_eq!(defaults.fps_limit, Some(60.0));
+        assert_eq!(defaults.scale_hack, None);
+        assert_eq!(defaults.orientation, None);
+        assert!(!defaults.fullscreen);
+        assert_eq!(defaults.renderer_mode, RendererMode::NativeGles);
+    }
+
+    #[test]
+    fn picker_settings_emit_explicit_values_and_preserve_app_defaults() {
+        let mut settings = settings();
+        settings.fix_texture_min_filter = None;
+        settings.present_rotate = None;
+        let default_args = quick_options_picker_settings_arguments(&settings);
+        assert!(!default_args
+            .iter()
+            .any(|arg| arg.starts_with("--present-rotate=")));
+        assert!(!default_args
+            .iter()
+            .any(|arg| arg.contains("fix-texture-min-filter")));
+        assert!(!default_args.contains(&"--no-controller-to-touch".to_string()));
+        assert!(default_args.contains(&"--no-corrupt-game".to_string()));
+        assert!(!default_args
+            .iter()
+            .any(|arg| arg.starts_with("--deadzone=")));
+        assert!(!default_args
+            .iter()
+            .any(|arg| arg.starts_with("--x-tilt-offset=")));
+        assert!(!default_args
+            .iter()
+            .any(|arg| arg.starts_with("--fps-limit=")));
+        assert_eq!(
+            manual_value_text(&settings, MANUAL_X_TILT_OFFSET).as_deref(),
+            Some("App default")
+        );
+        assert_eq!(
+            manual_value_text(&settings, manual_button_tag(Button::A)).as_deref(),
+            Some("App default")
+        );
+
+        settings.vsync = VsyncMode::On;
+        settings.present_mode = PresentMode::Readback;
+        settings.fix_texture_min_filter = Some(false);
+        settings.present_rotate = Some(90);
+        settings.deadzone = 0.25;
+        settings.x_tilt_range = 120.0;
+        settings.fps_limit = Some(120.0);
+        settings.print_fps = true;
+        settings.popup_errors = false;
+        settings.controller_to_touch = Some(true);
+        settings.button_to_touch.insert(Button::A, (12.0, 34.0));
+        settings.dpad_to_touch = Some((1.0, 2.0, 3.0, 4.0));
+        settings.manual_value_overrides.extend([
+            MANUAL_DEADZONE,
+            MANUAL_X_TILT_RANGE,
+            MANUAL_FPS_LIMIT,
+        ]);
+        let args = quick_options_picker_settings_arguments(&settings);
+        for expected in [
+            "--vsync=on",
+            "--present-mode=readback",
+            "--no-fix-texture-min-filter",
+            "--present-rotate=90",
+            "--deadzone=0.25",
+            "--x-tilt-range=120",
+            "--fps-limit=120",
+            "--print-fps",
+            "--no-error-popup",
+            "--button-to-touch=A,12,34",
+            "--dpad-to-touch=1,2,3,4",
+        ] {
+            assert!(args.iter().any(|arg| arg == expected), "missing {expected}");
+        }
+        assert_eq!(
+            args.iter()
+                .filter(|arg| arg.as_str() == "--no-controller-to-touch")
+                .count(),
+            1
+        );
+        settings.controller_to_touch = None;
+        let app_default_args = quick_options_picker_settings_arguments(&settings);
+        assert!(!app_default_args.contains(&"--no-controller-to-touch".to_string()));
+        assert!(!app_default_args
+            .iter()
+            .any(|arg| arg.starts_with("--button-to-touch=")));
+        assert_eq!(
+            apply_manual_value(
+                &mut settings,
+                MANUAL_X_TILT_OFFSET,
+                "App default",
+                320.0,
+                480.0
+            ),
+            Some("App default".to_string())
+        );
+        assert!(!settings
+            .manual_value_overrides
+            .contains(&MANUAL_X_TILT_OFFSET));
+    }
+}
+
+#[cfg(test)]
+mod limiter_option_tests {
+    use super::*;
+
+    #[test]
+    fn ram_limiter_choices_map_to_labels_and_tags() {
+        assert_eq!(memory_limit_label(None), "Default");
+        assert_eq!(memory_limit_label(Some(128)), "128 MB");
+        assert_eq!(memory_limit_label(Some(512)), "512 MB");
+        assert_eq!(memory_limit_label(Some(1024)), "1 GB");
+        assert_eq!(memory_limit_label(Some(2048)), "2 GB");
+
+        assert_eq!(memory_limit_label(Some(32)), "32 MB");
+        assert_eq!(memory_limit_label(Some(64)), "64 MB");
+        assert_eq!(memory_limit_label(Some(3000)), "3000 MB");
+        // A size that isn't a round number of gigabytes stays in megabytes.
+        assert_eq!(memory_limit_label(Some(1536)), "1536 MB");
+        assert_eq!(memory_limit_label(Some(3072)), "3 GB");
+
+        for (idx, choice) in MEMORY_LIMIT_CHOICES.iter().enumerate() {
+            assert_eq!(memory_limit_tag(*choice), idx as i32);
+            assert_eq!(memory_limit_choice(Some(idx as i32)), *choice);
+        }
+        // A size that isn't a preset keeps the "Custom…" row ticked.
+        assert_eq!(memory_limit_tag(Some(10)), MEMORY_LIMIT_CUSTOM_TAG);
+        assert_eq!(memory_limit_tag(Some(3000)), MEMORY_LIMIT_CUSTOM_TAG);
+        // The "Custom…" row names no size of its own, so it applies nothing.
+        assert_eq!(memory_limit_choice(Some(MEMORY_LIMIT_CUSTOM_TAG)), None);
+        assert_eq!(memory_limit_choice(Some(i32::MAX)), None);
+    }
+
+    #[test]
+    fn ram_limiter_arguments_are_only_emitted_for_explicit_choices() {
+        assert!(quick_options_ram_limiter_arguments(None).is_empty());
+        assert_eq!(
+            quick_options_ram_limiter_arguments(Some(1024)),
+            vec!["--memory-limit=1024"]
+        );
+        assert_eq!(
+            quick_options_ram_limiter_arguments(Some(256)),
+            vec!["--memory-limit=256"]
+        );
+    }
+    #[test]
+    fn custom_ram_limiter_sizes_are_typed_in_megabytes() {
+        assert_eq!(custom_memory_limit_mb("10"), Some(10));
+        assert_eq!(custom_memory_limit_mb("3000"), Some(3000));
+        assert_eq!(custom_memory_limit_mb("1"), Some(1));
+        assert_eq!(custom_memory_limit_mb("3072"), Some(3072));
+        // One digit too many is clamped rather than refused.
+        assert_eq!(custom_memory_limit_mb("5000"), Some(CUSTOM_LIMIT_MAX_MB));
+        // Nothing to apply.
+        assert_eq!(custom_memory_limit_mb(""), None);
+        assert_eq!(custom_memory_limit_mb("0"), None);
+        assert_eq!(custom_memory_limit_mb("0000"), None);
+        assert_eq!(custom_memory_limit_mb("12a"), None);
+        assert_eq!(custom_memory_limit_mb("12345"), None);
+        // The keypad echoes the size the way the dropdown would name it.
+        assert_eq!(custom_memory_limit_display(""), "—");
+        assert_eq!(custom_memory_limit_display("10"), "10 MB");
+        assert_eq!(custom_memory_limit_display("3000"), "3000 MB");
+        assert_eq!(custom_memory_limit_display("3072"), "3 GB");
+        assert_eq!(custom_memory_limit_display("0"), "0 MB");
+    }
+
+    #[test]
+    fn the_ram_limiter_dropdown_ends_with_a_custom_row() {
+        let spec = memory_limit_dropdown_spec();
+        assert_eq!(spec.entries.len(), MEMORY_LIMIT_CHOICES.len() + 1);
+        let (title, tag) = spec.entries.last().unwrap();
+        assert_eq!(title.as_str(), "Custom…");
+        assert_eq!(*tag, MEMORY_LIMIT_CUSTOM_TAG as NSInteger);
+        // Every preset keeps the tag its position gives it.
+        for (idx, (title, tag)) in spec
+            .entries
+            .iter()
+            .enumerate()
+            .take(MEMORY_LIMIT_CHOICES.len())
+        {
+            assert_eq!(*tag, idx as NSInteger);
+            assert_eq!(
+                title.as_str(),
+                memory_limit_label(MEMORY_LIMIT_CHOICES[idx]).as_str()
+            );
+        }
     }
 }
 

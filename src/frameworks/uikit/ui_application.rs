@@ -29,6 +29,7 @@ pub struct State {
     /// Whether shake to edit is enabled
     pub(super) application_supports_shake_to_edit: bool,
     pub(super) ignoring_interaction_events_count: u32,
+    termination_prepared: bool,
 }
 
 #[derive(Default)]
@@ -467,10 +468,28 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())sendEvent:(id)event { // UIEvent*
-    log_dbg!("UIApplication sendEvent: forwarding to key window");
-    let window: id = msg![env; this keyWindow];
-    if window != nil {
-        msg![env; window sendEvent:event]
+    // Touches keep their original window for the whole gesture, even if a
+    // different window becomes key before the finger is released.
+    // https://developer.apple.com/documentation/uikit/uiapplication/sendevent(_:)
+    let touches: id = msg![env; event allTouches];
+    let array: id = msg![env; touches allObjects];
+    let count: NSUInteger = msg![env; array count];
+    let mut windows = Vec::new();
+    for i in 0..count {
+        let touch: id = msg![env; array objectAtIndex:i];
+        let window: id = msg![env; touch window];
+        if window != nil && !windows.contains(&window) {
+            windows.push(window);
+        }
+    }
+    if windows.is_empty() {
+        let window: id = msg![env; this keyWindow];
+        if window != nil {
+            windows.push(window);
+        }
+    }
+    for window in windows {
+        () = msg![env; window sendEvent:event];
     }
 }
 
@@ -896,6 +915,17 @@ pub(super) fn UIApplicationMain(
     principal_class_name: id, // NSString*
     delegate_class_name: id,  // NSString*
 ) {
+    // This is initial launch state, so it must be available to the principal
+    // class's initializer and to objects decoded from the main nib. Applying
+    // it afterward gives applicationFrame the wrong status-bar inset and
+    // overwrites changes made by the app during initialization.
+    // https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/iPhoneOSKeys.html#//apple_ref/doc/uid/TP40009252-SW20
+    env.framework_state.uikit.ui_application.status_bar_hidden = env.bundle.status_bar_hidden();
+    // UIKit applies the initial interface rotation after the launch
+    // delegate returns, not while the delegate is still building and
+    // sizing its views.
+    env.framework_state.uikit.ui_view.ui_window.defer_autorotation = true;
+
     let ui_application = {
         let pool: id = msg_class![env; NSAutoreleasePool new];
 
@@ -925,10 +955,6 @@ pub(super) fn UIApplicationMain(
             } else {
                 log!("Warning: couldn't load main nib file.");
             }
-        }
-
-        if env.bundle.status_bar_hidden() {
-            let _: () = msg![env; ui_application setStatusBarHidden:true];
         }
 
         let delegate: id = msg![env; ui_application delegate];
@@ -1067,6 +1093,9 @@ pub(super) fn UIApplicationMain(
         let _: () = msg![env; pool drain];
     }
 
+    // The delegate has returned, so the root views exist at their final
+    // sizes: apply the launch rotation now and lay out afterwards.
+    super::ui_view::ui_window::finish_launch_autorotation(env);
     let views = env.framework_state.uikit.ui_view.views.clone();
     for view in views {
         () = msg![env; view layoutSubviews];
@@ -1212,7 +1241,23 @@ pub(super) fn handle_did_become_active(env: &mut Environment) {
     let _: () = msg![env; pool drain];
 }
 
-pub(super) fn exit(env: &mut Environment) {
+/// Give the app a chance to save state before its environment is destroyed.
+/// Window-close and process-quit paths must both deliver these callbacks.
+///
+/// <https://developer.apple.com/documentation/uikit/uiapplicationdelegate/applicationwillterminate(_:)>
+pub(crate) fn prepare_for_termination(env: &mut Environment) {
+    if env
+        .framework_state
+        .uikit
+        .ui_application
+        .termination_prepared
+    {
+        return;
+    }
+    env.framework_state
+        .uikit
+        .ui_application
+        .termination_prepared = true;
     let ui_application: id = msg_class![env; UIApplication sharedApplication];
     let center: id = msg_class![env; NSNotificationCenter defaultCenter];
 
@@ -1246,8 +1291,18 @@ pub(super) fn exit(env: &mut Environment) {
         () = msg![env; center postNotificationName:notif_name object:ui_application userInfo:nil];
         let _: () = msg![env; pool drain];
     };
+}
 
+pub(super) fn exit(env: &mut Environment) {
+    prepare_for_termination(env);
     std::process::exit(0);
+}
+
+#[cfg(test)]
+pub(crate) fn create_test_application(env: &mut Environment) -> id {
+    let application: id = msg_class![env; UIApplication new];
+    env.framework_state.uikit.ui_application.shared_application = Some(application);
+    application
 }
 
 const UIApplicationDidFinishLaunchingNotification: &str =

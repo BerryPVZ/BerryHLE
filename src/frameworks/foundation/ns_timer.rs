@@ -55,7 +55,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // Sanitize the interval before handing it to `Duration::from_secs_f64`,
     // which panics on NaN, infinity, negative, or huge values. iPhone OS
     // historically clamps such values silently (Crazy Frog Racer
-    // — HyperHLE log #4 — sends a non-finite value here on first
+    // — AppleJuiceHLE log #4 — sends a non-finite value here on first
     // NSTimer fire), so do the same instead of aborting the emulator.
     let ns_interval = if ns_interval.is_finite() && ns_interval > 0.0001 {
         ns_interval
@@ -97,8 +97,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (id)allocWithZone:(NSZonePtr)_zone {
-    // Безопасно зануляем структуру
-    let host_object = Box::new(unsafe { std::mem::zeroed::<NSTimerHostObject>() });
+    let host_object = Box::<NSTimerHostObject>::default();
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
 

@@ -8,7 +8,7 @@
 //! `NSDate`.
 
 use super::ns_string::{from_rust_ordering, from_rust_string, get_static_str};
-use super::{NSComparisonResult, NSTimeInterval};
+use super::{NSComparisonResult, NSTimeInterval, NSUInteger};
 use crate::frameworks::core_foundation::time::{
     apple_epoch, CFAbsoluteTimeGetGregorianDate, SECS_FROM_UNIX_TO_APPLE_EPOCHS,
 };
@@ -336,11 +336,12 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; this isEqualToDate:other]
 }
 
-- (u32)hash {
-    // Simple hash based on time interval
+- (NSUInteger)hash {
+    // Agree with -isEqual:, which compares the time interval. The NSObject
+    // default hashes the pointer, so two equal dates would miss each other as
+    // dictionary keys.
     let time_interval = env.objc.borrow::<NSDateHostObject>(this).time_interval;
-    let bits = time_interval.to_bits();
-    (bits ^ (bits >> 32)) as u32
+    super::hash_helper(&time_interval.to_bits())
 }
 
 @end

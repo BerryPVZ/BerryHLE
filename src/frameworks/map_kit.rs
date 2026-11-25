@@ -15,7 +15,7 @@
 //! `/System/Library/Frameworks/MapKit.framework/MapKit`, touchHLE prints a
 //! `Warning: app binary depends on unimplemented or missing dylib …` at
 //! startup, which can spook users into reporting otherwise-fine apps as
-//! broken (e.g. HyperHLE appdb report #52, Pumpkins vs Monsters — which
+//! broken (e.g. AppleJuiceHLE appdb report #52, Pumpkins vs Monsters — which
 //! never actually opens a map view, it only links MapKit).
 //!
 //! This stub exists so the dependency is recognized and the warning is

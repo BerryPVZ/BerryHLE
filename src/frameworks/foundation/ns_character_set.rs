@@ -5,7 +5,7 @@
  */
 //! The `NSCharacterSet` class cluster, including `NSMutableCharacterSet`.
 
-use super::{ns_string, unichar};
+use super::{ns_string, unichar, NSUInteger};
 use crate::frameworks::foundation::NSRange;
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, retain, ClassExports, HostObject, NSZonePtr,
@@ -493,6 +493,15 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     let b = env.objc.borrow::<CharacterSetHostObject>(other);
     a_set == b.set && a_inv == b.inverted
+}
+- (NSUInteger)hash {
+    // Agree with -isEqual:, which compares the members and the inversion.
+    let host = env.objc.borrow::<CharacterSetHostObject>(this);
+    let mut hash: NSUInteger = host.inverted as NSUInteger;
+    for member in &host.set {
+        hash = hash.wrapping_add(super::hash_helper(member));
+    }
+    hash
 }
 
 - (id)invertedSet {

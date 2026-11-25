@@ -133,9 +133,9 @@ impl GLESContext for GLES3NativeContext {
     fn make_current<'gl_ctx, 'win: 'gl_ctx>(
         &'gl_ctx mut self,
         window: &'win mut Window,
-    ) -> Box<dyn GLES + 'gl_ctx> {
+    ) -> crate::gles::CurrentGLES<'gl_ctx> {
         if self.gl_ctx.is_current() && self.is_loaded {
-            return Box::new(GLES3Native {
+            return crate::gles::CurrentGLES::NativeES3(GLES3Native {
                 _gl_lifetime: PhantomData,
                 pvrtc_native: self.pvrtc_native,
             });
@@ -158,7 +158,7 @@ impl GLESContext for GLES3NativeContext {
             self.pvrtc_native = unsafe { detect_pvrtc_support() };
             self.pvrtc_native_checked = true;
         }
-        Box::new(GLES3Native {
+        crate::gles::CurrentGLES::NativeES3(GLES3Native {
             _gl_lifetime: PhantomData,
             pvrtc_native: self.pvrtc_native,
         })
@@ -168,9 +168,9 @@ impl GLESContext for GLES3NativeContext {
         &'gl_ctx mut self,
         make_current_fn: &mut dyn FnMut(&GLContext),
         loader_fn: &mut dyn FnMut(&'static str) -> *const std::ffi::c_void,
-    ) -> Box<dyn GLES + 'gl_ctx> {
+    ) -> crate::gles::CurrentGLES<'gl_ctx> {
         if self.gl_ctx.is_current() && self.is_loaded {
-            return Box::new(GLES3Native {
+            return crate::gles::CurrentGLES::NativeES3(GLES3Native {
                 _gl_lifetime: PhantomData,
                 pvrtc_native: self.pvrtc_native,
             });
@@ -184,7 +184,7 @@ impl GLESContext for GLES3NativeContext {
             self.pvrtc_native = detect_pvrtc_support();
             self.pvrtc_native_checked = true;
         }
-        Box::new(GLES3Native {
+        crate::gles::CurrentGLES::NativeES3(GLES3Native {
             _gl_lifetime: PhantomData,
             pvrtc_native: self.pvrtc_native,
         })
@@ -1168,6 +1168,7 @@ impl GLES for GLES3Native<'_> {
         stride: GLsizei,
         pointer: *const GLvoid,
     ) {
+        let type_ = super::util::core_vertex_attrib_type(type_);
         gles30::VertexAttribPointer(index, size, type_, normalized, stride, pointer)
     }
     unsafe fn VertexAttrib1f(&mut self, index: GLuint, x: GLfloat) {
@@ -1377,6 +1378,9 @@ impl GLES for GLES3Native<'_> {
     }
 
     // -- Buffer object operations --
+    fn supports_map_buffer_range(&self) -> bool {
+        true
+    }
     unsafe fn MapBufferRange(
         &mut self,
         target: GLenum,
@@ -1577,6 +1581,16 @@ impl GLES for GLES3Native<'_> {
         )
     }
     unsafe fn RenderbufferStorageMultisample(
+        &mut self,
+        target: GLenum,
+        samples: GLsizei,
+        internalformat: GLenum,
+        width: GLsizei,
+        height: GLsizei,
+    ) {
+        gles30::RenderbufferStorageMultisample(target, samples, internalformat, width, height)
+    }
+    unsafe fn RenderbufferStorageMultisampleAPPLE(
         &mut self,
         target: GLenum,
         samples: GLsizei,

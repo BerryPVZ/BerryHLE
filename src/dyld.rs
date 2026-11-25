@@ -20,6 +20,7 @@
 //! See [crate::mach_o] for resources.
 
 mod dylib_list;
+pub(crate) mod dylib_paths;
 mod swift_runtime;
 
 use crate::abi::{CallFromGuest, GuestFunction};
@@ -30,7 +31,7 @@ use crate::mach_o::{MachO, SectionType};
 use crate::mem::{ConstPtr, ConstVoidPtr, GuestUSize, Mem, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::{nil, ClassExports, ObjC};
 use crate::Environment;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub use dylib_list::DYLIB_LIST;
 
@@ -441,7 +442,8 @@ pub struct Dyld {
     linked_host_functions: Vec<(&'static str, HostFunction)>,
     return_to_host_routine: Option<GuestFunction>,
     thread_exit_routine: Option<GuestFunction>,
-    constants_to_link_later: Vec<(MutPtr<ConstVoidPtr>, &'static HostConstant)>,
+    constants_to_link_later: Vec<(MutPtr<ConstVoidPtr>, &'static str)>,
+    host_constant_addresses: HashMap<&'static str, ConstVoidPtr>,
     non_lazy_host_functions: HashMap<&'static str, GuestFunction>,
     /// Cache of Swift runtime function trampolines (see `swift_runtime`).
     swift_fn_cache: HashMap<String, GuestFunction>,
@@ -465,6 +467,11 @@ pub struct Dyld {
     /// keyed by `(svc_pc, svc)`, with the number of times each was reported.
     /// A stray trap can be hit on every frame, so logging is capped.
     stray_svc_reports: HashMap<(u32, u32), u32>,
+    /// Symbols the guest referenced but no host library implements, with the
+    /// number of reference sites. These are linked to NULL, so the app only
+    /// fails once it uses one. Filled by `do_non_lazy_linking` and reported
+    /// once at the end of linking.
+    unresolved_symbols: BTreeMap<String, usize>,
 }
 
 impl Dyld {
@@ -494,6 +501,7 @@ impl Dyld {
             return_to_host_routine: None,
             thread_exit_routine: None,
             constants_to_link_later: Vec::new(),
+            host_constant_addresses: HashMap::new(),
             non_lazy_host_functions: HashMap::new(),
             swift_fn_cache: HashMap::new(),
             swift_fn_names: HashMap::new(),
@@ -502,6 +510,7 @@ impl Dyld {
             guest_sjlj_runtime_available: false,
             guest_cxxabi_exports: HashMap::new(),
             stray_svc_reports: HashMap::new(),
+            unresolved_symbols: BTreeMap::new(),
         }
     }
 
@@ -539,6 +548,7 @@ impl Dyld {
         bins: &[MachO],
         mem: &mut Mem,
         objc: &mut ObjC,
+        preserve_stubs: bool,
     ) {
         assert!(self.return_to_host_routine.is_none());
         assert!(self.thread_exit_routine.is_none());
@@ -574,23 +584,33 @@ impl Dyld {
         self.return_to_host_routine =
             Some(write_return_to_host_routine(mem, Self::SVC_RETURN_TO_HOST));
         self.thread_exit_routine = Some(write_return_to_host_routine(mem, Self::SVC_THREAD_EXIT));
-        // Currently assuming only the app binary contains Objective-C things.
-
-        // Route modern libpng's windowBits=0 through the old-zlib adapter.
-        self.create_proc_address_no_inval(mem, "_inflateInit2_").unwrap();
-        objc.register_bin_selectors(&bins[0], mem);
+        self.create_proc_address_no_inval(mem, "_inflateInit2_")
+            .unwrap();
+        for bin in bins {
+            objc.register_bin_selectors(bin, mem);
+        }
         objc.register_host_selectors(mem);
         for bin in bins {
-            self.setup_lazy_linking(bin, mem);
             // Must happen before `register_bin_classes`, else superclass
             // pointers will be wrong.
             self.do_non_lazy_linking(bin, bins, mem, objc);
+            // Eager binding overwrites pointer slots. Apply relocation addends
+            // first so a slot shared with an external relocation is not bound
+            // twice, treating the first resolved address as an addend.
+            self.setup_lazy_linking(bin, mem, preserve_stubs.then_some(bins));
         }
+        self.report_unresolved_symbols();
 
-        objc.register_bin_classes(bundle, &bins[0], mem);
-        objc.register_bin_categories(&bins[0], mem);
-
-        ns_string::register_constant_strings(&bins[0], mem, objc);
+        for bin in bins {
+            objc.register_bin_classes(bundle, bin, mem);
+        }
+        // A superclass may belong to another image. Reconcile only once all
+        // images' class objects have been registered.
+        objc.reconcile_bin_class_ivars(mem);
+        for bin in bins {
+            objc.register_bin_categories(bin, mem);
+            ns_string::register_constant_strings(bin, mem, objc);
+        }
 
         // The `std::__throw_*` helpers in the bundled libstdc++ dylib are
         // `noreturn` — they construct and throw a C++ exception. touchHLE
@@ -838,7 +858,7 @@ impl Dyld {
     ///
     /// These stubs already exist in the binary, but they need to be rewritten
     /// so that they will invoke our dynamic linker.
-    fn setup_lazy_linking(&self, bin: &MachO, mem: &mut Mem) {
+    fn setup_lazy_linking(&mut self, bin: &MachO, mem: &mut Mem, preserve: Option<&[MachO]>) {
         let Some(stubs) = bin.get_section(SectionType::SymbolStubs) else {
             return;
         };
@@ -871,6 +891,17 @@ impl Dyld {
         let mut skipped_stubs: Vec<u32> = Vec::new();
         let mut skipped_stub_count = 0usize;
         for i in 0..stub_count {
+            // LOCAL/ABS entries describe already-bound pointers, rather than
+            // undefined symbols. Preserve their original call sequence.
+            // https://github.com/apple-oss-distributions/dyld/blob/dyld-360.22/src/ImageLoaderMachOClassic.cpp
+            if indirect_info
+                .indirect_undef_symbols
+                .get(i as usize)
+                .and_then(Option::as_ref)
+                .is_none()
+            {
+                continue;
+            }
             let ptr: MutPtr<u32> = Ptr::from_bits(stubs.addr + i * entry_size);
 
             // Check that the stub matches the expected pattern.
@@ -897,6 +928,31 @@ impl Dyld {
                 if skipped_stubs.len() < 8 {
                     skipped_stubs.push(stubs.addr + i * entry_size);
                 }
+                continue;
+            }
+
+            if let Some(bins) = preserve {
+                // iOS dyld binds the pointer slot, leaving these instructions
+                // intact. Engines can therefore inspect/checksum their code.
+                // https://github.com/apple-oss-distributions/dyld/blob/dyld-210.2.3/src/ImageLoaderMachOClassic.cpp
+                let slot = match entry_size {
+                    4 => {
+                        let instruction = mem.read(ptr);
+                        assert_eq!(instruction & !0xfff, Self::SYMBOL_STUB1_INSTRUCTIONS[0]);
+                        ptr.to_bits().wrapping_add(8 + (instruction & 0xfff))
+                    }
+                    12 => mem.read(ptr + 2),
+                    16 => ptr
+                        .to_bits()
+                        .wrapping_add(12)
+                        .wrapping_add(mem.read(ptr + 3)),
+                    _ => unreachable!(),
+                };
+                let symbol = indirect_info.indirect_undef_symbols[i as usize]
+                    .as_deref()
+                    .unwrap();
+                let target = self.resolve_preserved_stub(bin, bins, mem, symbol);
+                mem.write(Ptr::<u32, true>::from_bits(slot), target);
                 continue;
             }
 
@@ -927,6 +983,58 @@ impl Dyld {
                 skipped_stubs
             );
         }
+    }
+
+    /// Use the same symbol precedence as the lazy linker, but bind up front
+    /// so calls need no patches inside the app's instruction stream.
+    fn resolve_preserved_stub(
+        &mut self,
+        bin: &MachO,
+        bins: &[MachO],
+        mem: &mut Mem,
+        symbol: &str,
+    ) -> u32 {
+        if let Some(address) = self.guest_cxxabi_export(symbol) {
+            register_cxxabi_typeinfo_vtable(
+                symbol,
+                address,
+                &mut self.cxxabi_typeinfo_vtable_kinds,
+            );
+            return address;
+        }
+        if let Some(address) = self.non_lazy_host_functions.get(symbol) {
+            return address.addr_with_thumb_bit();
+        }
+        if let Some(address) = self.cxxabi_intercept(mem, symbol) {
+            return address.addr_with_thumb_bit();
+        }
+        if let Some(address) = bins
+            .iter()
+            .find_map(|image| image.external_symbols.get(symbol))
+        {
+            let address = *address;
+            register_cxxabi_typeinfo_vtable(
+                symbol,
+                address,
+                &mut self.cxxabi_typeinfo_vtable_kinds,
+            );
+            return address;
+        }
+        if let Ok(address) = self.create_proc_address_no_inval(mem, symbol) {
+            return address.addr_with_thumb_bit();
+        }
+        if let Some(address) = local_code_symbol(bin, symbol) {
+            return address;
+        }
+        log!("Warning: unimplemented import {symbol}; binding existing return-0 handler");
+        let symbol: &'static str = Box::leak(symbol.to_owned().into_boxed_str());
+        let function = self.create_guest_function(
+            mem,
+            symbol,
+            &(unimplemented_function_stub as fn(&mut Environment) -> i32),
+        );
+        self.non_lazy_host_functions.insert(symbol, function);
+        function.addr_with_thumb_bit()
     }
 
     /// Link non-lazy symbols for a loaded binary.
@@ -966,335 +1074,296 @@ impl Dyld {
             // offset that should be applied to the external symbol's address.
             // It is often 0, but not always.
             let offset: u32 = mem.read(ptr_ptr).to_bits();
-            let guest_cxxabi_export =
-                if self.guest_sjlj_runtime_available && is_guest_cxxabi_symbol(name) {
-                    self.guest_cxxabi_export(name)
-                } else {
-                    None
-                };
+            let guest_cxxabi_export = if self.guest_sjlj_runtime_available
+                && is_guest_cxxabi_symbol(name)
+                && !(trace_cxx_exceptions() && is_cxx_throw_symbol(name))
+            {
+                self.guest_cxxabi_export(name)
+            } else {
+                None
+            };
             // Keep guest vtable methods for exception handling; the host RTTI walker
             // needs the Itanium class kind at each guest vtable address point.
             if let Some(addr) = guest_cxxabi_export {
                 register_cxxabi_typeinfo_vtable(name, addr, &mut self.cxxabi_typeinfo_vtable_kinds);
             }
-            let target: ConstVoidPtr = if let Some(name) = name.strip_prefix("_OBJC_CLASS_$_") {
-                objc.link_class(name, /* is_metaclass: */ false, mem)
-                    .cast()
-                    .cast_const()
-            } else if let Some(name) = name.strip_prefix("_OBJC_METACLASS_$_") {
-                objc.link_class(name, /* is_metaclass: */ true, mem)
-                    .cast()
-                    .cast_const()
-            } else if name == "___CFConstantStringClassReference" {
-                // See ns_string::register_constant_strings
-                nil.cast().cast_const()
-            } else if let Some(addr) = guest_cxxabi_export {
-                log_dbg!("Linked guest C++ ABI symbol {} at {:#x}", name, addr);
-                Ptr::from_bits(addr)
-            } else if name == "___mb_cur_max" {
-                // __mb_cur_max is a pointer to the C locale's max
-                // multibyte character byte count. libstdc++ reads
-                // *__mb_cur_max in locale/string code; if this pointer
-                // is NULL the dereference crashes. Provide a static
-                // value of 1 (single-byte / ASCII locale).
-                let val_ptr: MutPtr<u32> = mem.alloc(4).cast();
-                mem.write(val_ptr, 1u32);
-                log_dbg!("Stubbed ___mb_cur_max at {:?}", val_ptr);
-                val_ptr.cast().cast_const()
-            } else if name == "dyld_stub_binder" || name == "_dyld_stub_binder" {
-                // In iOS, dyld_stub_binder handles lazy symbol binding.
-                // However, touchHLE resolves lazy symbols entirely via SVC
-                // traps,
-                // bypassing the need for a guest-side binder.
-                // We create a minimal ARM32 function (BX LR) so if it's somehow
-                // called, it just returns safely without executing random
-                // memory.
-                let fn_ptr: MutPtr<u32> = mem.alloc(8).cast();
-                mem.write(fn_ptr + 0, encode_a32_ret());
-                mem.write(fn_ptr + 1, encode_a32_trap());
-                log_dbg!("Stubbed dyld_stub_binder at {:?}", fn_ptr);
-                fn_ptr.cast().cast_const()
-            } else if name == "__NSConcreteGlobalBlock"
-                || name == "__NSConcreteStackBlock"
-                || name == "__NSConcreteMallocBlock"
-            {
-                // Blocks runtime class descriptor. Point the block `isa` at
-                // the real `_touchHLE_NSBlock` class (see ns_object.rs) so
-                // that `[block copy]` / `[block retain]` / `[block release]`
-                // route to the Blocks runtime instead of hitting a dummy
-                // class with no methods (which returned nil and left callback
-                // blocks, e.g. cocos2d v3 `CCTimer._block`, nil). All block
-                // symbols share this one class; `_Block_copy` uses the block's
-                // flags (not its isa) to distinguish stack/global/malloc.
-                let _ = &mut block_class_addrs;
-                objc.get_known_class("_touchHLE_NSBlock", mem)
-                    .cast()
-                    .cast_const()
-            } else if name == "__ZTVN10__cxxabiv117__class_type_infoE"
-                || name == "__ZTVN10__cxxabiv120__si_class_type_infoE"
-                || name == "__ZTVN10__cxxabiv121__vmi_class_type_infoE"
-                || name == "__ZTVN10__cxxabiv119__pointer_type_infoE"
-                || name == "__ZTVN10__cxxabiv120__function_type_infoE"
-                || name == "__ZTVN10__cxxabiv116__enum_type_infoE"
-                || name == "__ZTVN10__cxxabiv117__pbase_type_infoE"
-                || name == "__ZTVN10__cxxabiv129__pointer_to_member_type_infoE"
-            {
-                // C++ Itanium ABI type_info vtable. Without this every
-                // type_info object in the app has a NULL vptr, and any call
-                // through the vptr (dynamic_cast, exception type matching,
-                // type_info comparison) lands on address 0 and crashes.
-                //
-                // Layout (32-bit ARM, addend +8 from the symbol so callers
-                // land on the first method):
-                //   +0   offset_to_top   (= 0)
-                //   +4   typeinfo for the vtable's class (= 0; never used)
-                //   +8   ~type_info() complete dtor   -> BX LR stub
-                //   +12  ~type_info() deleting dtor   -> BX LR stub
-                //   +16  __is_pointer_p()             -> returns 0 (false)
-                //   +20  __is_function_p()            -> returns 0 (false)
-                //   +24  __do_catch()                 -> returns 0 (no match)
-                //   +28  __do_upcast()                -> returns 0 (no match)
-                //   +32  reserved
-                //   +36  reserved
-                //
-                // The relocation addend (usually +8) is applied below, so we
-                // return the vtable base here.
-                let target = link_cxxabi_vtable(
-                    name,
-                    &mut cxxabi_vtable_addrs,
-                    &mut self.cxxabi_typeinfo_vtable_kinds,
-                    mem,
-                );
-                log_dbg!("Stubbed C++ vtable {} -> {:#x}", name, target.to_bits());
-                target
-            } else if name == "___gxx_personality_sj0" {
-                // C++ SjLj exception personality routine. Called by the
-                // unwinder for every frame; returning 0 (_URC_NO_REASON)
-                // tells it "no handler here, keep going". touchHLE never
-                // actually invokes the unwinder, but other code may store
-                // this pointer in an LSDA and read it back.
-                let fn_ptr: MutPtr<u32> = mem.alloc(8).cast();
-                mem.write(fn_ptr + 0, encode_a32_ret());
-                mem.write(fn_ptr + 1, encode_a32_trap());
-                log_dbg!("Stubbed ___gxx_personality_sj0 -> {:#x}", fn_ptr.to_bits());
-                fn_ptr.cast().cast_const()
-            } else if name == "_objc_msgSendSuper" || name == "_objc_msgSendSuper_stret" {
-                // `objc_msgSendSuper` (the non-`2` variant) takes a pointer to
-                // an `objc_super` struct where the `class` field points directly
-                // to the *superclass* to start method lookup from (unlike
-                // `objc_msgSendSuper2` where it's the *current* class and the
-                // runtime dereferences to the super).
-                //
-                // Some apps (FlyCraft, GameStop) have non-lazy relocations to
-                // these symbols from WebKit/SDK stubs compiled with older
-                // toolchains.  We resolve them to `objc_msgSendSuper2` /
-                // `objc_msgSendSuper2_stret` respectively because:
-                //   1. The runtime always finds the method by walking up from
-                //      the given class — whether we start from superclass or
-                //      from (class whose super we look up) the result is
-                //      identical in practice for apps.
-                //   2. All touchHLE-implemented classes use the `2` variant
-                //      internally anyway.
-                //
-                // Create a trampoline that calls our existing host
-                // implementation of the `2` variant.
-                let target_name = if name == "_objc_msgSendSuper" {
-                    "_objc_msgSendSuper2"
-                } else {
-                    "_objc_msgSendSuper2_stret"
-                };
-                if let Some((sym, _)) =
-                    search_host_dylibs(|dylib| dylib.function_exports, target_name)
-                {
-                    let trampoline_ptr = self
-                        .create_proc_address_no_inval(mem, sym)
-                        .unwrap()
-                        .to_ptr();
-                    log_dbg!("Linked {} -> {} at {:?}", name, target_name, trampoline_ptr);
-                    trampoline_ptr
-                } else {
-                    // Fallback: a BX LR stub that returns 0
+            let guest_external = bins
+                .iter()
+                .find_map(|other_bin| other_bin.external_symbols.get(name))
+                .copied();
+            let target: ConstVoidPtr =
+                if let Some(target) = crate::objc::exceptions::link_symbol(self, objc, mem, name) {
+                    target
+                } else if let Some(class_name) = name.strip_prefix("_OBJC_CLASS_$_") {
+                    guest_external.map(Ptr::from_bits).unwrap_or_else(|| {
+                        objc.link_class(class_name, /* is_metaclass: */ false, mem)
+                            .cast()
+                            .cast_const()
+                    })
+                } else if let Some(class_name) = name.strip_prefix("_OBJC_METACLASS_$_") {
+                    guest_external.map(Ptr::from_bits).unwrap_or_else(|| {
+                        objc.link_class(class_name, /* is_metaclass: */ true, mem)
+                            .cast()
+                            .cast_const()
+                    })
+                } else if name == "___CFConstantStringClassReference" {
+                    // See ns_string::register_constant_strings
+                    nil.cast().cast_const()
+                } else if let Some(addr) = guest_cxxabi_export {
+                    log_dbg!("Linked guest C++ ABI symbol {} at {:#x}", name, addr);
+                    Ptr::from_bits(addr)
+                } else if name == "___mb_cur_max" {
+                    // __mb_cur_max is a pointer to the C locale's max
+                    // multibyte character byte count. libstdc++ reads
+                    // *__mb_cur_max in locale/string code; if this pointer
+                    // is NULL the dereference crashes. Provide a static
+                    // value of 1 (single-byte / ASCII locale).
+                    let val_ptr: MutPtr<u32> = mem.alloc(4).cast();
+                    mem.write(val_ptr, 1u32);
+                    log_dbg!("Stubbed ___mb_cur_max at {:?}", val_ptr);
+                    val_ptr.cast().cast_const()
+                } else if name == "dyld_stub_binder" || name == "_dyld_stub_binder" {
+                    // In iOS, dyld_stub_binder handles lazy symbol binding.
+                    // However, touchHLE resolves lazy symbols entirely via SVC
+                    // traps,
+                    // bypassing the need for a guest-side binder.
+                    // We create a minimal ARM32 function (BX LR) so if it's somehow
+                    // called, it just returns safely without executing random
+                    // memory.
                     let fn_ptr: MutPtr<u32> = mem.alloc(8).cast();
                     mem.write(fn_ptr + 0, encode_a32_ret());
                     mem.write(fn_ptr + 1, encode_a32_trap());
+                    log_dbg!("Stubbed dyld_stub_binder at {:?}", fn_ptr);
                     fn_ptr.cast().cast_const()
-                }
-            } else if name == "__ZTId"
-                || name == "__ZTIf"
-                || name == "__ZTIi"
-                || name == "__ZTIl"
-                || name == "__ZTIj"
-                || name == "__ZTIs"
-                || name == "__ZTIc"
-                || name == "__ZTIv"
-                || name == "__ZTIb"
-                || name == "__ZTIPKc"
-                || name == "__ZTIPc"
-                || name == "__ZTIPv"
-                || name == "__ZTIPKv"
-                || name == "__ZTIw"
-                || name == "__ZTIPw"
-                || name == "__ZTIPKw"
-                || name == "__ZTIw"
-                || name == "__ZTIPw"
-                || name == "__ZTIPKw"
-            {
-                // C++ RTTI type_info objects for fundamental types (double,
-                // float, int, long, unsigned int, short, char, void, bool,
-                // wchar_t, const char*, char*, void*, const void*,
-                // wchar_t*, wchar_t const*).
-                //
-                // The Itanium ABI requires each fundamental type to have a
-                // unique type_info object with a specific mangled name. Apps
-                // that use dynamic_cast or exception handling may reference
-                // these. We allocate a minimal type_info struct:
-                //   +0: vptr (→ __cxxabiv117__class_type_infoE vtable + 8)
-                //   +4: name pointer (→ mangled type name C string)
-                //
-                // The name string is never actually used for comparison (RTTI
-                // compares by pointer identity on most embedded platforms), but
-                // providing a non-NULL value prevents crashes in debuggers.
-                let ti = link_cxxabi_typeinfo(
-                    name,
-                    &mut cxxabi_vtable_addrs,
-                    &mut self.cxxabi_typeinfo_vtable_kinds,
-                    mem,
-                );
-                log_dbg!("Stubbed C++ typeinfo {} at {:#x}", name, ti.to_bits());
-                ti
-            } else if name == "___objc_personality_v0" {
-                // Objective-C exception personality routine. Mirrors the
-                // non-lazy stub above: a guest-code BX LR returning 0
-                // (_URC_NO_REASON) so the unwinder keeps walking instead
-                // of branching to NULL when an iOS 5+ binary places a
-                // pointer to this symbol directly into its __DATA section
-                // via an external relocation (rather than through the
-                // __nl_symbol_ptr table).
-                let fn_ptr: MutPtr<u32> = mem.alloc(8).cast();
-                mem.write(fn_ptr + 0, encode_a32_ret());
-                mem.write(fn_ptr + 1, encode_a32_trap());
-                log_dbg!("Stubbed ___objc_personality_v0 -> {:#x}", fn_ptr.to_bits());
-                fn_ptr.cast().cast_const()
-            } else if name == "___cxa_terminate_handler"
-                || name == "___cxa_unexpected_handler"
-                || name == "___cxa_new_handler"
-            {
-                // Global function-pointer variables: std::terminate_handler,
-                // std::unexpected_handler, std::new_handler. The default
-                // value is a NULL function pointer; the real C++ runtime
-                // checks for NULL and falls back to abort. Provide a single
-                // word of zero-initialised guest memory.
-                let p: MutPtr<u32> = mem.alloc(4).cast();
-                mem.write(p, 0);
-                p.cast().cast_const()
-            } else if name == "__dispatch_source_type_read"
-                || name == "__dispatch_source_type_write"
-                || name == "__dispatch_source_type_timer"
-                || name == "__dispatch_source_type_data_add"
-                || name == "__dispatch_source_type_data_or"
-                || name == "__dispatch_source_type_data_replace"
-                || name == "__dispatch_source_type_signal"
-                || name == "__dispatch_source_type_proc"
-                || name == "__dispatch_source_type_vnode"
-                || name == "__dispatch_source_type_mach_send"
-                || name == "__dispatch_source_type_mach_recv"
-                || name == "__dispatch_source_type_memorypressure"
-                || name == "__dispatch_queue_attr_concurrent"
-                || name == "__dispatch_queue_attr_serial"
-                || name == "__dispatch_data_empty"
-                || name == "__dispatch_data_destructor_default"
-                || name == "__dispatch_data_destructor_free"
-                || name == "__dispatch_data_destructor_munmap"
-                || name == "__dispatch_main_q"
-                || name == "__dispatch_queue_main"
-            {
-                // Dispatch source types carry small internal tags; other
-                // libdispatch constants remain opaque non-NULL markers.
-                let p: MutPtr<u32> = mem.alloc(4).cast();
-                mem.write(p, crate::libc::dispatch_source::source_type_tag(name));
-                p.cast().cast_const()
-            } else if name == "_in6addr_any" || name == "_in6addr_loopback" {
-                // `struct in6_addr` is 16 bytes. `in6addr_any` is all zeros
-                // (`::`) and `in6addr_loopback` is `::1` (last byte = 1).
-                let p: MutPtr<u8> = mem.alloc(16).cast();
-                for i in 0..16 {
-                    mem.write(p + i, 0);
-                }
-                if name == "_in6addr_loopback" {
-                    mem.write(p + 15, 1u8);
-                }
-                p.cast().cast_const()
-            } else if name == "_objc_ehtype_vtable" {
-                // Apple libobjc (objc4) ships `objc_ehtype_vtable` as the
-                // Itanium-ABI C++ typeinfo vtable shared by every
-                // per-class `__objc_ehtype` struct used in Objective-C++
-                // `@catch (ObjCClass *)` blocks. touchHLE's `__cxa_throw`
-                // is a no-op (we never actually unwind), so the vtable is
-                // not consulted for type matching — but t
-                let p: MutPtr<u32> = mem.alloc(4).cast();
-                mem.write(p, 0);
-                p.cast().cast_const()
-            } else if name == "_NDR_record" {
-                // MIG `NDR_record` is a 12-byte transfer-syntax descriptor
-                // that's part of the (unused-by-touchHLE) Mach IPC stack.
-                // Apps reference the symbol from auto-generated MIG stubs but
-                // never actually transmit the bytes. Provide a zero-filled
-                // slot so the linker doesn't leave a NULL pointer behind.
-                let p: MutPtr<u8> = mem.alloc(12).cast();
-                for i in 0..12 {
-                    mem.write(p + i, 0);
-                }
-                p.cast().cast_const()
-            } else if let Some(stub) = self.cxxabi_intercept(mem, name) {
-                Ptr::<std::ffi::c_void, false>::from_bits(stub.to_ptr().to_bits())
-            } else if let Some(link) = self.swift_intercept(mem, name) {
-                match link {
-                    swift_runtime::SwiftLink::Function(f) => {
-                        Ptr::<std::ffi::c_void, false>::from_bits(f.to_ptr().to_bits())
+                } else if name == "__NSConcreteGlobalBlock"
+                    || name == "__NSConcreteStackBlock"
+                    || name == "__NSConcreteMallocBlock"
+                {
+                    // Blocks runtime class descriptor. Point the block `isa` at
+                    // the real `_touchHLE_NSBlock` class (see ns_object.rs) so
+                    // that `[block copy]` / `[block retain]` / `[block release]`
+                    // route to the Blocks runtime instead of hitting a dummy
+                    // class with no methods (which returned nil and left callback
+                    // blocks, e.g. cocos2d v3 `CCTimer._block`, nil). All block
+                    // symbols share this one class; `_Block_copy` uses the block's
+                    // flags (not its isa) to distinguish stack/global/malloc.
+                    let _ = &mut block_class_addrs;
+                    objc.get_known_class("_touchHLE_NSBlock", mem)
+                        .cast()
+                        .cast_const()
+                } else if name == "__ZTVN10__cxxabiv117__class_type_infoE"
+                    || name == "__ZTVN10__cxxabiv120__si_class_type_infoE"
+                    || name == "__ZTVN10__cxxabiv121__vmi_class_type_infoE"
+                    || name == "__ZTVN10__cxxabiv119__pointer_type_infoE"
+                    || name == "__ZTVN10__cxxabiv120__function_type_infoE"
+                    || name == "__ZTVN10__cxxabiv116__enum_type_infoE"
+                    || name == "__ZTVN10__cxxabiv117__pbase_type_infoE"
+                    || name == "__ZTVN10__cxxabiv129__pointer_to_member_type_infoE"
+                {
+                    // C++ Itanium ABI type_info vtable. Without this every
+                    // type_info object in the app has a NULL vptr, and any call
+                    // through the vptr (dynamic_cast, exception type matching,
+                    // type_info comparison) lands on address 0 and crashes.
+                    //
+                    // Layout (32-bit ARM, addend +8 from the symbol so callers
+                    // land on the first method):
+                    //   +0   offset_to_top   (= 0)
+                    //   +4   typeinfo for the vtable's class (= 0; never used)
+                    //   +8   ~type_info() complete dtor   -> BX LR stub
+                    //   +12  ~type_info() deleting dtor   -> BX LR stub
+                    //   +16  __is_pointer_p()             -> returns 0 (false)
+                    //   +20  __is_function_p()            -> returns 0 (false)
+                    //   +24  __do_catch()                 -> returns 0 (no match)
+                    //   +28  __do_upcast()                -> returns 0 (no match)
+                    //   +32  reserved
+                    //   +36  reserved
+                    //
+                    // The relocation addend (usually +8) is applied below, so we
+                    // return the vtable base here.
+                    let target = link_cxxabi_vtable(
+                        name,
+                        &mut cxxabi_vtable_addrs,
+                        &mut self.cxxabi_typeinfo_vtable_kinds,
+                        mem,
+                    );
+                    log_dbg!("Stubbed C++ vtable {} -> {:#x}", name, target.to_bits());
+                    target
+                } else if name == "___gxx_personality_sj0" {
+                    // C++ SjLj exception personality routine. Called by the
+                    // unwinder for every frame; returning 0 (_URC_NO_REASON)
+                    // tells it "no handler here, keep going". touchHLE never
+                    // actually invokes the unwinder, but other code may store
+                    // this pointer in an LSDA and read it back.
+                    let fn_ptr: MutPtr<u32> = mem.alloc(8).cast();
+                    mem.write(fn_ptr + 0, encode_a32_ret());
+                    mem.write(fn_ptr + 1, encode_a32_trap());
+                    log_dbg!("Stubbed ___gxx_personality_sj0 -> {:#x}", fn_ptr.to_bits());
+                    fn_ptr.cast().cast_const()
+                } else if name == "__ZTId"
+                    || name == "__ZTIf"
+                    || name == "__ZTIi"
+                    || name == "__ZTIl"
+                    || name == "__ZTIj"
+                    || name == "__ZTIs"
+                    || name == "__ZTIc"
+                    || name == "__ZTIv"
+                    || name == "__ZTIb"
+                    || name == "__ZTIPKc"
+                    || name == "__ZTIPc"
+                    || name == "__ZTIPv"
+                    || name == "__ZTIPKv"
+                    || name == "__ZTIw"
+                    || name == "__ZTIPw"
+                    || name == "__ZTIPKw"
+                    || name == "__ZTIw"
+                    || name == "__ZTIPw"
+                    || name == "__ZTIPKw"
+                {
+                    // C++ RTTI type_info objects for fundamental types (double,
+                    // float, int, long, unsigned int, short, char, void, bool,
+                    // wchar_t, const char*, char*, void*, const void*,
+                    // wchar_t*, wchar_t const*).
+                    //
+                    // The Itanium ABI requires each fundamental type to have a
+                    // unique type_info object with a specific mangled name. Apps
+                    // that use dynamic_cast or exception handling may reference
+                    // these. We allocate a minimal type_info struct:
+                    //   +0: vptr (→ __cxxabiv117__class_type_infoE vtable + 8)
+                    //   +4: name pointer (→ mangled type name C string)
+                    //
+                    // The name string is never actually used for comparison (RTTI
+                    // compares by pointer identity on most embedded platforms), but
+                    // providing a non-NULL value prevents crashes in debuggers.
+                    let ti = link_cxxabi_typeinfo(
+                        name,
+                        &mut cxxabi_vtable_addrs,
+                        &mut self.cxxabi_typeinfo_vtable_kinds,
+                        mem,
+                    );
+                    log_dbg!("Stubbed C++ typeinfo {} at {:#x}", name, ti.to_bits());
+                    ti
+                } else if name == "___cxa_terminate_handler"
+                    || name == "___cxa_unexpected_handler"
+                    || name == "___cxa_new_handler"
+                {
+                    // Global function-pointer variables: std::terminate_handler,
+                    // std::unexpected_handler, std::new_handler. The default
+                    // value is a NULL function pointer; the real C++ runtime
+                    // checks for NULL and falls back to abort. Provide a single
+                    // word of zero-initialised guest memory.
+                    let p: MutPtr<u32> = mem.alloc(4).cast();
+                    mem.write(p, 0);
+                    p.cast().cast_const()
+                } else if name == "__dispatch_source_type_read"
+                    || name == "__dispatch_source_type_write"
+                    || name == "__dispatch_source_type_timer"
+                    || name == "__dispatch_source_type_data_add"
+                    || name == "__dispatch_source_type_data_or"
+                    || name == "__dispatch_source_type_data_replace"
+                    || name == "__dispatch_source_type_signal"
+                    || name == "__dispatch_source_type_proc"
+                    || name == "__dispatch_source_type_vnode"
+                    || name == "__dispatch_source_type_mach_send"
+                    || name == "__dispatch_source_type_mach_recv"
+                    || name == "__dispatch_source_type_memorypressure"
+                    || name == "__dispatch_queue_attr_concurrent"
+                    || name == "__dispatch_queue_attr_serial"
+                    || name == "__dispatch_data_empty"
+                    || name == "__dispatch_data_destructor_default"
+                    || name == "__dispatch_data_destructor_free"
+                    || name == "__dispatch_data_destructor_munmap"
+                {
+                    // Dispatch source types carry small internal tags; other
+                    // libdispatch constants remain opaque non-NULL markers.
+                    let p: MutPtr<u32> = mem.alloc(4).cast();
+                    mem.write(p, crate::libc::dispatch_source::source_type_tag(name));
+                    p.cast().cast_const()
+                } else if name == "_in6addr_any" || name == "_in6addr_loopback" {
+                    // `struct in6_addr` is 16 bytes. `in6addr_any` is all zeros
+                    // (`::`) and `in6addr_loopback` is `::1` (last byte = 1).
+                    let p: MutPtr<u8> = mem.alloc(16).cast();
+                    for i in 0..16 {
+                        mem.write(p + i, 0);
                     }
-                    swift_runtime::SwiftLink::Data(slot) => slot,
-                }
-            } else if let Some(&external_addr) = bins
-                .iter()
-                .flat_map(|other_bin| other_bin.external_symbols.get(name))
-                .next()
-            {
-                // Often used for C++ RTTI
-                Ptr::from_bits(external_addr)
-            } else if let Some((symbol, _)) =
-                search_host_dylibs(|dylib| dylib.function_exports, name)
-            {
-                // We want the same symbol name to always point to the same
-                // function.
-                let trampoline_ptr = self
-                    .create_proc_address_no_inval(mem, symbol)
-                    .unwrap()
-                    .to_ptr();
-                log_dbg!(
-                    "Linked external relocation to host function {} at {:?}",
-                    symbol,
+                    if name == "_in6addr_loopback" {
+                        mem.write(p + 15, 1u8);
+                    }
+                    p.cast().cast_const()
+                } else if name == "_objc_ehtype_vtable" {
+                    // Apple libobjc (objc4) ships `objc_ehtype_vtable` as the
+                    // Itanium-ABI C++ typeinfo vtable shared by every
+                    // per-class `__objc_ehtype` struct used in Objective-C++
+                    // `@catch (ObjCClass *)` blocks. touchHLE's `__cxa_throw`
+                    // is a no-op (we never actually unwind), so the vtable is
+                    // not consulted for type matching — but t
+                    let p: MutPtr<u32> = mem.alloc(4).cast();
+                    mem.write(p, 0);
+                    p.cast().cast_const()
+                } else if name == "_NDR_record" {
+                    // MIG `NDR_record` is a 12-byte transfer-syntax descriptor
+                    // that's part of the (unused-by-touchHLE) Mach IPC stack.
+                    // Apps reference the symbol from auto-generated MIG stubs but
+                    // never actually transmit the bytes. Provide a zero-filled
+                    // slot so the linker doesn't leave a NULL pointer behind.
+                    let p: MutPtr<u8> = mem.alloc(12).cast();
+                    for i in 0..12 {
+                        mem.write(p + i, 0);
+                    }
+                    p.cast().cast_const()
+                } else if let Some(stub) = self.cxxabi_intercept(mem, name) {
+                    Ptr::<std::ffi::c_void, false>::from_bits(stub.to_ptr().to_bits())
+                } else if let Some(external_addr) = guest_external {
+                    Ptr::from_bits(external_addr)
+                } else if let Some(link) = self.swift_intercept(mem, name) {
+                    match link {
+                        swift_runtime::SwiftLink::Function(f) => {
+                            Ptr::<std::ffi::c_void, false>::from_bits(f.to_ptr().to_bits())
+                        }
+                        swift_runtime::SwiftLink::Data(slot) => slot,
+                    }
+                } else if let Some((symbol, _)) =
+                    search_host_dylibs(|dylib| dylib.function_exports, name)
+                {
+                    // We want the same symbol name to always point to the same
+                    // function.
+                    let trampoline_ptr = self
+                        .create_proc_address_no_inval(mem, symbol)
+                        .unwrap()
+                        .to_ptr();
+                    log_dbg!(
+                        "Linked external relocation to host function {} at {:?}",
+                        symbol,
+                        trampoline_ptr
+                    );
                     trampoline_ptr
-                );
-                trampoline_ptr
-            } else if let Some((_, template)) =
-                search_host_dylibs(|dylib| dylib.constant_exports, name)
-            {
-                // Constants from host dylibs need late linking (they may
-                // require a full Environment to resolve, e.g. NSString
-                // objects). Store for resolution in do_late_linking().
-                // NOTE: We must NOT skip these — a binary may reference a
-                // constant ONLY via external relocations without a matching
-                // __nl_symbol_ptr entry (e.g. ___sF in Digital Chocolate
-                // games compiled with older toolchains).
-                self.constants_to_link_later.push((ptr_ptr, template));
-                continue;
-            } else {
-                unhandled_relocations
-                    .entry(name)
-                    .or_default()
-                    .push(ptr_ptr.to_bits());
-                continue;
-            };
+                } else if let Some((symbol, _)) =
+                    search_host_dylibs(|dylib| dylib.constant_exports, name)
+                {
+                    // Constants from host dylibs need late linking (they may
+                    // require a full Environment to resolve, e.g. NSString
+                    // objects). Store for resolution in do_late_linking().
+                    // NOTE: We must NOT skip these — a binary may reference a
+                    // constant ONLY via external relocations without a matching
+                    // __nl_symbol_ptr entry (e.g. ___sF in Digital Chocolate
+                    // games compiled with older toolchains).
+                    self.constants_to_link_later.push((ptr_ptr, symbol));
+                    continue;
+                } else {
+                    unhandled_relocations
+                        .entry(name)
+                        .or_default()
+                        .push(ptr_ptr.to_bits());
+                    *self.unresolved_symbols.entry(name.to_string()).or_default() += 1;
+                    // Point the slot at a trap instead of leaving NULL (which is
+                    // what a zero-initialised slot holds anyway). Guest code that
+                    // calls the import then reports its name and call site; NULL
+                    // only produced a jump to address 0, which Dynarmic reported
+                    // as a bare "Error during CPU execution: MemoryError".
+                    let symbol: &'static str = Box::leak(name.to_string().into_boxed_str());
+                    let trap: HostFunction = Box::leak(Box::new(UnresolvedImportCalled { symbol }));
+                    let stub = self.create_guest_function(mem, symbol, trap);
+                    Ptr::from_bits(stub.to_ptr().to_bits())
+                };
             // wrapping_add() is used in case the offset is negative. I haven't
             // seen it happen, but it would make sense if that is allowed.
             mem.write(
@@ -1373,35 +1442,6 @@ impl Dyld {
                 continue;
             }
 
-            // `objc_msgSendSuper` / `objc_msgSendSuper_stret` referenced
-            // through `__nl_symbol_ptr` (same symbols as the special case in
-            // the external-relocation loop above: apps built with older
-            // toolchains emit non-lazy references from SDK stubs). Resolve to
-            // the existing host `objc_msgSendSuper2` / `_stret` trampolines.
-            if symbol == "_objc_msgSendSuper" || symbol == "_objc_msgSendSuper_stret" {
-                let target_name = if symbol == "_objc_msgSendSuper" {
-                    "_objc_msgSendSuper2"
-                } else {
-                    "_objc_msgSendSuper2_stret"
-                };
-                if let Some((sym, _)) =
-                    search_host_dylibs(|dylib| dylib.function_exports, target_name)
-                {
-                    let trampoline_ptr = self
-                        .create_proc_address_no_inval(mem, sym)
-                        .unwrap()
-                        .to_ptr();
-                    mem.write(ptr_ptr, trampoline_ptr);
-                    log_dbg!(
-                        "Linked non-lazy {} -> {} at {:?}",
-                        symbol,
-                        target_name,
-                        trampoline_ptr
-                    );
-                    continue;
-                }
-            }
-
             if let Some((symbol, _)) = search_host_dylibs(|dylib| dylib.function_exports, symbol) {
                 // We want the same symbol name to always point to the same
                 // function. It could point to a specific stub entry, but it's
@@ -1420,11 +1460,10 @@ impl Dyld {
                 log_dbg!("{:?}", self.non_lazy_host_functions);
                 continue;
             }
-            if let Some((_, template)) = search_host_dylibs(|dylib| dylib.constant_exports, symbol)
-            {
+            if let Some((symbol, _)) = search_host_dylibs(|dylib| dylib.constant_exports, symbol) {
                 // Delay linking of constant until we have a `&mut Environment`,
                 // that makes it much easier to build NSString objects etc.
-                self.constants_to_link_later.push((ptr_ptr, template));
+                self.constants_to_link_later.push((ptr_ptr, symbol));
                 continue;
             }
 
@@ -1445,39 +1484,8 @@ impl Dyld {
                 continue;
             }
 
-            // C++ / ObjC exception handling symbols. If these are
-            // NULL the C++ unwinder crashes when any @try block is
-            // entered or any ObjC exception is thrown, producing
-            // sequential NULL-page reads followed by UndefinedInst.
-            //
-            // _OBJC_EHTYPE_*: ObjC exception type-info descriptors
-            // used by @catch type matching. A dummy non-null object
-            // is enough to prevent the NULL dereference.
-            //
-            // ___objc_personality_v0: called by _Unwind_RaiseException
-            // for every frame. We install a trivial stub (BX LR) that
-            // returns 0 (_URC_NO_REASON / continue unwinding) so the
-            // unwinder keeps moving instead of branching to 0x0.
-            if symbol == "_OBJC_EHTYPE_id" || symbol == "_OBJC_EHTYPE_$_NSException" {
-                let dummy = mem.alloc(32);
-                mem.write(ptr_ptr, dummy.cast().cast_const());
-                log_dbg!(
-                    "Patched ObjC EH type descriptor {} -> {:#x}",
-                    symbol,
-                    dummy.to_bits()
-                );
-                continue;
-            }
-
-            if symbol == "___objc_personality_v0" {
-                // Minimal ARM32 function: BX LR (returns 0 in R0).
-                // Returning _URC_NO_REASON (0) for every frame tells
-                // the unwinder "no handler here, keep searching".
-                let fn_ptr: MutPtr<u32> = mem.alloc(8).cast();
-                mem.write(fn_ptr + 0, encode_a32_ret());
-                mem.write(fn_ptr + 1, encode_a32_trap());
-                mem.write(ptr_ptr, fn_ptr.cast().cast_const());
-                log_dbg!("Stubbed ___objc_personality_v0 -> {:#x}", fn_ptr.to_bits());
+            if let Some(target) = crate::objc::exceptions::link_symbol(self, objc, mem, symbol) {
+                mem.write(ptr_ptr, target);
                 continue;
             }
 
@@ -1529,18 +1537,12 @@ impl Dyld {
                 || symbol == "__dispatch_data_destructor_default"
                 || symbol == "__dispatch_data_destructor_free"
                 || symbol == "__dispatch_data_destructor_munmap"
-                || symbol == "__dispatch_main_q"
-                || symbol == "__dispatch_queue_main"
             {
                 // See the matching branch in the external-relocation loop.
                 let p: MutPtr<u32> = mem.alloc(4).cast();
                 mem.write(p, crate::libc::dispatch_source::source_type_tag(symbol));
                 mem.write(ptr_ptr, p.cast().cast_const());
-                log_dbg!(
-                    "libdispatch identity tag {} -> {:#x}",
-                    symbol,
-                    p.to_bits()
-                );
+                log_dbg!("libdispatch identity tag {} -> {:#x}", symbol, p.to_bits());
                 continue;
             }
 
@@ -1608,7 +1610,11 @@ impl Dyld {
                     }
                 };
                 mem.write(ptr_ptr, target.cast());
-                log_dbg!("Linked Swift runtime symbol {} at {:#x}", symbol, target.to_bits());
+                log_dbg!(
+                    "Linked Swift runtime symbol {} at {:#x}",
+                    symbol,
+                    target.to_bits()
+                );
                 continue;
             }
 
@@ -1650,6 +1656,10 @@ impl Dyld {
                 continue;
             }
 
+            *self
+                .unresolved_symbols
+                .entry(symbol.to_string())
+                .or_default() += 1;
             log!(
                 "Warning: unhandled non-lazy symbol {:?} at {:?} in \"{}\"",
                 symbol,
@@ -1661,32 +1671,89 @@ impl Dyld {
         // FIXME: check for internal relocations?
     }
 
+    /// Print one summary of the symbols the guest linked to NULL, so a
+    /// missing export is visible at the end of the log instead of being
+    /// buried among the per-relocation warnings.
+    fn report_unresolved_symbols(&self) {
+        if self.unresolved_symbols.is_empty() {
+            return;
+        }
+        let references: usize = self.unresolved_symbols.values().sum();
+        log!(
+            "Warning: {} symbol(s) the emulator does not implement were linked to NULL ({} reference(s)); the app may misbehave where they are used:",
+            self.unresolved_symbols.len(),
+            references
+        );
+        for (symbol, count) in &self.unresolved_symbols {
+            log!("  {} ({} reference(s))", symbol, count);
+        }
+    }
+
+    /// Fail if the guest linked a symbol the emulator does not implement.
+    /// Used by `--strict-symbols`, so a test or a compatibility run fails
+    /// loudly instead of running on with NULL pointers.
+    pub fn assert_no_unresolved_symbols(&self) {
+        if self.unresolved_symbols.is_empty() {
+            return;
+        }
+        let mut message = format!(
+            "{} symbol(s) the emulator does not implement were linked to NULL:",
+            self.unresolved_symbols.len()
+        );
+        for (symbol, count) in &self.unresolved_symbols {
+            message.push_str(&format!("\n  {} ({} reference(s))", symbol, count));
+        }
+        panic!("{message}");
+    }
+
     /// Do linking that can only be done once there is a full [Environment].
     /// Not to be confused with lazy linking.
     pub fn do_late_linking(env: &mut Environment) {
         // TODO: do symbols ever appear in __nl_symbol_ptr multiple times?
         let to_link = std::mem::take(&mut env.dyld.constants_to_link_later);
-        for (symbol_ptr_ptr, template) in to_link {
-            let symbol_ptr: ConstVoidPtr = match template {
-                HostConstant::NSString(static_str) => {
-                    let string_ptr = ns_string::get_static_str(env, static_str);
-                    let string_ptr_ptr = env.mem.alloc_and_write(string_ptr);
-                    string_ptr_ptr.cast().cast_const()
-                }
-                HostConstant::NullPtr => {
-                    let null_ptr: ConstVoidPtr = Ptr::null();
-                    let null_ptr_ptr = env.mem.alloc_and_write(null_ptr);
-                    null_ptr_ptr.cast().cast_const()
-                }
-                HostConstant::Custom(f) => f(env),
-            };
+        for (symbol_ptr_ptr, symbol) in to_link {
+            let symbol_ptr = Self::constant_address(env, symbol).unwrap();
             env.mem.write(symbol_ptr_ptr, symbol_ptr.cast());
         }
+    }
+
+    /// Return the address of an exported data symbol, sharing its storage
+    /// between normal linking and dlsym. A pointer-valued constant needs a
+    /// slot containing the pointer, not the pointee's address.
+    pub(crate) fn constant_address(env: &mut Environment, symbol: &str) -> Option<ConstVoidPtr> {
+        if let Some(&address) = env.dyld.host_constant_addresses.get(symbol) {
+            return Some(address);
+        }
+        let &(symbol, ref template) = search_host_dylibs(|dylib| dylib.constant_exports, symbol)?;
+        let address = match template {
+            HostConstant::NSString(value) => {
+                let value = ns_string::get_static_str(env, value);
+                env.mem.alloc_and_write(value).cast().cast_const()
+            }
+            HostConstant::NullPtr => env
+                .mem
+                .alloc_and_write(ConstVoidPtr::null())
+                .cast()
+                .cast_const(),
+            HostConstant::Custom(create) => create(env),
+        };
+        env.dyld.host_constant_addresses.insert(symbol, address);
+        Some(address)
     }
 
     /// Return a host function that can be called to handle an SVC instruction
     /// encountered during CPU emulation. If `None` is returned, the execution
     /// needs to resume at `svc_pc`.
+    pub(crate) fn svc_symbol(&self, svc: u32) -> &'static str {
+        let svc = svc & !Self::SVC_LAZY_LINK_RET_FLAG;
+        if svc < Self::SVC_LINKED_FUNCTIONS_BASE {
+            return "lazy-link";
+        }
+        self.linked_host_functions
+            .get((svc - Self::SVC_LINKED_FUNCTIONS_BASE) as usize)
+            .map_or("unknown-hle", |&(symbol, _)| symbol)
+    }
+
     pub fn get_svc_handler(
         &mut self,
         bins: &[MachO],
@@ -1875,21 +1942,18 @@ impl Dyld {
             );
         };
 
-        if self.guest_sjlj_runtime_available && is_guest_cxxabi_symbol(symbol) {
+        if self.guest_sjlj_runtime_available
+            && is_guest_cxxabi_symbol(symbol)
+            && !(trace_cxx_exceptions() && is_cxx_throw_symbol(symbol))
+        {
             if let Some(addr) = self.guest_cxxabi_export(symbol) {
                 register_cxxabi_typeinfo_vtable(
                     symbol,
                     addr,
                     &mut self.cxxabi_typeinfo_vtable_kinds,
                 );
-                let (stub_function_ptr, la_symbol_ptr) = link_by_restoring_stub(
-                    mem,
-                    cpu,
-                    addr,
-                    svc_pc,
-                    info.entry_size,
-                    pic_offset,
-                );
+                let (stub_function_ptr, la_symbol_ptr) =
+                    link_by_restoring_stub(mem, cpu, addr, svc_pc, info.entry_size, pic_offset);
                 log!(
                     "Linked guest C++ ABI symbol {} from a bundled dylib at {:?}/{:?}",
                     symbol,
@@ -2017,42 +2081,10 @@ impl Dyld {
             return None;
         }
 
-        // Fallback: the symbol isn't implemented by any host dylib and isn't
-        // exported by any loaded guest dylib. Instead of panicking (which kills
-        // the app), install a stub that logs a warning and returns 0. This
-        // lets the emulator keep running for relatively harmless symbols like
-        // `_getuid`, `_geteuid`, `_getpid`, etc.
-        let symbol_kind = if is_gles_function_symbol(symbol) {
-            "GLES function"
-        } else {
-            "function"
-        };
-        log!(
-            "Warning: call to unimplemented {} {} at {:#x}; installing return-0 stub",
-            symbol_kind,
-            symbol,
-            svc_pc
-        );
-        // `linked_host_functions` requires a `&'static str`, so leak the name.
-        let leaked_symbol: &'static str = Box::leak(symbol.to_string().into_boxed_str());
-        let f: HostFunction = &(unimplemented_function_stub as fn(&mut Environment) -> i32);
-        // Allocate an SVC ID for this stub (same pattern as the host-dylib
-        // branch above).
-        let idx: u32 = self.linked_host_functions.len().try_into().unwrap();
-        let mut svc = idx + Self::SVC_LINKED_FUNCTIONS_BASE;
-        if info.entry_size == 4 {
-            assert!(svc < Self::SVC_LAZY_LINK_RET_FLAG);
-            svc |= Self::SVC_LAZY_LINK_RET_FLAG;
-        }
-        self.linked_host_functions.push((leaked_symbol, f));
-        // Rewrite the stub function to trap into our SVC handler.
-        let stub_function_ptr: MutPtr<u32> = Ptr::from_bits(svc_pc);
-        mem.write(stub_function_ptr, encode_a32_svc(svc));
-        if info.entry_size != 4 {
-            assert!(mem.read(stub_function_ptr + 1) == encode_a32_ret());
-        }
-        cpu.invalidate_cache_range(stub_function_ptr.to_bits(), 4);
-        Some(f)
+        // Lazy linking happens only when guest code calls this import. Unknown
+        // functions have unknown return types and side effects, so fail here
+        // rather than fabricating a return value.
+        unresolved_function_called(symbol, svc_pc, cpu.regs()[Cpu::LR])
     }
 
     /// Creates a guest function that will call a host function with the name
@@ -2176,10 +2208,11 @@ fn cxxabi_throw_intercept(
     env: &mut Environment,
     exception: MutVoidPtr,
     tinfo: MutVoidPtr,
-    _dest: MutVoidPtr,
+    dest: MutVoidPtr,
 ) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static LOGGED: AtomicU32 = AtomicU32::new(0);
+    static TRACED: AtomicU32 = AtomicU32::new(0);
 
     // type_info layout (Itanium, 32-bit): +0 vptr, +4 `char const* name`.
     let type_name = if !tinfo.is_null() {
@@ -2204,6 +2237,36 @@ fn cxxabi_throw_intercept(
         String::new()
     };
 
+    if trace_cxx_exceptions() {
+        let n = TRACED.fetch_add(1, Ordering::Relaxed);
+        if n < 32 {
+            log!(
+                "Guest C++ exception: type={} what={} at exception={:?}.",
+                if type_name.is_empty() {
+                    "?"
+                } else {
+                    &type_name[..]
+                },
+                if what.is_empty() { "?" } else { &what[..] },
+                exception
+            );
+        } else if n == 32 {
+            log!("Guest C++ exception: further throws are not logged.");
+        }
+        // The app brought its own C++ runtime, so hand the throw back to it
+        // instead of unwinding on the host.
+        let forwarded = ["___cxa_throw", "__cxa_throw"].into_iter().any(|name| {
+            crate::libc::cxxabi::forward_to_guest_cxxabi(
+                env,
+                name,
+                &[exception.to_bits(), tinfo.to_bits(), dest.to_bits()],
+            )
+        });
+        if forwarded {
+            return;
+        }
+    }
+
     let continuation = crate::libc::cxxabi::unwind_to_app_frame(env);
     let n = LOGGED.fetch_add(1, Ordering::Relaxed);
     if n < 8 {
@@ -2211,7 +2274,11 @@ fn cxxabi_throw_intercept(
             log!(
                 "Suppressed guest C++ exception (no unwinder): type={} what={} at \
                  exception={:?}; unwound to app frame {:#010x}.",
-                if type_name.is_empty() { "?" } else { &type_name[..] },
+                if type_name.is_empty() {
+                    "?"
+                } else {
+                    &type_name[..]
+                },
                 if what.is_empty() { "?" } else { &what[..] },
                 exception,
                 continuation.addr_with_thumb_bit()
@@ -2220,7 +2287,11 @@ fn cxxabi_throw_intercept(
             log!(
                 "Suppressed guest C++ exception (no unwinder): type={} what={} at \
                  exception={:?}; no safe frame, returning after the throw point.",
-                if type_name.is_empty() { "?" } else { &type_name[..] },
+                if type_name.is_empty() {
+                    "?"
+                } else {
+                    &type_name[..]
+                },
                 if what.is_empty() { "?" } else { &what[..] },
                 exception
             );
@@ -2255,14 +2326,6 @@ fn dyld_stub_binder(_env: &mut Environment, _arg: u32) {
     );
 }
 
-fn is_gles_function_symbol(symbol: &str) -> bool {
-    let symbol = symbol.trim_start_matches('_');
-    symbol
-        .strip_prefix("gl")
-        .and_then(|rest| rest.chars().next())
-        .is_some_and(|character| character.is_ascii_uppercase())
-}
-
 /// Generic fallback stub for functions referenced by the guest binary but
 /// not implemented by any host dylib. Returns 0 so that calls to things like
 /// `getuid`, `geteuid`, `getpid`, etc. don't panic the emulator.
@@ -2272,7 +2335,6 @@ fn is_gles_function_symbol(symbol: &str) -> bool {
 fn unimplemented_function_stub(_env: &mut Environment) -> i32 {
     0
 }
-
 fn local_code_symbol(bin: &MachO, symbol: &str) -> Option<u32> {
     if bin.external_symbols.contains_key(symbol) {
         return None;
@@ -2292,26 +2354,64 @@ fn local_code_symbol(bin: &MachO, symbol: &str) -> Option<u32> {
         .then_some(address)
 }
 
+/// Reports a call to an import no host library implements.
+///
+/// Unresolved imports used to be linked to NULL, so calling one jumped to
+/// address 0 and surfaced as a bare `MemoryError`. The trap names the symbol
+/// and the guest call site instead. It deliberately does not invent a return
+/// value: unknown imports have unknown side effects, and a fake success hides
+/// the real failure.
+struct UnresolvedImportCalled {
+    symbol: &'static str,
+}
+
+impl CallFromGuest for UnresolvedImportCalled {
+    fn call_from_guest(&self, env: &mut Environment) {
+        let lr = env.cpu.regs()[Cpu::LR];
+        let site = env.guest_symbol_suffix(lr);
+        log!(
+            "Error: the unimplemented import {} was called; LR={:#010x}{}",
+            self.symbol,
+            lr,
+            site
+        );
+        panic!(
+            "Guest called the unimplemented import {} (caller LR={:#010x}{}). \
+             AppleJuiceHLE links imports it cannot implement to this trap, so the \
+             call is reported with its name and call site instead of failing as \
+             a jump to address 0.",
+            self.symbol, lr, site
+        );
+    }
+}
+
+fn unresolved_function_called(symbol: &str, stub_pc: u32, caller_lr: u32) -> ! {
+    log!(
+        "Error: unresolved function {} called through stub at {:#x} (caller LR={:#010x})",
+        symbol,
+        stub_pc,
+        caller_lr
+    );
+    panic!(
+        "unresolved guest function {} called through stub at {:#x} (caller LR={:#010x})",
+        symbol, stub_pc, caller_lr
+    )
+}
+
 fn lazy_stub_section_offset(section_addr: u32, section_size: u32, svc_pc: u32) -> Option<u32> {
     let offset = svc_pc.checked_sub(section_addr)?;
     (offset < section_size).then_some(offset)
 }
 
-fn fallback_for_unmapped_lazy_link(
-    cpu: &mut Cpu,
-    svc_pc: u32,
-    reason: &str,
-) -> Option<HostFunction> {
+fn fallback_for_unmapped_lazy_link(cpu: &mut Cpu, svc_pc: u32, reason: &str) -> ! {
     let lr = cpu.regs()[Cpu::LR];
-    log_once!("Warning: lazy-link SVC could not be matched to a symbol stub; returning 0 to the caller.");
-    log_dbg!(
-        "Unmapped lazy-link SVC at {:#x} ({}); returning to LR {:#x}.",
+    log!(
+        "Error: lazy-link SVC could not be matched to a symbol stub at {:#x} ({}); LR={:#x}.",
         svc_pc,
         reason,
         lr
     );
-    cpu.branch(GuestFunction::from_addr_with_thumb_bit(lr));
-    Some(&(unimplemented_function_stub as fn(&mut Environment) -> i32))
+    panic!("unmapped lazy-link SVC at {:#x} ({})", svc_pc, reason)
 }
 
 fn has_guest_sjlj_runtime(mut has_symbol: impl FnMut(&str) -> bool) -> bool {
@@ -2322,7 +2422,8 @@ fn has_guest_sjlj_runtime(mut has_symbol: impl FnMut(&str) -> bool) -> bool {
 }
 
 fn is_guest_cxxabi_symbol(name: &str) -> bool {
-    name.starts_with("___cxa_")
+    name == "__ZSt9terminatev"
+        || name.starts_with("___cxa_")
         || name.starts_with("__Unwind_")
         || name.starts_with("___gxx_personality_")
         || name.starts_with("__ZTVN10__cxxabiv1")
@@ -2330,35 +2431,35 @@ fn is_guest_cxxabi_symbol(name: &str) -> bool {
         || name.starts_with("__ZTS")
 }
 
-fn cxxabi_intercept_symbol(name: &str, guest_sjlj_runtime_available: bool) -> Option<&'static str> {
-    match name {
-        "___dynamic_cast" | "__dynamic_cast" => Some("___dynamic_cast"),
-        "__cxa_throw" if !guest_sjlj_runtime_available => Some("__cxa_throw"),
-        "___cxa_throw" if !guest_sjlj_runtime_available => Some("___cxa_throw"),
-        _ => None,
-    }
+/// Set from `--trace-cxx-exceptions`. Off by default: preferring our stub over
+/// the app's bundled C++ runtime changes link precedence for every C++ app, so
+/// it stays opt-in.
+static TRACE_CXX_EXCEPTIONS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_trace_cxx_exceptions(enabled: bool) {
+    TRACE_CXX_EXCEPTIONS.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
-#[cfg(test)]
-mod gles_symbol_detection_tests {
-    use super::is_gles_function_symbol;
+fn trace_cxx_exceptions() -> bool {
+    TRACE_CXX_EXCEPTIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
-    #[test]
-    fn recognizes_mangled_and_unmangled_gles_entry_points() {
-        for symbol in [
-            "_glBindBuffer",
-            "glGetAttachedShaders",
-            "_glDiscardFramebufferEXT",
-        ] {
-            assert!(is_gles_function_symbol(symbol));
-        }
-    }
+fn is_cxx_throw_symbol(name: &str) -> bool {
+    matches!(name, "__cxa_throw" | "___cxa_throw")
+}
 
-    #[test]
-    fn ignores_non_gles_symbols() {
-        for symbol in ["_getuid", "_global_init", "_GLESContext", "_gl_lowercase"] {
-            assert!(!is_gles_function_symbol(symbol));
-        }
+/// Names the stub that should intercept `name`, or `None` to leave the symbol
+/// to the app's own dylibs. The throw symbols are taken over only when the app
+/// has no C++ runtime of its own, or when `--trace-cxx-exceptions` asks for
+/// them to be logged.
+fn cxxabi_intercept_symbol(name: &str, guest_sjlj_runtime_available: bool) -> Option<&'static str> {
+    let intercept_throws = trace_cxx_exceptions() || !guest_sjlj_runtime_available;
+    match name {
+        "___dynamic_cast" | "__dynamic_cast" => Some("___dynamic_cast"),
+        "__cxa_throw" if intercept_throws => Some("__cxa_throw"),
+        "___cxa_throw" if intercept_throws => Some("___cxa_throw"),
+        _ => None,
     }
 }
 
@@ -2475,9 +2576,13 @@ mod cxxabi_runtime_detection_tests {
 
 #[cfg(test)]
 mod lazy_link_recovery_tests {
-    use super::{fallback_for_unmapped_lazy_link, lazy_stub_section_offset, local_code_symbol};
+    use super::{
+        fallback_for_unmapped_lazy_link, lazy_stub_section_offset, local_code_symbol,
+        unresolved_function_called, Dyld,
+    };
     use crate::cpu::Cpu;
-    use crate::mach_o::{MachO, Section, SectionType};
+    use crate::mach_o::{DyldIndirectSymbolInfo, MachO, Section, SectionType};
+    use crate::mem::{Mem, MutPtr};
     use std::collections::HashMap;
 
     #[test]
@@ -2493,15 +2598,34 @@ mod lazy_link_recovery_tests {
     }
 
     #[test]
-    fn unmapped_lazy_link_returns_to_arm_or_thumb_link_register() {
+    fn unmapped_lazy_link_fails_instead_of_fabricating_a_return_value() {
         let mut cpu = Cpu::new(None);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fallback_for_unmapped_lazy_link(&mut cpu, 0x3000, "test")
+        }))
+        .unwrap_err();
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap();
+        assert!(message.contains("0x3000"));
+        assert!(message.contains("test"));
+    }
 
-        for (lr, expected_pc, expected_thumb) in [(0x1000, 0x1000, false), (0x2001, 0x2000, true)] {
-            cpu.regs_mut()[Cpu::LR] = lr;
-            assert!(fallback_for_unmapped_lazy_link(&mut cpu, 0x3000, "test").is_some());
-            assert_eq!(cpu.regs()[Cpu::PC], expected_pc);
-            assert_eq!(cpu.cpsr() & Cpu::CPSR_THUMB != 0, expected_thumb);
-        }
+    #[test]
+    fn unresolved_function_reports_symbol_and_stub_address() {
+        let panic =
+            std::panic::catch_unwind(|| unresolved_function_called("_missing", 0x1234, 0x5678))
+                .unwrap_err();
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap();
+        assert!(message.contains("_missing"));
+        assert!(message.contains("0x1234"));
+        assert!(message.contains("0x00005678"));
     }
 
     fn mock_binary(symbol: &str, address: u32, section_name: &str, external: bool) -> MachO {
@@ -2514,21 +2638,27 @@ mod lazy_link_recovery_tests {
 
         MachO {
             name: "test".to_owned(),
+            loaded_path: "/test".to_owned(),
             dynamic_libraries: Vec::new(),
+            run_paths: Vec::new(),
+            slide: 0,
             sections: vec![Section {
                 name: section_name.to_owned(),
+                segment_name: "__TEXT".to_owned(),
                 addr: 0x1000,
                 size: 0x100,
                 type_: SectionType::Normal,
                 dyld_indirect_symbol_info: None,
             }],
             exported_symbols,
+            symbol_locations: HashMap::new(),
             external_symbols,
             external_relocations: Vec::new(),
             entry_point_pc: None,
             entry_point_is_lc_main: false,
             last_segment_end: 0x2000,
             text_base: 0x1000,
+            mapped_segments: vec![0x1000..0x2000],
         }
     }
 
@@ -2544,5 +2674,140 @@ mod lazy_link_recovery_tests {
         let external_code = mock_binary(symbol, 0x1011, "__text", true);
         assert_eq!(local_code_symbol(&external_code, symbol), None);
         assert_eq!(local_code_symbol(&private_code, "__other"), None);
+    }
+
+    // A local/absolute entry has no symbol to bind. Rewriting its PIC stub
+    // into an SVC loses the existing target and corrupts the return value.
+    // https://github.com/apple-oss-distributions/dyld/blob/dyld-360.22/src/ImageLoaderMachOClassic.cpp
+    #[test]
+    fn lazy_linking_preserves_already_bound_pic_stubs() {
+        let mut mem = Mem::new();
+        let stubs: MutPtr<u32> = mem.alloc(32).cast();
+        let mut original = Dyld::PIC_SYMBOL_STUB_INSTRUCTIONS.to_vec();
+        original.push(0x2000);
+        for stub_index in 0..2 {
+            for (index, &instruction) in original.iter().enumerate() {
+                mem.write(stubs + stub_index * 4 + index as u32, instruction);
+            }
+        }
+        let mut bin = mock_binary("_unused", 0x1011, "__text", false);
+        bin.sections = vec![Section {
+            name: "__picsymbolstub4".to_owned(),
+            segment_name: "__TEXT".to_owned(),
+            addr: stubs.to_bits(),
+            size: 32,
+            type_: SectionType::SymbolStubs,
+            dyld_indirect_symbol_info: Some(DyldIndirectSymbolInfo {
+                entry_size: 16,
+                indirect_undef_symbols: vec![None, Some("_objc_retain".to_owned())],
+            }),
+        }];
+
+        Dyld::new().setup_lazy_linking(&bin, &mut mem, None);
+        for (index, &instruction) in original.iter().enumerate() {
+            assert_eq!(mem.read(stubs + index as u32), instruction);
+        }
+        assert_eq!(
+            mem.read(stubs + 4),
+            super::encode_a32_svc(Dyld::SVC_LAZY_LINK)
+        );
+        assert_eq!(mem.read(stubs + 5), super::encode_a32_ret());
+        assert_eq!(mem.read(stubs + 7), original[3]);
+    }
+
+    // Exercise the original ARM stub instructions, including PC-relative
+    // pointer loads. Binding must not change the code a checksum would read.
+    // https://github.com/apple-oss-distributions/dyld/blob/dyld-210.2.3/src/ImageLoaderMachOClassic.cpp
+    #[test]
+    fn preserved_stubs_execute_through_bound_pointers() {
+        for entry_size in [4, 12, 16] {
+            let mut mem = Mem::new();
+            mem.set_null_segment_size(0x1000);
+            let code: MutPtr<u32> = mem.alloc(12).cast();
+            mem.write(code, 0xe3a0002a); // MOV r0, #42
+            mem.write(code + 1, super::encode_a32_ret());
+            mem.write(code + 2, 0xe1200070); // BKPT
+            let stub: MutPtr<u32> = mem.alloc(32).cast();
+            let slot = stub + 6;
+            let instructions = match entry_size {
+                4 => vec![Dyld::SYMBOL_STUB1_INSTRUCTIONS[0] | 16],
+                12 => vec![0xe59fc000, 0xe59cf000, slot.to_bits()],
+                16 => vec![0xe59fc004, 0xe08fc00c, 0xe59cf000, 12],
+                _ => unreachable!(),
+            };
+            for (index, &instruction) in instructions.iter().enumerate() {
+                mem.write(stub + index as u32, instruction);
+            }
+            let mut bin = mock_binary("_stub_target", code.to_bits(), "__text", true);
+            bin.sections = vec![Section {
+                name: "__symbol_stubs".to_owned(),
+                segment_name: "__TEXT".to_owned(),
+                addr: stub.to_bits(),
+                size: entry_size,
+                type_: SectionType::SymbolStubs,
+                dyld_indirect_symbol_info: Some(DyldIndirectSymbolInfo {
+                    entry_size,
+                    indirect_undef_symbols: vec![Some("_stub_target".to_owned())],
+                }),
+            }];
+            // Compressed Mach-O binding can also describe this lazy slot as
+            // an external relocation with addend zero. Initial linking must
+            // not add the function address to an already bound pointer.
+            bin.external_relocations
+                .push((slot.to_bits(), "_stub_target".to_owned()));
+            mem.write(slot, 0);
+            let mut dyld = Dyld::new();
+            dyld.do_initial_linking(
+                &crate::bundle::Bundle::new_fake_bundle(),
+                std::slice::from_ref(&bin),
+                &mut mem,
+                &mut crate::objc::ObjC::new(),
+                true,
+            );
+            assert_eq!(mem.read(slot), code.to_bits());
+            for (index, &instruction) in instructions.iter().enumerate() {
+                assert_eq!(mem.read(stub + index as u32), instruction);
+            }
+            let mut cpu = Cpu::new(None);
+            cpu.branch(crate::abi::GuestFunction::from_addr_with_thumb_bit(
+                stub.to_bits(),
+            ));
+            cpu.regs_mut()[Cpu::LR] = (code + 2).to_bits();
+            let state = cpu.run_or_step(&mut mem, Some(&mut 100));
+            assert!(matches!(
+                state,
+                crate::cpu::CpuState::Error(crate::cpu::CpuError::Breakpoint)
+            ));
+            assert_eq!(cpu.regs()[0], 42);
+        }
+    }
+}
+
+#[cfg(test)]
+mod unresolved_symbol_tests {
+    use super::Dyld;
+
+    #[test]
+    fn strict_symbols_only_fails_when_a_symbol_is_unresolved() {
+        let mut dyld = Dyld::new();
+        // Nothing unresolved: strict mode must not complain.
+        dyld.assert_no_unresolved_symbols();
+
+        dyld.unresolved_symbols
+            .insert("_NSURLIsExcludedFromBackupKey".to_string(), 2);
+
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dyld.assert_no_unresolved_symbols()
+        }));
+        std::panic::set_hook(previous_hook);
+
+        let message = result.expect_err("strict mode must fail on an unresolved symbol");
+        let message = message
+            .downcast_ref::<String>()
+            .expect("panic message should be a String");
+        assert!(message.contains("_NSURLIsExcludedFromBackupKey"));
+        assert!(message.contains("2 reference(s)"));
     }
 }

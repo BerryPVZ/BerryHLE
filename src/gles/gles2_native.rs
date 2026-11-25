@@ -13,10 +13,56 @@ use super::gles11_raw as gles11;
 use super::gles11_raw::types::*;
 use super::gles2_glsl::patch_shadow_samplers_extension;
 use super::gles2_raw as gles2;
+use super::gles30_raw as gles30;
+use std::cell::Cell;
+use std::rc::Rc;
+
+#[derive(Clone, Copy, Debug, Default)]
+enum MultisampleApi {
+    Core,
+    Apple,
+    Angle,
+    #[default]
+    Unsupported,
+}
+
+unsafe fn detect_multisample_api(native_es3: bool) -> MultisampleApi {
+    if native_es3
+        && gles30::RenderbufferStorageMultisample::is_loaded()
+        && gles30::BlitFramebuffer::is_loaded()
+    {
+        return MultisampleApi::Core;
+    }
+    let extensions = gles2::GetString(gles11::EXTENSIONS);
+    if extensions.is_null() {
+        return MultisampleApi::Unsupported;
+    }
+    let extensions = CStr::from_ptr(extensions.cast()).to_string_lossy();
+    let has = |name| {
+        extensions
+            .split_whitespace()
+            .any(|extension| extension == name)
+    };
+    if has("GL_APPLE_framebuffer_multisample")
+        && gles2::RenderbufferStorageMultisampleAPPLE::is_loaded()
+        && gles2::ResolveMultisampleFramebufferAPPLE::is_loaded()
+    {
+        MultisampleApi::Apple
+    } else if has("GL_ANGLE_framebuffer_multisample")
+        && has("GL_ANGLE_framebuffer_blit")
+        && gles2::RenderbufferStorageMultisampleANGLE::is_loaded()
+        && gles2::BlitFramebufferANGLE::is_loaded()
+    {
+        MultisampleApi::Angle
+    } else {
+        MultisampleApi::Unsupported
+    }
+}
+
 use super::gles_generic::{GLchar, GLES};
 use super::util::{try_decode_pvrtc, PalettedTextureFormat};
 use super::GLESContext;
-use crate::window::{GLContext, GLVersion, Window};
+use crate::window::{GLContext, Window};
 use std::ffi::CStr;
 use std::marker::PhantomData;
 
@@ -42,6 +88,10 @@ pub struct GLES2NativeContext {
     shadow_samplers_ext_supported: bool,
     /// Whether the host driver advertises `GL_OES_texture_3D`.
     texture_3d_ext_supported: bool,
+    map_buffer_range_supported: bool,
+    native_es3: bool,
+    multisample_api: MultisampleApi,
+    multisample_error: Rc<Cell<GLenum>>,
 }
 
 impl GLESContext for GLES2NativeContext {
@@ -51,27 +101,35 @@ impl GLESContext for GLES2NativeContext {
 
     fn new(window: &mut Window) -> Result<Self, String> {
         Ok(Self {
-            gl_ctx: window.create_gl_context(GLVersion::GLES20)?,
+            gl_ctx: window.create_gles2_gl_context()?,
             is_loaded: false,
             pvrtc_native: false,
             pvrtc_native_checked: false,
             texture_lod_ext_supported: false,
             shadow_samplers_ext_supported: false,
             texture_3d_ext_supported: false,
+            map_buffer_range_supported: false,
+            native_es3: false,
+            multisample_api: MultisampleApi::Unsupported,
+            multisample_error: Rc::default(),
         })
     }
 
     fn make_current<'gl_ctx, 'win: 'gl_ctx>(
         &'gl_ctx mut self,
         window: &'win mut Window,
-    ) -> Box<dyn GLES + 'gl_ctx> {
+    ) -> crate::gles::CurrentGLES<'gl_ctx> {
         if self.gl_ctx.is_current() && self.is_loaded {
-            return Box::new(GLES2Native {
+            return crate::gles::CurrentGLES::NativeES2(GLES2Native {
                 _gl_lifetime: PhantomData,
                 pvrtc_native: self.pvrtc_native,
                 texture_lod_ext_supported: self.texture_lod_ext_supported,
                 shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
                 texture_3d_ext_supported: self.texture_3d_ext_supported,
+                map_buffer_range_supported: self.map_buffer_range_supported,
+                native_es3: self.native_es3,
+                multisample_api: self.multisample_api,
+                multisample_error: self.multisample_error.clone(),
                 map_buffer_stagings: Vec::new(),
             });
         }
@@ -79,24 +137,35 @@ impl GLESContext for GLES2NativeContext {
             window.make_gl_context_current(&self.gl_ctx);
         }
         gles2::load_with(|s| window.gl_get_proc_address(s));
+        gles30::RenderbufferStorageMultisample::load_with(|s| window.gl_get_proc_address(s));
+        gles30::BlitFramebuffer::load_with(|s| window.gl_get_proc_address(s));
         // Some symbols (e.g. glGetString) are technically also part of ES 1.1
         // and are referenced via gles11:: in the surrounding code; load those
         // too so the existing helpers continue to work.
         gles11::load_with(|s| window.gl_get_proc_address(s));
         self.is_loaded = true;
         if !self.pvrtc_native_checked {
-            self.pvrtc_native = unsafe { detect_pvrtc_support() };
-            self.texture_lod_ext_supported = unsafe { detect_texture_lod_ext_support() };
-            self.shadow_samplers_ext_supported = unsafe { detect_shadow_samplers_ext_support() };
-            self.texture_3d_ext_supported = unsafe { detect_texture_3d_ext_support() };
+            let extensions = unsafe { detect_extensions() };
+            self.pvrtc_native = unsafe { detect_pvrtc_support(&extensions) };
+            self.texture_lod_ext_supported = unsafe { detect_texture_lod_ext_support(&extensions) };
+            self.shadow_samplers_ext_supported =
+                unsafe { detect_shadow_samplers_ext_support(&extensions) };
+            self.texture_3d_ext_supported = unsafe { detect_texture_3d_ext_support(&extensions) };
             self.pvrtc_native_checked = true;
+            self.map_buffer_range_supported = unsafe { detect_map_buffer_range_support() };
+            self.native_es3 = unsafe { detect_native_es3() };
+            self.multisample_api = unsafe { detect_multisample_api(self.native_es3) };
         }
-        Box::new(GLES2Native {
+        crate::gles::CurrentGLES::NativeES2(GLES2Native {
             _gl_lifetime: PhantomData,
             pvrtc_native: self.pvrtc_native,
             texture_lod_ext_supported: self.texture_lod_ext_supported,
             shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
             texture_3d_ext_supported: self.texture_3d_ext_supported,
+            map_buffer_range_supported: self.map_buffer_range_supported,
+            native_es3: self.native_es3,
+            multisample_api: self.multisample_api,
+            multisample_error: self.multisample_error.clone(),
             map_buffer_stagings: Vec::new(),
         })
     }
@@ -105,113 +174,93 @@ impl GLESContext for GLES2NativeContext {
         &'gl_ctx mut self,
         make_current_fn: &mut dyn FnMut(&GLContext),
         loader_fn: &mut dyn FnMut(&'static str) -> *const std::ffi::c_void,
-    ) -> Box<dyn GLES + 'gl_ctx> {
+    ) -> crate::gles::CurrentGLES<'gl_ctx> {
         if self.gl_ctx.is_current() && self.is_loaded {
-            return Box::new(GLES2Native {
+            return crate::gles::CurrentGLES::NativeES2(GLES2Native {
                 _gl_lifetime: PhantomData,
                 pvrtc_native: self.pvrtc_native,
                 texture_lod_ext_supported: self.texture_lod_ext_supported,
                 shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
                 texture_3d_ext_supported: self.texture_3d_ext_supported,
+                map_buffer_range_supported: self.map_buffer_range_supported,
+                native_es3: self.native_es3,
+                multisample_api: self.multisample_api,
+                multisample_error: self.multisample_error.clone(),
                 map_buffer_stagings: Vec::new(),
             });
         }
         make_current_fn(&self.gl_ctx);
         gles2::load_with(&mut *loader_fn);
+        gles30::RenderbufferStorageMultisample::load_with(&mut *loader_fn);
+        gles30::BlitFramebuffer::load_with(&mut *loader_fn);
         gles11::load_with(&mut *loader_fn);
         self.is_loaded = true;
         if !self.pvrtc_native_checked {
-            self.pvrtc_native = detect_pvrtc_support();
-            self.texture_lod_ext_supported = detect_texture_lod_ext_support();
-            self.shadow_samplers_ext_supported = detect_shadow_samplers_ext_support();
-            self.texture_3d_ext_supported = detect_texture_3d_ext_support();
+            let extensions = detect_extensions();
+            self.pvrtc_native = detect_pvrtc_support(&extensions);
+            self.texture_lod_ext_supported = detect_texture_lod_ext_support(&extensions);
+            self.shadow_samplers_ext_supported = detect_shadow_samplers_ext_support(&extensions);
+            self.texture_3d_ext_supported = detect_texture_3d_ext_support(&extensions);
+            self.map_buffer_range_supported = detect_map_buffer_range_support();
+            self.native_es3 = detect_native_es3();
+            self.multisample_api = detect_multisample_api(self.native_es3);
             self.pvrtc_native_checked = true;
         }
-        Box::new(GLES2Native {
+        crate::gles::CurrentGLES::NativeES2(GLES2Native {
             _gl_lifetime: PhantomData,
             pvrtc_native: self.pvrtc_native,
             texture_lod_ext_supported: self.texture_lod_ext_supported,
             shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
             texture_3d_ext_supported: self.texture_3d_ext_supported,
+            map_buffer_range_supported: self.map_buffer_range_supported,
+            native_es3: self.native_es3,
+            multisample_api: self.multisample_api,
+            multisample_error: self.multisample_error.clone(),
             map_buffer_stagings: Vec::new(),
         })
     }
 }
 
-/// Query `GL_EXTENSIONS` and return whether the current OpenGL ES 2.0 driver
-/// advertises `GL_IMG_texture_compression_pvrtc`. Must be called with a
-/// current GL context.
+/// Fetch `GL_EXTENSIONS` once for this GLES 2.0 context.
 ///
 /// On strict OpenGL ES 3.0+ contexts `glGetString(GL_EXTENSIONS)` is
 /// deprecated and may return an empty string. We can't use `glGetStringi`
-/// here because the touchHLE GLES 2.0 raw bindings (generated for Core
-/// ES 2.0 only) don't expose it. When the legacy string is unavailable we
-/// conservatively return `false`, which causes us to software-decode PVRTC.
-/// That's the safe choice: it produces correct output everywhere, at the
-/// cost of one extra in-memory pass per texture upload on hosts where
-/// PVRTC could otherwise be uploaded directly.
-unsafe fn detect_pvrtc_support() -> bool {
+/// because the touchHLE GLES 2.0 raw bindings (generated for Core ES 2.0
+/// only) don't expose it. An empty set makes every query below return
+/// `false`, which conservatively forces software PVRTC decoding and shader
+/// patching: correct everywhere, at the cost of one extra in-memory pass.
+/// Must be called with a current GL context.
+unsafe fn detect_extensions() -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
     let legacy = gles2::GetString(gles11::EXTENSIONS);
     if legacy.is_null() {
-        return false;
+        return set;
     }
     let Ok(s) = CStr::from_ptr(legacy as *const _).to_str() else {
-        return false;
+        return set;
     };
-    if s.is_empty() {
-        return false;
+    for ext in s.split_whitespace() {
+        set.insert(ext.to_owned());
     }
-    s.split(' ')
-        .any(|ext| ext == "GL_IMG_texture_compression_pvrtc")
+    set
 }
 
-/// Query `GL_EXTENSIONS` and return whether the current OpenGL ES 2.0 driver
-/// advertises `GL_EXT_shader_texture_lod`. When it does not, we must patch
-/// shaders that use `texture2DLodEXT` / `texture2DProjLodEXT` /
-/// `textureCubeLodEXT` because those functions won't exist in the driver's
-/// GLSL compiler.
-unsafe fn detect_texture_lod_ext_support() -> bool {
-    let legacy = gles2::GetString(gles11::EXTENSIONS);
-    if legacy.is_null() {
-        return false;
-    }
-    let Ok(s) = CStr::from_ptr(legacy as *const _).to_str() else {
-        return false;
-    };
-    if s.is_empty() {
-        return false;
-    }
-    s.split(' ').any(|ext| ext == "GL_EXT_shader_texture_lod")
+unsafe fn detect_pvrtc_support(extensions: &std::collections::HashSet<String>) -> bool {
+    extensions.contains("GL_IMG_texture_compression_pvrtc")
 }
 
-/// Query `GL_EXTENSIONS` and return whether the current OpenGL ES 2.0 driver
-/// advertises `GL_EXT_shadow_samplers`. Must be called with a current GL context.
-unsafe fn detect_shadow_samplers_ext_support() -> bool {
-    let legacy = gles2::GetString(gles11::EXTENSIONS);
-    if legacy.is_null() {
-        return false;
-    }
-    let Ok(extensions) = CStr::from_ptr(legacy as *const _).to_str() else {
-        return false;
-    };
-    extensions
-        .split_whitespace()
-        .any(|extension| extension == "GL_EXT_shadow_samplers")
+unsafe fn detect_texture_lod_ext_support(extensions: &std::collections::HashSet<String>) -> bool {
+    extensions.contains("GL_EXT_shader_texture_lod")
 }
 
-/// Query `GL_EXTENSIONS` and return whether the current driver supports 3D
-/// textures for OpenGL ES 2.0 shaders.
-unsafe fn detect_texture_3d_ext_support() -> bool {
-    let legacy = gles2::GetString(gles11::EXTENSIONS);
-    if legacy.is_null() {
-        return false;
-    }
-    let Ok(extensions) = CStr::from_ptr(legacy as *const _).to_str() else {
-        return false;
-    };
-    extensions
-        .split_whitespace()
-        .any(|extension| extension == "GL_OES_texture_3D")
+unsafe fn detect_shadow_samplers_ext_support(
+    extensions: &std::collections::HashSet<String>,
+) -> bool {
+    extensions.contains("GL_EXT_shadow_samplers")
+}
+
+unsafe fn detect_texture_3d_ext_support(extensions: &std::collections::HashSet<String>) -> bool {
+    extensions.contains("GL_OES_texture_3D")
 }
 
 /// Returns `true` if the shader source contains a top-level default float
@@ -499,6 +548,34 @@ mod tests {
     }
 }
 
+/// A loader can return a dispatch stub even for an unsupported API. Require
+/// the current context's version/extension as well as the entry points.
+unsafe fn detect_map_buffer_range_support() -> bool {
+    if !gles2::MapBufferRangeEXT::is_loaded()
+        || !gles2::FlushMappedBufferRangeEXT::is_loaded()
+        || !gles2::UnmapBufferOES::is_loaded()
+    {
+        return false;
+    }
+    if detect_native_es3() {
+        return true;
+    }
+    let extensions = gles2::GetString(gles2::EXTENSIONS);
+    !extensions.is_null()
+        && CStr::from_ptr(extensions.cast())
+            .to_bytes()
+            .split(|b| b.is_ascii_whitespace())
+            .any(|e| e == b"GL_EXT_map_buffer_range")
+}
+
+unsafe fn detect_native_es3() -> bool {
+    let version = gles2::GetString(gles2::VERSION);
+    !version.is_null()
+        && CStr::from_ptr(version.cast())
+            .to_bytes()
+            .starts_with(b"OpenGL ES 3.")
+}
+
 pub struct GLES2Native<'gl_ctx> {
     _gl_lifetime: PhantomData<&'gl_ctx ()>,
     pvrtc_native: bool,
@@ -506,6 +583,10 @@ pub struct GLES2Native<'gl_ctx> {
     texture_lod_ext_supported: bool,
     shadow_samplers_ext_supported: bool,
     texture_3d_ext_supported: bool,
+    map_buffer_range_supported: bool,
+    native_es3: bool,
+    multisample_api: MultisampleApi,
+    multisample_error: Rc<Cell<GLenum>>,
     /// CPU staging buffers for the `glMapBufferOES` fallback (see below).
     ///
     /// Games can legitimately have more than one buffer mapped at a time
@@ -586,7 +667,12 @@ impl GLES for GLES2Native<'_> {
 
     // Generic state manipulation
     unsafe fn GetError(&mut self) -> GLenum {
-        gles2::GetError()
+        let error = self.multisample_error.replace(0);
+        if error != 0 {
+            error
+        } else {
+            gles2::GetError()
+        }
     }
     unsafe fn Enable(&mut self, cap: GLenum) {
         if is_es1_only_capability(cap) {
@@ -1083,18 +1169,9 @@ impl GLES for GLES2Native<'_> {
     ) {
         gles2::RenderbufferStorage(target, internalformat, width, height)
     }
-    // GL_APPLE_framebuffer_multisample
-    //
-    // The canonical iOS EAGLView MSAA pattern allocates a multisample
-    // "sample" renderbuffer, renders into it, then resolves it into the
-    // single-sample "resolve" renderbuffer whose color storage is the
-    // CAEAGLLayer drawable, and finally calls `-presentRenderbuffer:`.
-    // Real iPhone OS ES 2.0 drivers expose this extension natively, and so
-    // do many Android GPUs (e.g. Adreno advertises
-    // GL_APPLE_framebuffer_multisample). When the host driver exports the
-    // native entry points we forward to them directly; otherwise we degrade
-    // gracefully so the app keeps running (see the generic-backend fallback
-    // in `gles_generic`).
+    // Apple MSAA maps directly to ES 3 core or the equivalent ANGLE
+    // extensions. A no-op resolve loses every frame in the resolve buffer.
+    // https://registry.khronos.org/OpenGL/extensions/APPLE/APPLE_framebuffer_multisample.txt
     unsafe fn RenderbufferStorageMultisampleAPPLE(
         &mut self,
         target: GLenum,
@@ -1103,34 +1180,103 @@ impl GLES for GLES2Native<'_> {
         width: GLsizei,
         height: GLsizei,
     ) {
-        if gles2::RenderbufferStorageMultisampleAPPLE::is_loaded() {
-            gles2::RenderbufferStorageMultisampleAPPLE(
+        match self.multisample_api {
+            MultisampleApi::Core => gles30::RenderbufferStorageMultisample(
                 target,
                 samples,
                 internalformat,
                 width,
                 height,
-            )
-        } else {
-            log_once!(
-                "RenderbufferStorageMultisampleAPPLE: host ES 2.0 driver lacks \
-                 GL_APPLE_framebuffer_multisample; using single-sample storage"
-            );
-            gles2::RenderbufferStorage(target, internalformat, width, height)
+            ),
+            MultisampleApi::Apple => gles2::RenderbufferStorageMultisampleAPPLE(
+                target,
+                samples,
+                internalformat,
+                width,
+                height,
+            ),
+            MultisampleApi::Angle => gles2::RenderbufferStorageMultisampleANGLE(
+                target,
+                samples,
+                internalformat,
+                width,
+                height,
+            ),
+            MultisampleApi::Unsupported if samples == 0 => {
+                gles2::RenderbufferStorage(target, internalformat, width, height)
+            }
+            MultisampleApi::Unsupported => {
+                // The host supports zero multisamples. Report the specified
+                // samples > MAX_SAMPLES error instead of inventing storage.
+                if self.multisample_error.get() == 0 {
+                    self.multisample_error.set(gles11::INVALID_VALUE);
+                }
+            }
         }
     }
     unsafe fn ResolveMultisampleFramebufferAPPLE(&mut self) {
-        if gles2::ResolveMultisampleFramebufferAPPLE::is_loaded() {
-            // The app has already bound the sample framebuffer to
-            // GL_READ_FRAMEBUFFER_APPLE and the resolve framebuffer to
-            // GL_DRAW_FRAMEBUFFER_APPLE; the driver does the resolve.
-            gles2::ResolveMultisampleFramebufferAPPLE()
-        } else {
-            log_once!(
-                "ResolveMultisampleFramebufferAPPLE: host ES 2.0 driver lacks \
-                 GL_APPLE_framebuffer_multisample; relying on the single-sample \
-                 fallback from RenderbufferStorageMultisampleAPPLE"
-            );
+        match self.multisample_api {
+            MultisampleApi::Apple => {
+                gles2::ResolveMultisampleFramebufferAPPLE();
+                return;
+            }
+            MultisampleApi::Unsupported => {
+                if self.multisample_error.get() == 0 {
+                    self.multisample_error.set(gles11::INVALID_OPERATION);
+                }
+                return;
+            }
+            _ => {}
+        }
+        let mut color = 0;
+        let mut previous = 0;
+        let mut width = 0;
+        let mut height = 0;
+        gles2::GetFramebufferAttachmentParameteriv(
+            0x8ca8,
+            gles2::COLOR_ATTACHMENT0,
+            gles2::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+            &mut color,
+        );
+        gles2::GetIntegerv(gles2::RENDERBUFFER_BINDING, &mut previous);
+        gles2::BindRenderbuffer(gles2::RENDERBUFFER, color as GLuint);
+        gles2::GetRenderbufferParameteriv(
+            gles2::RENDERBUFFER,
+            gles2::RENDERBUFFER_WIDTH,
+            &mut width,
+        );
+        gles2::GetRenderbufferParameteriv(
+            gles2::RENDERBUFFER,
+            gles2::RENDERBUFFER_HEIGHT,
+            &mut height,
+        );
+        gles2::BindRenderbuffer(gles2::RENDERBUFFER, previous as GLuint);
+        match self.multisample_api {
+            MultisampleApi::Core => gles30::BlitFramebuffer(
+                0,
+                0,
+                width,
+                height,
+                0,
+                0,
+                width,
+                height,
+                gles2::COLOR_BUFFER_BIT,
+                gles2::NEAREST,
+            ),
+            MultisampleApi::Angle => gles2::BlitFramebufferANGLE(
+                0,
+                0,
+                width,
+                height,
+                0,
+                0,
+                width,
+                height,
+                gles2::COLOR_BUFFER_BIT,
+                gles2::NEAREST,
+            ),
+            _ => unreachable!(),
         }
     }
     unsafe fn FramebufferRenderbuffer(
@@ -1189,6 +1335,29 @@ impl GLES for GLES2Native<'_> {
     // games (e.g. LEGO Ninjago Spinjitzu Scavenger Hunt) call these even when
     // they asked EAGL for an ES 1.1 context — combined with
     // `--prefer-gles2-context`, they end up here.
+    fn supports_map_buffer_range(&self) -> bool {
+        self.map_buffer_range_supported
+    }
+    unsafe fn MapBufferRange(
+        &mut self,
+        target: GLenum,
+        offset: GLintptr,
+        length: GLsizeiptr,
+        access: GLbitfield,
+    ) -> *mut GLvoid {
+        gles2::MapBufferRangeEXT(target, offset, length, access)
+    }
+    unsafe fn FlushMappedBufferRange(
+        &mut self,
+        target: GLenum,
+        offset: GLintptr,
+        length: GLsizeiptr,
+    ) {
+        gles2::FlushMappedBufferRangeEXT(target, offset, length)
+    }
+    unsafe fn UnmapBuffer(&mut self, target: GLenum) -> GLboolean {
+        gles2::UnmapBufferOES(target)
+    }
     unsafe fn MapBufferOES(&mut self, target: GLenum, access: GLenum) -> *mut GLvoid {
         if gles2::MapBufferOES::is_loaded() {
             let mapped = gles2::MapBufferOES(target, access);
@@ -1569,21 +1738,11 @@ impl GLES for GLES2Native<'_> {
         stride: GLsizei,
         pointer: *const GLvoid,
     ) {
-        // GL_HALF_FLOAT_OES (0x8D61) is the ES 2.0 OES-extension token for
-        // 16-bit floats in vertex attributes (GL_OES_vertex_half_float).
-        // In ES 3.0+ and desktop OpenGL the core token is GL_HALF_FLOAT
-        // (0x140B) — a different numeric value.  AMD's native GLES 3.x
-        // driver on Windows only accepts the core token, so passing 0x8D61
-        // yields GL_INVALID_ENUM every frame, breaking the stage render.
-        // We translate here so that apps using GLES 2.0 half-float vertex
-        // data (e.g. the Supercell SC3D engine used by Brawl Stars) work
-        // correctly on any host driver.
-        //
-        // Reference: https://registry.khronos.org/OpenGL/extensions/OES/OES_vertex_half_float.txt
-        const GL_HALF_FLOAT_OES: GLenum = 0x8D61;
-        const GL_HALF_FLOAT: GLenum = 0x140B;
-        let type_ = if type_ == GL_HALF_FLOAT_OES {
-            GL_HALF_FLOAT
+        // A real ES 2.0 driver requires HALF_FLOAT_OES; ES 3.x hosts
+        // (including an ES 3.x driver serving this ES 2.0 backend) use the
+        // core token. Query the host version, not the guest context API.
+        let type_ = if self.native_es3 {
+            super::util::core_vertex_attrib_type(type_)
         } else {
             type_
         };

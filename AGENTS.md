@@ -1,45 +1,179 @@
 # AGENTS.md
 
+Two products in this tree:
+
+1. **touchHLE** (Rust) — an HLE iPhone OS app emulator. Its Rust host
+   reimplements iOS frameworks and runs guest ARM code (Dynarmic JIT, with an
+   interpreter fallback).
+2. **AppDB** (Python/FastAPI) — a compatibility report web app at `appdb/`.
+
+Also present: `telegram_bot/` (app-fix request bot), `android/` (Gradle app),
+`platform/ios/` (Applesauce host app).
+
 ## Rules for emulator changes
 
-These rules come from bugs that reached trunk. They apply to every agent and environment.
+These come from bugs that reached trunk and apply to every agent.
 
-1. **Run the full test suite.** Run `cargo test` with `test_app` before you open a PR. TestApp needs LLVM 12 in `tests/llvm` and the common-3.0 SDK in `tests/common-3.0.sdk`; the macOS job in `.github/workflows/HyperHLE_release.yml` shows where to get them. If you cannot run TestApp, write "TestApp not run" in the PR. Never delete, skip or weaken a failing test or CI step to get a green run: fix the cause, or leave it failing and report it.
-2. **Do not change shared behavior for one game.** A change that affects every app must match real iOS. If one game needs different behavior, add a general option in `src/options.rs` and enable it for that bundle ID in `touchHLE_default_options.txt`. Do not add new `bundle_identifier()` checks in code.
-3. **When a game crashes, find and fix the root cause first.**
-   - Investigate the last emulated API calls, loader, CPU, memory, audio or graphics state against Apple's documentation before considering any fallback.
-   - If the emulator is wrong, fix the underlying API or subsystem and add a regression test (`TestApp` where possible, otherwise a Rust unit test).
-   - Keep `--headless` (and `TestApp`) strict: headless runs must never mask guest `exit`, `abort`, uncaught exceptions or fatal signals, so automated tests always surface regressions immediately.
-   - GUI compatibility fallbacks (such as surviving legacy DRM/anti-tamper `exit()`/`abort()` checks or ignoring unhandled `SIGPIPE` from old ad SDKs) must remain scoped to non-headless sessions and must never replace fixing an actual HLE bug.
-4. **Match iOS and cite the source.** Before you implement or change an API, check Apple's documentation (old references are on web.archive.org) and touchHLE. Link the source in the commit message or the test.
-5. **Search before adding.** Before you add a class, method, function or constant, search for an existing one. The `no_duplicate_*` tests fail on duplicates.
+1. **Run the test suite.** `cargo test` covers the unit tests and TestApp. If you
+   cannot run TestApp, write "TestApp not run" and why. Never delete, skip or
+   weaken a failing test or CI step: fix the cause, or leave it failing and report
+   it.
+2. **Do not change shared behavior for one game.** Anything affecting every app
+   must match real iOS. Per-game differences go in a general option in
+   `src/options.rs`, enabled for that bundle ID in `touchHLE_default_options.txt`;
+   no new `bundle_identifier()` checks in code.
+3. **Find the root cause before any fallback.** Check the last emulated API calls,
+   loader, CPU, memory, audio and graphics state against Apple's documentation
+   first. Fix the subsystem and add a regression test (TestApp, else a Rust unit
+   test). `--headless` and TestApp stay strict: never mask guest `exit`, `abort`,
+   uncaught exceptions or fatal signals. GUI fallbacks (legacy DRM/anti-tamper
+   `exit()`/`abort()`, unhandled `SIGPIPE` from old ad SDKs) stay scoped to
+   non-headless sessions and never replace a real fix.
+4. **Match iOS and cite the source.** Check Apple's documentation (old references
+   are on web.archive.org) and touchHLE before implementing or changing an API;
+   link the source in the commit message or test.
+5. **Search before adding.** Check for an existing class, method, function or
+   constant first; the `no_duplicate_*` tests fail on duplicates.
 
-## Cursor Cloud specific instructions
+## Applying edits
 
-### Overview
+Read the file first. Use `edit` with an exact `oldString`, including blank
+lines and indentation, and enough context to match once; set `replaceAll` only
+when every occurrence should change. Use `write` for new files or full rewrites,
+never shell redirection or `sed`. Run `git diff --check` after editing.
 
-This repo contains two products:
-1. **touchHLE emulator** (Rust) — an HLE iPhone OS app emulator
-2. **AppDB** (Python/FastAPI) — a compatibility report web app at `appdb/`
+## Where things live
 
-### Building the Rust emulator
+- `src/lib.rs` — `main()` and the module list; `src/environment.rs` —
+  `Environment`, threads, run loop.
+- `src/environment/app_picker.rs` (~8.8k lines) — native app picker and the whole
+  Settings screen; most settings/UI work lands here, not in `frameworks/`.
+- `src/frameworks/<framework>/` — HLE implementations (`uikit/`, `foundation/`,
+  `core_animation/`, `opengles/`, ...); `src/libc/` and `src/dyld/` — C runtime
+  and loader; `src/objc/` — Objective-C runtime and the `msg!`, `msg_super!`,
+  `msg_class!`, `objc_classes!` macros; `src/window.rs` — SDL window, input,
+  device profiles; `src/quick_menu.rs`, `src/trainer_ui.rs` — in-game overlays,
+  drawn last in `src/gles/present.rs`, fed touches before the guest in
+  `src/window.rs`.
+- Guest pointers are 32-bit, host pointers 64-bit: use `Ptr`/`MutPtr` from
+  `src/mem.rs`, never raw host pointers, for anything the guest can see.
+- `appdb/`: `cd appdb && pip install -e . && uvicorn app.main:app`.
 
-- **Git submodules must be initialized** before building: `git submodule update --init`
-- The build requires `libboost-dev`, `libstdc++-14-dev`, `libsndio-dev`, and X11 development headers (`libxext-dev`, `libx11-dev`, etc.) on Linux.
-- On this Cloud Agent VM (x86_64 Linux with clang), you **must** set `RUSTFLAGS="-C link-arg=-latomic"` for linking to succeed. OpenAL Soft's static build uses `std::atomic` operations that require `libatomic`, but the build scripts don't link it automatically.
-- Build: `RUSTFLAGS="-C link-arg=-latomic" cargo build`
-- The emulator binary requires a display/window system (SDL2) to run graphically. In headless environments, use `--help`, `--copyright`, or `--info` flags to verify the binary works.
+## Adding an iOS API
 
-### Linting and testing
+- Implement in the framework module: classes in `objc_classes!` as
+  `@implementation Class: Superclass`, C functions with `export_c_func!`,
+  constants with `HostConstant`.
+- Export via the module's `FUNCTIONS`/`CLASSES`/`CONSTANTS`, wired through its
+  `DYLIB` const and listed in `DYLIB_LIST` (`src/dyld/dylib_list.rs`); nothing
+  resolves until then. `no_duplicate_classes`/`_functions`/`_constants` fail on
+  duplicates.
+- `objc_classes!` needs all `+` class methods before the first `-` instance
+  method.
+- `msg!` arguments must each be a single token tree: bind complex expressions
+  first (`let hidden = !selected;` then `msg![env; this setHidden:hidden]`).
+  `msg_super!` only works inside `objc_classes!`.
+- In `-dealloc`, `std::mem::take` on a host object resets the embedded superclass
+  host object; copy `superclass` back before `msg_super![env; this dealloc]`
+  (pattern at `src/frameworks/uikit/ui_view/ui_scroll_view/ui_text_view.rs:158`)
+  or the superclass's retained fields leak.
 
-- Lint: `dev-scripts/lint.sh` (runs comment-length check + `cargo clippy -- --deny warnings` + `cargo doc`). Note: the `t` branch has pre-existing long comment lines and clippy warnings with Rust 1.95+, so the full lint script will fail. Running `cargo clippy` alone (without `--deny warnings`) confirms no hard errors.
-- Tests: `RUSTFLAGS="-C link-arg=-latomic" cargo test -- --skip test_app` (the `test_app` integration tests require a custom LLVM/SDK toolchain not available in the Cloud VM). This is not a full check: say in the PR that TestApp was not run. CI runs it on macOS.
-- Format: `dev-scripts/format.sh` (requires `clang-format` for C/C++ files).
+## Options and the Settings screen
 
-### Running the AppDB
+- Options live in `src/options.rs` (fields, parsing, a large `#[cfg(test)]` suite).
+  Help text is `OPTIONS_HELP.txt`, `include_str!`'d, so `--help` and the on-disk
+  copy change together.
+- A new setting touches three places: `src/options.rs`, `OPTIONS_HELP.txt`, and a
+  row in the Settings screen in `src/environment/app_picker.rs`.
+- Per-app defaults go in `touchHLE_default_options.txt`, one line per bundle ID;
+  read its header before editing.
 
-- Setup: `cd appdb && python3 -m venv .venv && source .venv/bin/activate && pip install -e .`
-- Run: `cd appdb && source .venv/bin/activate && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload`
-- The SQLite DB is auto-created and seeded with demo data on first startup.
-- Submitting reports requires GitHub OAuth (`GITHUB_OAUTH_CLIENT_ID` / `GITHUB_OAUTH_CLIENT_SECRET` env vars); without these, the app works in read-only mode.
-- The triage JSON API requires `APPDB_TRIAGE_TOKEN` env var.
+## Build, test, lint
+
+- Initialize submodules: `git submodule update --init --recursive`.
+- With CMake 4, older bundled CMake projects may need
+  `export CMAKE_POLICY_VERSION_MINIMUM=3.5`.
+- `cargo test` runs Rust unit and integration tests. TestApp needs
+  `tests/llvm/bin/clang` (LLVM 12 is tested) and `tests/common-3.0.sdk`;
+  see `tests/README.md` for setup.
+- One test: `cargo test --lib <name>`. TestApp only:
+  `cargo test --test integration test_app`.
+- Run an app: `cargo run --release -- path/to/app.app`, with the bundle in
+  `touchHLE_apps/`.
+- Android: `android/` builds the core with `--no-default-features` and
+  `sdl2/bundled` plus two static wrappers, not the default feature set (see
+  `extraCargoBuildArguments` in `android/app/build.gradle`).
+- AppDB requires Python 3.11+: `cd appdb && pip install -e . && uvicorn app.main:app --reload`.
+  Its development SQLite database and uploads are local; production uses `/data`.
+- Telegram bot requires Python 3.10+: `cd telegram_bot && pip install -e '.[test]' && pytest`.
+  See `telegram_bot/README.md` for required environment variables.
+
+## Formatting and lint
+
+Never run `cargo fmt`: `cargo fmt --check` reports 986 files because the tree is
+hand-formatted (4-space indent, wrapped by hand), so it buries a real change in an
+unreviewable diff. Follow the surrounding style.
+
+`dev-scripts/lint.sh` checks line lengths, Clippy and documentation with warnings
+denied. Existing violations may prevent a clean run; report failures and avoid
+adding new ones.
+
+## Commits and docs
+
+- Subject style is a lowercase area prefix: `uikit:`, `renderer:`, `settings:`,
+  `libc:`, `opengles:`.
+- A user-visible change updates `README.md`, `CHANGELOG.md` and
+  `OPTIONS_HELP.txt` where relevant.
+- Commit messages and tests cite the iOS behaviour they match (rule 4 above).
+
+## Optional agent tooling
+
+Optional: skip any tool that is not installed.
+
+- **Code graph (graphify)** — if `graphify-out/graph.json` exists, run
+  `graphify query "<question>"` before grep or reads and pass that rule to
+  subagents. `graphify path A B` maps relationships, `explain X` covers one
+  concept, and `section "<heading>"` prints one Markdown section. Navigate with
+  `graphify-out/wiki/index.md`; read `GRAPH_REPORT.md` only for broad
+  architecture. After code changes run `graphify update .`; never hand-edit
+  `graphify-out/`.
+- **Search tools (bettergrep, betterglob, betterread)** — plugins that keep the
+  `grep`, `glob`, `read` names with filters, limits and continuation footers.
+  `betterread` skips nested `AGENTS.md`, so open `appdb/AGENTS.md` directly.
+- **Symbol navigation (serena)** — call `initial_instructions` first. Use
+  `find_symbol` for definitions, `find_referencing_symbols` for callers, and
+  `replace_symbol_body` for whole-symbol edits; prefer them to text search for
+  named symbols.
+- **Library docs (context7)** — for a library, framework, SDK, API or CLI
+  question, call `resolve-library-id` then `query-docs`. Use `query-code` when
+  docs lack an exact signature, default or error; cite the file and line. Skip
+  for refactoring or debugging independent of a library API.
+- **Memory (mnemon, claudemem, hindsight, openviking)** — recall before
+  answering anything that may depend on past sessions, decisions or preferences.
+  During a large plan, store findings, decisions and the plan as you go; that
+  survives compaction and session switches. Never store secrets or transient
+  state.
+- **Caveman (skill, blocks, native)** — if installed, its terse style applies
+  only while active; code, comments, commits and docs stay normal. Follow
+  `caveman-blocks` hints. `caveman-native` hooks inject context and shrink
+  output, so leave compression to them; otherwise compress large output with
+  the caveman tool and keep the `ccr_` handle. Compress by need.
+- **Context mode (context-mode plugin)** — if enabled, run shell commands and
+  reads through `ctx_execute`, printing only the answer; pass `file:` and read
+  `$CTX_FILE`, and set `intent` for large output. Use `ctx_batch` for several
+  commands or queries. Store reusable output with `ctx_index`, find it with
+  `ctx_search` (scope `session`, `worktree` or `project`), and call
+  `ctx_resume` after compaction. Keep `write`/`edit` direct. Each call is a
+  fresh subprocess, so `cd` and env changes do not persist.
+- **Context management (billion-context / ACP)** — `acp_status` shows usage and
+  compressible ranges, `search_context` finds an old block, `decompress`
+  restores it, and `compress` folds consumed ranges. A summary is not a plan of
+  record: put durable work in memory.
+- **Ponytail (lite/full/ultra)** — the smallest complete change: reuse what
+  exists, add no speculative abstraction, and finish the callers, tests and
+  fixtures it needs. The level changes verbosity, not correctness. Load with
+  `/ponytail`.
+- **Skills (grilling, grill-me, find-skills, ...)** — for an ambiguous request
+  or an expensive-to-reverse plan, load the skill and question the user first;
+  skip for small, well-specified fixes. Use `find-skills` to find missing
+  capabilities.

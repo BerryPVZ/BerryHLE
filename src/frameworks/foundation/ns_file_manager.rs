@@ -906,6 +906,15 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 }
 
+- (bool)removeItemAtURL:(id)url // NSURL*
+                 error:(MutPtr<id>)out_error {
+    // Darwin removes the item behind the URL's path, so the path variant does
+    // the work, error reporting included:
+    // https://developer.apple.com/documentation/foundation/nsfilemanager/removeitem(at:)
+    let path: id = msg![env; url path];
+    msg![env; this removeItemAtPath:path error:out_error]
+}
+
 // MARK: - Moving and Copying Items
 
 - (bool)copyItemAtPath:(id)src

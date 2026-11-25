@@ -1,4 +1,4 @@
-# BerryHLE update
+# AppleJuiceHLE update
 
 ## Upstream integration
 
@@ -12,7 +12,7 @@ consolidated rather than running both implementations.
 ## Branding and landscape launcher
 
 The launcher, window titles, Android/iOS display metadata, macOS app bundle,
-Windows installer and release artifact names now use BerryHLE. Existing bundle
+Windows installer and release artifact names now use AppleJuiceHLE. Existing bundle
 identifiers, executable names, options, resources and sandbox paths stay stable
 so installations and saved data remain compatible. Upstream attribution remains.
 

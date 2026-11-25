@@ -37,7 +37,7 @@ use crate::objc::{
 use crate::Environment;
 use std::collections::{HashMap, HashSet};
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub(crate) struct CALayerHostObject {
     // CAMetalLayer storage (Metal presentation path). Kept on the layer host
     // object so CALayer subclasses keep working with the CoreAnimation
@@ -71,7 +71,7 @@ pub(crate) struct CALayerHostObject {
     pub(super) sublayer_transform: CATransform3D,
     pub(super) hidden: bool,
     pub(super) opaque: bool,
-    pub(super) masks_to_bounds: bool,
+
     pub(super) opacity: f32,
     pub(super) background_color: Option<CGColorHostObject>,
     /// CGImageRef for pattern backgrounds (set via colorWithPatternImage:)
@@ -101,6 +101,10 @@ pub(crate) struct CALayerHostObject {
     pub(super) anonymous_animations: HashSet<id>,
     pub(super) name: Option<String>,
     pub(super) mask: id,
+    /// `masksToBounds` — clip this layer and its subtree to `bounds`,
+    /// rounded by `cornerRadius`. Defaults to false.
+    /// <https://developer.apple.com/documentation/quartzcore/calayer/maskstobounds>
+    pub(super) masks_to_bounds: bool,
     /// `contentsGravity` — one of the `kCAGravity*` strings. Defaults to
     /// `"resize"` per Apple's CALayer documentation:
     /// <https://developer.apple.com/documentation/quartzcore/calayer/1410933-contentsgravity>
@@ -136,7 +140,161 @@ pub(crate) struct CALayerHostObject {
 }
 impl HostObject for CALayerHostObject {}
 
+pub(super) struct TransitionTree {
+    pub(super) root: id,
+    pub(super) sources: Vec<(id, id)>,
+}
+
+fn copy_transition_properties(env: &mut Environment, layer: id, cache: bool) -> CALayerHostObject {
+    let mut host = env.objc.borrow::<CALayerHostObject>(layer).clone();
+    host.sublayers.clear();
+    host.delegate = nil;
+    host.superlayer = nil;
+    host.drawable_properties = nil;
+    host.animations.clear();
+    host.anonymous_animations.clear();
+    host.needs_display = false;
+    host.gles_texture = None;
+    host.gles_texture_size = None;
+    host.gles_texture_is_up_to_date = false;
+    host.background_pattern_gles_texture = None;
+    retain(env, host.contents);
+    retain(env, host.mask);
+    retain(env, host.background_pattern_cg_image);
+    if let Some(context) = host.cg_context {
+        if cache && host.contents == nil {
+            host.contents =
+                crate::frameworks::core_graphics::cg_bitmap_context::CGBitmapContextCreateImage(
+                    env, context,
+                );
+            host.cg_context = None;
+        } else {
+            crate::frameworks::core_graphics::cg_context::CGContextRetain(env, context);
+        }
+    }
+    host
+}
+
+/// Keep the entire outgoing topology, including children removed from nested
+/// containers. Uncached snapshots refresh properties from their live sources.
+pub(super) fn copy_transition_tree(
+    env: &mut Environment,
+    layer: id,
+    cache: bool,
+) -> TransitionTree {
+    fn copy(env: &mut Environment, layer: id, cache: bool, sources: &mut Vec<(id, id)>) -> id {
+        let children = env
+            .objc
+            .borrow::<CALayerHostObject>(layer)
+            .sublayers
+            .clone();
+        let mut host = copy_transition_properties(env, layer, cache);
+        for child in children {
+            host.sublayers.push(copy(env, child, cache, sources));
+        }
+        let class = env.objc.get_known_class("CALayer", &mut env.mem);
+        let snapshot = env.objc.alloc_object(class, Box::new(host), &mut env.mem);
+        if !cache {
+            retain(env, layer);
+            sources.push((snapshot, layer));
+        }
+        snapshot
+    }
+    let mut sources = Vec::new();
+    let root = copy(env, layer, cache, &mut sources);
+    TransitionTree { root, sources }
+}
+
+pub(super) fn refresh_transition_tree(env: &mut Environment, sources: &[(id, id)]) {
+    for &(snapshot, source) in sources {
+        () = msg![env; source displayIfNeeded];
+        let mut fresh = copy_transition_properties(env, source, false);
+        let old = env.objc.borrow_mut::<CALayerHostObject>(snapshot);
+        fresh.sublayers = std::mem::take(&mut old.sublayers);
+        fresh.gles_texture = old.gles_texture.take();
+        fresh.gles_texture_size = old.gles_texture_size;
+        if old.background_pattern_cg_image == fresh.background_pattern_cg_image {
+            fresh.background_pattern_gles_texture = old.background_pattern_gles_texture.take();
+        } else if let (Some(texture), Some(window)) = (
+            old.background_pattern_gles_texture.take(),
+            env.window.as_mut(),
+        ) {
+            unsafe {
+                window
+                    .make_internal_gl_ctx_current()
+                    .DeleteTextures(1, &texture);
+            }
+        }
+        let old = std::mem::replace(env.objc.borrow_mut::<CALayerHostObject>(snapshot), fresh);
+        release(env, old.contents);
+        release(env, old.mask);
+        release(env, old.background_pattern_cg_image);
+        if let Some(context) = old.cg_context {
+            CGContextRelease(env, context);
+        }
+    }
+}
+
+pub(super) fn retain_transition_delegates(env: &mut Environment, layer: id) -> Vec<id> {
+    let host = env.objc.borrow::<CALayerHostObject>(layer);
+    let delegate = host.delegate;
+    let children = host.sublayers.clone();
+    let mut retained = Vec::new();
+    if delegate != nil {
+        retain(env, delegate);
+        retained.push(delegate);
+    }
+    for child in children {
+        retained.extend(retain_transition_delegates(env, child));
+    }
+    retained
+}
+
+fn release_transition_node(env: &mut Environment, layer: id) {
+    let host = env.objc.borrow_mut::<CALayerHostObject>(layer);
+    let children = std::mem::take(&mut host.sublayers);
+    let pattern = std::mem::replace(&mut host.background_pattern_cg_image, nil);
+    let textures: Vec<_> = [
+        host.gles_texture.take(),
+        host.background_pattern_gles_texture.take(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if let Some(window) = env.window.as_mut() {
+        let mut gles = window.make_internal_gl_ctx_current();
+        unsafe {
+            gles.DeleteTextures(textures.len() as _, textures.as_ptr());
+        }
+    }
+    release(env, pattern);
+    for child in children {
+        release_transition_node(env, child);
+    }
+    release(env, layer);
+}
+
+pub(super) fn release_transition_tree(env: &mut Environment, tree: TransitionTree) {
+    release_transition_node(env, tree.root);
+    for (_, source) in tree.sources {
+        release(env, source);
+    }
+}
+
 impl CALayerHostObject {
+    /// Snapshot render state without copying an entire EAGL readback frame.
+    /// Pixel uploads invalidate gles_texture_is_up_to_date; forced EAGL
+    /// presentations always draw, even when the geometry stays the same.
+    pub(super) fn composition_snapshot(&mut self) -> Self {
+        let pixels = self.presented_pixels.take();
+        let mut snapshot = self.clone();
+        if let Some((_, width, height)) = &pixels {
+            snapshot.presented_pixels = Some((Vec::new(), *width, *height));
+        }
+        self.presented_pixels = pixels;
+        snapshot
+    }
+
     pub(super) fn delegate_for_debug(&self) -> id {
         self.delegate
     }
@@ -152,6 +310,33 @@ impl CALayerHostObject {
     pub(crate) fn set_frame_metal(&mut self, frame: CGRect) {
         self.bounds = frame;
     }
+    /// A synthetic layer that fills `bounds` (rounded by `radius`) with
+    /// opaque white, used as the mask for `masksToBounds`.
+    pub(super) fn bounds_mask(bounds: CGRect, radius: CGFloat) -> Self {
+        Self {
+            bounds,
+            position: CGPoint {
+                x: bounds.origin.x + bounds.size.width * 0.5,
+                y: bounds.origin.y + bounds.size.height * 0.5,
+            },
+            anchor_point: CGPoint { x: 0.5, y: 0.5 },
+            transform_3d: CATransform3DIdentity,
+            // CGAffineTransform derives Default as all-zeroes, which would
+            // collapse the clip to a point, so spell the identity out.
+            affine_transform: CGAffineTransformIdentity,
+            opacity: 1.0,
+            corner_radius: radius,
+            background_color: Some(CGColorHostObject {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 1.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
     pub(super) fn superlayer_to_layer_transform(&self) -> CGAffineTransform {
         CGAffineTransform::make_translation(-self.bounds.origin.x, -self.bounds.origin.y)
             .concat(CGAffineTransform::make_translation(
@@ -462,7 +647,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         sublayer_transform: CATransform3DIdentity,
         hidden: false,
         opaque: false,
-        masks_to_bounds: false,
+
         opacity: 1.0,
         background_color: None,
         background_pattern_cg_image: nil,
@@ -484,6 +669,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         anonymous_animations: HashSet::new(),
         name: None,
         mask: nil,
+        masks_to_bounds: false,
         contents_gravity: kCAGravityResize.to_owned(),
         contents_rect: CGRect {
             origin: CGPoint { x: 0.0, y: 0.0 },
@@ -528,7 +714,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // and would keep the retain count above zero. In touchHLE the
     // retain/release accounting is occasionally off for games that mix
     // direct -release with cached `id` references (e.g. Chuzzle's alert-
-    // view init path which produced HyperHLE log #3 — the dealloc fires
+    // view init path which produced AppleJuiceHLE log #3 — the dealloc fires
     // while the layer is still installed in the alert view hierarchy).
     // Panicking the whole emulator over a reference-counting glitch in
     // the guest is worse than the alternative, so we instead detach
@@ -687,10 +873,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 }
 
-- (bool)masksToBounds { env.objc.borrow::<CALayerHostObject>(this).masks_to_bounds }
-- (())setMasksToBounds:(bool)clips {
-    env.objc.borrow_mut::<CALayerHostObject>(this).masks_to_bounds = clips;
-}
+
 
 - (CGRect)bounds { env.objc.borrow::<CALayerHostObject>(this).bounds }
 - (())setBounds:(CGRect)bounds {
@@ -753,7 +936,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 // `-[CALayer transform]` is a CATransform3D (4x4 matrix). touchHLE's
 // renderer is 2D, so a CATransform3D assigned here is collapsed to its 2x3
 // affine submatrix for the existing frame/bounds pipeline; the full 4x4
-// is kept for roundtrip reads. iMilk (HyperHLE appdb report #70) was the
+// is kept for roundtrip reads. iMilk (AppleJuiceHLE appdb report #70) was the
 // motivating case — without these the app crashed with "CALayer does not
 // respond to setTransform:".
 - (CATransform3D)transform { env.objc.borrow::<CALayerHostObject>(this).transform_3d }
@@ -1019,6 +1202,22 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<CALayerHostObject>(this).name = name_str;
 }
 
+    // <https://developer.apple.com/documentation/quartzcore/calayer/maskstobounds>
+ - (bool)masksToBounds { env.objc.borrow::<CALayerHostObject>(this).masks_to_bounds }
+ - (())setMasksToBounds:(bool)clip {
+    let was_clipping = env.objc.borrow_mut::<CALayerHostObject>(this).masks_to_bounds;
+    if was_clipping == clip { return; }
+    env.objc.borrow_mut::<CALayerHostObject>(this).masks_to_bounds = clip;
+    if clip {
+        // The contents were rasterised without a clip, so turn the layer
+        // back into a tile of its own and let it redraw under the new
+        // geometry. A scrolling ancestor treats a clipsToBounds layer
+        // differently from a plain one, so a layer that gains a clip late
+        // must not keep the tile it drew before.
+        () = msg![env; this setNeedsDisplay];
+    }
+}
+
 - (id)mask { env.objc.borrow::<CALayerHostObject>(this).mask }
 
 - (())setMask:(id)mask {
@@ -1111,6 +1310,19 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())addAnimation:(id)anim forKey:(id)key {
+    // A CATransition swaps the whole layer over time instead of
+    // interpolating a property, so the compositor has to drive it.
+    let is_transition = env
+        .objc
+        .get_host_object(anim)
+        .is_some_and(|object| {
+            object
+                .as_any()
+                .is::<super::ca_animation::CATransitionHostObject>()
+        });
+    if is_transition {
+        super::view_transition::begin_ca_transition(env, this, anim);
+    }
     if key == nil && env.objc.borrow::<CALayerHostObject>(this).anonymous_animations.contains(&anim) {
         return;
     }
@@ -1479,21 +1691,53 @@ pub fn set_use_implicit_animations(env: &mut Environment, layer: id, enable: boo
         .use_implicit_animations = enable;
 }
 
-
 /// Recover local bounds from the axis-aligned frame, then place the transformed
 /// anchor-relative rectangle at the requested origin. Inverting the frame's
 /// origin directly gives the wrong position for a rotated layer.
-fn geometry_for_frame(frame: CGRect, anchor: CGPoint, transform: CGAffineTransform) -> (CGSize, CGPoint) {
-    let (a, b, c, d) = (transform.a.abs(), transform.b.abs(), transform.c.abs(), transform.d.abs());
+fn geometry_for_frame(
+    frame: CGRect,
+    anchor: CGPoint,
+    transform: CGAffineTransform,
+) -> (CGSize, CGPoint) {
+    let (a, b, c, d) = (
+        transform.a.abs(),
+        transform.b.abs(),
+        transform.c.abs(),
+        transform.d.abs(),
+    );
     let determinant = a * d - b * c;
-    let fallback = transform.invert().apply_to_rect(CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: frame.size }).size;
+    let fallback = transform
+        .invert()
+        .apply_to_rect(CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: frame.size,
+        })
+        .size;
     let size = if determinant.abs() > 0.000001 {
         let width = (frame.size.width * d - frame.size.height * c) / determinant;
         let height = (frame.size.height * a - frame.size.width * b) / determinant;
-        if width.is_finite() && height.is_finite() && width >= 0.0 && height >= 0.0 { CGSize { width, height } } else { fallback }
-    } else { fallback };
-    let extent = transform.apply_to_rect(CGRect { origin: CGPoint { x: -size.width * anchor.x, y: -size.height * anchor.y }, size });
-    (size, CGPoint { x: frame.origin.x - extent.origin.x, y: frame.origin.y - extent.origin.y })
+        if width.is_finite() && height.is_finite() && width >= 0.0 && height >= 0.0 {
+            CGSize { width, height }
+        } else {
+            fallback
+        }
+    } else {
+        fallback
+    };
+    let extent = transform.apply_to_rect(CGRect {
+        origin: CGPoint {
+            x: -size.width * anchor.x,
+            y: -size.height * anchor.y,
+        },
+        size,
+    });
+    (
+        size,
+        CGPoint {
+            x: frame.origin.x - extent.origin.x,
+            y: frame.origin.y - extent.origin.y,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1501,12 +1745,29 @@ mod frame_geometry_tests {
     use super::*;
     #[test]
     fn rotated_frames_round_trip_with_noncentral_anchors() {
-        for angle in [0.0, std::f32::consts::FRAC_PI_2, -std::f32::consts::FRAC_PI_2, std::f32::consts::PI] {
+        for angle in [
+            0.0,
+            std::f32::consts::FRAC_PI_2,
+            -std::f32::consts::FRAC_PI_2,
+            std::f32::consts::PI,
+        ] {
             for anchor in [CGPoint { x: 0.5, y: 0.5 }, CGPoint { x: 0.0, y: 1.0 }] {
                 let transform = CGAffineTransform::make_rotation(angle);
-                let frame = CGRect { origin: CGPoint { x: 17.0, y: 23.0 }, size: CGSize { width: 480.0, height: 320.0 } };
+                let frame = CGRect {
+                    origin: CGPoint { x: 17.0, y: 23.0 },
+                    size: CGSize {
+                        width: 480.0,
+                        height: 320.0,
+                    },
+                };
                 let (size, position) = geometry_for_frame(frame, anchor, transform);
-                let actual = transform.apply_to_rect(CGRect { origin: CGPoint { x: -size.width * anchor.x, y: -size.height * anchor.y }, size });
+                let actual = transform.apply_to_rect(CGRect {
+                    origin: CGPoint {
+                        x: -size.width * anchor.x,
+                        y: -size.height * anchor.y,
+                    },
+                    size,
+                });
                 assert!((actual.origin.x + position.x - frame.origin.x).abs() < 0.001);
                 assert!((actual.origin.y + position.y - frame.origin.y).abs() < 0.001);
                 assert!((actual.size.width - frame.size.width).abs() < 0.001);
@@ -1555,5 +1816,22 @@ mod tests {
         assert_eq!(fit, rect(50.0, 0.0, 60.0, 60.0));
         let fill = contents_rect_for_gravity(kCAGravityResizeAspectFill, bounds, square);
         assert_eq!(fill, rect(0.0, -50.0, 160.0, 160.0));
+    }
+
+    /// `composite_layer_contents` translates by `bounds.origin` when it draws
+    /// a quad, and `superlayer_to_layer_transform` translates back by the
+    /// same amount, so the two cancel. The synthetic clip mask has to land
+    /// on exactly the layer's rectangle for both corners (including a
+    /// scrolled, non-zero origin) and must not double that offset.
+    #[test]
+    fn bounds_mask_sits_on_the_layer_rectangle() {
+        let bounds = rect(12.0, 34.0, 100.0, 40.0);
+        let mask = CALayerHostObject::bounds_mask(bounds, 8.0);
+        assert_eq!(mask.bounds, bounds);
+        assert_eq!(mask.corner_radius, 8.0);
+        assert_eq!(mask.opacity, 1.0);
+        // A scrolled layer carries a non-zero bounds origin; the mask must
+        // still map to an identity offset so it covers exactly that rect.
+        assert!(mask.superlayer_to_layer_transform().is_identity());
     }
 }

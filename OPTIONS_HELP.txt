@@ -5,16 +5,17 @@ View options:
         instead, except on Android which always uses full screen.
         The launcher opens fullscreen independently of this game setting.
 
-        The app's output will fit your screen without stretching, with black
-        borders in unused space to preserve its proportions. This is independent
+        The app's output will be scaled to fit your screen. This is independent
         of the internal resolution, so if the scale hack (see below) is not also
         in use, the result may be a bit blurry. An internal resolution larger
         than your screen's is possible, in which case the output is downscaled.
+        Whether it is stretched to fill the screen or centered with black bars
+        to preserve its aspect ratio follows the aspect-ratio setting below.
 
     --preserve-aspect-ratio / --no-preserve-aspect-ratio
         On desktop systems, choose whether resizing a window preserves the
-        emulated display's aspect ratio. By default, the display stretches to
-        fill the window. The app picker also exposes this in Graphics settings.
+        emulated display's aspect ratio. By default, proportions are preserved
+        with black borders. The app picker also exposes this in Graphics settings.
 
     --landscape-left
     --landscape-right
@@ -26,12 +27,12 @@ View options:
         --landscape-right means rotate 90° clockwise from portrait.
         --upside-down means rotate 180° from portrait (portrait upside-down).
 
-        Usually apps that require landscape mode will tell touchHLE about this,
+        Usually apps that require landscape mode will tell AppleJuiceHLE about this,
         and it will automatically rotate the window, but some apps neglect to
         do this. These options may be useful in that case.
 
     --scale-hack=...
-        Set a scaling factor for the window. touchHLE will attempt to run the
+        Set a scaling factor for the window. AppleJuiceHLE will attempt to run the
         app with an increased internal resolution. This is a hack and there's
         no guarantee it will work correctly for all apps.
 
@@ -41,7 +42,7 @@ View options:
         This is a natural number that is at least 1.
 
     --ui-scale=...
-        Set a resolution multiplier for the user interface that touchHLE
+        Set a resolution multiplier for the user interface that AppleJuiceHLE
         itself renders (the app picker and UIKit-based app UIs). Layer
         bitmaps (including text) are rasterized at N times their logical
         size and composited into a proportionally larger framebuffer, which
@@ -82,7 +83,7 @@ Device options:
 
         A model's hardware identifier (e.g. "iphone4,1") is also accepted.
 
-        Use "auto" to let touchHLE inspect your host display's resolution,
+        Use "auto" to let AppleJuiceHLE inspect your host display's resolution,
         expose that resolution directly to the app, and still pick the device
         family whose bundled resources are the closest match. The chosen family
         is still validated against what the app bundle supports, so an
@@ -100,7 +101,7 @@ Device options:
         auto-detection.
     --ios-version=MAJOR.MINOR[.PATCH]
         Select the iOS version reported to the game. The default is "Latest",
-        currently the highest compatibility version exposed by HyperHLE.
+        currently the highest compatibility version exposed by AppleJuiceHLE.
 
 
 Game controller options:
@@ -113,12 +114,15 @@ Game controller options:
 
         This is a floating-point (decimal) number between 0 and 1.
 
+    --no-controller-to-touch
+        Clear button, D-pad and stick-to-touch mappings.
+
     --disable-analog-stick-tilt-controls
     --enable-analog-stick-tilt-controls
         Disables mapping of analog stick input to simulated rotation of the
         device.
 
-        By default, if touchHLE detects a game controller, its analog sticks
+        By default, if AppleJuiceHLE detects a game controller, its analog sticks
         will be used for simulated accelerometer tilt controls. When this
         happens, the real accelerometer (e.g. on an Android phone), if present,
         is ignored. By setting this option, the real accelerometer can be used
@@ -126,7 +130,7 @@ Game controller options:
         that integrates both an accelerometer and a game controller, or if you
         do not want to disconnect your game controller.
 
-        Note that touchHLE does not currently support accelerometers contained
+        Note that AppleJuiceHLE does not currently support accelerometers contained
         within game controllers.
 
     --x-tilt-range=...
@@ -249,31 +253,60 @@ Game controller options:
         movements within a 10px radius will be completely ignored.
 
 Graphics driver options:
+    --renderer-mode=angle
+    --renderer-mode=native-gles
+        Select the host OpenGL ES renderer on Android. ANGLE is the default;
+        native-gles uses the device's native OpenGL ES driver. The app picker's
+        Renderer Mode setting overrides this for launches from the picker.
+
+    --gles-native
+    --no-gles-native
+        Legacy aliases for --renderer-mode=native-gles and
+        --renderer-mode=angle respectively.
+
     --gles2-compat
-        Enables touchHLE's experimental OpenGL ES 2.0 subset using the desktop
-        OpenGL 2.1 compatibility backend. This is an app-specific option and
-        is not a complete implementation of OpenGL ES 2.0.
+        Force the legacy desktop OpenGL 2.1 compatibility backend for guest
+        OpenGL ES 2.0 contexts instead of trying the native ES 2.0 backend.
+        Context creation fails if the backend is unavailable.
 
     --gles1=...
-        Force touchHLE to use a particular OpenGL ES 1.1 implementation.
+        Force AppleJuiceHLE to use a particular OpenGL ES 1.1 implementation.
         This may be useful for troubleshooting graphics driver issues.
 
-        --gles1=gles1_on_gl2 will use touchHLE's GLES1-on-GL2 layer.
+        --gles1=gles1_on_gl2 will use AppleJuiceHLE's GLES1-on-GL2 layer.
         --gles1=gles1_native will use native OpenGL ES 1.1.
 
-        When this option isn't in use, touchHLE will try each in order and use
+        When this option isn't in use, AppleJuiceHLE will try each in order and use
         the first one that works.
 
 Debugging options:
+    --zero-memory-on-alloc / --zero-memory-on-free
+        Zero heap bytes when allocating instead of when freeing them, for
+        legacy apps that read freed objects during cleanup. Freed allocations
+        are still reclaimed immediately and weak references are still cleared.
+        BackStab enables this through its bundled defaults. The second option
+        restores the usual zero-on-free policy for apps without older overrides.
+
+    --preserve-dyld-stubs / --no-preserve-dyld-stubs
+        Resolve lazy imports through their data pointers at startup, preserving
+        the executable's original linker instructions. This supports engines
+        that checksum their own code. Disabled unless an app default enables it.
+
+    --dladdr / --no-dladdr
+        Enable the real dladdr() implementation instead of the default
+        failure stub. Some legacy games hang during startup when dladdr()
+        resolves their images and symbols; enable this only for apps that
+        need it (for example Earn to Die).
+
     --disable-direct-memory-access
         Force dynarmic to always access guest memory via the memory access
         callbacks, rather than using the fast direct access path (page tables).
 
     --gdb=...
-        Starts touchHLE in debugging mode, listening for GDB remote serial
+        Starts AppleJuiceHLE in debugging mode, listening for GDB remote serial
         protocol connections over TCP on the specified host and port.
 
-        You can then connect to touchHLE with GDB and make use of its features
+        You can then connect to AppleJuiceHLE with GDB and make use of its features
         to inspect memory and registers, set up software breakpoints, and
         continue or step execution.
 
@@ -285,6 +318,10 @@ Debugging options:
         Disables the graphical error message box (outputs to terminal/log file
         only).
 
+    --error-popup
+        Enables graphical error message boxes. This has no effect in headless
+        mode.
+
     --dump=...
         Dumps some information about app/emulator to dump file. Check
         src/options.rs:parse_dump_options for the currently available options.
@@ -295,6 +332,13 @@ Debugging options:
         file will get truncated (deleted) if it already exists!
 
 Other options:
+    --audio-unit-render-thread / --no-audio-unit-render-thread
+        Drive Audio Unit render callbacks on a guest audio thread so they keep
+        running while the main event loop is blocked. Enabled for Minecraft:
+        Story Mode, whose synchronous FMOD bank load needs audio processing
+        during startup. Disabled globally while the legacy audio path remains
+        in use for other apps.
+
     --preferred-languages=...
         Specifies a list of preferred languages to be reported to the app.
 
@@ -310,30 +354,61 @@ Other options:
         language is supported, is determined entirely by the app.
 
     --headless
-        Run in headless mode. touchHLE will not create a window, so there will
+        Run in headless mode. AppleJuiceHLE will not create a window, so there will
         be no graphical output and no input. Only useful for command-line apps.
         Implies --no-error-popup.
 
+    --strict-symbols
+  Fail at startup if the app or one of its libraries references a symbol
+  that touchHLE could not resolve, instead of leaving it NULL. A missing
+  symbol usually shows up much later as a crash or a wrong result, so
+  this turns it into an immediate, named failure. The same list is
+  printed as a summary at normal verbosity either way.
+
+ --trace-cxx-exceptions
+ Log every C++ exception the app throws, with its type name and what(),
+ before the app's own C++ runtime unwinds it. Apps that bundle their own
+ C++ runtime normally bind the throw symbols straight to it, which makes
+ a throw invisible in the log; this routes them through the emulator
+ first, so a throw shows up even when the app catches it. Off by default
+ because it changes which definition of those symbols wins.
+
+  --skip-launch-image
+        Skip decoding and showing the game's launch image (splash screen) on
+        startup. Makes game launch noticeably faster, at the cost of not
+        seeing the app's launch artwork. Decoded images are cached in the
+        AppleJuiceHLE user data directory, so the first launch still pays the
+        decode cost but every later launch loads the raw pixels from disk.
+
+    --no-skip-launch-image
+        Show the launch image (the default).
+
     --args
         All arguments following this option will be passed to the app (via C's
-        argc/argv) rather than processed by touchHLE. This option can't be used
-        via touchHLE_options.txt or touchHLE_default_options.txt.
+        argc/argv) rather than processed by AppleJuiceHLE. This option can't be used
+        via HyperHLE_options.txt or touchHLE_default_options.txt.
 
     --overlay=on|off
-        Start the performance display enabled or hidden. It is enabled by
+        Start the performance display enabled or hidden. It is disabled by
         default. The mode defaults to Title bar on desktop and Minimal on
-        mobile. F1 toggles it for the current run; F2 moves the on-screen panel
-        clockwise through the four corners. TOUCHHLE_OVERLAY=0 starts hidden,
-        but F1 can still enable it.
+        mobile. The display is never drawn in the app picker or its settings;
+        its setting applies to games. F1 toggles it for the current game; F2
+        moves the on-screen panel clockwise through the four corners.
+        TOUCHHLE_OVERLAY=0 starts hidden, but F1 can still enable it.
 
     --overlay-mode=full|minimal|titlebar
         Show all counters and the frame-time graph, only FPS/CPU/GPU/time, or
         the minimal summary in the desktop window title bar. On Android/iOS,
         titlebar falls back to Minimal because the OS has no window title bar.
-        Metrics unavailable from the host remain N/A; MEM is process resident
-        memory. Q DIRECT and GLALLOC describe HyperHLE's GLES path, not Vulkan.
-        GC stays 0/0/0 because the Rust runtime has no garbage collector. Android
-        GPU load is read from vendor kernel counters when the app can access them.
+        Metrics unavailable from the host remain N/A; MEM is the emulator
+        process's resident memory, VMEM is the guest's own heap (what the
+        emulated app has allocated with malloc; while --memory-limit= is in
+        effect it reads used/limit), and BUF/IMG are the memory used by GL
+        buffers and textures. Q DIRECT and GLALLOC describe
+        AppleJuiceHLE's GLES path, not Vulkan. CPU is the process's usage of one
+        core, like top's %CPU, so a value above 100% means more than one core
+        is busy. Android GPU load is read from vendor kernel counters when the
+        app can access them.
 
     --overlay-corner=topleft|topright|bottomright|bottomleft
         Choose the saved corner for the on-screen panel. F2 changes the corner
@@ -346,7 +421,7 @@ Other options:
     --fps-limit=...
         Modify or disable the framerate (FPS) limit.
 
-        By default, touchHLE limits the framerate of an app to 60fps, because
+        By default, AppleJuiceHLE limits the framerate of an app to 60fps, because
         this is required for accurate emulation. Some apps can however run
         correctly at a higher framerate than normal.
 
@@ -356,6 +431,58 @@ Other options:
         Note that many apps have an internal timer that determines how often
         they present frames; increasing the limit will not increase their
         framerate, but may make it less consistent.
+
+    --memory-limit=...
+        Limit the RAM available to the emulated app's heap, in MiB ("RAM
+        Limiter" in the graphical settings screen). This is a whole number of
+        mebibytes such as 32, 64, 128, 256, 512, 1024 or 2048, or 'off' (the
+        default) to let the Device model decide: the heap is then capped at
+        half of the model's RAM, which is roughly where iOS would kill the app
+        for using too much. That matters because the guest has a 4 GiB address
+        space regardless of the model, so without a ceiling a runtime that
+        keeps growing its heap (Mono's Boehm GC does) can take all of it and
+        take the host device down with it.
+
+        Two clamps keep that rule usable at the edges: the ceiling is never
+        less than 256 MiB, since half the RAM of the oldest profiles would
+        leave only 64-128 MiB and can be too restrictive for some apps. For
+        128 MiB models this floor is higher than the model's reported RAM. The
+        ceiling is never more than 2 GiB because the app's segments and stacks
+        share the same 4 GiB address space. A ceiling is permission, not a
+        reservation: memory-reporting APIs still report the model's RAM, and
+        an app may choose how much of the permitted heap to allocate.
+
+        When the cap is reached, the app's allocations fail and return NULL,
+        exactly like malloc() on a real device that has run out of memory
+        (vm_allocate() reports KERN_NO_SPACE, mmap() reports MAP_FAILED). The
+        performance overlay shows the cap as VMEM used/limit. Refusals are
+        logged, but only a handful for the whole run, with one line saying the
+        rest are silenced, because apps tend to retry in a loop. Most apps
+        handle that badly (they may crash or log errors), so this is mainly a
+        way to reproduce low-memory behaviour and to keep the emulator inside a
+        tight host memory budget.
+
+        The graphical RAM Limiter offers Default, 32, 64, 128, 256 and 512 MB,
+        1 GB, 2 GB and Custom… at the bottom of the list. Custom opens a
+        keypad where the size is typed in mebibytes, so 10 means 10 MB and
+        3000 means about 3 GB (1 to 3072 MB).
+
+        Mach-O segments, thread stacks and other reserved memory are not part
+        of the heap and do not count against the cap, and the cap does not
+        change how much RAM the app thinks the device has: that still comes
+        from the Device model.
+
+    --quick-menu
+        Show a pause button in the top-left corner of the screen while an app
+        runs ("Quick menu" in the graphical settings screen's Emulation
+        section). It opens a menu with device orientation, performance display,
+        FPS limiter, RAM limiter and Cheat Engine, plus an "Exit emulator"
+        button that returns to the app picker. Tapping a row changes it in the
+        menu; the batch takes effect on "Resume" or when the pause button is
+        tapped again. These changes apply to the current game session only.
+
+    --no-quick-menu
+        Hide the quick menu button (the default).
 
     --force-composition
         Forces presentation of renderbuffer as if no fullscreen EAGL layer is
@@ -368,13 +495,45 @@ Other options:
         Disables forced composition, including when it was enabled by an
         app-specific options file.
 
+    --ios-es2-direct-present
+    --no-ios-es2-direct-present
+        On iOS, present an ES 2.0 drawable directly even when it is not the
+        fullscreen layer. This makes The Sims Medieval visible, but forces a
+        renderbuffer readback and upload every frame and can starve UIKit's
+        event loop. Off by default; the `--no-` form restores composition even
+        when an app profile enabled the direct path.
+
+    --landscape-uiscreen-bounds
+    --no-landscape-uiscreen-bounds
+        Report UIScreen bounds in the current landscape orientation instead of
+        iOS's portrait-native bounds. This is for apps that size their
+        renderbuffer directly from UIScreen.bounds without accounting for
+        orientation; it also changes the coordinate space used for touch
+        mapping. Off by default unless `TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS` is
+        set. The `--no-` form overrides both an app profile and the environment
+        setting for this app.
+
+    --present-rotate=0|90|180|270
+    --no-present-rotate
+        Replace orientation-derived EAGL presentation rotation with the fixed
+        clockwise angle. Use 0 when the guest already draws upright. Clearing
+        the override restores automatic rotation, including when an app profile
+        specified a fixed angle.
+
+    --ignore-gl-errors
+    --no-ignore-gl-errors
+        Make guest glGetError() report GL_NO_ERROR even when the host reports an
+        error. This can keep games running past harmless host-driver errors, but
+        hides real guest-visible GL failures and makes diagnosis harder. Off by
+        default; the `--no-` form overrides app-specific profiles.
+
     --present-mode=...
         How a frame that an app rendered into a fullscreen EAGL layer is put
         on the screen. One of:
 
         'auto' (default): present on the GPU (the renderbuffer is copied to a
         texture and drawn into the window). If the first frames come out
-        black while the renderbuffer clearly has content, HyperHLE assumes the
+        black while the renderbuffer clearly has content, AppleJuiceHLE assumes the
         host driver mishandles this path and switches to 'readback' for the
         rest of the session (a message is logged).
 
@@ -429,7 +588,7 @@ Other options:
         KERN_SUCCESS as if it had been signalled. 0 disables it (the default).
 
         This is a last-resort workaround for an app whose worker thread parks
-        on a Mach semaphore that never gets signalled under touchHLE's
+        on a Mach semaphore that never gets signalled under AppleJuiceHLE's
         cooperative scheduler, and whose wait loop re-checks its own state on
         wake (FMOD's worker threads in Minecraft: Story Mode).
 
@@ -442,23 +601,82 @@ Other options:
         Force EAGL initWithAPI: to create an OpenGL ES 2.0 context even when
         the app requested an OpenGL ES 1.1 context.
 
-        Some apps (e.g. Lego Ninjago Spinjitzu Scavenger Hunt) ask EAGL for an
-        ES 1.1 context but actually drive rendering with shader entry points
-        such as glUseProgram and glCreateShader. Without this flag, on real
-        ES drivers (e.g. Adreno / Mali on Android) those calls fall through
-        to the GLES 1.1-only stubs and the app renders an empty (black)
-        frame even though its render loop is alive.
+        This is for apps that request ES 1.1 but use shader entry points. It
+        fixes their black frames on backends where those calls otherwise reach
+        ES 1.1 stubs. Apps that use the ES 1.1 fixed-function pipeline can
+        break; leave the option off unless the app needs shaders.
 
-        Apps that legitimately rely on the ES 1.1 fixed-function pipeline
-        (glMatrixMode, glColor4f, glEnableClientState, glVertexPointer, …)
-        should NOT enable this flag, because real ES 2.0 has no fixed-function
-        pipeline.
+    --no-prefer-gles2-context
+        Keep the API requested by the app, even if an app-specific profile
+        enabled the ES 2.0 upgrade.
+
+    --force-gles1-context
+        Force EAGL initWithAPI: to create an ES 1.1 fixed-function context even
+        when the app requested ES 2.0 or 3.x. This can recover engines with a
+        broken shader path, but ES 2.0-only apps will fail to create a context.
+
+    --corrupt-game
+        Enable deterministic RTCV-style corruption of live guest heap bytes.
+        Reserved stack and null-page memory are excluded. Disabled by default.
+        Use --no-corrupt-game to turn it off.
+
+    --no-corrupt-game
+        Disable the RTCV-style game corruption engine.
+
+    --corrupt-start-delay=<seconds>
+        Active emulation time to wait after the app first runs before
+        corruption can start (default: 0). Must be finite and >= 0.
+
+    --corrupt-cooldown=<seconds>
+        Minimum active emulation time between corruption bursts (default:
+        0.5). Must be finite and >= 0. Does not enable --corrupt-game.
+
+    --corrupt-intensity=<count>
+        Bytes corrupted per burst (default: 8). Must be greater than zero.
+        Implies --corrupt-game.
+
+    --corrupt-seed=<number>
+        Seed for the deterministic corruption stream. Implies --corrupt-game.
+
+    --corrupt-max-offset=<bytes>
+        Limit corruption to the first <bytes> of each allocation. Implies
+        --corrupt-game.
+
+    --no-corrupt-max-offset
+        Remove the allocation-size limit for corruption. Does not enable
+        --corrupt-game.
+
+    --no-gles3 / --gles3
+        Pretend the GPU has no OpenGL ES 3.0 support, so apps that
+        feature-test for it fall back to their older GLES renderer. ON means
+        "no ES 3.0"; --gles3 restores the default (real driver support).
+        Also available as the "No GLES 3" switch in Settings > Graphics.
+
+        Apple only exposes ES 3.0 on A7-class GPUs and later (iPhone 5s,
+        iPad Air), so on every earlier device the call
+        [EAGLContext initWithAPI:kEAGLRenderingAPIOpenGLES3] returns nil and
+        glGetString(GL_VERSION) reports "OpenGL ES 2.0 …". With this option
+        AppleJuiceHLE answers the same way: an ES 3.0 context request fails, and
+        an ES 2.0 context keeps reporting a 2.0 version string. Engines that
+        ship both a 3.0 and an older renderer (Unity 4.x, many cocos2d-x and
+        Gameloft titles) then take the older path instead of the 3.0 one,
+        which is often what fixes black, garbled or missing frames.
+
+        The confirmed case is Unity: on its ES 3.0 path many titles render
+        their textures broken here (scrambled, stretched, or showing another
+        image entirely), and with this option they switch to ES 2.0 and draw
+        correctly. If a game looks fine on 3.0, leave the switch alone.
+
+        Apps that are ES 3.0-only keep failing to create a context, exactly
+        as they would on the real hardware this option emulates.
 
     --allow-network-access
     --no-network-access
-        Allow apps running in touchHLE to access the Internet and the local network,
-        including HTTP/HTTPS URL-loading APIs (NSURLConnection, NSURLSession, and NSData).
-        Disabled by default.
+        Allow apps running in AppleJuiceHLE to access the Internet and the local
+        network, including HTTP/HTTPS URL-loading APIs (NSURLConnection,
+        NSURLSession, NSData, and UIWebView). Disabled by default. On Android
+        this also opts emulated WebViews into legacy cleartext HTTP; requests
+        are blocked when disabled.
 
     --game-center-authenticated
     --no-game-center-authenticated
@@ -466,12 +684,6 @@ Other options:
         that require authentication at startup enter their offline content.
         Also available as "Local Game Center sign-in" in Settings > Emulation.
         Disabled by default. Online Game Center services remain unavailable.
-
-    --ignore-gl-errors
-        Ignore host OpenGL errors as queried by glGetError function.
-        This only affects return value of glGetError as seen by the guest
-        and nothing else. Should be enabled only for apps which really
-        need this behaviour.
 
     --trace-gl-errors
     --no-trace-gl-errors
@@ -482,31 +694,46 @@ Other options:
         (GL_INVALID_VALUE) noise can be traced back to a specific call.
         This option exists for debugging black-screen / wrong-render bugs
         and adds a glGetError() round-trip per call, so it should not be
-        left on for normal use. Diagnostic only: it is not exposed in the
-        app picker's Settings screen, so use the command line or an
-        app-specific options file. The picker no longer overrides it with
-        --no-trace-gl-errors.
+        left on for normal use. Diagnostic only. Also available as "Trace GL
+        errors" in the app picker's Settings screen.
 
-    --gles-native / --no-gles-native
-        Android only. OFF by default (and exposed as the "GLES Native" switch
-        in the app picker's Settings screen): use the bundled ANGLE libraries
-        for OpenGL ES. Pass --gles-native (or switch "GLES Native" on) to use
-        the vendor's native OpenGL ES driver (Adreno/Mali) instead. The
-        native driver behaves closest to real iPhone-era hardware and avoids
-        ANGLE's stricter shader validation, which breaks some apps (e.g.
-        Gangstar), but it differs a lot between devices, so it is opt-in.
+        It also saves a handful of presented frames as PNG files in
+        touchHLE_dumps/ beside the log (frames 0, 60, 300, 600, 1200 and
+        2400), on the RAM readback present path. That is the frame the
+        emulator produced, before the compositor draws it, so it can be
+        compared with a screenshot: a file that looks right while the screen
+        does not is a presentation bug, and a file that already looks wrong
+        is a rendering one.
+
+    --trace-gl-draws
+    --no-trace-gl-draws
+        Log the active texture unit's 2D binding and available shader,
+        blend/depth, and vertex-attribute state for the first 12 draws and
+        up to 128 larger draws of each kind per GL context. Use this when
+        `--trace-gl-errors` shows no errors but geometry still looks wrong.
+        Diagnostic only; logs can be large and the vertex-buffer mirror is
+        capped at 16 MiB. Also available as "Trace GL draws" in the app
+        picker's Settings screen.
+
+        ANGLE is never used on some known-bad configurations regardless of
+        this option: PowerVR BXM-8-256 (ANGLE startup crash) and Qualcomm
+        Adreno 610 (e.g. the Snapdragon 665-class parts). On those devices
+        the native OpenGL ES driver is used instead, and the "GLES Native"
+        switch is disabled in the picker.
 
     --fix-texture-min-filter
-        Workaround for apps that rely on the default ES 1.1
-        GL_TEXTURE_MIN_FILTER (GL_NEAREST_MIPMAP_LINEAR) being usable
-        on a level-0-only texture. With this flag, after every
-        glTexImage2D(level=0) call HyperHLE issues an extra
-        glTexParameteri(GL_TEXTURE_MIN_FILTER, GL_LINEAR) so that
-        strict drivers (notably Qualcomm Adreno's native ES 1.1 path)
-        don't sample the texture as opaque black just because no
-        mipmaps were uploaded. The guest's own glTexParameteri calls
-        still override this. Apps that legitimately upload mipmaps
-        should NOT enable this flag.
+        Workaround for apps that ask for a mipmap GL_TEXTURE_MIN_FILTER
+        but upload only level 0. Strict drivers (notably Qualcomm
+        Adreno's native ES 1.1 path) sample such a texture as opaque
+        black, and Core Graphics atlases minified with GL_NEAREST show
+        stray texels as white blocks.
+        On an ES 2.0 context AppleJuiceHLE now generates the missing mip
+        chain after each level-0 upload and keeps the guest's filter,
+        so minification works as the app intended. On an ES 1.1
+        context (which cannot mipmap non-power-of-two textures) it
+        forces GL_TEXTURE_MIN_FILTER=GL_LINEAR after each level-0
+        upload instead. Apps that upload real mipmaps themselves are
+        unaffected either way.
 
         On Android builds this workaround is enabled by default, because
         Android hosts essentially always run Mali / Adreno / similar
@@ -528,7 +755,8 @@ Other options:
         state. This can make a difference for apps that store data on the
         stack and branch based on the stack's content. There is normally
         no reason to enable this option. The number of bytes must be
-        chosen carefully on a per-app basis.
+        chosen carefully on a per-app basis. Use 0 to disable it, including
+        when an app-specific profile enabled it.
 
     --fix-movie-player
         Opt in to the newer MPMoviePlayerController lifecycle and fullscreen
@@ -538,7 +766,7 @@ Other options:
         automatically. Disabled globally; the bundled default-options file
         enables it for GTA III. To enable it manually for a run, pass this
         flag after the app path. For example:
-        touchHLE GTA3.app --fix-movie-player
+        AppleJuiceHLE GTA3.app --fix-movie-player
         Also available as "Movie player fix" in Settings > Graphics. The
         switch is off on a fresh install: leaving it alone keeps the
         app-specific defaults, flipping it (on or off) overrides them.
@@ -564,17 +792,18 @@ Other options:
         Use UIKit's actual autorotation state to decide whether EAGL needs an
         extra 180-degree presentation compensation. This fixes iPad games that
         should only get the compensation when UIKit really rotated their root
-        view. Without this flag, HyperHLE keeps the legacy iPad/non-portrait
+        view. Without this flag, AppleJuiceHLE keeps the legacy iPad/non-portrait
         heuristic. Disabled globally; the bundled default-options file enables
         this together with --fix-movie-player for GTA III. Also available as
-        "Rotation fix" in Settings > Graphics. The switch is off on a fresh
+        "Rotation fix" in Settings > Display. The switch is off on a fresh
         install: leaving it alone keeps the app-specific defaults, flipping
         it (on or off) overrides them.
 
     --no-rotation-fix
         Explicitly use the legacy iPad/non-portrait rotation heuristic, even if
         the fix was enabled by an app-specific options file. Turning the
-        "Rotation fix" Settings switch off passes this flag.
+        "Rotation fix" Settings switch (Settings > Display) off passes this
+        flag.
 
 
     --globbert-debug
@@ -594,3 +823,10 @@ Other options:
 
 Arrow keys simulate device tilt in apps using the accelerometer. Changes
 in tilt direction give a short pulse on Android or a rumble-capable controller.
+    --manual-ui-rotation
+        Keep the root view in portrait coordinates for engines that rotate
+        their OpenGL drawing and touch coordinates themselves. The emulated
+        device and display still use the requested orientation.
+
+    --no-manual-ui-rotation
+        Restore UIKit root-view autorotation (the default).

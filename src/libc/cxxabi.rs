@@ -298,7 +298,7 @@ const THROW_LOOP_LIMIT: u32 = 512;
 /// host stub, so forward the call to the guest implementation as a tail call.
 /// The guest function returns to our caller's LR, exactly as a real
 /// implementation of the intercepted function would.
-fn forward_to_guest_cxxabi(env: &mut Environment, name: &str, args: &[u32]) -> bool {
+pub(crate) fn forward_to_guest_cxxabi(env: &mut Environment, name: &str, args: &[u32]) -> bool {
     use std::sync::atomic::{AtomicU32, Ordering};
     static FORWARD_LOGS: AtomicU32 = AtomicU32::new(0);
 
@@ -436,6 +436,49 @@ fn __cxa_throw(env: &mut Environment, exception: MutVoidPtr, tinfo: ConstVoidPtr
             "Warning: Could not unwind past C++ exception ({}); no app-level \
              frame on the stack. Returning to caller; guest will likely abort.",
             type_name
+        );
+    }
+}
+
+/// Bypass shared by the Objective-C exception entry points: there is no
+/// unwinder, so return to the nearest app-level frame, and stop a guest that
+/// keeps re-throwing so the emulator cannot spin forever. `key` identifies the
+/// exception for the loop guard; `description` is only logged.
+pub(crate) fn unwind_past_objc_exception(
+    env: &mut Environment,
+    key: &str,
+    description: &str,
+) {
+    let count = note_exception_throw(key);
+
+    if count <= 3 || count.is_multiple_of(64) {
+        log!(
+            "Guest threw an Objective-C exception {} (consecutive #{}): \
+             touchHLE has no real unwinder, so we unwind to the nearest \
+             app-level frame via the frame-pointer chain.",
+            description,
+            count
+        );
+    }
+    if count >= THROW_LOOP_LIMIT {
+        log!(
+            "Warning: Exception loop detected: {} Objective-C exceptions in a \
+             row. touchHLE's bypass is returning into a caller that re-throws \
+             every iteration. Stopping the guest instead of spinning forever.",
+            count
+        );
+        env.request_guest_termination(crate::environment::GuestTermination::Signal(
+            crate::libc::signal::SIGABRT,
+        ));
+        return;
+    }
+
+    if unwind_to_app_frame(env).is_none() {
+        log!(
+            "Warning: Could not unwind past the Objective-C exception ({}); no \
+             app-level frame on the stack. Returning to caller; guest will \
+             likely abort.",
+            description
         );
     }
 }

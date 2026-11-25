@@ -6,7 +6,7 @@
 //! Threads.
 
 use crate::abi::GuestFunction;
-use crate::dyld::{export_c_func, FunctionExports};
+use crate::dyld::{export_c_func, export_c_func_aliased, FunctionExports};
 use crate::libc::errno::{set_errno, EDEADLK, EINVAL, ESRCH};
 use crate::mem::{
     self, ConstPtr, ConstVoidPtr, GuestUSize, MutPtr, MutVoidPtr, Ptr, SafeRead, PAGE_SIZE,
@@ -379,6 +379,19 @@ pub fn pthread_create_suspended_np(
     0
 }
 
+/// `int pthread_main_np(void)`
+///
+/// Non-zero when the calling thread is the process's main thread, zero
+/// otherwise. Newer SDKs use it to decide whether UI work may run inline
+/// instead of being queued with `performSelectorOnMainThread:`. That function
+/// was unimplemented, so the guest stayed on the generic "unimplemented
+/// function" return-0 stub and every thread looked like a worker thread;
+/// RetroArch's iOS build checks it while setting up its main-thread job queue.
+/// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/pthread_main_np.3.html
+fn pthread_main_np(env: &mut Environment) -> i32 {
+    (env.current_thread == 0) as i32
+}
+
 fn pthread_equal(env: &mut Environment, thread1: pthread_t, thread2: pthread_t) -> i32 {
     // POSIX: pthread_equal() shall return a non-zero value if t1 and t2 are
     // equal; otherwise, zero shall be returned. On Darwin pthread_t is an
@@ -657,7 +670,7 @@ fn thread_id_from_mach_thread_port(port: mach_port_t, thread_count: usize) -> Op
     (thread_id < thread_count).then_some(thread_id)
 }
 
-fn _pthread_from_mach_thread_np(env: &mut Environment, port: mach_port_t) -> pthread_t {
+fn pthread_from_mach_thread_np(env: &mut Environment, port: mach_port_t) -> pthread_t {
     let Some(thread_id) = thread_id_from_mach_thread_port(port, env.threads.len()) else {
         return Ptr::null();
     };
@@ -901,6 +914,22 @@ fn pthread_threadid_np(env: &mut Environment, _thread: pthread_t, thread_id: Mut
     0
 }
 
+/// `int pthread_atfork(void (*prepare)(void), void (*parent)(void),
+///                     void (*child)(void));`
+///
+/// AppleJuiceHLE never forks (see `unistd::fork`), so there is no fork event to
+/// dispatch these handlers to. Registering them successfully is still
+/// important: libstdc++ and several analytics SDKs call this during static
+/// initialisation and treat a failure as a fatal error.
+fn pthread_atfork(
+    _env: &mut Environment,
+    _prepare: GuestFunction,
+    _parent: GuestFunction,
+    _child: GuestFunction,
+) -> i32 {
+    0
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     // Attributes
     export_c_func!(pthread_attr_init(_)),
@@ -920,9 +949,11 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(pthread_create_suspended_np(_, _, _, _)),
     export_c_func!(pthread_equal(_, _)),
     export_c_func!(pthread_self()),
+    export_c_func!(pthread_main_np()),
     export_c_func!(pthread_exit(_)),
     export_c_func!(pthread_join(_, _)),
     export_c_func!(pthread_detach(_)),
+    export_c_func!(pthread_atfork(_, _, _)),
     // Cancellation
     export_c_func!(pthread_cancel(_)),
     export_c_func!(pthread_setcancelstate(_, _)),
@@ -933,7 +964,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(pthread_kill(_, _)),
     // Darwin extensions
     export_c_func!(pthread_mach_thread_np(_)),
-    export_c_func!(_pthread_from_mach_thread_np(_)),
+    export_c_func!(pthread_from_mach_thread_np(_)),
     export_c_func!(pthread_get_stackaddr_np(_)),
     export_c_func!(pthread_get_stacksize_np(_)),
     export_c_func!(pthread_getschedparam(_, _, _)),
@@ -964,6 +995,6 @@ mod tests {
     fn private_reverse_mapping_symbol_is_exported() {
         assert!(FUNCTIONS
             .iter()
-            .any(|(symbol, _)| *symbol == "__pthread_from_mach_thread_np"));
+            .any(|(symbol, _)| *symbol == "_pthread_from_mach_thread_np"));
     }
 }

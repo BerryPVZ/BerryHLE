@@ -14,6 +14,12 @@ pub(super) struct CAValueFunctionHostObject {
 pub(super) struct CASpringAnimationHostObject {
     // CAAnimation & CAMediaTiming
     duration: f64,
+    begin_time: f64,
+    repeat_count: f32,
+    repeat_duration: f64,
+    speed: f32,
+    time_offset: f64,
+    autoreverses: bool,
     fill_mode: id,
     delegate: id,
     removed_on_completion: bool,
@@ -45,6 +51,12 @@ pub(super) struct CASpringAnimationHostObject {
 pub(super) struct CAKeyframeAnimationHostObject {
     // CAAnimation & CAMediaTiming
     duration: f64,
+    begin_time: f64,
+    repeat_count: f32,
+    repeat_duration: f64,
+    speed: f32,
+    time_offset: f64,
+    autoreverses: bool,
     fill_mode: id,
     delegate: id,
     removed_on_completion: bool,
@@ -120,7 +132,9 @@ pub const CLASSES: crate::objc::ClassExports = objc_classes! {
     @implementation CASpringAnimation : NSObject
     + (id)alloc {
         let host_object = Box::new(CASpringAnimationHostObject {
-            duration: 0.0, fill_mode: nil, delegate: nil, removed_on_completion: true, timing_function: nil,
+            duration: 0.0, begin_time: 0.0, repeat_count: 0.0, repeat_duration: 0.0,
+            speed: 1.0, time_offset: 0.0, autoreverses: false,
+            fill_mode: nil, delegate: nil, removed_on_completion: true, timing_function: nil,
             key_path: nil, is_cumulative: false, is_additive: false, value_function: nil,
             from_value: nil, to_value: nil, by_value: nil,
             damping: 10.0, initial_velocity: 0.0, mass: 1.0, stiffness: 100.0,
@@ -166,6 +180,19 @@ pub const CLASSES: crate::objc::ClassExports = objc_classes! {
     // (Повторяем базовые геттеры/сеттеры для CASpringAnimation)
     - (f64)duration { env.objc.borrow::<CASpringAnimationHostObject>(this).duration }
     - (())setDuration:(f64)val { env.objc.borrow_mut::<CASpringAnimationHostObject>(this).duration = val; }
+
+    - (f64)beginTime { env.objc.borrow::<CASpringAnimationHostObject>(this).begin_time }
+    - (())setBeginTime:(f64)val { env.objc.borrow_mut::<CASpringAnimationHostObject>(this).begin_time = val; }
+    - (f32)repeatCount { env.objc.borrow::<CASpringAnimationHostObject>(this).repeat_count }
+    - (())setRepeatCount:(f32)val { env.objc.borrow_mut::<CASpringAnimationHostObject>(this).repeat_count = val; }
+    - (f64)repeatDuration { env.objc.borrow::<CASpringAnimationHostObject>(this).repeat_duration }
+    - (())setRepeatDuration:(f64)val { env.objc.borrow_mut::<CASpringAnimationHostObject>(this).repeat_duration = val; }
+    - (f32)speed { env.objc.borrow::<CASpringAnimationHostObject>(this).speed }
+    - (())setSpeed:(f32)val { env.objc.borrow_mut::<CASpringAnimationHostObject>(this).speed = val; }
+    - (f64)timeOffset { env.objc.borrow::<CASpringAnimationHostObject>(this).time_offset }
+    - (())setTimeOffset:(f64)val { env.objc.borrow_mut::<CASpringAnimationHostObject>(this).time_offset = val; }
+    - (bool)autoreverses { env.objc.borrow::<CASpringAnimationHostObject>(this).autoreverses }
+    - (())setAutoreverses:(bool)val { env.objc.borrow_mut::<CASpringAnimationHostObject>(this).autoreverses = val; }
 
     - (bool)isRemovedOnCompletion { env.objc.borrow::<CASpringAnimationHostObject>(this).removed_on_completion }
     - (())setRemovedOnCompletion:(bool)val { env.objc.borrow_mut::<CASpringAnimationHostObject>(this).removed_on_completion = val; }
@@ -271,7 +298,14 @@ pub const CLASSES: crate::objc::ClassExports = objc_classes! {
     @implementation CAKeyframeAnimation : NSObject
     + (id)alloc {
         let host_object = Box::new(CAKeyframeAnimationHostObject {
-            duration: 0.0, fill_mode: nil, delegate: nil, removed_on_completion: true, timing_function: nil,
+            duration: 0.0,
+            begin_time: 0.0,
+            repeat_count: 0.0,
+            repeat_duration: 0.0,
+            speed: 1.0,
+            time_offset: 0.0,
+            autoreverses: false,
+            fill_mode: nil, delegate: nil, removed_on_completion: true, timing_function: nil,
             key_path: nil, is_cumulative: false, is_additive: false, value_function: nil,
             values: nil, path: nil, key_times: nil, timing_functions: nil, calculation_mode: nil,
             rotation_mode: nil, tension_values: nil, continuity_values: nil, bias_values: nil,
@@ -323,6 +357,24 @@ pub const CLASSES: crate::objc::ClassExports = objc_classes! {
     // CAAnimation + CAPropertyAnimation
     - (f64)duration { env.objc.borrow::<CAKeyframeAnimationHostObject>(this).duration }
     - (())setDuration:(f64)val { env.objc.borrow_mut::<CAKeyframeAnimationHostObject>(this).duration = val; }
+
+    - (f64)beginTime { env.objc.borrow::<CAKeyframeAnimationHostObject>(this).begin_time }
+    - (())setBeginTime:(f64)val { env.objc.borrow_mut::<CAKeyframeAnimationHostObject>(this).begin_time = val; }
+
+    - (f32)repeatCount { env.objc.borrow::<CAKeyframeAnimationHostObject>(this).repeat_count }
+    - (())setRepeatCount:(f32)val { env.objc.borrow_mut::<CAKeyframeAnimationHostObject>(this).repeat_count = val; }
+
+    - (f64)repeatDuration { env.objc.borrow::<CAKeyframeAnimationHostObject>(this).repeat_duration }
+    - (())setRepeatDuration:(f64)val { env.objc.borrow_mut::<CAKeyframeAnimationHostObject>(this).repeat_duration = val; }
+
+    - (f32)speed { env.objc.borrow::<CAKeyframeAnimationHostObject>(this).speed }
+    - (())setSpeed:(f32)val { env.objc.borrow_mut::<CAKeyframeAnimationHostObject>(this).speed = val; }
+
+    - (f64)timeOffset { env.objc.borrow::<CAKeyframeAnimationHostObject>(this).time_offset }
+    - (())setTimeOffset:(f64)val { env.objc.borrow_mut::<CAKeyframeAnimationHostObject>(this).time_offset = val; }
+
+    - (bool)autoreverses { env.objc.borrow::<CAKeyframeAnimationHostObject>(this).autoreverses }
+    - (())setAutoreverses:(bool)val { env.objc.borrow_mut::<CAKeyframeAnimationHostObject>(this).autoreverses = val; }
 
     - (bool)isRemovedOnCompletion { env.objc.borrow::<CAKeyframeAnimationHostObject>(this).removed_on_completion }
     - (())setRemovedOnCompletion:(bool)val { env.objc.borrow_mut::<CAKeyframeAnimationHostObject>(this).removed_on_completion = val; }

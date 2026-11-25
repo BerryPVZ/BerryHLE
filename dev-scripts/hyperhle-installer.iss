@@ -1,4 +1,4 @@
-; Inno Setup script for the BerryHLE Windows installer.
+; Inno Setup script for the AppleJuiceHLE Windows installer.
 ;
 ; Packages the output of make-windows-bundle.sh plus the documentation that
 ; the release zip ships. Build it with Inno Setup 6.3 or newer, e.g.:
@@ -9,7 +9,7 @@
 ;
 ; touchHLE reads its resources from, and writes user data (sandbox, options,
 ; picker settings) to, the current directory. Shortcuts therefore start it
-; from the install directory, which has to be writable: by default BerryHLE is
+; from the install directory, which has to be writable: by default AppleJuiceHLE is
 ; installed per-user, and an all-users install grants users write access.
 
 #ifndef AppVersion
@@ -26,7 +26,7 @@
   #define OutputDir "."
 #endif
 
-#define AppName "BerryHLE"
+#define AppName "AppleJuiceHLE"
 #define AppExeName "touchHLE.exe"
 
 [Setup]
@@ -35,7 +35,7 @@ AppId={{240E0CC4-02F5-4DEB-A0F8-902393AEB609}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
-AppPublisher=BerryHLE contributors
+AppPublisher=AppleJuiceHLE contributors
 AppPublisherURL=https://github.com/BerryPVZ/BerryHLE
 AppSupportURL=https://github.com/BerryPVZ/BerryHLE/issues
 AppUpdatesURL=https://github.com/BerryPVZ/BerryHLE/releases
@@ -50,7 +50,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 SetupIconFile=..\res\icon.ico
 UninstallDisplayIcon={app}\{#AppExeName}
 OutputDir={#OutputDir}
-OutputBaseFilename=BerryHLE_Windows_x86_64_Setup
+OutputBaseFilename=AppleJuiceHLE_Windows_x86_64_Setup
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
@@ -72,8 +72,8 @@ Source: "{#BundleDir}\touchHLE_fonts\*"; DestDir: "{app}\touchHLE_fonts"; Flags:
 Source: "{#BundleDir}\touchHLE_default_options.txt"; DestDir: "{app}"; Flags: ignoreversion
 ; The user is expected to edit or replace these, so keep their copies.
 Source: "{#BundleDir}\touchHLE_wallpaper.png"; DestDir: "{app}"; Flags: onlyifdoesntexist uninsneveruninstall
-Source: "..\touchHLE_options.txt"; DestDir: "{app}"; Flags: onlyifdoesntexist uninsneveruninstall
-Source: "..\touchHLE_apps\README.txt"; DestDir: "{app}\touchHLE_apps"; Flags: ignoreversion
+Source: "..\HyperHLE_options.txt"; DestDir: "{app}"; DestName: "touchHLE_options.txt"; Flags: onlyifdoesntexist uninsneveruninstall
+Source: "..\HyperHLE_apps\README.txt"; DestDir: "{app}\touchHLE_apps"; Flags: ignoreversion
 Source: "..\OPTIONS_HELP.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion

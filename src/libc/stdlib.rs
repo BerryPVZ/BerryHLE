@@ -130,6 +130,9 @@ fn malloc(env: &mut Environment, mut size: GuestUSize) -> MutVoidPtr {
     let ptr = env.mem.alloc(size);
     if ptr.is_null() {
         set_errno(env, crate::libc::errno::ENOMEM);
+    } else {
+        let site = env.cpu.regs()[crate::cpu::Cpu::LR];
+        crate::mem::note_allocation_site(site, size);
     }
     ptr.cast()
 }
@@ -173,7 +176,12 @@ fn calloc(env: &mut Environment, count: GuestUSize, size: GuestUSize) -> MutVoid
         total = 1;
         // Защита от падения
     }
-    env.mem.calloc(total)
+    let ptr = env.mem.calloc(total);
+    if !ptr.is_null() {
+        let site = env.cpu.regs()[crate::cpu::Cpu::LR];
+        crate::mem::note_allocation_site(site, total);
+    }
+    ptr
 }
 
 fn NSZoneMalloc(env: &mut Environment, _zone: id, mut size: GuestUSize) -> MutVoidPtr {
@@ -407,6 +415,12 @@ where
     Ok(count - offset)
 }
 
+// atoll has strtoll's decimal conversion semantics.
+// https://github.com/apple-oss-distributions/Libc/blob/main/stdlib/FreeBSD/atoll.c
+fn atoll(env: &mut Environment, string: ConstPtr<u8>) -> i64 {
+    strtoll(env, string, Ptr::null(), 10)
+}
+
 fn atoi(env: &mut Environment, s: ConstPtr<u8>) -> i32 {
     set_errno(env, 0);
     let (res, _) = strtol_inner(env, s, 10).unwrap_or((0, 0));
@@ -487,6 +501,16 @@ fn arc4random_addrandom(env: &mut Environment) -> u32 {
 fn arc4random(env: &mut Environment) -> u32 {
     env.libc_state.stdlib.arc4random = prng(env.libc_state.stdlib.arc4random);
     env.libc_state.stdlib.arc4random
+}
+
+/// Fill all requested bytes from the host's cryptographic random source.
+/// https://github.com/apple-oss-distributions/Libc/blob/main/gen/FreeBSD/arc4random.c
+fn arc4random_buf(env: &mut Environment, buffer: MutVoidPtr, size: GuestUSize) {
+    if size == 0 {
+        return;
+    }
+    getrandom::getrandom(env.mem.bytes_at_mut(buffer.cast(), size))
+        .expect("Could not obtain cryptographic random bytes");
 }
 
 /// `arc4random_uniform(upper_bound)` — returns a uniformly distributed
@@ -945,7 +969,7 @@ fn quick_exit(env: &mut Environment, exit_code: i32) {
     immediate_exit(env, "quick_exit", exit_code);
 }
 
-fn abort(env: &mut Environment) {
+pub(crate) fn abort(env: &mut Environment) {
     let outcome = raise_signal(env, SIGABRT);
     if outcome == RaiseOutcome::DefaultActionPerformed
         || env.is_guest_termination_requested()
@@ -1152,15 +1176,25 @@ fn strtoll(env: &mut Environment, str: ConstPtr<u8>, endptr: MutPtr<MutPtr<u8>>,
         0, // starting offset
         base.try_into().unwrap(),
         u32::MAX, // max_length
-        |s, base| i64::from_str_radix(s, base).unwrap_or(i64::MAX),
-        |num| num.checked_mul(-1).unwrap_or(i64::MIN),
+        |s, base| i128::from_str_radix(s, base).unwrap_or(i128::MAX),
+        |num| -num,
     );
     match parse_res {
         Ok((res, len)) => {
             if !endptr.is_null() {
                 env.mem.write(endptr, (str + len).cast_mut());
             }
-            res
+            match i64::try_from(res) {
+                Ok(value) => value,
+                Err(_) => {
+                    set_errno(env, super::errno::ERANGE);
+                    if res < 0 {
+                        i64::MIN
+                    } else {
+                        i64::MAX
+                    }
+                }
+            }
         }
         Err(_) => {
             if !endptr.is_null() {
@@ -1263,7 +1297,7 @@ fn realpath(
     resolve_name
 }
 
-fn mbstowcs(
+pub fn mbstowcs(
     env: &mut Environment,
     pwcs: MutPtr<wchar_t>,
     s: ConstPtr<u8>,
@@ -1271,7 +1305,15 @@ fn mbstowcs(
 ) -> GuestUSize {
     set_errno(env, 0);
     let ctype_locale = setlocale(env, LC_CTYPE, Ptr::null());
-    assert_eq!(env.mem.read(ctype_locale), b'C');
+    let ctype_locale_byte = env.mem.read(ctype_locale);
+    if ctype_locale_byte != b'C' {
+        // We only model the C locale; treat anything else as C rather than
+        // aborting the emulator.
+        log!(
+            "Warning: mbstowcs(): unexpected LC_CTYPE locale {:?}; treating as C locale.",
+            ctype_locale_byte
+        );
+    }
     let size = strlen(env, s);
     let to_write = size.min(n);
     for i in 0..to_write {
@@ -1354,7 +1396,11 @@ fn system(env: &mut Environment, cmd: ConstPtr<u8>) -> i32 {
     }
 }
 
-pub(super) fn restore_dladdr_compatibility_metadata(env: &mut Environment, index: usize, base: u32) {
+pub(super) fn restore_dladdr_compatibility_metadata(
+    env: &mut Environment,
+    index: usize,
+    base: u32,
+) {
     // BTC's GameManager init inspects the in-memory encryption command.
     // A decrypted dump clears cryptid, unlike the running device image.
     // Restore that metadata for these apps only, after the loader has accepted
@@ -1954,9 +2000,19 @@ fn flistxattr(
 /// Compatibility with modern libpng's windowBits=0 (read window from header).
 /// The bundled zlib 1.2.3 predates that convention; a 32 KiB window can decode
 /// all valid zlib streams. Other window modes pass through unchanged.
-fn inflateInit2_(env: &mut Environment, stream: MutVoidPtr, bits: i32,
-                 version: ConstPtr<u8>, size: i32) -> i32 {
-    let Some(addr) = env.bins.iter().find_map(|b| b.external_symbols.get("_inflateInit2_")).copied() else {
+fn inflateInit2_(
+    env: &mut Environment,
+    stream: MutVoidPtr,
+    bits: i32,
+    version: ConstPtr<u8>,
+    size: i32,
+) -> i32 {
+    let Some(addr) = env
+        .bins
+        .iter()
+        .find_map(|b| b.external_symbols.get("_inflateInit2_"))
+        .copied()
+    else {
         return -2;
     };
     let bits = if bits == 0 { 15 } else { bits };
@@ -1965,13 +2021,28 @@ fn inflateInit2_(env: &mut Environment, stream: MutVoidPtr, bits: i32,
 
 /// Reinitialize the old guest decompressor rather than reporting a fake reset.
 fn inflateReset2(env: &mut Environment, stream: MutVoidPtr, bits: i32) -> i32 {
-    if stream.is_null() { return -2; }
-    let end = env.bins.iter().find_map(|b| b.external_symbols.get("_inflateEnd")).copied();
-    let version = env.bins.iter().find_map(|b| b.external_symbols.get("_zlibVersion")).copied();
-    let (Some(end), Some(version)) = (end, version) else { return -2; };
+    if stream.is_null() {
+        return -2;
+    }
+    let end = env
+        .bins
+        .iter()
+        .find_map(|b| b.external_symbols.get("_inflateEnd"))
+        .copied();
+    let version = env
+        .bins
+        .iter()
+        .find_map(|b| b.external_symbols.get("_zlibVersion"))
+        .copied();
+    let (Some(end), Some(version)) = (end, version) else {
+        return -2;
+    };
     let result: i32 = GuestFunction::from_addr_with_thumb_bit(end).call_from_host(env, (stream,));
-    if result != 0 { return result; }
-    let version: ConstPtr<u8> = GuestFunction::from_addr_with_thumb_bit(version).call_from_host(env, ());
+    if result != 0 {
+        return result;
+    }
+    let version: ConstPtr<u8> =
+        GuestFunction::from_addr_with_thumb_bit(version).call_from_host(env, ());
     inflateInit2_(env, stream, bits, version, 56)
 }
 
@@ -2006,6 +2077,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(valloc(_)),
     export_c_func!(atexit(_)),
     export_c_func!(atoi(_)),
+    export_c_func!(atoll(_)),
     export_c_func!(atol(_)),
     export_c_func!(atof(_)),
     export_c_func!(getloadavg(_, _)),
@@ -2017,6 +2089,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(srandom(_)),
     export_c_func!(random()),
     export_c_func!(arc4random()),
+    export_c_func!(arc4random_buf(_, _)),
     export_c_func!(arc4random_uniform(_)),
     export_c_func!(arc4random_stir()),
     export_c_func!(arc4random_addrandom()),

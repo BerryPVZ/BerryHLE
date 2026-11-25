@@ -5,11 +5,12 @@
  */
 
 #include "system_headers.h"
+
 #include <math.h>
 
 #include "GUITestsCALayerTestsView.h"
 
-#define NUM_TESTS 19
+#define NUM_TESTS 21
 
 @implementation GUITestsCALayerTestsView : UIView
 
@@ -491,5 +492,53 @@ CALayer *sublayer;
   [sublayer setPosition:position];
 
   [CATransaction commit];
+}
+
+- (void)test20 {
+  UIView *view = [self addViewWithFrame:CGRectMake(0, 0, 80, 80)
+                                  color:[UIColor redColor]];
+  CAKeyframeAnimation *animation =
+      [CAKeyframeAnimation animationWithKeyPath:@"opacity"];
+  animation.values = @[ @0.2, @1.0, @0.2 ];
+  animation.keyTimes = @[ @0.0, @0.5, @1.0 ];
+  animation.calculationMode = @"linear";
+  animation.duration = 1000.0;
+  animation.beginTime = CACurrentMediaTime() - 500.0;
+  [view.layer addAnimation:animation forKey:@"keyframe-opacity"];
+}
+
+- (void)test21 {
+  UIView *view = [self addViewWithFrame:CGRectMake(100, 100, 80, 80)
+                                  color:[UIColor redColor]];
+  CAKeyframeAnimation *position =
+      [CAKeyframeAnimation animationWithKeyPath:@"position"];
+  position.values = @[
+    [NSValue valueWithCGPoint:CGPointMake(140, 140)],
+    [NSValue valueWithCGPoint:CGPointMake(220, 140)],
+    [NSValue valueWithCGPoint:CGPointMake(140, 140)],
+  ];
+  position.keyTimes = @[ @0.0, @0.5, @1.0 ];
+  position.calculationMode = @"linear";
+  position.duration = 4.0;
+  position.repeatCount = HUGE_VALF;
+  [view.layer addAnimation:position forKey:@"keyframe-position"];
+
+  CAKeyframeAnimation *rotation =
+      [CAKeyframeAnimation animationWithKeyPath:@"transform.rotation.z"];
+  rotation.values = @[ @0.0, @3.14159265, @6.28318531 ];
+  rotation.keyTimes = @[ @0.0, @0.5, @1.0 ];
+  rotation.calculationMode = @"linear";
+  rotation.duration = 4.0;
+  rotation.repeatCount = HUGE_VALF;
+  [view.layer addAnimation:rotation forKey:@"keyframe-rotation"];
+
+  CAKeyframeAnimation *opacity =
+      [CAKeyframeAnimation animationWithKeyPath:@"opacity"];
+  opacity.values = @[ @1.0, @0.2, @1.0 ];
+  opacity.keyTimes = @[ @0.0, @0.5, @1.0 ];
+  opacity.calculationMode = @"discrete";
+  opacity.duration = 4.0;
+  opacity.repeatCount = HUGE_VALF;
+  [view.layer addAnimation:opacity forKey:@"keyframe-opacity"];
 }
 @end

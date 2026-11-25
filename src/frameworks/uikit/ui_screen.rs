@@ -27,7 +27,7 @@ pub const CONSTANTS: ConstantExports = &[
 
 #[derive(Default)]
 pub struct State {
-    main_screen: Option<id>,
+    pub(crate) main_screen: Option<id>,
     current_mode: Option<id>,
     /// `-brightness`, clamped to the documented 0.0-1.0 range.
     brightness: CGFloat,
@@ -40,12 +40,28 @@ pub struct State {
     overscan_compensation: NSInteger,
 }
 
+/// Screen metrics describe the emulated device even without an SDL window.
+/// This also lets TestApp instantiate UIKit views in headless mode.
+/// https://developer.apple.com/documentation/uikit/uiscreen/scale
+fn screen_scale(env: &crate::Environment) -> CGFloat {
+    if let Some(window) = &env.window {
+        window.screen_scale()
+    } else if env.options.host_screen_size.is_some() {
+        1.0
+    } else {
+        env.options
+            .device_family
+            .unwrap_or(crate::window::DeviceFamily::iPhone)
+            .scale_factor()
+    }
+}
+
 /// Return the main screen's physical pixel size for the current orientation.
 /// UIKit `bounds` is expressed in logical points; `nativeBounds` and
 /// `UIScreenMode.size` are expressed in pixels.
 fn screen_pixel_size_for_current_orientation(env: &mut crate::Environment) -> (CGFloat, CGFloat) {
     let (width, height) = screen_size_for_current_orientation(env);
-    let scale = env.window().screen_scale() as CGFloat;
+    let scale = screen_scale(env);
     (width as CGFloat * scale, height as CGFloat * scale)
 }
 
@@ -56,10 +72,22 @@ fn screen_size_for_current_orientation(env: &mut crate::Environment) -> (u32, u3
     // Previously this read `device_family().portrait_size()` directly, so a
     // custom/auto resolution was stored but never actually exposed to the guest
     // — the app kept rendering at the device's native point size.
-    let portrait_size = env.window().screen_size();
-    let orientation = env.window().current_rotation();
-    let landscape_bounds = env.options.landscape_uiscreen_bounds
-        || crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS");
+    let (portrait_size, orientation) = if let Some(window) = &env.window {
+        (window.screen_size(), window.current_rotation())
+    } else {
+        let size = env
+            .options
+            .host_screen_size
+            .map(|(width, height)| (width.min(height), width.max(height)))
+            .unwrap_or_else(|| {
+                env.options
+                    .device_family
+                    .unwrap_or(crate::window::DeviceFamily::iPhone)
+                    .portrait_size()
+            });
+        (size, env.options.initial_orientation)
+    };
+    let landscape_bounds = env.options.landscape_uiscreen_bounds_enabled();
     screen_size_for_orientation(portrait_size, orientation, landscape_bounds)
 }
 
@@ -192,9 +220,7 @@ impl HostObject for UICoordinateSpaceHostObject {}
 /// the emulator retains it.
 fn new_screen_coordinate_space(env: &mut crate::Environment, screen: id) -> id {
     let bounds: CGRect = msg![env; screen bounds];
-    let class = env
-        .objc
-        .get_known_class("UICoordinateSpace", &mut env.mem);
+    let class = env.objc.get_known_class("UICoordinateSpace", &mut env.mem);
     let object = env.objc.alloc_object(
         class,
         Box::new(UICoordinateSpaceHostObject { bounds }),
@@ -246,7 +272,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (CGRect)bounds {
     let (width, height) = screen_size_for_current_orientation(env);
-    if env.options.landscape_uiscreen_bounds || crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS") {
+    if env.options.landscape_uiscreen_bounds_enabled() {
         // `-bounds` is called hundreds of times during app launch, and every
         // `log!` costs a logcat round trip plus a write to the log file, so
         // report the override once instead of on every call.
@@ -274,7 +300,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // aliasing it to point-sized bounds made games render at half resolution
     // on Retina device profiles.
     let bounds: CGRect = msg![env; this bounds];
-    let scale = env.window().screen_scale() as CGFloat;
+    let scale = screen_scale(env);
     CGRect {
         origin: CGPoint { x: 0.0, y: 0.0 },
         size: CGSize {
@@ -294,10 +320,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     bounds
 }
 
-// MARK: - Scale
+// MARK: - Refresh rate
+
 
 - (CGFloat)scale {
-    env.window().screen_scale() as CGFloat
+    screen_scale(env)
 }
 
 - (CGFloat)nativeScale {
@@ -306,7 +333,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // size their framebuffers; reporting 1.0 while `scale` reports 2.0
     // made such games allocate a half-resolution framebuffer and draw
     // zoomed / cropped.
-    env.window().screen_scale() as CGFloat
+    screen_scale(env)
 }
 
 // MARK: - Brightness
@@ -352,7 +379,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // area and draw the scene into a corner of the screen on Retina
     // device profiles.
     let (width, height) = screen_size_for_current_orientation(env);
-    let scale = env.window().screen_scale() as CGFloat;
+    let scale = screen_scale(env);
     let size = CGSize {
         width:  width  as CGFloat * scale,
         height: height as CGFloat * scale,
@@ -472,6 +499,18 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)fixedCoordinateSpace {
     new_screen_coordinate_space(env, this)
 }
+
+// `- (NSInteger)maximumFramesPerSecond` (iOS 10.3+)
+//
+// The emulated hardware is a 60 Hz iPhone, which is what the device classes
+// this emulator models actually run at. Apps query it to pick their video
+// timing; the unimplemented selector answered 0 (via the "does not respond"
+// path), which reads as "unknown refresh rate".
+// https://developer.apple.com/documentation/uikit/uiscreen/3029468-maximumframespersecond
+- (NSInteger)maximumFramesPerSecond {
+    60
+}
+// MARK: - Scale
 
 @end
 

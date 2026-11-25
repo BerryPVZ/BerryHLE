@@ -63,7 +63,7 @@ impl State {
         //    libc-provided `FILE*` symbols without ever calling `fopen`, so
         //    there is no `FILEHostObject` until the first I/O call.
         // 2. App-provided `FILE*`s that got out of sync with our bookkeeping.
-        //    Several games (e.g. the path that triggered HyperHLE log #1,
+        //    Several games (e.g. the path that triggered AppleJuiceHLE log #1,
         //    Ankagua's resource loader) call `free()` directly on a `FILE*`,
         //    skipping `fclose()`. The allocator can then hand the same
         //    address back to a later `fopen()`, or — for read-only streams
@@ -185,6 +185,25 @@ fn fopen(env: &mut Environment, filename: ConstPtr<u8>, mode: ConstPtr<u8>) -> M
             res
         }
     }
+}
+
+/// `FILE *fdopen(int fd, const char *mode)` — wrap an already-open
+/// descriptor. The mode string is advisory here; the descriptor's flags were
+/// fixed at open() time.
+fn fdopen(env: &mut Environment, fd: posix_io::FileDescriptor, _mode: ConstPtr<u8>) -> MutPtr<FILE> {
+    if fd < 0 {
+        set_errno(env, EBADF);
+        return Ptr::null();
+    }
+    let res = env.mem.alloc_and_write(FILE { fd });
+    State::get_mut(env).file_streams.insert(
+        res,
+        FILEHostObject {
+            pushbacks: Vec::new(),
+            error: false,
+        },
+    );
+    res
 }
 
 fn freopen(
@@ -1077,6 +1096,7 @@ pub const CONSTANTS: ConstantExports = &[
 pub const FUNCTIONS: FunctionExports = &[
     // Standard C functions
     export_c_func!(fopen(_, _)),
+    export_c_func!(fdopen(_, _)),
     export_c_func!(freopen(_, _, _)),
     export_c_func!(fread(_, _, _, _)),
     export_c_func!(fgetc(_)),

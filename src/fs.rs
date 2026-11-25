@@ -231,7 +231,11 @@ impl GuestPath {
     /// purposes.
     /// For Foundation case, use `[NSString stringByAppendingPathComponent:]`
     pub fn join<P: AsRef<str>>(&self, path: P) -> GuestPathBuf {
-        GuestPathBuf::from(format!("{}/{}", self.as_str(), path.as_ref()))
+        // A path ending in "/" must not produce "//", which some apps treat as
+        // a different name.
+        let base = self.as_str();
+        let base = base.strip_suffix('/').unwrap_or(base);
+        GuestPathBuf::from(format!("{}/{}", base, path.as_ref()))
     }
 
     /// Splits the path into a parent path and a file name.
@@ -321,6 +325,19 @@ impl std::borrow::Borrow<GuestPath> for GuestPathBuf {
     fn borrow(&self) -> &GuestPath {
         self
     }
+}
+
+/// HFSX catalog entries use binary UTF-16 name order on case-sensitive
+/// volumes. Preserve that order instead of leaking HashMap's random order to
+/// readdir, NSDirectoryEnumerator and NSBundle resource arrays.
+/// https://developer.apple.com/library/archive/technotes/tn/tn1150.html#CatalogFile
+fn ordered_directory_entries(children: &HashMap<String, FsNode>) -> Vec<(&str, &FsNode)> {
+    let mut entries: Vec<_> = children
+        .iter()
+        .map(|(name, node)| (name.as_str(), node))
+        .collect();
+    entries.sort_unstable_by(|(left, _), (right, _)| left.encode_utf16().cmp(right.encode_utf16()));
+    entries
 }
 
 fn apply_path_component<'a>(components: &mut Vec<&'a str>, component: &'a str) {
@@ -593,7 +610,12 @@ impl PipeBuffer {
 
 #[derive(Debug)]
 pub enum GuestFile {
-    Directory,
+    /// An open directory, with the offset a seek would report.
+    ///
+    /// Darwin lets a guest seek a directory descriptor even though the entries
+    /// themselves are read with `opendir()`/`readdir()`, so the offset is kept
+    /// here instead of failing every seek.
+    Directory(u64),
     File(File),
     IpaBundleFile(IpaFile),
     ResourceFile(paths::ResourceFile),
@@ -614,6 +636,18 @@ pub enum GuestFile {
 }
 
 impl GuestFile {
+    /// Clone a regular host file for an mmap backing that must outlive its
+    /// guest descriptor.
+    pub fn try_clone_host_file(&self) -> std::io::Result<File> {
+        match self {
+            GuestFile::File(file) => file.try_clone(),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "mmap writeback requires a regular host file",
+            )),
+        }
+    }
+
     fn from_host_file(file: File) -> GuestFile {
         GuestFile::File(file)
     }
@@ -627,7 +661,7 @@ impl GuestFile {
     }
 
     fn from_directory() -> GuestFile {
-        GuestFile::Directory
+        GuestFile::Directory(0)
     }
 
     /// Construct a `/dev/random` / `/dev/urandom` character device.
@@ -639,11 +673,26 @@ impl GuestFile {
         match self {
             GuestFile::File(file) => file.sync_all(),
             GuestFile::IpaBundleFile(_) | GuestFile::ResourceFile(_) => Ok(()),
-            GuestFile::Directory => {
+            GuestFile::Directory(_) => {
                 log!("Warning: syncing directory as a guest file.");
                 Ok(())
             }
             // Syncing a character device is a no-op.
+            GuestFile::Random(_) | GuestFile::PipeRead(_) | GuestFile::PipeWrite(_) => Ok(()),
+            GuestFile::Socket => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Sync operation not supported on socket",
+            )),
+        }
+    }
+    pub fn sync_data(&self) -> std::io::Result<()> {
+        match self {
+            GuestFile::File(file) => file.sync_data(),
+            GuestFile::IpaBundleFile(_) | GuestFile::ResourceFile(_) => Ok(()),
+            GuestFile::Directory(_) => {
+                log!("Warning: syncing directory as a guest file.");
+                Ok(())
+            }
             GuestFile::Random(_) | GuestFile::PipeRead(_) | GuestFile::PipeWrite(_) => Ok(()),
             GuestFile::Socket => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -658,7 +707,7 @@ impl GuestFile {
                 std::io::ErrorKind::PermissionDenied,
                 "Attempt to resize a read-only file",
             )),
-            GuestFile::Directory => Err(std::io::Error::new(
+            GuestFile::Directory(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::IsADirectory,
                 "Attempt to resize a directory as a guest file",
             )),
@@ -719,7 +768,7 @@ impl GuestFile {
                     "Cannot duplicate a resource file descriptor",
                 ))
             }
-            GuestFile::Directory => Ok(GuestFile::Directory),
+            GuestFile::Directory(offset) => Ok(GuestFile::Directory(*offset)),
             // A fresh, independent random source is an acceptable duplicate:
             // both handles yield unrelated random bytes, just like the kernel
             // device.
@@ -787,7 +836,7 @@ impl Read for GuestFile {
                 std::io::ErrorKind::Unsupported,
                 "attempt to read from the write end of a pipe",
             )),
-            GuestFile::Directory => Err(std::io::Error::new(
+            GuestFile::Directory(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::IsADirectory,
                 "Attempt to read from a directory as a guest file",
             )),
@@ -829,7 +878,7 @@ impl Write for GuestFile {
                 pipe.bytes.extend(buf);
                 Ok(buf.len())
             }
-            GuestFile::Directory => Err(std::io::Error::new(
+            GuestFile::Directory(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::IsADirectory,
                 "Attempt to write to a directory as a guest file",
             )),
@@ -850,7 +899,7 @@ impl Write for GuestFile {
                 "Attempt to flush a read-only file",
             )),
             GuestFile::Random(_) | GuestFile::PipeRead(_) | GuestFile::PipeWrite(_) => Ok(()),
-            GuestFile::Directory => Err(std::io::Error::new(
+            GuestFile::Directory(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::IsADirectory,
                 "Attempt to flush a directory as a guest file",
             )),
@@ -868,17 +917,25 @@ impl Seek for GuestFile {
             GuestFile::File(file) => file.seek(pos),
             GuestFile::IpaBundleFile(file) => file.seek(pos),
             GuestFile::ResourceFile(file) => file.get().seek(pos),
-            GuestFile::Directory => {
-                // Note: directories as supposed to be seekable on iOS!
-                // https://stackoverflow.com/questions/65911066/what-does-lseek-mean-for-a-directory-file-descriptor
-                // As far as I can (f)tell, apps are really not using that
-                // properly and returning -1 on fseek/ftell is fine.
-                // TODO: implement seeking properly and return "cookie" values
-                log!("Warning: Seeking a directory as a guest file!");
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::IsADirectory,
-                    "Attempt to seek a directory as a guest file",
-                ))
+            GuestFile::Directory(offset) => {
+                // Darwin allows seeking a directory descriptor, and guests do
+                // rely on it: Overkill 2 seeks around a directory while it
+                // looks up its assets, and failing the seek made every lookup
+                // miss. Only the offset is tracked; the entries are read with
+                // `opendir()`/`readdir()`, not from this offset.
+                let new_offset = match pos {
+                    std::io::SeekFrom::Start(position) => position,
+                    std::io::SeekFrom::Current(delta) => {
+                        offset.saturating_add_signed(delta)
+                    }
+                    // `fstat()` reports a size of 0 for a directory, so there
+                    // is nowhere else for `SEEK_END` to start from.
+                    std::io::SeekFrom::End(delta) => {
+                        0u64.saturating_add_signed(delta)
+                    }
+                };
+                *offset = new_offset;
+                Ok(new_offset)
             }
             // Seeking a character device is a no-op: the offset is
             // meaningless, so report position 0 rather than failing.
@@ -1304,6 +1361,22 @@ impl Fs {
         self.lookup_node(path).is_some()
     }
 
+/// Resolve a writable sandbox file for a native library (such as SQLite).
+/// Create it through the VFS first so mount permissions and the directory
+/// inventory remain authoritative; never derive a host path from text.
+    pub fn writable_host_path(&mut self, path: &GuestPath) -> Result<PathBuf, ()> {
+        let mut options = GuestOpenOptions::new();
+        options.write().create();
+        drop(self.open_with_options(path, options)?);
+        match self.lookup_node(path) {
+            Some(FsNode::File {
+                location: FileLocation::Path(path),
+                writeable: true,
+            }) => Ok(path.clone()),
+            _ => Err(()),
+        }
+    }
+
     /// Resolve an existing guest path using the case-insensitive semantics of
     /// the iPhone OS application volume.
     ///
@@ -1516,7 +1589,9 @@ impl Fs {
         let Some(FsNode::Directory { children, .. }) = self.lookup_node(path.as_ref()) else {
             return Err(());
         };
-        Ok(children.keys().map(|name| name.as_str()))
+        Ok(ordered_directory_entries(children)
+            .into_iter()
+            .map(|(name, _)| name))
     }
 
     /// Similar to [Fs::enumerate], but also returns fs node type.
@@ -1527,15 +1602,17 @@ impl Fs {
         let Some(FsNode::Directory { children, .. }) = self.lookup_node(path.as_ref()) else {
             return Err(());
         };
-        Ok(children.iter().map(|(name, node)| {
-            (
-                name.as_str(),
-                match node {
-                    FsNode::File { .. } => FsNodeType::File,
-                    FsNode::Directory { .. } => FsNodeType::Directory,
-                },
-            )
-        }))
+        Ok(ordered_directory_entries(children)
+            .into_iter()
+            .map(|(name, node)| {
+                (
+                    name,
+                    match node {
+                        FsNode::File { .. } => FsNodeType::File,
+                        FsNode::Directory { .. } => FsNodeType::Directory,
+                    },
+                )
+            }))
     }
 
     /// Recursively list the paths of files/directories in a directory.
@@ -1550,14 +1627,14 @@ impl Fs {
 
         let mut paths = Vec::new();
         let mut component_stack: Vec<&str> = Vec::new();
-        let mut iterator_stack = vec![children.iter()];
+        let mut iterator_stack = vec![ordered_directory_entries(children).into_iter()];
         loop {
             let current_iterator = iterator_stack.last_mut().unwrap();
             if let Some((next_component, next_node)) = current_iterator.next() {
                 component_stack.push(next_component);
                 paths.push(GuestPathBuf::from(component_stack.join("/")));
                 if let FsNode::Directory { children, .. } = next_node {
-                    iterator_stack.push(children.iter());
+                    iterator_stack.push(ordered_directory_entries(children).into_iter());
                 } else {
                     component_stack.pop();
                 }
@@ -2215,6 +2292,76 @@ mod tests {
         assert!(fs
             .resolve_case_insensitive_path(GuestPath::new("Data/not-present"))
             .is_none());
+    }
+
+    // Darwin allows seeking a directory descriptor, and guests do rely on it:
+    // Overkill 2 seeks around a directory while it looks up its assets.
+    #[test]
+    fn seeking_a_directory_tracks_the_offset() {
+        use std::io::{Seek, SeekFrom};
+
+        let mut directory = GuestFile::from_directory();
+        assert_eq!(directory.seek(SeekFrom::Start(5)).unwrap(), 5);
+        assert_eq!(directory.seek(SeekFrom::Current(-2)).unwrap(), 3);
+        assert_eq!(directory.seek(SeekFrom::End(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn enumerators_preserve_catalog_name_order() {
+        let mut fs = case_test_fs();
+        let file = || FsNode::resource_file("unused".to_string());
+        fs.root = FsNode::dir().with_child(
+            "frames",
+            FsNode::dir()
+                .with_child("frame02.png", file())
+                .with_child("frame01.png", file())
+                .with_child("Frame00.png", file())
+                .with_child("\u{e000}", file())
+                .with_child("\u{10000}", file())
+                .with_child(
+                    "nested",
+                    FsNode::dir()
+                        .with_child("z.png", file())
+                        .with_child("a.png", file()),
+                ),
+        );
+        let expected = [
+            "Frame00.png",
+            "frame01.png",
+            "frame02.png",
+            "nested",
+            "\u{10000}",
+            "\u{e000}",
+        ];
+        assert_eq!(
+            fs.enumerate("/frames").unwrap().collect::<Vec<_>>(),
+            expected
+        );
+        let typed: Vec<_> = fs.enumerate_with_types("/frames").unwrap().collect();
+        assert_eq!(
+            typed.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            expected
+        );
+        assert!(matches!(typed[3].1, FsNodeType::Directory));
+        let recursive: Vec<String> = fs
+            .enumerate_recursive("/frames")
+            .unwrap()
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        assert_eq!(
+            recursive,
+            [
+                "Frame00.png",
+                "frame01.png",
+                "frame02.png",
+                "nested",
+                "nested/a.png",
+                "nested/z.png",
+                "\u{10000}",
+                "\u{e000}"
+            ]
+        );
     }
 
     #[test]

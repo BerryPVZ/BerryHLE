@@ -11,6 +11,8 @@
 //!
 //! - Apple's [iOS Manual Pages](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/) (contains what would be `man` pages if iOS had a command line)
 
+use crate::mem::MutPtr;
+
 pub mod aio;
 pub mod arpa;
 pub mod asl;
@@ -38,9 +40,9 @@ pub mod mach;
 pub mod mach_o;
 pub mod malloc;
 pub mod math;
-pub mod mmap;
 pub mod net;
 pub mod netdb;
+pub mod notify;
 pub mod posix_io;
 pub mod pthread;
 pub mod pwd;
@@ -56,6 +58,7 @@ pub mod string;
 pub mod sys;
 pub mod sysctl;
 pub mod time;
+pub mod tlv;
 pub mod unistd;
 pub mod uuid;
 pub mod wchar;
@@ -109,9 +112,11 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ifaddrs::FUNCTIONS,
         keymgr::FUNCTIONS,
         libkern::os_atomic::FUNCTIONS,
+        libkern::os_cache_control::FUNCTIONS,
         mach::arm::task::FUNCTIONS,
         mach::arm::thread_act::FUNCTIONS,
         mach::error::FUNCTIONS,
+        mach::exception::FUNCTIONS,
         libkern::task::FUNCTIONS,
         mach::host::FUNCTIONS,
         mach::init::FUNCTIONS,
@@ -124,9 +129,10 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         mach_o::FUNCTIONS,
         malloc::FUNCTIONS,
         math::FUNCTIONS,
-        mmap::FUNCTIONS,
+        sys::mman::FUNCTIONS,
         net::if_::FUNCTIONS,
         netdb::FUNCTIONS,
+        notify::FUNCTIONS,
         posix_io::FUNCTIONS,
         posix_io::stat::FUNCTIONS,
         posix_io::statvfs::FUNCTIONS,
@@ -157,6 +163,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         sys::wait::FUNCTIONS,
         sysctl::FUNCTIONS,
         time::FUNCTIONS,
+        tlv::FUNCTIONS,
         unistd::FUNCTIONS,
         uuid::FUNCTIONS,
         wchar::FUNCTIONS,
@@ -191,7 +198,9 @@ pub struct State {
     mach_vm: mach::vm_map::State,
     mach_ports: mach::mach_port::State,
     mach_error: mach::error::State,
-    mmap: mmap::State,
+    mmap: sys::mman::State,
+    /// Guest copy of the program name returned by `getprogname()`.
+    getprogname_buf: Option<MutPtr<u8>>,
 }
 
 impl State {

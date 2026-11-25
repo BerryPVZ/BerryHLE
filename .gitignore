@@ -1,10 +1,17 @@
 /target
 /vendor/boost
-/touchHLE_sandbox
+/HyperHLE_sandbox
 /DCIM
-/touchHLE_apps/*.ipa
-/touchHLE_apps/*.app
+/HyperHLE_apps/*.ipa
+/HyperHLE_apps/*.app
+HyperHLE_log.txt
+# User-supplied picker wallpaper; the shipped default is touchHLE_wallpaper.png.
+/HyperHLE_wallpaper.*
+# Legacy names: copied forward on first launch and never deleted.
+/touchHLE_sandbox
+/touchHLE_apps/
 touchHLE_log.txt
+/touchHLE_dumps
 
 # Xcode (integration testing app)
 
@@ -38,12 +45,31 @@ DUMP.txt
 
 # Local debug junk
 *.log
-touchHLE_apps/
+HyperHLE_apps/
 target/
 *.ipa
 touchHLE_pvrtc_cache/
+app_scan_cache.json
+image_cache/
 
 # iOS build (platform/ios)
 /dist
 xcuserdata/
 *.xcuserstate
+
+# Graphify artifacts
+/graphify-out/
+/.agents/agents
+/.agents
+/.opencode/agents
+/.opencode
+/.serena/memories
+/.serena
+/docs/superpowers
+/testing
+
+/AppleJuiceHLE_log.txt
+/touchHLE_apps/*.ipa
+/touchHLE_apps/*.app
+/touchHLE_sandbox/
+/touchHLE_sqlite/

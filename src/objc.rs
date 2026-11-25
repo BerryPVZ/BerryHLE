@@ -27,6 +27,7 @@ use crate::MutexId;
 
 mod btc_content;
 mod classes;
+pub(crate) mod exceptions;
 mod messages;
 mod methods;
 mod objects;
@@ -37,26 +38,41 @@ mod synchronization;
 pub(crate) mod type_encoding;
 mod weak;
 
+// The objc_msgSend recursion depth is a host thread-local that the thread
+// scheduler has to swap per guest thread: guest threads are coroutines sharing
+// one host thread. See `messages::DispatchDepth`.
+pub(crate) use messages::{set_dispatch_depth, take_dispatch_depth};
+
 pub use classes::{
-    __objc_deallocOnMainThreadHelper, class_addMethod, class_conformsToProtocol,
+    __objc_deallocOnMainThreadHelper, class_addIvar, class_addMethod,
+    class_addProtocol, class_conformsToProtocol,
     class_copyIvarList, class_copyMethodList, class_copyPropertyList, class_copyProtocolList,
+    class_createInstance,
     class_getClassMethod, class_getInstanceMethod, class_getInstanceSize,
-    class_getMethodImplementation, class_getMethodImplementation_stret, class_getName,
+    class_getIvarLayout, class_getMethodImplementation, class_getMethodImplementation_stret,
+    class_getName,
     class_getProperty, class_getSuperclass, class_isMetaClass, class_replaceMethod,
     class_respondsToSelector, class_setSuperclass, method_copyArgumentType, method_copyReturnType,
     method_exchangeImplementations, method_getArgumentType, method_getImplementation,
     method_getName, method_getNumberOfArguments, method_getReturnType, method_getTypeEncoding,
     method_setImplementation, objc_alloc, objc_allocWithZone, objc_allocateClassPair,
     objc_autorelease, objc_autoreleasePoolPop, objc_autoreleasePoolPush,
-    objc_autoreleaseReturnValue, objc_begin_catch, objc_classes, objc_copyClassList,
-    objc_copyClassNamesForImage, objc_copyImageNames, objc_disposeClassPair, objc_end_catch,
-    objc_exception_throw, objc_getClass, objc_getClassList, objc_getMetaClass, objc_getProtocol,
-    objc_getRequiredClass, objc_lookUpClass, objc_readClassPair, objc_registerClassPair,
+    objc_autoreleaseReturnValue, objc_classes, objc_constructInstance, objc_copyClassList,
+    objc_copyClassNamesForImage, objc_copyCppObjectAtomic, objc_copyImageNames,
+    objc_disposeClassPair, objc_getClass, objc_getClassList,
+    objc_getMetaClass, objc_getProtocol,
+    objc_getRequiredClass, objc_initializeClassPair, objc_lookUpClass, objc_readClassPair,
+    objc_registerClassPair, objc_terminate,
     objc_release, objc_retain, objc_retainAutorelease, objc_retainAutoreleaseReturnValue,
     objc_retainAutoreleasedReturnValue, objc_retainBlock, objc_storeStrong,
     objc_unsafeClaimAutoreleasedReturnValue, object_getClass, object_getClassName,
-    object_getIndexedIvars, protocol_conformsToProtocol, protocol_getMethodDescription,
-    protocol_getName, swift_getInitializedObjCClass, Class, ClassExports, ClassTemplate,
+    object_getIndexedIvars, protocol_conformsToProtocol, protocol_copyMethodDescriptionList,
+    protocol_copyProtocolList, protocol_getMethodDescription, protocol_getName,
+    swift_getInitializedObjCClass, Class, ClassExports, ClassTemplate,
+};
+pub use exceptions::{
+    __objc_personality_v0, objc_begin_catch, objc_end_catch, objc_exception_rethrow,
+    objc_exception_throw,
 };
 pub use messages::{
     autorelease, msg, msg_class, msg_send, msg_send_no_initialize, msg_send_no_type_checking,
@@ -66,17 +82,22 @@ pub use methods::{HostIMP, IMP};
 pub use objects::{
     id, impl_HostObject_with_superclass, nil, AnyHostObject, HostObject, TrivialHostObject,
 };
-pub use properties::{class_getInstanceVariable, object_getIvar, object_setIvar, todo_objc_setter};
+pub use properties::{
+    class_addProperty, class_getInstanceVariable, ivar_getName, ivar_getOffset,
+    object_getInstanceVariable, object_getIvar, object_setInstanceVariable, object_setIvar,
+    property_copyAttributeList, todo_objc_setter,
+};
 pub use selectors::{selector, SEL};
 
-use crate::objc::classes::___objc_personality_v0;
-use crate::objc::classes::imp_implementationWithBlock;
+use crate::objc::classes::{
+    imp_getBlock, imp_implementationWithBlock, imp_removeBlock, object_setClass,
+};
 use crate::objc::classes::{objc_msgForward, objc_msgForward_stret};
 use crate::Environment;
 use classes::{ClassHostObject, FakeClass, UnimplementedClass};
 use messages::{
-    objc_enumerationMutation, objc_msgSendSuper2, objc_msgSendSuper2_stret, objc_msgSend_stret,
-    MsgSendSignature, MsgSendSuperSignature,
+    objc_enumerationMutation, objc_msgSendSuper, objc_msgSendSuper2, objc_msgSendSuper2_stret,
+    objc_msgSendSuper_stret, objc_msgSend_stret, MsgSendSignature, MsgSendSuperSignature,
 };
 use methods::method_list_t;
 use objects::{objc_object, HostObjectEntry};
@@ -158,6 +179,12 @@ pub struct ObjC {
     /// <https://developer.apple.com/documentation/objectivec/nsobject/1418639-initialize>
     pub(super) initialized_classes: FxHashSet<Class>,
 
+    /// Classes whose `+initialize` is running on some thread right now, with
+    /// the mutex/condvar other threads wait on. Apple's runtime serialises
+    /// `+initialize` per class: a second thread sending a message to the class
+    /// blocks until the first thread's `+initialize` returns.
+    pub(super) initializer_threads: FxHashMap<Class, messages::ThreadInitializer>,
+
     /// ARC weak-reference side table.
     ///
     /// `objc_storeWeak(location, value)` registers `location` (a guest
@@ -218,6 +245,8 @@ pub struct ObjC {
     /// `method_getImplementation(m) == method_getImplementation(m)` holds,
     /// matching Apple's behaviour.
     pub(super) host_imp_tokens: FxHashMap<usize, crate::mem::MutVoidPtr>,
+    pub(super) block_imps: FxHashMap<u32, crate::mem::ConstVoidPtr>,
+    exceptions: exceptions::State,
 }
 
 impl ObjC {
@@ -232,11 +261,14 @@ impl ObjC {
             property_locks: FxHashMap::default(),
             message_type_info: None,
             initialized_classes: FxHashSet::default(),
+            initializer_threads: FxHashMap::default(),
             weak_refs: FxHashMap::default(),
             associated_objects: FxHashMap::default(),
             method_handles: FxHashMap::default(),
             imp_tokens: FxHashMap::default(),
             host_imp_tokens: FxHashMap::default(),
+            block_imps: FxHashMap::default(),
+            exceptions: Default::default(),
         }
     }
 
@@ -375,8 +407,42 @@ const CONSTANTS: ConstantExports = &[
     // and avoids a linker error for the integration tests.
     ("__objc_empty_vtable", HostConstant::NullPtr),
     ("__objc_empty_cache", HostConstant::NullPtr),
-    ("_OBJC_EHTYPE_$_NSException", HostConstant::NullPtr),
-    ("_OBJC_EHTYPE_id", HostConstant::NullPtr),
+    (
+        "_OBJC_EHTYPE_$_NSException",
+        HostConstant::Custom(|env| {
+            exceptions::link_symbol(
+                &mut env.dyld,
+                &mut env.objc,
+                &mut env.mem,
+                "_OBJC_EHTYPE_$_NSException",
+            )
+            .unwrap()
+        }),
+    ),
+    (
+        "_OBJC_EHTYPE_id",
+        HostConstant::Custom(|env| {
+            exceptions::link_symbol(
+                &mut env.dyld,
+                &mut env.objc,
+                &mut env.mem,
+                "_OBJC_EHTYPE_id",
+            )
+            .unwrap()
+        }),
+    ),
+    (
+        "_objc_ehtype_vtable",
+        HostConstant::Custom(|env| {
+            exceptions::link_symbol(
+                &mut env.dyld,
+                &mut env.objc,
+                &mut env.mem,
+                "_objc_ehtype_vtable",
+            )
+            .unwrap()
+        }),
+    ),
     // `NSObject`'s only ivar (`isa`) lives at offset 0 in the object layout
     // on 32-bit iOS, so resolving the ivar-offset symbol to a 4-byte zero
     // gives any binary that does `obj + _OBJC_IVAR_$_NSObject.isa` the
@@ -391,6 +457,8 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(objc_msgSend_stret(_, _, _)),
     export_c_func!(objc_msgSendSuper2_stret(_, _, _)),
     export_c_func!(objc_msgSendSuper2(_, _)),
+    export_c_func!(objc_msgSendSuper(_, _)),
+    export_c_func!(objc_msgSendSuper_stret(_, _, _)),
     export_c_func!(objc_getProperty(_, _, _, _)),
     export_c_func!(objc_setProperty(_, _, _, _, _, _)),
     export_c_func!(objc_setProperty_nonatomic_copy(_, _, _, _)),
@@ -399,14 +467,16 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(objc_copyStruct(_, _, _, _, _)),
     export_c_func!(objc_sync_enter(_)),
     export_c_func!(objc_sync_exit(_)),
+    export_c_func!(objc_enumerationMutation(_)),
     export_c_func!(sel_registerName(_)),
     export_c_func!(sel_getUid(_)),
     export_c_func!(sel_getName(_)),
     export_c_func!(sel_isEqual(_, _)),
     export_c_func!(objc_getClass(_)),
-    export_c_func!(objc_getMetaClass(_, _)),
+    export_c_func!(objc_getMetaClass(_)),
     export_c_func!(object_getClassName(_)),
     export_c_func!(object_getClass(_)),
+    export_c_func!(object_setClass(_, _)),
     export_c_func!(objc_retainAutoreleasedReturnValue(_)),
     export_c_func!(objc_unsafeClaimAutoreleasedReturnValue(_)),
     export_c_func!(objc_autoreleaseReturnValue(_)),
@@ -421,21 +491,39 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(objc_autorelease(_)),
     export_c_func!(objc_retainBlock(_)),
     export_c_func!(imp_implementationWithBlock(_)),
+    export_c_func!(imp_getBlock(_)),
+    export_c_func!(imp_removeBlock(_)),
     export_c_func!(objc_release(_)),
     export_c_func!(objc_setProperty_nonatomic(_, _, _, _)),
     export_c_func!(objc_exception_throw(_)),
+    export_c_func!(objc_exception_rethrow()),
+    export_c_func!(objc_terminate()),
     export_c_func!(objc_begin_catch(_)),
-    export_c_func!(objc_end_catch(_)),
+    export_c_func!(objc_end_catch()),
     export_c_func!(class_getSuperclass(_)),
-    export_c_func!(class_getInstanceSize(_, _)),
+    export_c_func!(class_getInstanceSize(_)),
+    export_c_func!(class_createInstance(_, _)),
     export_c_func!(class_getInstanceVariable(_, _)),
+    export_c_func!(ivar_getOffset(_)),
+    export_c_func!(ivar_getName(_)),
     export_c_func!(object_getIvar(_, _)),
+    export_c_func!(object_getInstanceVariable(_, _, _)),
+    export_c_func!(object_setInstanceVariable(_, _, _)),
     export_c_func!(object_setIvar(_, _, _)),
     export_c_func!(class_isMetaClass(_)),
     export_c_func!(class_getInstanceMethod(_, _)),
     export_c_func!(class_getClassMethod(_, _)),
     export_c_func!(class_respondsToSelector(_, _)),
     export_c_func!(class_addMethod(_, _, _, _)),
+    export_c_func!(class_addProtocol(_, _)),
+    export_c_func!(class_addProperty(_, _, _, _)),
+    export_c_func!(class_getIvarLayout(_)),
+    export_c_func!(property_copyAttributeList(_, _)),
+    export_c_func!(protocol_copyMethodDescriptionList(_, _, _, _)),
+    export_c_func!(protocol_copyProtocolList(_, _)),
+    export_c_func!(objc_constructInstance(_, _)),
+    export_c_func!(objc_initializeClassPair(_, _, _, _)),
+    export_c_func!(class_addIvar(_, _, _, _, _)),
     export_c_func!(class_getProperty(_, _)),
     export_c_func!(property_getName(_)),
     export_c_func!(property_getAttributes(_)),
@@ -458,7 +546,7 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(class_getMethodImplementation(_, _)),
     export_c_func!(class_getMethodImplementation_stret(_, _)),
     export_c_func!(objc_storeStrong(_, _)),
-    export_c_func!(___objc_personality_v0(_, _, _, _, _)),
+    export_c_func!(__objc_personality_v0(_, _, _, _, _)),
     export_c_func_aliased!("_objc_msgForward", objc_msgForward(_, _)),
     export_c_func_aliased!("_objc_msgForward_stret", objc_msgForward_stret(_, _, _)),
     // Additional ObjC runtime helpers needed by iOS 5/6 binaries.
@@ -466,6 +554,7 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(objc_lookUpClass(_)),
     export_c_func!(objc_getRequiredClass(_)),
     export_c_func!(objc_allocateClassPair(_, _, _)),
+    export_c_func!(objc_copyCppObjectAtomic(_, _, _)),
     export_c_func!(objc_readClassPair(_, _)),
     export_c_func!(objc_registerClassPair(_)),
     export_c_func!(objc_disposeClassPair(_)),

@@ -185,7 +185,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     let this = init_common(env, this);
 
     let key_ns_string = get_static_str(env, "UISwitchEnabled");
-    let enabled: bool = msg![env; coder decodeBoolForKey:key_ns_string];
+    // Nibs can omit properties whose values match UIKit's defaults.
+    // https://developer.apple.com/documentation/uikit/uicontrol/isenabled
+    let enabled: bool = if msg![env; coder containsValueForKey:key_ns_string] {
+        msg![env; coder decodeBoolForKey:key_ns_string]
+    } else {
+        true
+    };
 
     let key_ns_string = get_static_str(env, "UISwitchOn");
     let is_on: bool = msg![env; coder decodeBoolForKey:key_ns_string];
@@ -287,7 +293,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     let UISwitchHostObject {
-        superclass: _,
+        superclass,
         is_on: _,
         back,
         thumb,
@@ -299,6 +305,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, thumb);
     release(env, label_on);
     release(env, label_off);
+    // Preserve superclass ownership until its own deallocator runs.
+    env.objc.borrow_mut::<UISwitchHostObject>(this).superclass = superclass;
     msg_super![env; this dealloc]
 }
 

@@ -1383,7 +1383,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         // This follows the same total ordering as Foundation's
         // CFNumberCompare (CoreFoundation `CFNumber.c`): NaN compares equal
         // to NaN; a lone NaN is greater than a negative value and less than a
-        // positive value; and signed zero is respected (-0.0 < +0.0).
+        // positive value; and signed zero compares equal (+0.0 == -0.0).
         _ => {
             let d1 = num.as_double();
             let d2 = other_num.as_double();
@@ -1397,10 +1397,6 @@ pub const CLASSES: ClassExports = objc_classes! {
                 if s2 < 0.0 { Ordering::Greater } else { Ordering::Less }
             } else if d2.is_nan() {
                 if s1 < 0.0 { Ordering::Less } else { Ordering::Greater }
-            } else if s1 < s2 {
-                Ordering::Less
-            } else if s2 < s1 {
-                Ordering::Greater
             } else if d1 < d2 {
                 Ordering::Less
             } else if d2 < d1 {

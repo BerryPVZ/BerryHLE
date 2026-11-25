@@ -362,11 +362,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 @implementation AVAudioSession: NSObject
 
 + (id)sharedInstance {
-    // ИСПРАВЛЕНО: Теперь объект действительно работает как синглтон и сохраняет
-    // свое состояние
+    // The guest object is a real singleton and keeps its state.
     if let Some(instance) = env.framework_state.avfoundation.av_audio_session.shared_instance {
         return instance;
     }
+
+    // Normal level: an app that configures audio through AVAudioSession never
+    // calls AudioSessionInitialize, so this is its "audio was reached" line.
+    log!("AVAudioSession sharedInstance created");
 
     let category = ns_string::get_static_str(env, AVAudioSessionCategorySoloAmbient);
     let mode = ns_string::get_static_str(env, AVAudioSessionModeDefault);

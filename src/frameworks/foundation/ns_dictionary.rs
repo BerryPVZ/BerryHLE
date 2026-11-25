@@ -14,7 +14,7 @@ use super::{
     _nib_archive_decoder, ns_array, ns_keyed_archiver, ns_keyed_unarchiver, ns_string, ns_url,
     NSComparisonResult, NSUInteger,
 };
-use crate::abi::{CallFromHost, GuestFunction, VaList};
+use crate::abi::{CallFromHost, DotDotDot, GuestFunction, VaList};
 use crate::frameworks::core_foundation::{CFHashCode, CFIndex};
 use crate::frameworks::foundation::ns_enumerator::{
     fast_enumeration_helper, NSFastEnumerationState,
@@ -22,12 +22,13 @@ use crate::frameworks::foundation::ns_enumerator::{
 use crate::frameworks::foundation::ns_file_manager::{
     NSFileModificationDate, NSFileSize, NSFileType,
 };
+use crate::dyld::{export_c_func, export_c_func_aliased, FunctionExports};
 use crate::fs::GuestPath;
 use crate::libc::stdlib::qsort::qsort_generic;
 use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr, Ptr, SafeRead};
 use crate::objc::{
     autorelease, id, msg, msg_class, msg_send, nil, objc_classes, release, retain,
-    todo_objc_setter, Class, ClassExports, HostObject, NSZonePtr, SEL,
+    Class, ClassExports, HostObject, NSZonePtr, SEL,
 };
 use crate::{impl_HostObject_with_superclass, Environment};
 use std::collections::hash_map::Entry;
@@ -360,6 +361,31 @@ fn init_with_dictionary_common(env: &mut Environment, this: id, other_dict: id) 
     this
 }
 
+/// Helper function to share `initWithDictionary:copyItems:` implementations.
+/// Apple sends each value `-copyWithZone:nil` (that is `-copy`) when
+/// `copy_items` is true; the keys are copied unconditionally.
+fn init_with_dictionary_copy_items_common(
+    env: &mut Environment,
+    this: id,
+    other_dict: id,
+    copy_items: bool,
+) -> id {
+    let this = init_with_dictionary_common(env, this, other_dict);
+    if !copy_items {
+        return this;
+    }
+    let host_object: &mut DictionaryHostObject = env.objc.borrow_mut(this);
+    let mut map = std::mem::take(&mut host_object.map);
+    for (_, value) in map.values_mut().flatten() {
+        let original: id = *value;
+        let copy: id = msg![env; original copy];
+        release(env, original);
+        *value = copy;
+    }
+    env.objc.borrow_mut::<DictionaryHostObject>(this).map = map;
+    this
+}
+
 /// Helper function so share `initWithObjects:ForKeys:` implementations
 fn init_with_objects_for_keys_common(env: &mut Environment, this: id, objects: id, keys: id) -> id {
     let keys_size: NSUInteger = msg![env; keys count];
@@ -436,6 +462,15 @@ fn all_keys_common(env: &mut Environment, this: id) -> id {
     let res = ns_array::from_vec(env, keys);
     autorelease(env, res)
 }
+
+pub const FUNCTIONS: FunctionExports = &[
+    export_c_func!(NSDictionaryOfVariableBindings(_, _)),
+    // Apple exports the macro's symbol with two leading underscores.
+    export_c_func_aliased!(
+        "_NSDictionaryOfVariableBindings",
+        NSDictionaryOfVariableBindings(_, _)
+    ),
+];
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -535,6 +570,20 @@ pub const CLASSES: ClassExports = objc_classes! {
         "Warning: -[NSDictionary init] called on the abstract base class; \
          returning empty dictionary."
     );
+    // Guest class clusters (JSONKit's JKDictionary is a common example) can
+    // allocate an instance through their own guest-side allocator and then
+    // call `[super init]` on raw guest storage. Such an object has no host
+    // record yet, so `borrow_mut` used to fall through to the phantom-object
+    // path and print "SUPER HACK! Faking borrow_mut for missing object".
+    // Register a real static host object for the receiver first; the object
+    // is guest-owned, so no refcount is attached (matching the allocator's
+    // ownership).
+    if env.objc.get_host_object(this).is_none() {
+        env.objc.register_static_object(
+            this,
+            Box::<DictionaryHostObject>::default(),
+        );
+    }
     *env.objc.borrow_mut(this) = <DictionaryHostObject as Default>::default();
     this
 }
@@ -910,6 +959,20 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     msg![env; this isEqualToDictionary:other]
 }
+- (NSUInteger)hash {
+    // Agree with -isEqual:, which compares the entries. The NSObject default
+    // hashes the pointer, so two equal dictionaries would miss each other as
+    // dictionary keys.
+    let keys: id = msg![env; this allKeys];
+    let count: NSUInteger = msg![env; keys count];
+    let mut hash: NSUInteger = count;
+    for i in 0..count {
+        let key: id = msg![env; keys objectAtIndex:i];
+        let key_hash: NSUInteger = msg![env; key hash];
+        hash = hash.wrapping_add(key_hash);
+    }
+    hash
+}
 - (bool)isEqualToDictionary:(id)other { // NSDictionary *
     if other == nil {
         return false;
@@ -1093,6 +1156,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)initWithDictionary:(id)dictionary {
     init_with_dictionary_common(env, this, dictionary)
+}
+- (id)initWithDictionary:(id)dictionary copyItems:(bool)copy_items {
+    init_with_dictionary_copy_items_common(env, this, dictionary, copy_items)
 }
 // Category method used by some ad/analytics SDKs (Burstly-era
 // "NSDictionary+JSON"): serialize the receiver to a JSON string, dropping
@@ -1359,6 +1425,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)initWithDictionary:(id)dictionary {
     init_with_dictionary_common(env, this, dictionary)
+}
+- (id)initWithDictionary:(id)dictionary copyItems:(bool)copy_items {
+    init_with_dictionary_copy_items_common(env, this, dictionary, copy_items)
 }
 
 - (id)init {
@@ -1855,6 +1924,32 @@ pub fn dict_from_keys_and_objects(env: &mut Environment, keys_and_objects: &[(id
     dict
 }
 
+/// The function behind Apple's `NSDictionaryOfVariableBindings()` macro:
+/// `#define NSDictionaryOfVariableBindings(...) _NSDictionaryOfVariableBindings(@"" # __VA_ARGS__, __VA_ARGS__, nil)`
+/// (<https://developer.apple.com/documentation/foundation/nsdictionaryofvariablebindings>).
+/// The first argument is one string naming the variables in order, then their
+/// values follow, terminated by nil.
+pub fn NSDictionaryOfVariableBindings(
+    env: &mut Environment,
+    names: id,
+    values: DotDotDot,
+) -> id {
+    if names.is_null() {
+        return nil;
+    }
+    let names = to_rust_string(env, names);
+    let mut values = values.start();
+    let mut keys_and_objects = Vec::new();
+    for name in names.split(',') {
+        let value: id = values.next(env);
+        if value.is_null() {
+            break;
+        }
+        keys_and_objects.push((from_rust_string(env, name.trim().to_string()), value));
+    }
+    dict_from_keys_and_objects(env, &keys_and_objects)
+}
+
 /// Direct constructor for use by host code, similar to
 /// `[[NSMutableDictionary alloc] initWithObjectsAndKeys:]` but without
 /// variadics and with a more intuitive argument order.
@@ -1908,4 +2003,45 @@ fn build_description(env: &mut Environment, dict: id) -> id {
     let desc_imm = msg![env; desc copy];
     release(env, desc);
     autorelease(env, desc_imm)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `-[NSDictionary initWithDictionary:copyItems:]` sends each value
+    /// `-copyWithZone:nil` when `copyItems` is YES, so later mutations of the
+    /// source's mutable values do not reach the copy.
+    /// https://developer.apple.com/documentation/foundation/nsdictionary/1410126-init
+    #[test]
+    fn initWith_dictionary_copy_items_copies_values() {
+        let _lock = crate::environment::ENVIRONMENT_TEST_LOCK.lock().unwrap();
+        let options = crate::options::Options {
+            headless: true,
+            popup_errors: false,
+            ..Default::default()
+        };
+        let icon = crate::image::Image::from_pixels(1, 1, vec![0; 4]);
+        let mut env = Environment::new_without_app(options, icon).unwrap();
+        let env = &mut env;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let key_cstr = env.mem.alloc_and_write_cstr(b"key");
+        let key: id = msg_class![env; NSString stringWithUTF8String:key_cstr];
+        let value: id = msg_class![env; NSMutableString new];
+        () = msg![env; value appendString:key];
+        let source: id = msg_class![env; NSMutableDictionary new];
+        () = msg![env; source setObject:value forKey:key];
+        let copy: id = msg_class![env; NSDictionary alloc];
+        let copy: id = msg![env; copy initWithDictionary:source copyItems:true];
+        let copied_value: id = msg![env; copy objectForKey:key];
+        assert_ne!(copied_value, value, "copyItems:YES must copy the value");
+        assert!(msg![env; copied_value isEqual:value]);
+        () = msg![env; value appendString:key];
+        let copied_value_again: id = msg![env; copy objectForKey:key];
+        assert_eq!(copied_value_again, copied_value);
+        assert!(!msg![env; copied_value isEqual:value]);
+        let count: NSUInteger = msg![env; copy count];
+        assert_eq!(count, 1);
+        () = msg![env; pool drain];
+    }
 }

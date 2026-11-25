@@ -162,7 +162,7 @@ fn memchr(env: &mut Environment, string: ConstVoidPtr, c: i32, size: GuestUSize)
 fn memcmp(env: &mut Environment, a: ConstVoidPtr, b: ConstVoidPtr, size: GuestUSize) -> i32 {
     GenericChar::<u8>::memcmp(env, a.cast(), b.cast(), size)
 }
-pub(super) fn strlen(env: &mut Environment, s: ConstPtr<u8>) -> GuestUSize {
+pub(crate) fn strlen(env: &mut Environment, s: ConstPtr<u8>) -> GuestUSize {
     GenericChar::<u8>::strlen(env, s)
 }
 pub(super) fn strcpy(env: &mut Environment, dest: MutPtr<u8>, src: ConstPtr<u8>) -> MutPtr<u8> {
@@ -312,6 +312,40 @@ fn __strncat_chk(
 ) -> MutPtr<u8> {
     GenericChar::<u8>::strncat(env, dest, src, n)
 }
+// The length bounds reads of the haystack, including when there is no NUL.
+// https://github.com/apple-oss-distributions/Libc/blob/main/string/FreeBSD/strnstr.c
+fn strnstr(
+    env: &mut Environment,
+    string: ConstPtr<u8>,
+    substring: ConstPtr<u8>,
+    length: GuestUSize,
+) -> ConstPtr<u8> {
+    let needle = env.mem.cstr_at(substring).to_vec();
+    if needle.is_empty() {
+        return string;
+    }
+    if needle.len() > length as usize {
+        return Ptr::null();
+    }
+    for offset in 0..=length - needle.len() as u32 {
+        if env.mem.read(string + offset) == 0 {
+            break;
+        }
+        let mut matches = true;
+        for (index, &expected) in needle.iter().enumerate() {
+            let byte = env.mem.read(string + offset + index as u32);
+            if byte != expected {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            return string + offset;
+        }
+    }
+    Ptr::null()
+}
+
 fn strstr(env: &mut Environment, string: ConstPtr<u8>, substring: ConstPtr<u8>) -> ConstPtr<u8> {
     GenericChar::<u8>::strstr(env, string, substring)
 }
@@ -342,6 +376,37 @@ fn strlcat(
     dst: MutPtr<u8>,
     src: ConstPtr<u8>,
     size: GuestUSize,
+) -> GuestUSize {
+    GenericChar::<u8>::strlcat(env, dst, src, size)
+}
+
+/// `size_t ___strlcpy_chk(char *dst, const char *src, size_t size,
+///     size_t dst_size)`
+///
+/// `_FORTIFY_SOURCE` builds call the `_chk` variants instead of the plain
+/// functions. The extra argument is the compile-time-known size of `dst`,
+/// which Apple's implementation only uses to report a buffer overflow; the
+/// copy itself is the ordinary `strlcpy`/`strlcat`. These were unimplemented
+/// stubs that returned 0 and copied nothing, so any fortified string copy in
+/// the app silently became a no-op — RetroArch's iOS build imports both.
+fn __strlcpy_chk(
+    env: &mut Environment,
+    dst: MutPtr<u8>,
+    src: ConstPtr<u8>,
+    size: GuestUSize,
+    _dst_size: GuestUSize,
+) -> GuestUSize {
+    GenericChar::<u8>::strlcpy(env, dst, src, size)
+}
+
+/// `size_t ___strlcat_chk(char *dst, const char *src, size_t size,
+///     size_t dst_size)` — see [__strlcpy_chk].
+fn __strlcat_chk(
+    env: &mut Environment,
+    dst: MutPtr<u8>,
+    src: ConstPtr<u8>,
+    size: GuestUSize,
+    _dst_size: GuestUSize,
 ) -> GuestUSize {
     GenericChar::<u8>::strlcat(env, dst, src, size)
 }
@@ -643,6 +708,72 @@ fn strcasestr(env: &mut Environment, haystack: MutPtr<u8>, needle: ConstPtr<u8>)
     Ptr::null()
 }
 
+// POSIX/Darwin path helper. Returns a pointer inside `path`; no allocation.
+fn basename(env: &mut Environment, path: MutPtr<u8>) -> MutPtr<u8> {
+    if path.is_null() {
+        return path;
+    }
+    let bytes = env.mem.cstr_at(path);
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1] == b'/' {
+        end -= 1;
+    }
+    if end == 0 {
+        return path + bytes.len() as GuestUSize;
+    }
+    let start = bytes[..end]
+        .iter()
+        .rposition(|&b| b == b'/')
+        .map_or(0, |i| i + 1);
+    path + start as GuestUSize
+}
+
+// The emulator currently models C-locale collation. The ordinary and xlocale
+// entry points must agree; guest libstdc++ imports both spellings.
+// https://github.com/apple-oss-distributions/Libc/blob/main/string/FreeBSD/strxfrm.c
+fn strcoll(env: &mut Environment, a: ConstPtr<u8>, b: ConstPtr<u8>) -> i32 {
+    strcoll_l(env, a, b, MutVoidPtr::null())
+}
+
+fn strxfrm(
+    env: &mut Environment,
+    dest: MutPtr<u8>,
+    src: ConstPtr<u8>,
+    n: GuestUSize,
+) -> GuestUSize {
+    strxfrm_l(env, dest, src, n, MutVoidPtr::null())
+}
+
+fn strcoll_l(
+    env: &mut Environment,
+    a: ConstPtr<u8>,
+    b: ConstPtr<u8>,
+    _loc: crate::libc::clocale::locale_t,
+) -> i32 {
+    let a = env.mem.cstr_at(a);
+    let b = env.mem.cstr_at(b);
+    a.cmp(b) as i32
+}
+
+fn strxfrm_l(
+    env: &mut Environment,
+    dest: MutPtr<u8>,
+    src: ConstPtr<u8>,
+    n: GuestUSize,
+    _loc: crate::libc::clocale::locale_t,
+) -> GuestUSize {
+    let bytes = env.mem.cstr_at(src).to_vec();
+    let len = bytes.len() as GuestUSize;
+    if !dest.is_null() && n > 0 {
+        let copy = (len as usize).min(n as usize - 1);
+        for (i, &byte) in bytes[..copy].iter().enumerate() {
+            env.mem.write(dest + i as GuestUSize, byte);
+        }
+        env.mem.write(dest + copy as GuestUSize, 0);
+    }
+    len
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(strtok(_, _)),
     export_c_func!(bzero(_, _)),
@@ -662,6 +793,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(strcpy(_, _)),
     export_c_func!(__strcpy_chk(_, _, _)),
     export_c_func!(strcat(_, _)),
+    export_c_func!(strspn(_, _)),
     export_c_func!(strcspn(_, _)),
     export_c_func!(__strcat_chk(_, _, _)),
     export_c_func!(strncpy(_, _, _)),
@@ -675,13 +807,15 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(strncat(_, _, _)),
     export_c_func!(__strncat_chk(_, _, _, _)),
     export_c_func!(strstr(_, _)),
+    export_c_func!(strnstr(_, _, _)),
     export_c_func!(strchr(_, _)),
     export_c_func!(index(_, _)),
     export_c_func!(strrchr(_, _)),
+    export_c_func!(strpbrk(_, _)),
     export_c_func!(strlcpy(_, _, _)),
     export_c_func!(strlcat(_, _, _)),
-    export_c_func!(strspn(_, _)),
-    export_c_func!(strpbrk(_, _)),
+    export_c_func!(__strlcpy_chk(_, _, _, _)),
+    export_c_func!(__strlcat_chk(_, _, _, _)),
     export_c_func!(strndup(_, _)),
     export_c_func!(memrchr(_, _, _)),
     export_c_func!(memmem(_, _, _, _)),
@@ -694,6 +828,11 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(explicit_bzero(_, _)),
     // strerror is exported from libc::errno; not duplicated here.
     export_c_func!(strerror_r(_, _, _)),
+    export_c_func!(strcoll_l(_, _, _)),
+    export_c_func!(strxfrm_l(_, _, _, _)),
+    export_c_func!(strcoll(_, _)),
+    export_c_func!(strxfrm(_, _, _)),
+    export_c_func!(basename(_)),
     export_c_func!(bcopy(_, _, _)),
     export_c_func!(strnlen(_, _)),
     export_c_func!(strcasestr(_, _)),

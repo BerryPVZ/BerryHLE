@@ -8,7 +8,7 @@
 use super::ui_control::UIControlHostObject;
 use crate::frameworks::foundation::NSInteger;
 use crate::objc::{
-    id, impl_HostObject_with_superclass, msg_class, nil, objc_classes, release, retain,
+    id, impl_HostObject_with_superclass, msg_class, msg_super, nil, objc_classes, release, retain,
     ClassExports, NSZonePtr,
 };
 
@@ -70,7 +70,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     );
     release(env, tint);
     release(env, current_tint);
-    env.objc.dealloc_object(this, &mut env.mem)
+    msg_super![env; this dealloc]
 }
 
 // MARK: - Page count

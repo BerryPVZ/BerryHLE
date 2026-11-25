@@ -28,7 +28,7 @@ use crate::libc::errno::{
     EAFNOSUPPORT, EIO, EISCONN, ENETUNREACH, ENOPROTOOPT, ENOTCONN, ENOTSUP, ENOTTY,
     EPROTONOSUPPORT, ESOCKTNOSUPPORT, ETIMEDOUT,
 };
-use crate::libc::posix_io::{close, find_or_create_socket, is_socket, FileDescriptor};
+use crate::libc::posix_io::{close, find_or_create_socket, iovec, is_socket, FileDescriptor};
 use crate::libc::time::timeval;
 use crate::mem::{
     guest_size_of, ConstPtr, ConstVoidPtr, GuestUSize, MutPtr, MutVoidPtr, Ptr, SafeRead,
@@ -1918,6 +1918,159 @@ fn sendto(
     num_bytes_written.min(i32::MAX as usize) as i32
 }
 
+/// `struct msghdr` from `<sys/socket.h>`, 32-bit iOS ABI layout (28 bytes).
+struct msghdr {
+    msg_name: MutVoidPtr,
+    msg_namelen: socklen_t,
+    msg_iov: ConstPtr<iovec>,
+    msg_iovlen: i32,
+    msg_control: MutVoidPtr,
+    msg_controllen: socklen_t,
+    msg_flags: i32,
+}
+unsafe impl SafeRead for msghdr {}
+unsafe impl crate::mem::SafeWrite for msghdr {}
+
+/// Sums a guest scatter list, saturating instead of wrapping.
+fn iovec_total(env: &mut Environment, iov: ConstPtr<iovec>, count: i32) -> GuestUSize {
+    let mut total: GuestUSize = 0;
+    for index in 0..count.max(0) as u32 {
+        let entry = env.mem.read(iov + index);
+        total = total.saturating_add(entry.iov_len);
+    }
+    total
+}
+
+/// Copies a guest scatter list into one contiguous buffer of `limit` bytes.
+fn iovec_gather(
+    env: &mut Environment,
+    iov: ConstPtr<iovec>,
+    count: i32,
+    dest: MutVoidPtr,
+    limit: GuestUSize,
+) {
+    let mut offset: GuestUSize = 0;
+    for index in 0..count.max(0) as u32 {
+        let entry = env.mem.read(iov + index);
+        let len = entry.iov_len.min(limit.saturating_sub(offset));
+        if len > 0 {
+            let source = env.mem.bytes_at(entry.iov_base, len).to_vec();
+            env.mem
+                .bytes_at_mut(dest.cast(), limit)
+                [offset as usize..(offset + len) as usize]
+                .copy_from_slice(&source);
+        }
+        offset += len;
+    }
+}
+
+/// Spreads a received contiguous buffer back over a guest scatter list.
+fn iovec_scatter(
+    env: &mut Environment,
+    iov: ConstPtr<iovec>,
+    count: i32,
+    source: MutVoidPtr,
+    length: GuestUSize,
+) {
+    let data = env.mem.bytes_at(source.cast(), length).to_vec();
+    let mut offset: GuestUSize = 0;
+    for index in 0..count.max(0) as u32 {
+        let entry = env.mem.read(iov + index);
+        let len = entry.iov_len.min(length.saturating_sub(offset));
+        if len > 0 {
+            let start = offset as usize;
+            env.mem
+                .bytes_at_mut(entry.iov_base.cast(), len)
+                .copy_from_slice(&data[start..start + len as usize]);
+        }
+        offset += len;
+    }
+}
+
+/// `ssize_t sendmsg(int socket, const struct msghdr *message, int flags)`
+///
+/// The scatter list is joined into one temporary guest buffer so the
+/// ordinary `send`/`sendto` paths handle the socket types. Control data
+/// (ancillary fds, credentials) is not supported and is reported.
+fn sendmsg(env: &mut Environment, socket: i32, message: ConstPtr<msghdr>, flags: i32) -> i32 {
+    if message.is_null() {
+        set_errno(env, EINVAL);
+        return -1;
+    }
+    let message = env.mem.read(message);
+    if !message.msg_control.is_null() && message.msg_controllen != 0 {
+        log!(
+            "Warning: sendmsg({}) ignoring {} bytes of control data",
+            socket,
+            message.msg_controllen
+        );
+    }
+    let length = iovec_total(env, message.msg_iov, message.msg_iovlen);
+    let buffer = env.mem.alloc(length.max(1));
+    iovec_gather(env, message.msg_iov, message.msg_iovlen, buffer, length);
+    let result = if message.msg_name.is_null() {
+        send(env, socket, buffer, length, flags)
+    } else {
+        sendto(
+            env,
+            socket,
+            buffer,
+            length,
+            flags,
+            message.msg_name.cast(),
+            message.msg_namelen,
+        )
+    };
+    env.mem.free(buffer);
+    result
+}
+
+/// `ssize_t recvmsg(int socket, struct msghdr *message, int flags)`
+///
+/// Receives into one temporary guest buffer, then scatters it across the
+/// iovec list. Ancillary data is never produced, so `msg_control` stays
+/// untouched, and truncation is not reported because the host read clips
+/// the datagram silently.
+fn recvmsg(env: &mut Environment, socket: i32, message: MutPtr<msghdr>, flags: i32) -> i32 {
+    if message.is_null() {
+        set_errno(env, EINVAL);
+        return -1;
+    }
+    let mut message_value = env.mem.read(message);
+    if !message_value.msg_control.is_null() && message_value.msg_controllen != 0 {
+        log!("Warning: recvmsg({}) cannot supply control data", socket);
+    }
+    let capacity = iovec_total(env, message_value.msg_iov, message_value.msg_iovlen);
+    let buffer = env.mem.alloc(capacity.max(1));
+    // recvfrom() reports the peer address through a length pointer, while
+    // msghdr carries the length by value.
+    let address_len: MutPtr<socklen_t> = env.mem.alloc_and_write(message_value.msg_namelen);
+    let received = recvfrom(
+        env,
+        socket,
+        buffer,
+        capacity,
+        flags,
+        message_value.msg_name.cast(),
+        address_len,
+    );
+    if received > 0 {
+        iovec_scatter(
+            env,
+            message_value.msg_iov,
+            message_value.msg_iovlen,
+            buffer,
+            received as GuestUSize,
+        );
+    }
+    message_value.msg_namelen = env.mem.read(address_len);
+    message_value.msg_flags = 0;
+    env.mem.free(address_len.cast());
+    env.mem.free(buffer);
+    env.mem.write(message, message_value);
+    received
+}
+
 const SHUT_RD: i32 = 0;
 const SHUT_WR: i32 = 1;
 const SHUT_RDWR: i32 = 2;
@@ -2069,9 +2222,11 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(accept(_, _, _)),
     export_c_func!(recv(_, _, _, _)),
     export_c_func!(recvfrom(_, _, _, _, _, _)),
+    export_c_func!(recvmsg(_, _, _)),
     export_c_func!(send(_, _, _, _)),
     // ИСПРАВЛЕНИЕ: здесь 6 подчеркиваний вместо 7
     export_c_func!(sendto(_, _, _, _, _, _)),
+    export_c_func!(sendmsg(_, _, _)),
     export_c_func!(shutdown(_, _)),
     export_c_func!(getsockname(_, _, _)),
     export_c_func!(getpeername(_, _, _)),

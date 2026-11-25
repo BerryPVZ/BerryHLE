@@ -19,7 +19,9 @@ use crate::frameworks::core_foundation::cf_run_loop::{
     kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoopRef,
 };
 use crate::frameworks::{core_animation, media_player, uikit};
-use crate::objc::{id, msg, nil, objc_classes, release, retain, Class, ClassExports, HostObject, SEL};
+use crate::objc::{
+    id, msg, nil, objc_classes, release, retain, Class, ClassExports, HostObject, SEL,
+};
 use crate::Environment;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -58,6 +60,9 @@ pub(crate) struct NSRunLoopHostObject {
     /// via `_touchHLE_CFRunLoopSource`) currently registered in this run
     /// loop, per Apple's CFRunLoopAddSource semantics.
     pub(crate) sources: Vec<id>,
+    /// Strong references to `CFRunLoopObserverRef` objects registered with
+    /// this run loop (per CFRunLoopAddObserver semantics).
+    pub(crate) observers: Vec<id>,
     /// Strong references to `NSPort*` objects registered via
     /// `-[NSRunLoop addPort:forMode:]`. The run loop owns its scheduled ports
     /// (per Apple's docs), so we retain them here and release on removal.
@@ -67,6 +72,10 @@ pub(crate) struct NSRunLoopHostObject {
     ports: Vec<id>,
     /// Set by CFRunLoopStop; cleared at the start of the next run.
     pub(crate) stopped: bool,
+    pub(crate) owner_thread: ThreadId,
+    pub(crate) current_mode: Option<String>,
+    pub(crate) common_modes: std::collections::HashSet<String>,
+    pub(crate) blocks: Vec<(Vec<String>, crate::mem::MutVoidPtr)>,
 }
 impl HostObject for NSRunLoopHostObject {}
 
@@ -90,7 +99,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (()) release {}
 - (id) autorelease { this }
 
-- (bool)runMode:(id)_mode beforeDate:(id)limit_date {
+- (bool)runMode:(id)mode beforeDate:(id)limit_date {
     // Run the run loop for one iteration, honouring the caller's time limit.
     // Apps frequently call this in a synchronous spin like:
     //
@@ -118,7 +127,10 @@ pub const CLASSES: ClassExports = objc_classes! {
         limit_date,
         time_limit
     );
+    let mode = ns_string::to_rust_string(env, mode).into_owned();
+    let previous = env.objc.borrow_mut::<NSRunLoopHostObject>(this).current_mode.replace(mode);
     run_run_loop(env, this, /* single_iteration: */ true, time_limit);
+    env.objc.borrow_mut::<NSRunLoopHostObject>(this).current_mode = previous;
     true
 }
 
@@ -207,6 +219,12 @@ pub const CLASSES: ClassExports = objc_classes! {
     host_object.timers.push(timer);
     ns_timer::set_run_loop(env, timer, this);
 }
+
+// `-cancelPerformSelector:target:argument:` removes one request queued by
+// `-performSelector:target:argument:order:modes:`. touchHLE does not queue
+// such requests (they are dispatched immediately via NSTimer based scheduling
+// in NSObject), so there is nothing to cancel here.
+- (())cancelPerformSelector:(SEL)_selector target:(id)_target argument:(id)_argument {}
 
 - (())cancelPerformSelectorsWithTarget:(id)target {
         if target == nil {
@@ -351,6 +369,32 @@ pub(crate) fn remove_timer(env: &mut Environment, run_loop: id, timer: id) {
 
 /// Run the run loop for just a single iteration. Used by the app picker and
 /// by `-[NSRunLoop runMode:beforeDate:]`.
+pub(crate) fn drain_blocks(env: &mut Environment, run_loop: id) {
+    let state = env.objc.borrow_mut::<NSRunLoopHostObject>(run_loop);
+    let mode = state
+        .current_mode
+        .as_deref()
+        .unwrap_or(kCFRunLoopDefaultMode);
+    let common = mode == kCFRunLoopDefaultMode || state.common_modes.contains(mode);
+    let mut pending = Vec::new();
+    let mut ready = Vec::new();
+    for (modes, block) in std::mem::take(&mut state.blocks) {
+        if modes
+            .iter()
+            .any(|candidate| candidate == mode || (common && candidate == kCFRunLoopCommonModes))
+        {
+            ready.push(block);
+        } else {
+            pending.push((modes, block));
+        }
+    }
+    state.blocks = pending;
+    for block in ready {
+        crate::libc::dispatch::call_void_block(env, block);
+        crate::libc::blocks::_Block_release(env, block.cast_const());
+    }
+}
+
 pub fn run_run_loop_single_iteration(env: &mut Environment, run_loop: id) {
     run_run_loop(env, run_loop, /* single_iteration: */ true, None)
 }
@@ -361,6 +405,16 @@ pub fn run_run_loop(
     single_iteration: bool,
     unix_time_limit: Option<f64>,
 ) {
+    let inserted_default_mode = env
+        .objc
+        .borrow::<NSRunLoopHostObject>(run_loop)
+        .current_mode
+        .is_none();
+    if inserted_default_mode {
+        env.objc
+            .borrow_mut::<NSRunLoopHostObject>(run_loop)
+            .current_mode = Some(kCFRunLoopDefaultMode.to_owned());
+    }
     // Temporary vectors used to track things without needing a reference to the
     // environment or to lock the object. Re-used each iteration for efficiency.
     let mut timers_tmp = Vec::new();
@@ -383,12 +437,38 @@ pub fn run_run_loop(
         log_once!("Main run loop: now dispatching events, timers and composition");
     }
 
+    let mut first_iteration = true;
     loop {
         let mut sleep_until = None;
 
+        if first_iteration {
+            crate::frameworks::core_foundation::cf_run_loop::fire_observers(
+                env,
+                run_loop,
+                crate::frameworks::core_foundation::cf_run_loop::kCFRunLoopEntry,
+            );
+            first_iteration = false;
+        }
+        crate::frameworks::core_foundation::cf_run_loop::fire_observers(
+            env,
+            run_loop,
+            crate::frameworks::core_foundation::cf_run_loop::kCFRunLoopBeforeTimers,
+        );
+        // Apple's documented order is BeforeTimers, BeforeSources, then the
+        // block that services sources and timers; touchHLE services both in
+        // that same block below.
+        crate::frameworks::core_foundation::cf_run_loop::fire_observers(
+            env,
+            run_loop,
+            crate::frameworks::core_foundation::cf_run_loop::kCFRunLoopBeforeSources,
+        );
+
         // Deliver input before timers, but commit and compose after their
         // callbacks have updated the layer tree for this iteration.
+        drain_blocks(env, run_loop);
         if is_main_run_loop {
+            crate::libc::dispatch::drain_main_queue(env);
+
             let next_due = uikit::handle_events(env);
             limit_sleep_time(&mut sleep_until, next_due);
         }
@@ -430,7 +510,9 @@ pub fn run_run_loop(
             .extend_from_slice(&env.objc.borrow::<NSRunLoopHostObject>(run_loop).audio_units);
 
         for audio_unit in audio_units_tmp.drain(..) {
-            render_audio_unit(env, audio_unit);
+            if !env.options.audio_unit_render_thread {
+                render_audio_unit(env, audio_unit);
+            }
         }
 
         // Process Audio Services completion callbacks. Apple's
@@ -451,8 +533,8 @@ pub fn run_run_loop(
         ca_transaction::State::commit_implicit_transaction(env);
         if is_main_run_loop {
             uikit::ui_view::layout_pending_views(env);
-            let force_video_composition = media_player::has_active_video(env);
-            let next_due = core_animation::recomposite_if_necessary(env, force_video_composition);
+
+            let next_due = core_animation::recomposite_if_necessary(env, false);
             limit_sleep_time(&mut sleep_until, next_due);
         }
 
@@ -470,16 +552,39 @@ pub fn run_run_loop(
         // The compromise used here is that we will wait for a 60th of a second,
         // or until the next scheduled event, whichever is sooner. iPhone OS
         // apps can't do more than 60fps so this should be fine.
+        // BeforeWaiting fires once the sources above have been serviced and
+        // marks the run loop is about to block, which is the activity apps use
+        // most (deferring work to "after this iteration's sources").
+        crate::frameworks::core_foundation::cf_run_loop::fire_observers(
+            env,
+            run_loop,
+            crate::frameworks::core_foundation::cf_run_loop::kCFRunLoopBeforeWaiting,
+        );
         let limit = Duration::from_millis(1000 / 60);
         env.sleep(sleep_until.map_or(limit, |i| i.duration_since(Instant::now()).min(limit)));
+        crate::frameworks::core_foundation::cf_run_loop::fire_observers(
+            env,
+            run_loop,
+            crate::frameworks::core_foundation::cf_run_loop::kCFRunLoopAfterWaiting,
+        );
 
         if single_iteration {
+            crate::frameworks::core_foundation::cf_run_loop::fire_observers(
+                env,
+                run_loop,
+                crate::frameworks::core_foundation::cf_run_loop::kCFRunLoopExit,
+            );
             break;
         }
 
         // CFRunLoopStop sets this flag to break out of the loop.
         if env.objc.borrow::<NSRunLoopHostObject>(run_loop).stopped {
             env.objc.borrow_mut::<NSRunLoopHostObject>(run_loop).stopped = false;
+            crate::frameworks::core_foundation::cf_run_loop::fire_observers(
+                env,
+                run_loop,
+                crate::frameworks::core_foundation::cf_run_loop::kCFRunLoopExit,
+            );
             break;
         }
 
@@ -490,14 +595,26 @@ pub fn run_run_loop(
             // and not worthy to convert back and forth)
             // The host clock could be set before the Unix epoch (or skew
             // backwards); never panic on that, just treat it as "not yet".
-            let now_secs = env.guest_clock.system_time()
+            let now_secs = env
+                .guest_clock
+                .system_time()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs_f64();
             if now_secs >= limit {
+                crate::frameworks::core_foundation::cf_run_loop::fire_observers(
+                    env,
+                    run_loop,
+                    crate::frameworks::core_foundation::cf_run_loop::kCFRunLoopExit,
+                );
                 break;
             }
         }
+    }
+    if inserted_default_mode {
+        env.objc
+            .borrow_mut::<NSRunLoopHostObject>(run_loop)
+            .current_mode = None;
     }
 }
 
@@ -515,8 +632,13 @@ pub(crate) fn run_loop_for_thread(env: &mut Environment, this: Class, thread_id:
             audio_queues: Vec::new(),
             timers: Vec::new(),
             sources: Vec::new(),
+            observers: Vec::new(),
             ports: Vec::new(),
             stopped: false,
+            owner_thread: thread_id,
+            current_mode: None,
+            common_modes: Default::default(),
+            blocks: Vec::new(),
         });
         // TODO: is it OK to allocate static object for all threads,
         // not only main one?

@@ -23,14 +23,14 @@ use crate::gles::{
 };
 use crate::mem::MutPtr;
 use crate::objc::{
-    id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
+    id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject, ObjC,
 };
 use crate::options::{Options, PresentMode};
 use crate::Environment;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Copy, Clone)]
@@ -39,6 +39,7 @@ struct EaglPresentOptions {
     trace_gl_errors: bool,
     present_mode: PresentMode,
     present_finish: bool,
+    angle_backend: bool,
     /// The framebuffer that draws to the window. This is 0 everywhere except
     /// iOS, where SDL2 renders the window through a framebuffer object of its
     /// own (see `EAGLContextHostObject::drawable_framebuffer`).
@@ -52,6 +53,20 @@ struct EaglPresentOptions {
     /// plus those of its ancestors). Zero when the layer is not transformed or
     /// when the drawable is not the layer that is being presented as fullscreen.
     layer_rotation: f32,
+}
+
+// EAGL drawables belong to the Core Animation layer tree. A movie layer
+// above the drawable must be composited with it, even if the game keeps
+// presenting or has enabled the iOS ES2 direct-presentation workaround.
+// https://developer.apple.com/documentation/quartzcore/caeagllayer
+fn can_present_without_composition(
+    drawable: id,
+    fullscreen_layer: id,
+    ios_es2_direct: bool,
+    video_overlay_active: bool,
+) -> bool {
+    !video_overlay_active
+        && (drawable == fullscreen_layer || fullscreen_layer != nil || ios_es2_direct)
 }
 
 // These are used by the EAGLDrawable protocol implemented by CAEAGLayer.
@@ -101,18 +116,28 @@ const kEAGLRenderingAPIOpenGLES3: EAGLRenderingAPI = 3;
 /// rendering with shader entry points (`glUseProgram`, `glCreateShader`, …)
 /// route through the real native ES 2.0 backend instead of falling through
 /// to the GLES 1.1-only stubs in `gles_generic`.
+///
+/// With `--no-gles3` (`no_gles3`) the result is capped at ES 2.0: a context
+/// creation that asks for ES 3.0 is refused before this function is reached
+/// (see [`rejects_gles3_request`]), and nothing else may silently hand the
+/// app an ES 3.0 driver either.
 fn effective_eagl_api(
     requested: EAGLRenderingAPI,
     prefer_gles2_context: bool,
     force_gles1_context: bool,
+    no_gles3: bool,
 ) -> EAGLRenderingAPI {
     // Hardcoded driver pin: TOUCHHLE_FORCE_EAGL_API forces the reported/
     // effective EAGL rendering API (1, 2 or 3) regardless of what the guest
     // app requested. This pins the GPU driver surface the app sees, mirroring
     // TOUCHHLE_FORCE_GLES1 on the context-creation side.
+    //
+    // `--no-gles3` still wins over the pin: a context that pretends the GPU
+    // has no ES 3.0 support must not hand out an ES 3.0 driver after all.
     if let Ok(forced) = std::env::var("TOUCHHLE_FORCE_EAGL_API") {
         let forced = forced.trim();
         if let Ok(v) = forced.parse::<EAGLRenderingAPI>() {
+            let v = clamp_forced_api_for_no_gles3(v, no_gles3);
             if (1..=3).contains(&v) && v != requested {
                 log!(
                     "EAGL: TOUCHHLE_FORCE_EAGL_API active, overriding requested API {} with {}",
@@ -139,7 +164,85 @@ fn effective_eagl_api(
         );
         return kEAGLRenderingAPIOpenGLES2;
     }
-    requested
+    clamp_forced_api_for_no_gles3(requested, no_gles3)
+}
+
+/// Apply the `--no-gles3` pretence to a forced EAGL API.
+///
+/// `TOUCHHLE_FORCE_EAGL_API=3` normally pins the driver to an ES 3.0 one, but
+/// with `--no-gles3` the emulated GPU is supposed to have no ES 3.0 support at
+/// all, so the pin is capped to the newest API such a device would offer.
+fn clamp_forced_api_for_no_gles3(api: EAGLRenderingAPI, no_gles3: bool) -> EAGLRenderingAPI {
+    if no_gles3 && api == kEAGLRenderingAPIOpenGLES3 {
+        log!(
+            "EAGL: --no-gles3 active, capping TOUCHHLE_FORCE_EAGL_API=3 at \
+             kEAGLRenderingAPIOpenGLES2"
+        );
+        kEAGLRenderingAPIOpenGLES2
+    } else {
+        api
+    }
+}
+
+/// Should an `initWithAPI:` request be refused because `--no-gles3` is set?
+///
+/// On every iPhone/iPad before the A7 the GPU has no OpenGL ES 3.0 driver, so
+/// `-[EAGLContext initWithAPI:kEAGLRenderingAPIOpenGLES3]` returns `nil`.
+/// Engines that ship both a 3.0 and an older renderer (Unity 4.x, many
+/// cocos2d-x and Gameloft titles) feature-test exactly that way: a `nil`
+/// context sends them down their ES 2.0 / ES 1.1 path. Returning `nil` here
+/// reproduces the real device instead of quietly upgrading the app to a
+/// driver it did not ask for.
+fn rejects_gles3_request(requested: EAGLRenderingAPI, no_gles3: bool) -> bool {
+    no_gles3 && requested == kEAGLRenderingAPIOpenGLES3
+}
+
+#[cfg(test)]
+mod no_gles3_tests {
+    use super::*;
+
+    #[test]
+    fn gles3_context_requests_are_refused_only_with_the_pretence_on() {
+        assert!(rejects_gles3_request(kEAGLRenderingAPIOpenGLES3, true));
+        assert!(!rejects_gles3_request(kEAGLRenderingAPIOpenGLES3, false));
+        assert!(!rejects_gles3_request(kEAGLRenderingAPIOpenGLES2, true));
+        assert!(!rejects_gles3_request(kEAGLRenderingAPIOpenGLES1, true));
+    }
+
+    #[test]
+    fn a_forced_api_pin_cannot_hand_out_es3_when_the_gpu_has_none() {
+        assert_eq!(clamp_forced_api_for_no_gles3(3, true), 2);
+        assert_eq!(clamp_forced_api_for_no_gles3(2, true), 2);
+        assert_eq!(clamp_forced_api_for_no_gles3(1, true), 1);
+        assert_eq!(clamp_forced_api_for_no_gles3(3, false), 3);
+    }
+
+    #[test]
+    fn the_effective_api_never_reaches_es3_with_the_pretence_on() {
+        for requested in 1..=3 {
+            assert_ne!(
+                effective_eagl_api(requested, false, false, true),
+                kEAGLRenderingAPIOpenGLES3
+            );
+            assert_ne!(
+                effective_eagl_api(requested, true, false, true),
+                kEAGLRenderingAPIOpenGLES3
+            );
+        }
+        // The other context downgrades/upgrades still behave as before.
+        assert_eq!(
+            effective_eagl_api(2, false, true, true),
+            kEAGLRenderingAPIOpenGLES1
+        );
+        assert_eq!(
+            effective_eagl_api(1, true, false, true),
+            kEAGLRenderingAPIOpenGLES2
+        );
+        assert_eq!(
+            effective_eagl_api(3, false, false, false),
+            kEAGLRenderingAPIOpenGLES3
+        );
+    }
 }
 
 /// Host-side mirror of a few pieces of guest-visible OpenGL ES state.
@@ -159,6 +262,8 @@ fn effective_eagl_api(
 /// context (the presenter) always restores what it found, so the mirror stays
 /// valid across presents.
 pub(super) struct GLShadowState {
+    /// Errors raised while emulating operations outside the host driver.
+    pub(super) errors: std::collections::VecDeque<GLenum>,
     pub(super) resource_group_token: usize,
     /// `GL_ARRAY_BUFFER_BINDING`.
     pub(super) array_buffer: GLuint,
@@ -175,6 +280,12 @@ pub(super) struct GLShadowState {
     /// Draw-call guards for generic vertex attributes are skipped entirely
     /// for the (very common) fixed-function-only apps that never use them.
     pub(super) generic_attribs_used: bool,
+    /// Per-context budgets for opt-in draw diagnostics. New contexts start
+    /// with fresh budgets so reopening an app can produce another trace.
+    pub(super) draw_arrays_trace_count: u32,
+    pub(super) draw_arrays_trace_large_count: u32,
+    pub(super) draw_elements_trace_count: u32,
+    pub(super) draw_elements_trace_large_count: u32,
     /// Programs for which the guest app explicitly bound attribute locations
     /// via `glBindAttribLocation` before linking. For these, `glLinkProgram`
     /// must not force-rebind canonical attribute names, because that would
@@ -188,6 +299,20 @@ pub(super) struct GLShadowState {
     /// level is first allocated via `glTexImage2D`, so subsequent updates can
     /// use `glTexSubImage2D`.
     pub(super) pvrtc_unallocated_levels: HashSet<(GLenum, GLuint, GLint)>,
+    /// Depth renderbuffers this emulator created and attached itself, for a
+    /// framebuffer whose guest attached colour only (see
+    /// `gles_guest::glFramebufferRenderbufferOES`). They have to follow a later
+    /// re-specification of their colour renderbuffer, or the framebuffer goes
+    /// incomplete and every draw into it is discarded.
+    pub(super) auto_depth_renderbuffers: HashSet<GLuint>,
+    /// Textures whose mip chain the emulator generated for the level-0 contents
+    /// they currently hold, keyed by `(parameter target, texture name)`.
+    pub(super) generated_mipmaps: HashSet<(GLenum, GLuint)>,
+    /// Mipmap `GL_TEXTURE_MIN_FILTER` values a guest asked for before the
+    /// texture had a level 0. The chain can only be built after that upload,
+    /// so the request is kept here and applied then (see
+    /// `gles_guest::supply_min_filter_after_upload`).
+    pub(super) pending_min_filters: HashMap<(GLenum, GLuint), GLint>,
     pub(super) current_vertex_array: GLuint,
     pub(super) software_vertex_arrays: HashSet<GLuint>,
     pub(super) software_vao_element_array_buffers: HashMap<GLuint, GLuint>,
@@ -199,10 +324,15 @@ pub(super) struct GLShadowState {
     pub(super) vertex_array_state: VertexArrayState,
     /// Client array state of the other (software) vertex array objects.
     pub(super) software_vao_states: HashMap<GLuint, VertexArrayState>,
+    /// Error flags the emulator consumed from the driver while doing its own
+    /// validation, so `glGetError` can still report them to the guest.
+    /// Filled by `gles_guest::preserve_driver_errors`.
+    pub(super) pending_guest_errors: std::collections::VecDeque<GLenum>,
 }
 impl Default for GLShadowState {
     fn default() -> Self {
         GLShadowState {
+            errors: std::collections::VecDeque::new(),
             resource_group_token: 0,
             array_buffer: 0,
             element_array_buffer: Some(0),
@@ -211,9 +341,16 @@ impl Default for GLShadowState {
             fog_start: 0.0,
             fog_end: 1.0,
             generic_attribs_used: false,
+            draw_arrays_trace_count: 0,
+            draw_arrays_trace_large_count: 0,
+            draw_elements_trace_count: 0,
+            draw_elements_trace_large_count: 0,
             guest_bound_attribs: HashMap::new(),
             pvrtc_texture_levels: HashMap::new(),
             pvrtc_unallocated_levels: HashSet::new(),
+            auto_depth_renderbuffers: HashSet::new(),
+            generated_mipmaps: HashSet::new(),
+            pending_min_filters: HashMap::new(),
             current_vertex_array: 0,
             software_vertex_arrays: HashSet::new(),
             software_vao_element_array_buffers: HashMap::new(),
@@ -221,10 +358,16 @@ impl Default for GLShadowState {
             client_active_texture: 0,
             vertex_array_state: VertexArrayState::default(),
             software_vao_states: HashMap::new(),
+            pending_guest_errors: std::collections::VecDeque::new(),
         }
     }
 }
 impl GLShadowState {
+    pub(super) fn record_error(&mut self, error: GLenum) {
+        if error != gles11::NO_ERROR && !self.errors.contains(&error) {
+            self.errors.push_back(error);
+        }
+    }
     /// Forget everything that is stored in vertex array object state.
     pub(super) fn invalidate_vao_state(&mut self) {
         self.element_array_buffer = None;
@@ -280,9 +423,50 @@ impl GLShadowState {
             .remove(&(target, texture, level));
     }
     pub(super) fn forget_pvrtc_texture(&mut self, texture: GLuint) {
-        self.pvrtc_texture_levels
-            .retain(|key, _| key.1 != texture);
+        self.pvrtc_texture_levels.retain(|key, _| key.1 != texture);
         self.pvrtc_unallocated_levels.retain(|key| key.1 != texture);
+        self.generated_mipmaps.retain(|key| key.1 != texture);
+        self.pending_min_filters.retain(|key, _| key.1 != texture);
+    }
+    /// Record that the emulator, not the guest, attached this depth renderbuffer.
+    pub(super) fn record_auto_depth_renderbuffer(&mut self, renderbuffer: GLuint) {
+        self.auto_depth_renderbuffers.insert(renderbuffer);
+    }
+    pub(super) fn is_auto_depth_renderbuffer(&self, renderbuffer: GLuint) -> bool {
+        self.auto_depth_renderbuffers.contains(&renderbuffer)
+    }
+    pub(super) fn forget_auto_depth_renderbuffer(&mut self, renderbuffer: GLuint) {
+        self.auto_depth_renderbuffers.remove(&renderbuffer);
+    }
+    /// Note that a mip chain now exists for `texture`'s current level-0 contents.
+    /// Returns `true` only the first time, so callers generate it once.
+    pub(super) fn record_generated_mipmaps(&mut self, target: GLenum, texture: GLuint) -> bool {
+        self.generated_mipmaps.insert((target, texture))
+    }
+    /// A new level-0 upload invalidates whatever chain was generated before.
+    pub(super) fn forget_generated_mipmaps(&mut self, target: GLenum, texture: GLuint) {
+        self.generated_mipmaps.remove(&(target, texture));
+    }
+    /// Remember a mipmap min filter the guest set before the texture had a
+    /// level 0, so the chain and the filter can be applied after the upload.
+    pub(super) fn record_pending_min_filter(
+        &mut self,
+        target: GLenum,
+        texture: GLuint,
+        filter: GLint,
+    ) {
+        self.pending_min_filters.insert((target, texture), filter);
+    }
+    /// Take the remembered filter for `texture`, if any.
+    pub(super) fn take_pending_min_filter(
+        &mut self,
+        target: GLenum,
+        texture: GLuint,
+    ) -> Option<GLint> {
+        self.pending_min_filters.remove(&(target, texture))
+    }
+    pub(super) fn forget_pending_min_filter(&mut self, target: GLenum, texture: GLuint) {
+        self.pending_min_filters.remove(&(target, texture));
     }
     /// Mark a PVRTC level as not yet materialized: its first upload must use
     /// `glTexImage2D` (which defines the level) instead of
@@ -360,7 +544,9 @@ impl GLShadowState {
         }
         self.next_software_vertex_array = name.wrapping_add(1).max(1);
         self.software_vertex_arrays.insert(name);
-        self.software_vao_element_array_buffers.entry(name).or_insert(0);
+        self.software_vao_element_array_buffers
+            .entry(name)
+            .or_insert(0);
         name
     }
     pub(super) fn is_software_vertex_array(&self, array: GLuint) -> bool {
@@ -395,6 +581,7 @@ pub(super) struct EAGLContextHostObject {
     /// Guest object addresses can be reused when a game session restarts.
     present_token: usize,
     resource_group_token: usize,
+    sharegroup: id,
     /// See [GLShadowState].
     pub(super) shadow: GLShadowState,
     /// Which EAGL rendering API was requested. This influences how
@@ -411,18 +598,160 @@ pub(super) struct EAGLContextHostObject {
     renderbuffer_drawable_bindings: Rc<RefCell<HashMap<GLuint, id>>>,
     fps_counter: Option<FpsCounter>,
     next_frame_due: Option<Instant>,
-    /// Buffers the guest currently has mapped, keyed by target and buffer
-    /// object name: `(guest mirror, driver mapping, size)`.
-    ///
-    /// The driver mapping is only set for `glMapBufferRange`, whose mapping is
-    /// still open; `glMapBufferOES` keeps the data in the guest mirror alone
-    /// and uploads it on unmap, so it never holds a driver pointer across a
-    /// guest call (see `gles_guest::glMapBufferOES`).
-    pub mapped_buffers:
-        HashMap<(GLenum, GLuint), (MutPtr<GLvoid>, Option<*mut GLvoid>, usize)>,
+    last_profiled_frame: Option<Instant>,
+    profiled_frame_intervals: Vec<f64>,
+    /// Buffer mappings are object state, shared by every context in the group.
+    pub(super) buffers: Rc<RefCell<super::buffer_mapping::BufferObjects>>,
 }
 impl HostObject for EAGLContextHostObject {}
 
+/// Deleting a renderbuffer also drops its retained EAGLDrawable association.
+/// The mapping is shared by all contexts in the EAGLSharegroup, just like GL
+/// renderbuffer names. Otherwise resizing a GLKView leaks each previous layer.
+pub(crate) fn forget_renderbuffer_drawables(env: &mut Environment, renderbuffers: &[GLuint]) {
+    let Some(context) = *env
+        .framework_state
+        .opengles
+        .current_ctx_for_thread(env.current_thread)
+    else {
+        return;
+    };
+    let drawables = {
+        let host = env.objc.borrow::<EAGLContextHostObject>(context);
+        let mut bindings = host.renderbuffer_drawable_bindings.borrow_mut();
+        renderbuffers
+            .iter()
+            .filter_map(|buffer| bindings.remove(buffer))
+            .collect::<Vec<_>>()
+    };
+    for drawable in drawables {
+        release(env, drawable);
+    }
+}
+
+#[derive(Default)]
+struct EAGLSharegroupHostObject {
+    /// Weak context references avoid a cycle with contexts retaining the group.
+    contexts: Vec<id>,
+    /// Keep native resources alive if the sharegroup outlives its contexts.
+    retired_context: Option<Box<dyn GLESContext>>,
+    resource_group_token: usize,
+    renderbuffer_drawable_bindings: Rc<RefCell<HashMap<GLuint, id>>>,
+    buffers: Rc<RefCell<super::buffer_mapping::BufferObjects>>,
+}
+impl HostObject for EAGLSharegroupHostObject {}
+
+/// EAGLContext.sharegroup returns an EAGLSharegroup with stable identity.
+/// The context owns it; contexts initialized with that group share resources.
+/// https://developer.apple.com/documentation/opengles/eaglcontext/sharegroup
+fn attach_sharegroup(objc: &mut ObjC, mem: &mut crate::mem::Mem, context: id, group: id) -> id {
+    let group = if group == nil {
+        let host = objc.borrow::<EAGLContextHostObject>(context);
+        let object = EAGLSharegroupHostObject {
+            contexts: Vec::new(),
+            retired_context: None,
+            resource_group_token: host.present_token,
+            renderbuffer_drawable_bindings: host.renderbuffer_drawable_bindings.clone(),
+            buffers: host.buffers.clone(),
+        };
+        let class = objc.get_known_class("EAGLSharegroup", mem);
+        objc.alloc_object(class, Box::new(object), mem)
+    } else {
+        objc.increment_refcount(group);
+        group
+    };
+    let (token, bindings, buffers) = {
+        let host = objc.borrow_mut::<EAGLSharegroupHostObject>(group);
+        host.contexts.push(context);
+        (
+            host.resource_group_token,
+            host.renderbuffer_drawable_bindings.clone(),
+            host.buffers.clone(),
+        )
+    };
+    let host = objc.borrow_mut::<EAGLContextHostObject>(context);
+    host.sharegroup = group;
+    host.resource_group_token = token;
+    host.shadow.resource_group_token = token;
+    host.renderbuffer_drawable_bindings = bindings;
+    host.buffers = buffers;
+    group
+}
+
+fn detach_sharegroup(objc: &mut ObjC, context: id) -> id {
+    let group = objc.borrow::<EAGLContextHostObject>(context).sharegroup;
+    if group != nil {
+        let needs_anchor = {
+            let host = objc.borrow_mut::<EAGLSharegroupHostObject>(group);
+            host.contexts.retain(|&other| other != context);
+            host.contexts.is_empty() && host.retired_context.is_none()
+        };
+        if needs_anchor {
+            let native = objc
+                .borrow_mut::<EAGLContextHostObject>(context)
+                .gles_ctx
+                .take();
+            objc.borrow_mut::<EAGLSharegroupHostObject>(group)
+                .retired_context = native;
+        }
+    }
+    group
+}
+
+#[cfg(test)]
+#[test]
+fn sharegroup_preserves_type_identity_and_resources() {
+    let mut mem = crate::mem::Mem::new();
+    mem.set_null_segment_size(0x1000);
+    let mut objc = ObjC::new();
+    objc.register_host_selectors(&mut mem);
+    let class = objc.get_known_class("EAGLContext", &mut mem);
+    let context = || EAGLContextHostObject {
+        present_token: crate::gles::perf_overlay::allocate_context_token(),
+        ..Default::default()
+    };
+    let first = objc.alloc_object(class, Box::new(context()), &mut mem);
+    let second = objc.alloc_object(class, Box::new(context()), &mut mem);
+    let group = attach_sharegroup(&mut objc, &mut mem, first, nil);
+    assert_ne!(group, first);
+    assert_eq!(
+        objc.get_class_name(ObjC::read_isa(group, &mem)),
+        "EAGLSharegroup"
+    );
+    assert_eq!(attach_sharegroup(&mut objc, &mut mem, second, group), group);
+    assert_eq!(objc.get_refcount(group).get(), 2);
+    let first_host = objc.borrow::<EAGLContextHostObject>(first);
+    let second_host = objc.borrow::<EAGLContextHostObject>(second);
+    assert_eq!(first_host.sharegroup, second_host.sharegroup);
+    assert_eq!(
+        first_host.resource_group_token,
+        second_host.resource_group_token
+    );
+    assert!(Rc::ptr_eq(
+        &first_host.renderbuffer_drawable_bindings,
+        &second_host.renderbuffer_drawable_bindings
+    ));
+    assert!(Rc::ptr_eq(&first_host.buffers, &second_host.buffers));
+    assert_eq!(detach_sharegroup(&mut objc, first), group);
+    assert!(!objc.decrement_refcount(group));
+    objc.dealloc_object(first, &mut mem);
+    assert_eq!(
+        objc.borrow::<EAGLSharegroupHostObject>(group).contexts,
+        vec![second]
+    );
+    assert_eq!(
+        objc.borrow::<EAGLContextHostObject>(second).sharegroup,
+        group
+    );
+    assert_eq!(detach_sharegroup(&mut objc, second), group);
+    assert!(objc.decrement_refcount(group));
+    objc.dealloc_object(second, &mut mem);
+    assert!(objc
+        .borrow::<EAGLSharegroupHostObject>(group)
+        .contexts
+        .is_empty());
+    objc.dealloc_object(group, &mut mem);
+}
 
 /// Log the effective state of the `fix_texture_min_filter` option once,
 /// the first time an EAGL context is created. This makes it easy to
@@ -439,12 +768,14 @@ fn log_fix_min_filter_status(enabled: bool) {
     }
     if enabled {
         log!(
-            "fix_texture_min_filter: ON (after every level-0 texture upload, \
-             GL_TEXTURE_MIN_FILTER will be forced to GL_LINEAR if the guest \
-             never set it). This avoids flat-black/white-textured geometry on \
-             strict drivers (Mali, Adreno) for iOS games that don't ship \
-             mipmaps. Disable with --no-fix-texture-min-filter if a game \
-             genuinely needs mipmap minification."
+            "fix_texture_min_filter: ON. ES 2.0 contexts keep the guest's \
+             mipmap GL_TEXTURE_MIN_FILTER and get a mip chain generated after \
+             each level-0 texture upload; ES 1.1 contexts replace a mipmap \
+             filter with GL_LINEAR after every level-0 upload. Both avoid \
+             flat-black or blocky-white textured geometry on strict drivers (Mali, Adreno) \
+             for iOS games that don't ship mipmaps. Disable with \
+             --no-fix-texture-min-filter if a game genuinely needs mipmap \
+             minification."
         );
     } else {
         log!(
@@ -453,6 +784,25 @@ fn log_fix_min_filter_status(enabled: bool) {
              with --fix-texture-min-filter (or remove \
              --no-fix-texture-min-filter from your options)."
         );
+    }
+}
+
+// Resolve both halves of the existing single-drawable compatibility route.
+// Keeping the driver's depth-RB name after selecting the colour drawable
+// made every presenter copy depth storage instead of the rendered image.
+fn resolve_presented_renderbuffer(
+    bindings: &HashMap<GLuint, id>,
+    reported: GLuint,
+) -> Option<(GLuint, id)> {
+    if let Some(&drawable) = bindings.get(&reported) {
+        Some((reported, drawable))
+    } else if bindings.len() == 1 {
+        bindings
+            .iter()
+            .next()
+            .map(|(&rb, &drawable)| (rb, drawable))
+    } else {
+        None
     }
 }
 
@@ -467,13 +817,16 @@ pub const CLASSES: ClassExports = objc_classes! {
         gles_ctx: None,
         present_token: crate::gles::perf_overlay::allocate_context_token(),
         resource_group_token: 0,
+        sharegroup: nil,
         shadow: GLShadowState::default(),
         api: kEAGLRenderingAPIOpenGLES1,
         drawable_framebuffer: 0,
         renderbuffer_drawable_bindings: Rc::new(RefCell::new(HashMap::new())),
         fps_counter: None,
         next_frame_due: None,
-        mapped_buffers: HashMap::new(),
+        last_profiled_frame: None,
+        profiled_frame_intervals: Vec::new(),
+        buffers: Rc::default(),
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -513,21 +866,29 @@ pub const CLASSES: ClassExports = objc_classes! {
         return nil;
     }
 
+    if rejects_gles3_request(api, env.options.no_gles3) {
+        log!(
+            "App requested EAGL initWithAPI:3 (kEAGLRenderingAPIOpenGLES3) sharegroup:{:?}, \
+             returning nil: --no-gles3 reports that the GPU has no OpenGL ES 3.0 support",
+            group
+        );
+        return nil;
+    }
+
     if group == nil {
         return msg![env; this initWithAPI:api];
     }
 
-    let resource_group_token = {
-        let group_context = env.objc.borrow::<EAGLContextHostObject>(group);
-        if group_context.resource_group_token != 0 {
-            group_context.resource_group_token
-        } else {
-            group_context.present_token
-        }
-    };
+    let group_host = env.objc.borrow::<EAGLSharegroupHostObject>(group);
+    let resource_group_token = group_host.resource_group_token;
+    let representative = group_host.contexts.first().copied();
 
     let window = env.window.as_mut().expect("OpenGL ES is not supported in headless mode");
-    let prev_context = env.objc.borrow_mut::<EAGLContextHostObject>(group).gles_ctx.as_mut().unwrap();
+    let prev_context = if let Some(context) = representative {
+        env.objc.borrow_mut::<EAGLContextHostObject>(context).gles_ctx.as_mut().unwrap()
+    } else {
+        env.objc.borrow_mut::<EAGLSharegroupHostObject>(group).retired_context.as_mut().unwrap()
+    };
 
     // This is sort of a hack - we set the "current" context, then immediately
     // drop it. Since we know all the code between here and creating the new
@@ -542,13 +903,24 @@ pub const CLASSES: ClassExports = objc_classes! {
         api,
         env.options.prefer_gles2_context,
         env.options.force_gles1_context,
+        env.options.no_gles3,
     );
 
-    let mut gles_ins = match effective_api {
-        kEAGLRenderingAPIOpenGLES3 => create_gles3_ctx(env),
-        kEAGLRenderingAPIOpenGLES2 => create_gles2_ctx(env),
-        _ => create_gles1_ctx(env),
-    };
+// Context creation can fail (e.g. no usable GL driver); like the
+// unsupported-API path above, log it and return nil instead of aborting.
+let gles_ins = match effective_api {
+ kEAGLRenderingAPIOpenGLES3 => create_gles3_ctx(env),
+ kEAGLRenderingAPIOpenGLES2 => create_gles2_ctx(env),
+ _ => Ok(create_gles1_ctx(env)),
+};
+let mut gles_ins = match gles_ins {
+ Ok(ctx) => ctx,
+ Err(err) => {
+  log!("EAGLContext initWithAPI:{} failed: {}", api, err);
+  env.window.as_mut().unwrap().set_share_with_current_context(false);
+  return nil;
+ }
+};
 
     let window = env.window.as_mut().expect("OpenGL ES is not supported in headless mode");
     let drawable_framebuffer = {
@@ -562,6 +934,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         unsafe {
             gles_ctx.GetIntegerv(gles11::FRAMEBUFFER_BINDING_OES, &mut framebuffer);
         }
+        unsafe { drain_startup_gl_errors(gles_ctx.as_mut()) };
         framebuffer as GLuint
     };
 
@@ -577,7 +950,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     env.window.as_mut().unwrap().set_share_with_current_context(false);
 
-    env.objc.borrow_mut::<EAGLContextHostObject>(this).renderbuffer_drawable_bindings = env.objc.borrow::<EAGLContextHostObject>(group).renderbuffer_drawable_bindings.clone();
+    attach_sharegroup(&mut env.objc, &mut env.mem, this, group);
     this
 }
 
@@ -593,19 +966,37 @@ pub const CLASSES: ClassExports = objc_classes! {
         return nil;
     }
 
+    if rejects_gles3_request(api, env.options.no_gles3) {
+        log!(
+            "App requested EAGL initWithAPI:3 (kEAGLRenderingAPIOpenGLES3), returning nil: \
+             --no-gles3 reports that the GPU has no OpenGL ES 3.0 support"
+        );
+        return nil;
+    }
+
     let resource_group_token = env.objc.borrow::<EAGLContextHostObject>(this).present_token;
 
     let effective_api = effective_eagl_api(
         api,
         env.options.prefer_gles2_context,
         env.options.force_gles1_context,
+        env.options.no_gles3,
     );
 
-    let mut gles_ins = match effective_api {
-        kEAGLRenderingAPIOpenGLES3 => create_gles3_ctx(env),
-        kEAGLRenderingAPIOpenGLES2 => create_gles2_ctx(env),
-        _ => create_gles1_ctx(env),
-    };
+// Context creation can fail (e.g. no usable GL driver); report it and
+// return nil, like the unsupported-API path above.
+let gles_ins = match effective_api {
+ kEAGLRenderingAPIOpenGLES3 => create_gles3_ctx(env),
+ kEAGLRenderingAPIOpenGLES2 => create_gles2_ctx(env),
+ _ => Ok(create_gles1_ctx(env)),
+};
+let mut gles_ins = match gles_ins {
+ Ok(ctx) => ctx,
+ Err(err) => {
+  log!("EAGLContext initWithAPI:{} failed: {}", api, err);
+  return nil;
+ }
+};
 
     let window = env.window.as_mut().expect("OpenGL ES is not supported in headless mode");
     let drawable_framebuffer = {
@@ -619,6 +1010,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         unsafe {
             gles_ctx.GetIntegerv(gles11::FRAMEBUFFER_BINDING_OES, &mut framebuffer);
         }
+        unsafe { drain_startup_gl_errors(gles_ctx.as_mut()) };
         framebuffer as GLuint
     };
 
@@ -632,6 +1024,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     crate::gles::perf_overlay::register_gl_resource_context(resource_group_token);
 
+    attach_sharegroup(&mut env.objc, &mut env.mem, this, nil);
     this
 }
 
@@ -640,19 +1033,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)sharegroup {
-    // We use object itself as the sharegroup.
-    // Check initWithAPI:sharegroup: for more info
-    this
+    env.objc.borrow::<EAGLContextHostObject>(this).sharegroup
 }
 
 - (())dealloc {
-    let (resource_group_token, drawables, mapped_guest_buffers) = {
+    let group = detach_sharegroup(&mut env.objc, this);
+    let (resource_group_token, drawables) = {
         let host_obj = env.objc.borrow_mut::<EAGLContextHostObject>(this);
-        let mapped_guest_buffers = host_obj
-            .mapped_buffers
-            .values()
-            .map(|&(guest_buf, _, _)| guest_buf)
-            .collect::<Vec<_>>();
         let resource_group_token = host_obj.resource_group_token;
         host_obj.resource_group_token = 0;
         host_obj.shadow.resource_group_token = 0;
@@ -662,16 +1049,14 @@ pub const CLASSES: ClassExports = objc_classes! {
         } else {
             Vec::new()
         };
-        (resource_group_token, drawables, mapped_guest_buffers)
+        (resource_group_token, drawables)
     };
-    for guest_buffer in mapped_guest_buffers {
-        env.mem.free(guest_buffer);
-    }
     for drawable in drawables {
         release(env, drawable);
     }
     crate::gles::perf_overlay::unregister_gl_resource_context(resource_group_token);
     env.objc.dealloc_object(this, &mut env.mem);
+    release(env, group);
 }
 
 - (bool)renderbufferStorage:(NSUInteger)target
@@ -693,7 +1078,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // renderbuffer to a drawable and returns `YES`. touchHLE used to
     // assert against this case (`drawable != nil`), which crashed apps
     // that legitimately unbind during teardown (e.g. Resident Evil 4 —
-    // HyperHLE log #5 — calls `renderbufferStorage:fromDrawable:nil`
+    // AppleJuiceHLE log #5 — calls `renderbufferStorage:fromDrawable:nil`
     // while tearing down its EAGL surface during a scene transition).
     //
     // Spec behaviour: look up the currently bound renderbuffer (via
@@ -758,20 +1143,23 @@ pub const CLASSES: ClassExports = objc_classes! {
     let format_key = get_static_str(env, kEAGLDrawablePropertyColorFormat);
     let format_rgba8 = get_static_str(env, kEAGLColorFormatRGBA8);
     let format_rgb565 = get_static_str(env, kEAGLColorFormatRGB565);
+    let format_srgba8 = get_static_str(env, kEAGLColorFormatSRGBA8);
 
     let format: id = msg![env; props objectForKey:format_key];
-    // Theoretically this should map formats like:
-    // - kColorFormatRGBA8 => RGBA8_OES
-    // - kColorFormatRGB565 => RGB565_OES
-    // However, the specification of EXT_framebuffer_object allows the
-    // implementation to arbitrarily restrict which formats can be rendered to,
-    // and it seems like RGB565 isn't supported, at least on a machine with
-    // Intel HD Graphics 615 running macOS Monterey. I don't think RGBA8 is
-    // guaranteed either, but it at least seems to work.
-    if !msg![env; format isEqual:format_rgba8] && !msg![env; format isEqual:format_rgb565] {
-        log!("[renderbufferStorage:{:?} fromDrawable:{:?}] Warning: unhandled format {:?}, using RGBA8", target, drawable, format);
-    }
-    let internalformat = gles11::RGBA8_OES;
+    // EAGLDrawable.h specifies RGBA8 as the default, RGB565, and (iOS 7+)
+    // SRGBA8. Keep the resolve buffer's format consistent with GLKit's MSAA
+    // buffer; silently forcing RGBA8 makes RGB565/sRGB resolves invalid.
+    // https://developer.apple.com/documentation/opengles/eagldrawable
+    let internalformat = if format == nil || msg![env; format isEqual:format_rgba8] {
+        gles11::RGBA8_OES
+    } else if msg![env; format isEqual:format_rgb565] {
+        0x8d62 // GL_RGB565
+    } else if msg![env; format isEqual:format_srgba8] {
+        0x8c43 // GL_SRGB8_ALPHA8
+    } else {
+        log!("Unsupported EAGL drawable color format {:?}", format);
+        return false;
+    };
 
     let (width, height) = {
         // ULTRAHLE_MINIONJUMP_RENDERBUFFER_BEGIN
@@ -787,7 +1175,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
             // Apple's `-renderbufferStorage:fromDrawable:` derives the
             // renderbuffer size from the CAEAGLayer's bounds. Some apps (e.g.
-            // Beyond Gravity — HyperHLE log #1) momentarily present a layer
+            // Beyond Gravity — AppleJuiceHLE log #1) momentarily present a layer
             // whose `bounds.size` is bogus (non-finite, negative, or zero)
             // during an unbind/rebind cycle while tearing down and recreating
             // their EAGL surface. touchHLE used to `assert!` the size was in a
@@ -1047,6 +1435,21 @@ pub const CLASSES: ClassExports = objc_classes! {
     // plain log!() would flood, but the very first call is a key signal that
     // the app actually got past splash/init and is rendering.
     log_once!("[EAGLContext presentRenderbuffer:] first call (app reached first frame)");
+    if crate::env_flag_cached!("TOUCHHLE_FRAME_TIMES") {
+        let host = env.objc.borrow_mut::<EAGLContextHostObject>(this);
+        let now = Instant::now();
+        if let Some(previous) = host.last_profiled_frame.replace(now) {
+            host.profiled_frame_intervals.push(now.duration_since(previous).as_secs_f64() * 1000.0);
+            // Batch output to keep profiling from introducing a blocking
+            // write on every frame. Only explicit diagnostic runs collect it.
+            if host.profiled_frame_intervals.len() == 120 {
+                let samples = host.profiled_frame_intervals.iter()
+                    .map(|ms| format!("{ms:.3}")).collect::<Vec<_>>().join(",");
+                host.profiled_frame_intervals.clear();
+                log!("FRAME-TIMES context={:?} ms={}", this, samples);
+            }
+        }
+    }
     {
         static INPUT_POLL_THREAD_LOGGED: std::sync::Once = std::sync::Once::new();
         INPUT_POLL_THREAD_LOGGED.call_once(|| {
@@ -1102,10 +1505,12 @@ pub const CLASSES: ClassExports = objc_classes! {
             .count_frame(format_args!("EAGLContext {this:?}"), env.options.print_fps);
     }
 
+    let video_overlay_active = crate::frameworks::media_player::has_active_video(env);
     let mut fullscreen_layer = find_fullscreen_eagl_layer(env);
 
     // Unclear from documentation if this method requires the context to be
     // current, but it would be weird if it didn't?
+    let host_uses_angle = env.window.as_ref().is_some_and(|window| window.is_angle_backend());
     let Some(window) = env.window.as_mut() else {
         log_dbg!(
             "[EAGLContext presentRenderbuffer:{:#x}] ignored in headless mode",
@@ -1132,7 +1537,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         return false;
     };
 
-    let (renderbuffer, backend_is_translator, backend_is_native_es1, backend_is_es2) = unsafe {
+    let (reported_renderbuffer, backend_is_translator, backend_is_native_es1, backend_is_es2) = unsafe {
         let mut renderbuffer = 0;
         gles.GetIntegerv(gles11::RENDERBUFFER_BINDING_OES, &mut renderbuffer);
         (
@@ -1151,51 +1556,36 @@ pub const CLASSES: ClassExports = objc_classes! {
         .renderbuffer_drawable_bindings
         .borrow();
 
-    // The renderbuffer reported by the driver must be the drawable's colour
-    // renderbuffer, and that is what gets keyed in the map. Some engines
-    // (cocos2d 2.x, e.g. Geometry Dash) leave a different binding current
-    // around presentRenderbuffer:, which makes the driver-reported id miss
-    // the map — on iOS the renderbuffer attached to the drawable is still
-    // presented, so fall back to the single registered binding instead of
-    // silently dropping the frame (the silent drop manifests as a permanent
-    // black screen).
-    let drawable = match bindings.get(&renderbuffer) {
-        Some(&drawable) => drawable,
-        None => {
-            if bindings.len() == 1 {
-                let (&rb, &drawable) = bindings.iter().next().unwrap();
-                {
-                    static MISMATCH_LOGGED: std::sync::Once = std::sync::Once::new();
-                    MISMATCH_LOGGED.call_once(|| {
-                        log!(
-                            "[EAGLContext presentRenderbuffer:] renderbuffer binding \
-                             mismatch: driver reports {:#x}, drawable is bound to \
-                             {:#x}; presenting the bound drawable anyway. \
-                             [this log will only be shown once]",
-                            renderbuffer,
-                            rb
-                        );
-                    });
-                }
-                drawable
-            } else {
-                log!(
-                    "Warning: can't present a renderbuffer {:#x} not bound to a \
-                     drawable ({} bound renderbuffer(s): {:?}) - frame skipped.",
-                    renderbuffer,
-                    bindings.len(),
-                    bindings.keys().copied().collect::<Vec<_>>(),
-                );
-                drop(bindings);
-                if let Some(frame_due) = frame_due {
-                    pace_frame(env, frame_due);
-                }
-                return false;
-            }
+    let Some((renderbuffer, drawable)) =
+        resolve_presented_renderbuffer(&bindings, reported_renderbuffer)
+    else {
+        log!(
+            "Warning: can't present renderbuffer {:#x} not bound to a drawable \
+             ({} bound renderbuffer(s)) - frame skipped.",
+            reported_renderbuffer,
+            bindings.len(),
+        );
+        drop(bindings);
+        if let Some(frame_due) = frame_due {
+            pace_frame(env, frame_due);
         }
+        return false;
     };
+    if renderbuffer != reported_renderbuffer {
+        static MISMATCH_LOGGED: std::sync::Once = std::sync::Once::new();
+        MISMATCH_LOGGED.call_once(|| {
+            log!(
+                "EAGL presentation binding mismatch: driver bound {:#x}; copying \
+                 registered colour renderbuffer {:#x} for drawable {:?}.",
+                reported_renderbuffer, renderbuffer, drawable
+            );
+        });
+    }
     drop(bindings);
-    if fullscreen_layer != drawable && attach_orphaned_eagl_view_to_root(env, drawable) {
+    if !video_overlay_active
+        && fullscreen_layer != drawable
+        && attach_orphaned_eagl_view_to_root(env, drawable)
+    {
         fullscreen_layer = find_fullscreen_eagl_layer(env);
     }
 
@@ -1217,11 +1607,28 @@ pub const CLASSES: ClassExports = objc_classes! {
         && env.options.ios_es2_direct_present
         && fullscreen_layer == nil
         && env.objc.borrow::<EAGLContextHostObject>(this).api == kEAGLRenderingAPIOpenGLES2;
-    if use_ios_es2_direct_path {
+    if use_ios_es2_direct_path && !video_overlay_active {
         log_once!("Using the iOS ES2 direct presenter for a non-fullscreen CAEAGLLayer.");
     }
 
-    if drawable == fullscreen_layer || fullscreen_layer != nil || use_ios_es2_direct_path {
+    let bypass_composition = can_present_without_composition(
+        drawable,
+        fullscreen_layer,
+        use_ios_es2_direct_path,
+        video_overlay_active,
+    );
+    if crate::env_flag_cached!("TOUCHHLE_TRACE_PRESENT_ROUTE") {
+        static ROUTE_SAMPLES: AtomicU32 = AtomicU32::new(0);
+        let sample = ROUTE_SAMPLES.fetch_add(1, Ordering::Relaxed);
+        if sample < 8 || sample % 60 == 0 {
+            log!(
+                "PRESENT-ROUTE video_active={} bypass_composition={} drawable={:?}",
+                video_overlay_active, bypass_composition, drawable
+            );
+        }
+    }
+
+    if bypass_composition {
         // Decide between presenting on the GPU (copy the renderbuffer into a
         // texture and draw it into the window — cheap) and reading the frame
         // back to RAM and pushing it through the compositor (a full pipeline
@@ -1233,57 +1640,36 @@ pub const CLASSES: ClassExports = objc_classes! {
         // the biggest per-frame cost. It's now an explicit choice
         // (--present-mode=readback) or an automatic fallback when the GPU
         // route demonstrably produces black frames on this driver.
-        let use_readback = match env.options.present_mode {
-            PresentMode::Readback => {
-                if backend_is_es2 && !backend_is_translator {
-                    // The readback path speaks ES 1.1 (OES framebuffer entry
-                    // points); the shader presenter is the only option on a
-                    // real ES 2.0 driver.
-                    log_once!(
-                        "--present-mode=readback is not available on an OpenGL ES 2.0 backend; presenting directly"
-                    );
-                    false
-                } else {
-                    true
-                }
-            }
-            PresentMode::Direct => false,
-            // The ES 1.1-on-ES 2.0 translator can't run either GPU presenter
-            // (its glDrawArrays is the fixed-function emulation itself), so
-            // it keeps using readback unless explicitly overridden.
-            PresentMode::Auto => {
-                // Native ES 1.1 games keep the readback presenter by default.
-                // The GPU-copy path changes guest-visible fixed-function state
-                // in ways 2D engines (cocos2d etc.) notice — sprite
-                // blending/tinting breaks even though the frame is not black,
-                // so the automatic black-frame fallback never triggers. ES 2.0
-                // backends keep the fast GPU path (its save/restore is exact,
-                // and that is where the 3D games live).
-                backend_is_translator
-                    || backend_is_native_es1
-                    || (backend_is_es2 && direct_present_is_broken())
-            }
+        let backend = PresentBackend {
+            is_translator: backend_is_translator,
+            is_native_es1: backend_is_native_es1,
+            is_es2: backend_is_es2,
+            direct_present_broken: direct_present_is_broken(),
         };
+        let decision = select_present_route(env.options.present_mode, backend);
+        let use_readback = decision.route == PresentRoute::Readback;
         {
             static LOGGED: std::sync::Once = std::sync::Once::new();
             LOGGED.call_once(|| {
                 log!(
                     "EAGL presenter: fullscreen layer {:?} will be presented via {} \
-                     (present_mode={:?}, translator={}, native_es1={}, es2={}) \
-                     [this log will only be shown once]",
+                     (present_mode={:?}, force_composition={}, translator={}, \
+                     native_es1={}, es2={}): {} [this log will only be shown once]",
                     drawable,
-                    if use_readback {
-                        "glReadPixels readback + compositor"
-                    } else {
-                        "GPU copy (direct)"
-                    },
+                    decision.route.describe(),
                     env.options.present_mode,
-                    backend_is_translator,
-                    backend_is_native_es1,
-                    backend_is_es2,
+                    env.options.force_composition,
+                    backend.is_translator,
+                    backend.is_native_es1,
+                    backend.is_es2,
+                    decision.reason,
                 );
             });
         }
+        // One line per later change of route (e.g. the black-frame probe
+        // giving up on the GPU presenter mid-session), so a bug report that
+        // only shows part of the log still says how the frame got to screen.
+        note_present_route(decision, drawable, env.options.present_mode, backend);
         if use_readback {
             log_dbg!(
                 "Layer {:?} is the fullscreen layer, presenting renderbuffer {:?} through RAM readback.",
@@ -1304,6 +1690,7 @@ pub const CLASSES: ClassExports = objc_classes! {
                 trace_gl_errors: env.options.trace_gl_errors,
                 present_mode: env.options.present_mode,
                 present_finish: env.options.present_finish,
+                angle_backend: host_uses_angle,
                 window_framebuffer: env
                     .objc
                     .borrow::<EAGLContextHostObject>(this)
@@ -1328,7 +1715,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             }
         }
     } else {
-        if fullscreen_layer != nil {
+        if fullscreen_layer != nil && !video_overlay_active {
             // If there's a single layer that covers the screen, and this isn't
             // it, there's no point in presenting the output because it won't be
             // seen. Using a noisy log because it's a weird scenario and might
@@ -1381,16 +1768,25 @@ pub const CLASSES: ClassExports = objc_classes! {
         // again during composition. find_fullscreen_eagl_layer() exists to
         // avoid this.
         {
-            static SLOW_PATH_LOGGED: std::sync::Once = std::sync::Once::new();
-            SLOW_PATH_LOGGED.call_once(|| {
+            // Report the route change, not just the first frame: a fallback
+            // that starts with a movie and never ends was invisible in logs
+            // because this used to be a one-shot.
+            let readback = present_route_code(PresentRoute::Readback);
+            let previous = LAST_PRESENT_ROUTE.swap(readback, Ordering::Relaxed);
+            if previous != readback {
                 log!(
-                    "EAGL presenter: no fullscreen layer found; presenting renderbuffer \
-                     {:#x} to layer {:?} via RAM readback (slow path). [this log will \
-                     only be shown once]",
+                    "EAGL presenter: no fullscreen layer found ({}); presenting \
+                     renderbuffer {:#x} to layer {:?} via RAM readback + Core \
+                     Animation compositing.",
+                    if env.options.force_composition {
+                        "composition is forced by --force-composition"
+                    } else {
+                        "the drawable does not cover the screen as an opaque layer"
+                    },
                     renderbuffer,
                     drawable
                 );
-            });
+            }
         }
         let pixels_vec = get_pixels_vec_for_presenting(env, drawable);
         // re-borrow
@@ -1402,7 +1798,10 @@ pub const CLASSES: ClassExports = objc_classes! {
                 env.current_thread,
             );
             match maybe_gles {
-                Some(mut gles) => unsafe { read_renderbuffer(gles.as_mut(), renderbuffer, pixels_vec) },
+                Some(mut gles) => unsafe {
+                    log_drawable_capabilities_once(gles.as_mut());
+                    read_renderbuffer(gles.as_mut(), renderbuffer, pixels_vec)
+                },
                 None => {
                     log!(
                         "[EAGLContext presentRenderbuffer:{:#x}] lost GL \
@@ -1421,7 +1820,18 @@ pub const CLASSES: ClassExports = objc_classes! {
             }
             return false;
         };
-        dump_readback_ppm(&pixels_vec, width, height);
+        dump_readback_png(
+            &pixels_vec,
+            width,
+            height,
+            env.options.trace_gl_errors
+                || crate::env_flag_cached!("TOUCHHLE_DUMP_READBACK"),
+        );
+        // The GPU-present route probes its renderbuffer, but this route did
+        // not, so "the picture is black/x-ray" reports from users on the
+        // readback presenter had no pixel-level evidence attached. Same frame
+        // schedule as the GPU-route probe, so the two can be compared.
+        probe_readback_content(&pixels_vec, width, height);
         // DIAG (TOUCHHLE_TRACE_PRESENT=1): is the frame we read back actually
         // non-black? This tells apart "renderer produced a black frame"
         // (content/loading) from "we present fine but the pixels never reach
@@ -1440,6 +1850,7 @@ pub const CLASSES: ClassExports = objc_classes! {
                 );
             }
         }
+        log_nonopaque_present_once(env, drawable, &pixels_vec);
         present_pixels(env, drawable, pixels_vec, width, height);
 
         // The slow path stores the freshly rendered frame in `presented_pixels`
@@ -1463,6 +1874,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     if let Some(frame_due) = frame_due {
+        let _profile = crate::runtime_profile::scope(env.current_thread, "eagl.frame-sync");
         pace_frame(env, frame_due);
         }
 
@@ -1471,42 +1883,442 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @end
 
+@implementation EAGLSharegroup: NSObject
+- (())dealloc {
+    let drawables = {
+        let host = env.objc.borrow_mut::<EAGLSharegroupHostObject>(this);
+        host.buffers.borrow_mut().free_all(&mut env.mem);
+        std::mem::take(&mut *host.renderbuffer_drawable_bindings.borrow_mut())
+            .into_values().collect::<Vec<_>>()
+    };
+    for drawable in drawables {
+        release(env, drawable);
+    }
+    env.objc.dealloc_object(this, &mut env.mem);
+}
+@end
+
 };
 
-/// Dump one renderbuffer readback to a PPM for black-screen diagnosis
-/// (env var gated, as this is a developer-only diagnostic).
-fn dump_readback_ppm(pixels: &[u8], width: u32, height: u32) {
+/// Drain the GL error queue after touchHLE's own start-up probes, so the
+/// guest does not observe them.
+///
+/// touchHLE's start-up probes (extension, version and capability queries, and
+/// whatever a backend checks while it initialises) run on the same host
+/// context — and therefore the same `glGetError` queue — as the guest app.
+/// Strict drivers raise `GL_INVALID_ENUM` for some of those probes. That is
+/// harmless in itself: the emulated device is an iPhone OS PowerVR driver that
+/// would have accepted them. Left in the queue, though, such an error is the
+/// *first* thing the guest's own `glGetError` call returns, so an app that
+/// error-checks its set-up (common in middleware such as Unity and Cocos2d)
+/// takes a failure path it would never take on a real device, and a
+/// `--trace-gl-errors` log shows an error next to whichever innocent GL call
+/// happened to come next.
+///
+/// Must be called before the guest can make any GL call of its own.
+unsafe fn drain_startup_gl_errors(gles: &mut dyn GLES) {
+    if drain_gl_errors(gles) {
+        // Deliberately not `log_dbg!`: the point of the drain is that the
+        // guest will never report these, so if the queue was dirty at start-up
+        // the log is the only place the fact can survive.
+        log!(
+            "Drained GL errors raised by touchHLE's own start-up probes, \
+             before the guest could observe them."
+        );
+    }
+}
+
+/// Save one presented frame as a PNG, so a report of "the picture is wrong"
+/// can come with the picture.
+///
+/// The previous version of this wrote a PPM, which no phone can display: the
+/// point of comparing the frame the emulator produced with what the screen
+/// shows is lost if the tester has to convert a file first. PNG costs nothing
+/// extra, because `stb_image_write` is already linked for the screenshot API,
+/// and it keeps the alpha channel, which is exactly what the "see-through only
+/// with Force Composition" reports turn on.
+///
+/// `glReadPixels` returns rows bottom-up, so they are flipped here: the file is
+/// then in the same orientation as the screen, and the two can be compared
+/// pixel for pixel.
+///
+/// Gated on `--trace-gl-errors` (the picker's "Trace GL errors" switch, the one
+/// diagnostic a tester can actually turn on an Android device) or on the
+/// `TOUCHHLE_DUMP_READBACK` developer environment variable. Only a handful of
+/// frames are written: frame 0 can legitimately be a loading screen, so later
+/// frames are sampled too.
+fn dump_readback_png(pixels: &[u8], width: u32, height: u32, enabled: bool) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static CALLS: AtomicU32 = AtomicU32::new(0);
-    if !crate::env_flag_cached!("TOUCHHLE_DUMP_READBACK") {
+    let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    if !enabled {
         return;
     }
-    let n = CALLS.fetch_add(1, Ordering::Relaxed);
-    // Dump at several points in the session: the first frame can legitimately
-    // be black (loading screen), so also sample later frames.
     let targets = [0u32, 60, 300, 600, 1200, 2400];
     let Some(idx) = targets.iter().position(|&t| t == n) else {
         return;
     };
-    let header = format!("P6\n{} {}\n255\n", width, height);
-    let mut out = header.into_bytes();
-    let mut rgb = Vec::with_capacity((width * height * 3) as usize);
-    for px in pixels.chunks_exact(4) {
-        // read_renderbuffer gives RGBA8; PPM wants RGB.
-        rgb.extend_from_slice(&[px[0], px[1], px[2]]);
+    let Some(row_bytes) = (width as usize).checked_mul(4) else {
+        return;
+    };
+    let Some(image_bytes) = row_bytes.checked_mul(height as usize) else {
+        return;
+    };
+    if row_bytes == 0 || pixels.len() < image_bytes {
+        return;
     }
-    out.extend_from_slice(&rgb);
-    let path = format!("/tmp/a8run/readback_f{}.ppm", targets[idx]);
-    match std::fs::write(&path, &out) {
+    let mut flipped = Vec::with_capacity(image_bytes);
+    for row in pixels[..image_bytes].chunks_exact(row_bytes).rev() {
+        flipped.extend_from_slice(row);
+    }
+    let Some(png) =
+        crate::image::encode_png_rgba(width as i32, height as i32, &flipped, row_bytes as i32)
+    else {
+        log!("Failed to encode the presented-frame PNG (encoder ran out of memory?)");
+        return;
+    };
+    // Dumps go next to the log file, not to a hardcoded `/tmp` path that does
+    // not exist on Android or iOS.
+    let name = format!("presented_frame_f{}.png", targets[idx]);
+    let Some(path) = crate::paths::diagnostic_dump_path(&name) else {
+        return;
+    };
+    match std::fs::write(&path, &png) {
         Ok(()) => log!(
-            "Dumped renderbuffer readback #{} ({}x{}) to {}",
+            "Dumped presented frame #{} ({}x{}) to {} - this is the frame the \
+             emulator produced, before the compositor draws it",
             n,
             width,
             height,
-            path
+            path.display()
         ),
-        Err(e) => log!("Failed to dump readback to {}: {}", path, e),
+        Err(e) => log!(
+            "Failed to dump the presented frame to {}: {}",
+            path.display(),
+            e
+        ),
     }
+}
+
+/// Turn the frame-content counts from [probe_readback_content] into one
+/// sentence. Kept separate from the logging so the classification can be
+/// tested, and so both present routes describe a frame the same way.
+fn frame_content_verdict(sampled: u32, matching_centre: u32, black: u32) -> &'static str {
+    if sampled == 0 {
+        // Nothing was sampled: treat it as "we know nothing", not as "flat".
+        "unknown: no pixels sampled"
+    } else if black == sampled {
+        "all black: every sampled pixel is (0,0,0) (nothing drawn, or a failed upload)"
+    } else if matching_centre == sampled {
+        "flat: every sampled pixel equals CENTER (nothing drawn, or only a clear)"
+    } else {
+        "content present: the frame is not a single colour"
+    }
+}
+
+/// Report what the presented frame actually contains, once the frame has been
+/// read back from the renderbuffer.
+///
+/// The GPU-copy present route already probes its renderbuffer (see the
+/// "renderbuffer-content probe" line), but the RAM-readback route — the one
+/// `--force-composition` takes, and the one iOS-era games end up on when their
+/// drawable is not an opaque fullscreen layer — had no pixel-level diagnostic
+/// at all. That is backwards: the readback route is the one whose output can be
+/// wrong for reasons that have nothing to do with the guest's drawing (the
+/// readback itself, the compositor's upload, the blend used to composite it).
+///
+/// The corners and the centre are printed as RGBA. The alpha channel matters
+/// here: the direct route hands the frame to the platform swap chain, which
+/// ignores alpha, while the composition route blends it with Core Animation's
+/// premultiplied-alpha contract. A frame whose alpha is low in places is
+/// therefore a candidate for "looks see-through only with Force Composition",
+/// and the numbers say whether that is the case without a rebuild.
+///
+/// The scan over every 61st pixel separates the two worlds that "the screen is
+/// black / see-through" reports conflate:
+///
+/// - every sampled pixel is black, or every sampled pixel equals the centre
+///   sample: the frame is a single flat colour, so the guest drew nothing (or
+///   only a clear) and the bug is upstream of presentation — depth/alpha/cull
+///   state, texture uploads, or a missing draw;
+/// - anything else: the guest drew something, and the picture reaching the
+///   window is either being mangled afterwards (compositor alpha, upload
+///   format, scale/placement) or is correct and the complaint is about the
+///   scene's content, not its transport.
+///
+/// **This runs unconditionally**, unlike the GPU-route probe. The pixels are
+/// already in RAM on this route, so the cost is one strided pass over a buffer
+/// we just copied; and a bug report that arrives with the picker's "Trace GL
+/// errors" switch left off used to carry no pixel evidence at all. The line is
+/// printed on frames 0, 1, 5, 30, 120 and then every 600th frame, which is a
+/// dozen lines in a long session.
+///
+/// The line also carries `draw_stats::FrameWorkload` — how many draw calls,
+/// vertices and texture uploads the guest submitted since the previous
+/// present. That is the other half of the question the pixels answer: "flat
+/// frame" plus "no draws" means the scene was never submitted, while "flat
+/// frame" plus "120 draws, 45k vertices" means the geometry went somewhere
+/// that is not this renderbuffer (wrong FBO, rejected by state).
+///
+fn probe_readback_content(pixels: &[u8], width: u32, height: u32) {
+    use crate::frameworks::opengles::draw_stats;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static PROBE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    let count = PROBE_COUNT.fetch_add(1, Ordering::Relaxed);
+    // Front-loaded, then once every 600 frames: the first frames of a session
+    // are where "nothing is drawn yet" and "the menu is drawn" differ, and the
+    // 600-frame schedule keeps a long session's log small.
+    if !matches!(count, 0 | 1 | 5 | 30 | 120) && !count.is_multiple_of(600) {
+        // Drain anyway: three atomic swaps per frame cost nothing, and it
+        // keeps the printed numbers honest ("since the previous present", not
+        // "since the previous printed present") and the counters far from
+        // overflowing in a long session. Building the sentence is what is
+        // skipped.
+        let _ = draw_stats::take_frame_workload();
+        return;
+    }
+    let workload = draw_stats::describe(draw_stats::take_frame_workload());
+    if width == 0 || height == 0 || pixels.len() < 4 {
+        log!(
+            "present_renderbuffer readback content probe \
+             (frame={count}): empty frame buffer | {workload}"
+        );
+        return;
+    }
+    let pixel_at = |x: u32, y: u32| -> [u8; 4] {
+        let x = x.min(width - 1);
+        let y = y.min(height - 1);
+        let offset = ((y as usize) * (width as usize) + (x as usize)) * 4;
+        let mut px = [0u8; 4];
+        if let Some(slice) = pixels.get(offset..offset + 4) {
+            px.copy_from_slice(slice);
+        }
+        px
+    };
+    let bl = pixel_at(0, 0);
+    let br = pixel_at(width - 1, 0);
+    let tl = pixel_at(0, height - 1);
+    let tr = pixel_at(width - 1, height - 1);
+    let centre = pixel_at(width / 2, height / 2);
+    // How much of the frame matches the centre pixel? A frame that is one flat
+    // colour everywhere is the signature of "nothing was drawn into it".
+    let mut sampled = 0u32;
+    let mut matching_centre = 0u32;
+    let mut black = 0u32;
+    for px in pixels.chunks_exact(4).step_by(61) {
+        sampled += 1;
+        if px[..3] == centre[..3] {
+            matching_centre += 1;
+        }
+        if px[0] == 0 && px[1] == 0 && px[2] == 0 {
+            black += 1;
+        }
+    }
+    let verdict = frame_content_verdict(sampled, matching_centre, black);
+    log!(
+        "present_renderbuffer readback content probe \
+         (frame={}, {}x{}): \
+         BL=({},{},{},{}) BR=({},{},{},{}) TL=({},{},{},{}) TR=({},{},{},{}) \
+         CENTER=({},{},{},{}) | {}/{} sampled pixels match CENTER, \
+         {}/{} are black | {} | {}",
+        count,
+        width,
+        height,
+        bl[0],
+        bl[1],
+        bl[2],
+        bl[3],
+        br[0],
+        br[1],
+        br[2],
+        br[3],
+        tl[0],
+        tl[1],
+        tl[2],
+        tl[3],
+        tr[0],
+        tr[1],
+        tr[2],
+        tr[3],
+        centre[0],
+        centre[1],
+        centre[2],
+        centre[3],
+        matching_centre,
+        sampled,
+        black,
+        sampled,
+        verdict,
+        workload,
+    );
+}
+
+/// One-shot diagnostic for "the picture looks see-through / x-ray when Force
+/// Composition is on, but not when the frame goes straight to the screen".
+///
+/// The direct route hands the frame to the platform's swap chain, which has no
+/// alpha channel; the composition route blends the frame into the window using
+/// CoreAnimation's premultiplied-alpha contract, so the alpha channel that the
+/// app's GL pipeline happened to leave behind suddenly matters. A layer that
+/// was never marked opaque therefore composites differently from the direct
+/// route: `CALayer.opaque` defaults to `NO`, and an app that hands
+/// `renderbufferStorage:fromDrawable:` a bare `CALayer` instead of its view's
+/// backing layer never picks up UIKit's implicit `opaque = YES`.
+///
+/// Framebuffer alpha is also not meaningful in general: with
+/// `glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)` the alpha channel
+/// accumulates as `src + dst(1-src)` *of the source alpha*, so a scene whose
+/// materials use texture alpha ends up with alpha well under 255 in exactly
+/// the places that then look transparent.
+///
+/// Reading that back costs nothing here (the frame is already in RAM), so
+/// report it once per session rather than making the next bug report start
+/// with a rebuild.
+///
+/// See the note on `CALayer.opaque` in composition.rs:
+/// https://developer.apple.com/documentation/quartzcore/calayer/1410763-isopaque
+fn log_nonopaque_present_once(env: &mut Environment, drawable: id, pixels: &[u8]) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    // Mark the check done *before* looking: an opaque drawable is the common
+    // case, and it must not cost an Objective-C message send per frame.
+    if REPORTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // `-[CALayer isOpaque]` is the flag the compositor branches on (see
+    // ca_layer / composition); an opaque layer's frame has its alpha forced to
+    // 255 before upload, so alpha can't leak into the window.
+    let opaque: bool = msg![env; drawable isOpaque];
+    if opaque {
+        return;
+    }
+    // Sample rather than scan: a 320x480 frame is 153k pixels and this is
+    // only a triage hint, not a measurement.
+    let mut translucent = 0u32;
+    let mut fully_transparent = 0u32;
+    let mut sampled = 0u32;
+    for px in pixels.chunks_exact(4).step_by(97) {
+        sampled += 1;
+        match px[3] {
+            0 => {
+                fully_transparent += 1;
+                translucent += 1;
+            }
+            255 => {}
+            _ => translucent += 1,
+        }
+    }
+    log!(
+        "Presented frame to a non-opaque layer: sampling {sampled} pixels gives \
+         {translucent} with alpha < 255 and {fully_transparent} with alpha = 0. \
+         The composition path blends the frame with GL_ONE/ONE_MINUS_SRC_ALPHA, \
+         so a frame with meaningful alpha composites differently from the \
+         direct present path, which ignores it. If the picture is see-through \
+         or black only with Force Composition, this is why: check whether the \
+         app's drawable really is a bare CALayer that never got opaque = YES."
+    );
+}
+
+/// Description of the drawable the guest renders into and of the fixed-function
+/// state it renders with, printed twice: at the first presented frame and at
+/// frame 120.
+///
+/// Two checkpoints because the first presented frame of a game is usually a
+/// splash or loading screen, and the state it shows is not the state the scene
+/// is drawn with. A report of "black models" reads differently depending on
+/// whether `lighting` was on *while the models were drawn*, and frame 0 cannot
+/// answer that.
+///
+/// "See-through" and "black" scenes are usually explained by one of these
+/// numbers, and no other log line reports any of them:
+///
+/// - `DEPTH_BITS=0` together with `depth_test=true`: the app tests depth in a
+///   framebuffer that has no depth attachment. No fragment can then be
+///   rejected, so geometry the app expects to occlude shows through — the
+///   classic "x-ray" look. `gles_guest` auto-attaches a depth renderbuffer to
+///   colour-renderbuffer FBOs, so a zero here means the app draws into a
+///   framebuffer that workaround does not cover (framebuffer 0, or a
+///   texture-attached colour buffer).
+/// - `ALPHA_BITS=0`: the frame has no alpha channel for the compositor to blend
+///   against.
+/// - `lighting=true` with `0 of 8 lights enabled`: lit surfaces render black,
+///   because a material colour only reaches the rasteriser through a light.
+/// - `fog=true` with a dark fog colour: far geometry fades to black, which
+///   reads as "black shaders" on objects at the back of a scene.
+///
+/// Only ES 1.1 hosts with a real fixed-function pipeline are described: native
+/// OpenGL ES 1.1 and the ES1-on-GL2 backend. The ES1-on-ES2 translator and the
+/// ES 2.0/3.0 backends are skipped, because several of the enums below were
+/// removed from ES 2.0 and from desktop OpenGL's core profile, so querying them
+/// there would put a `GL_INVALID_ENUM` of ours in the app's own error queue —
+/// and the fixed-function state being described does not exist there anyway.
+///
+/// This deliberately does not drain the GL error queue: the app may be polling
+/// it, and on this route the frame has already been read back, so there is
+/// nothing to be gained by hiding its errors from it.
+unsafe fn log_drawable_capabilities_once(gles: &mut dyn GLES) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    if gles.is_es2() {
+        return;
+    }
+    let call = CALLS.fetch_add(1, Ordering::Relaxed);
+    // Two checkpoints, not one: the first presented frame of a game is often a
+    // splash or loading screen, and its state says nothing about the scene the
+    // tester is complaining about. Frame 120 is normally past the loading
+    // screen and into the game.
+    let when = match call {
+        0 => "at the first presented frame",
+        120 => "at frame 120",
+        _ => return,
+    };
+    // The framebuffer-state enums are spelled out because the generated ES 1.1
+    // bindings do not export them; the capability enums below are shared with
+    // the rest of the renderer.
+    let alpha_bits = get_int(gles, 0x0D55 /* GL_ALPHA_BITS */);
+    let depth_bits = get_int(gles, 0x0D56 /* GL_DEPTH_BITS */);
+    let stencil_bits = get_int(gles, 0x0D57 /* GL_STENCIL_BITS */);
+    let cap = |gles: &mut dyn GLES, name: GLenum| unsafe { gles.IsEnabled(name) != 0 };
+    let depth_test = cap(gles, gles11::DEPTH_TEST);
+    let alpha_test = cap(gles, gles11::ALPHA_TEST);
+    let blend = cap(gles, gles11::BLEND);
+    let cull_face = cap(gles, gles11::CULL_FACE);
+    let scissor_test = cap(gles, gles11::SCISSOR_TEST);
+    let texture_2d = cap(gles, gles11::TEXTURE_2D);
+    let lighting = cap(gles, gles11::LIGHTING);
+    let fog = cap(gles, gles11::FOG);
+    // GL_LIGHT0 is 0x4000 and the eight light enables are consecutive.
+    let mut enabled_lights = 0;
+    for index in 0..8 {
+        if cap(gles, 0x4000 + index) {
+            enabled_lights += 1;
+        }
+    }
+    let color_material = cap(gles, gles11::COLOR_MATERIAL);
+    // `GL_DEPTH_FUNC` (0x0B74) and `GL_DEPTH_WRITEMASK` (0x0B72) are valid
+    // ES 1.1 queries, so asking for them cannot raise an error of ours. They
+    // matter for the "geometry disappears" case: `depth_func=0x201` is
+    // `GL_LESS`, which rejects a second draw at the same depth, and that is
+    // what a painter-ordered 2D scene looks like when it is depth-tested
+    // against a buffer it never asked for.
+    // The host bit, not the guest's: they differ while a framebuffer without a
+    // guest-attached depth buffer is bound, which is exactly the case worth
+    // seeing in the log. Both are printed.
+    let guest_depth_test = crate::frameworks::opengles::draw_stats::guest_depth_test();
+    let depth_func = get_int(gles, 0x0B74 /* GL_DEPTH_FUNC */);
+    let depth_writemask = get_int(gles, 0x0B72 /* GL_DEPTH_WRITEMASK */);
+    log!(
+        "Drawable capabilities {when}: \
+         ALPHA_BITS={alpha_bits} DEPTH_BITS={depth_bits} \
+         STENCIL_BITS={stencil_bits} | guest state: \
+         depth_test={depth_test} (guest asked \
+         {guest_depth_test}) depth_func={depth_func:#x} \
+         depth_writemask={depth_writemask} alpha_test={alpha_test} \
+         blend={blend} cull_face={cull_face} scissor_test={scissor_test} \
+         texture_2d={texture_2d} lighting={lighting} \
+         ({enabled_lights} of 8 lights enabled) fog={fog} \
+         color_material={color_material}"
+    );
 }
 
 unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLuint, drawable: id) {
@@ -1529,7 +2341,10 @@ unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLu
             env.current_thread,
         );
         match maybe_gles {
-            Some(mut gles) => read_renderbuffer(gles.as_mut(), renderbuffer, pixels_vec),
+            Some(mut gles) => unsafe {
+                log_drawable_capabilities_once(gles.as_mut());
+                read_renderbuffer(gles.as_mut(), renderbuffer, pixels_vec)
+            },
             None => None,
         }
     };
@@ -1537,7 +2352,14 @@ unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLu
         log!("Native ES1 readback skipped because the GL context disappeared.");
         return;
     };
-    dump_readback_ppm(&pixels, width, height);
+    dump_readback_png(
+        &pixels,
+        width,
+        height,
+        env.options.trace_gl_errors || crate::env_flag_cached!("TOUCHHLE_DUMP_READBACK"),
+    );
+    probe_readback_content(&pixels, width, height);
+    log_nonopaque_present_once(env, drawable, &pixels);
     if full_frame {
         present_full_frame_readback(env, &pixels, width, height);
         env.framework_state.opengles.fullscreen_readback_pixels = pixels;
@@ -1621,7 +2443,7 @@ unsafe fn present_full_frame_readback(
         gles.MatrixMode(mode);
         gles.LoadIdentity();
     }
-    present_frame(gles.as_mut(), viewport, rotation, cursor, context_token);
+    present_frame(gles.as_mut(), viewport, rotation, (1.0,1.0), cursor, context_token);
     drop(gles);
     window.swap_window();
     env.framework_state.opengles.fullscreen_readback_texture = texture;
@@ -1649,7 +2471,11 @@ unsafe fn present_full_frame_readback(
 /// Returns the [Instant] the current frame is due at (or `None` if no pacing
 /// is needed), so the caller can pace the *next* guest work precisely with
 /// [pace_frame].
-fn limit_framerate(next_frame_due: &mut Option<Instant>, options: &Options, speed: f64) -> Option<Instant> {
+fn limit_framerate(
+    next_frame_due: &mut Option<Instant>,
+    options: &Options,
+    speed: f64,
+) -> Option<Instant> {
     let interval = if let Some(fps) = options.fps_limit {
         // Host frame spacing follows speed; the FPS counter itself stays real.
         1.0 / (fps * speed)
@@ -1710,6 +2536,7 @@ const FRAME_PACING_SPIN_BUDGET: Duration = Duration::from_millis(2);
 ///   milliseconds lands the wake-up within tens of microseconds of the
 ///   deadline — the frame pacing equivalent of a vsync phase-lock.
 fn pace_frame(env: &mut Environment, frame_due: Instant) {
+    let _profile = crate::runtime_profile::scope(env.current_thread, "eagl.frame-sync");
     let now = Instant::now();
     if frame_due <= now {
         return;
@@ -1772,7 +2599,172 @@ unsafe fn get_floats<const N: usize>(gles: &mut dyn GLES, pname: GLenum) -> [GLf
     gles.GetFloatv(pname, res.as_mut_ptr());
     res
 }
-unsafe fn get_renderbuffer_size(gles: &mut dyn GLES) -> (GLsizei, GLsizei) {
+#[cfg(test)]
+mod presentation_buffer_tests {
+    use super::*;
+
+    // BackStab keeps its ES2 render loop alive underneath MPMoviePlayer.
+    // A game-only swap must yield to the movie compositor, then resume once
+    // playback ends. Also cover the forced iOS presenter and a second layer.
+    #[test]
+    fn movie_overlay_prevents_game_only_swaps_and_gameplay_resumes() {
+        let drawable: id = crate::mem::Ptr::from_bits(0x1234);
+        let other_layer: id = crate::mem::Ptr::from_bits(0x5678);
+        for (fullscreen, ios_direct, gameplay_direct) in [
+            (drawable, false, true),
+            (other_layer, false, true),
+            (nil, true, true),
+            (nil, false, false),
+        ] {
+            assert_eq!(
+                can_present_without_composition(drawable, fullscreen, ios_direct, false),
+                gameplay_direct
+            );
+            assert!(!can_present_without_composition(
+                drawable, fullscreen, ios_direct, true
+            ));
+            assert_eq!(
+                can_present_without_composition(drawable, fullscreen, ios_direct, false),
+                gameplay_direct
+            );
+        }
+    }
+
+    struct ReadbackBackend {
+        renderbuffer: GLuint,
+        framebuffer: GLuint,
+        fail_read: bool,
+    }
+
+    #[allow(non_snake_case)]
+    impl GLES for ReadbackBackend {
+        unsafe fn GetIntegerv(&mut self, pname: GLenum, value: *mut GLint) {
+            *value = match pname {
+                gles11::RENDERBUFFER_BINDING_OES => self.renderbuffer as GLint,
+                gles11::FRAMEBUFFER_BINDING_OES => self.framebuffer as GLint,
+                gles11::PACK_ALIGNMENT => 4,
+                _ => panic!("unexpected query {pname:#x}"),
+            };
+        }
+        unsafe fn BindRenderbufferOES(&mut self, target: GLenum, rb: GLuint) {
+            assert_eq!(target, gles11::RENDERBUFFER_OES);
+            self.renderbuffer = rb;
+        }
+        unsafe fn GetRenderbufferParameterivOES(
+            &mut self,
+            _target: GLenum,
+            pname: GLenum,
+            value: *mut GLint,
+        ) {
+            let (width, height) = if self.renderbuffer == 1 {
+                (2, 1)
+            } else {
+                (8, 4)
+            };
+            *value = match pname {
+                gles11::RENDERBUFFER_WIDTH_OES => width,
+                gles11::RENDERBUFFER_HEIGHT_OES => height,
+                _ => panic!("unexpected size query {pname:#x}"),
+            };
+        }
+        unsafe fn GetFramebufferAttachmentParameterivOES(
+            &mut self,
+            _target: GLenum,
+            attachment: GLenum,
+            pname: GLenum,
+            value: *mut GLint,
+        ) {
+            assert_eq!(self.framebuffer, 10);
+            assert_eq!(attachment, gles11::COLOR_ATTACHMENT0_OES);
+            *value = match pname {
+                gles11::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME_OES => 1,
+                gles11::FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE_OES => gles11::RENDERBUFFER_OES as _,
+                _ => panic!("unexpected attachment query {pname:#x}"),
+            };
+        }
+        unsafe fn CheckFramebufferStatusOES(&mut self, _target: GLenum) -> GLenum {
+            gles11::FRAMEBUFFER_COMPLETE_OES
+        }
+        unsafe fn Finish(&mut self) {}
+        unsafe fn PixelStorei(&mut self, pname: GLenum, value: GLint) {
+            assert_eq!(pname, gles11::PACK_ALIGNMENT);
+            assert!([1, 4].contains(&value));
+        }
+        unsafe fn GetError(&mut self) -> GLenum { gles11::NO_ERROR }
+        unsafe fn ReadPixels(
+            &mut self,
+            _x: GLint,
+            _y: GLint,
+            width: GLsizei,
+            height: GLsizei,
+            format: GLenum,
+            type_: GLenum,
+            pixels: *mut GLvoid,
+        ) {
+            assert_eq!((width, height), (2, 1));
+            assert_eq!(self.framebuffer, 10);
+            assert_eq!((format, type_), (gles11::RGBA, gles11::UNSIGNED_BYTE));
+            if !self.fail_read {
+                let colours = [255u8, 0, 0, 255, 0, 255, 0, 255];
+                std::ptr::copy_nonoverlapping(colours.as_ptr(), pixels.cast(), colours.len());
+            }
+        }
+    }
+
+    // A depth binding must not replace either the colour image or its size.
+    // https://registry.khronos.org/OpenGL/extensions/OES/OES_framebuffer_object.txt
+    #[test]
+    fn colour_readback_keeps_guest_depth_binding_and_framebuffer() {
+        let drawable: id = crate::mem::Ptr::from_bits(0x1234);
+        let bindings = HashMap::from([(1, drawable)]);
+        let (rb, selected) = resolve_presented_renderbuffer(&bindings, 2).unwrap();
+        assert_eq!((rb, selected), (1, drawable));
+        let mut backend = ReadbackBackend {
+            renderbuffer: 2,
+            framebuffer: 10,
+            fail_read: false,
+        };
+        let (pixels, width, height) = unsafe { read_renderbuffer(&mut backend, rb, Vec::new()) }.unwrap();
+        assert_eq!((width, height), (2, 1));
+        assert_eq!(pixels, [255, 0, 0, 255, 0, 255, 0, 255]);
+        assert_eq!((backend.renderbuffer, backend.framebuffer), (2, 10));
+        // The default backend methods panic if a temporary FBO is created:
+        // the real application's colour attachment must remain the source.
+    }
+
+    #[test]
+    fn multiple_drawables_require_an_explicit_binding() {
+        let first: id = crate::mem::Ptr::from_bits(0x1234);
+        let second: id = crate::mem::Ptr::from_bits(0x5678);
+        let bindings = HashMap::from([(1, first), (3, second)]);
+        assert_eq!(
+            resolve_presented_renderbuffer(&bindings, 3),
+            Some((3, second))
+        );
+        assert_eq!(resolve_presented_renderbuffer(&bindings, 2), None);
+        assert_eq!(resolve_presented_renderbuffer(&HashMap::new(), 2), None);
+    }
+
+    #[test]
+    fn failed_readback_does_not_expose_old_or_uninitialized_pixels() {
+        let mut backend = ReadbackBackend {
+            renderbuffer: 2,
+            framebuffer: 10,
+            fail_read: true,
+        };
+        let (pixels, _, _) = unsafe { read_renderbuffer(&mut backend, 1, vec![0xaa; 8]) }.unwrap();
+        assert_eq!(pixels, [0; 8]);
+    }
+}
+
+// Size queries address the bound RB, not a framebuffer's colour attachment.
+// Select the requested object temporarily and preserve the guest binding.
+// https://registry.khronos.org/OpenGL/extensions/OES/OES_framebuffer_object.txt
+unsafe fn get_renderbuffer_size(gles: &mut dyn GLES, renderbuffer: GLuint) -> (GLsizei, GLsizei) {
+    let old_renderbuffer = get_int(gles, gles11::RENDERBUFFER_BINDING_OES) as GLuint;
+    if old_renderbuffer != renderbuffer {
+        gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, renderbuffer);
+    }
     let mut width: GLint = 0;
     let mut height: GLint = 0;
     gles.GetRenderbufferParameterivOES(
@@ -1785,24 +2777,29 @@ unsafe fn get_renderbuffer_size(gles: &mut dyn GLES) -> (GLsizei, GLsizei) {
         gles11::RENDERBUFFER_HEIGHT_OES,
         &mut height,
     );
+    if old_renderbuffer != renderbuffer {
+        gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, old_renderbuffer);
+    }
     (width, height)
 }
 
-/// Copies the pixels in a renderbuffer bound to `GL_RENDERBUFFER_BINDING_OES`
-/// (which should be provided by the app) to a provided [Vec], trying to avoid
+/// Copies the selected colour renderbuffer to a provided [Vec], trying to avoid
 /// noticeably modifying OpenGL ES state while doing so.
 ///
 /// This uses `glReadPixels()`, with all the associated performance risks. Any
-/// existing content in the [Vec] will bereplaced. The format is RGBA8.
+/// existing content in the [Vec] will be replaced. The format is RGBA8.
 /// The returned values are the [Vec], the width and height.
 ///
 /// The provided context must be current.
-unsafe fn read_renderbuffer(gles: &mut dyn GLES, renderbuffer: GLuint, mut pixel_buffer: Vec<u8>) -> Option<(Vec<u8>, u32, u32)> {
-    let old_renderbuffer = get_int(gles, gles11::RENDERBUFFER_BINDING_OES) as GLuint;
-    gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, renderbuffer);
-    let (width, height) = get_renderbuffer_size(gles);
-    gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, old_renderbuffer);
-    if width <= 0 || height <= 0 { return None; }
+unsafe fn read_renderbuffer(
+    gles: &mut dyn GLES,
+    renderbuffer: GLuint,
+    mut pixel_buffer: Vec<u8>,
+) -> Option<(Vec<u8>, u32, u32)> {
+    let (width, height) = get_renderbuffer_size(gles, renderbuffer);
+    if width <= 0 || height <= 0 {
+        return None;
+    }
     let width_u32: u32 = width.try_into().unwrap();
     let height_u32: u32 = height.try_into().unwrap();
 
@@ -1831,7 +2828,12 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, renderbuffer: GLuint, mut pixel
             &mut attached,
         );
         let mut object_type = 0;
-        gles.GetFramebufferAttachmentParameterivOES(gles11::FRAMEBUFFER_OES, gles11::COLOR_ATTACHMENT0_OES, gles11::FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE_OES, &mut object_type);
+        gles.GetFramebufferAttachmentParameterivOES(
+            gles11::FRAMEBUFFER_OES,
+            gles11::COLOR_ATTACHMENT0_OES,
+            gles11::FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE_OES,
+            &mut object_type,
+        );
         (
             attached as GLuint,
             object_type as GLenum,
@@ -1926,6 +2928,33 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, renderbuffer: GLuint, mut pixel
     let read_error = gles.GetError();
     gles.PixelStorei(gles11::PACK_ALIGNMENT, old_pack_alignment);
 
+    if gles.is_native_es1() {
+        static READBACK_FRAMES: AtomicU32 = AtomicU32::new(0);
+        let frame = READBACK_FRAMES.fetch_add(1, Ordering::Relaxed);
+        if matches!(frame, 0 | 60 | 300 | 600 | 1800 | 3600) {
+            let step = (pixel_buffer.len() / 4 / 256).max(1);
+            let colour_samples = pixel_buffer
+                .chunks_exact(4)
+                .step_by(step)
+                .filter(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0)
+                .count();
+            log!(
+                "Native ES1 readback #{}: rb={:#x} {}x{}, guest_fbo={:#x}, \
+                 colour_attachment={:#x}, status={:#x}, app_fbo={}, \
+                 nonblack_samples={}",
+                frame,
+                renderbuffer,
+                width,
+                height,
+                old_framebuffer,
+                attached_renderbuffer,
+                framebuffer_status,
+                use_bound_framebuffer,
+                colour_samples
+            );
+        }
+    }
+
     if !use_bound_framebuffer {
         gles.DeleteFramebuffersOES(1, &src_framebuffer);
         gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, old_framebuffer);
@@ -1966,7 +2995,9 @@ pub(crate) mod vertex_state;
 /// Query only enums supported by this context; cache per EAGL context.
 unsafe fn present_supports_srgb_write_control(gles: &mut dyn GLES) -> bool {
     PRESENT_SRGB_WRITE_CONTROL.with(|cache| {
-        if let Some(supported) = cache.get() { return supported; }
+        if let Some(supported) = cache.get() {
+            return supported;
+        }
         let mut supported = false;
         if gles.is_es3() {
             let count = get_int(gles, crate::gles::gles30_raw::NUM_EXTENSIONS);
@@ -1982,8 +3013,10 @@ unsafe fn present_supports_srgb_write_control(gles: &mut dyn GLES) -> bool {
         } else {
             let extensions = gles.GetString(crate::gles::gles2_raw::EXTENSIONS);
             if !extensions.is_null() {
-                supported = std::ffi::CStr::from_ptr(extensions.cast()).to_bytes()
-                    .split(|&c| c == b' ').any(|ext| ext == b"GL_EXT_sRGB_write_control");
+                supported = std::ffi::CStr::from_ptr(extensions.cast())
+                    .to_bytes()
+                    .split(|&c| c == b' ')
+                    .any(|ext| ext == b"GL_EXT_sRGB_write_control");
             }
         }
         cache.set(Some(supported));
@@ -2023,7 +3056,9 @@ unsafe fn present_renderbuffer_es2(
     gles.GetIntegerv(gles2::FRAMEBUFFER_BINDING, &mut old_framebuffer);
     let old_read_framebuffer = if gles.has_separate_framebuffer_bindings() {
         Some(get_int(gles, crate::gles::gles30_raw::READ_FRAMEBUFFER_BINDING) as GLuint)
-    } else { None };
+    } else {
+        None
+    };
     let mut old_viewport = [0i32; 4];
     gles.GetIntegerv(gles2::VIEWPORT, old_viewport.as_mut_ptr());
     let mut old_clear_color = [0.0f32; 4];
@@ -2043,13 +3078,7 @@ unsafe fn present_renderbuffer_es2(
     // Resolve the renderbuffer supplied by `-presentRenderbuffer:` into a
     // texture with cached ES 2.0 objects. Passing this explicit object avoids
     // trusting a guest's later renderbuffer binding.
-    let (width, height) = {
-        let mut w: GLint = 0;
-        let mut h: GLint = 0;
-        gles.GetRenderbufferParameteriv(gles2::RENDERBUFFER, gles2::RENDERBUFFER_WIDTH, &mut w);
-        gles.GetRenderbufferParameteriv(gles2::RENDERBUFFER, gles2::RENDERBUFFER_HEIGHT, &mut h);
-        (w, h)
-    };
+    let (width, height) = get_renderbuffer_size(gles, renderbuffer);
 
     let present_objects = ensure_present_objects(gles);
     if width > 0 && height > 0 {
@@ -2068,8 +3097,12 @@ unsafe fn present_renderbuffer_es2(
                 &mut attached,
             );
             let mut attachment_type = 0;
-            gles.GetFramebufferAttachmentParameteriv(gles2::FRAMEBUFFER, gles2::COLOR_ATTACHMENT0,
-                gles2::FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &mut attachment_type);
+            gles.GetFramebufferAttachmentParameteriv(
+                gles2::FRAMEBUFFER,
+                gles2::COLOR_ATTACHMENT0,
+                gles2::FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE,
+                &mut attachment_type,
+            );
             (
                 attached as GLuint,
                 attachment_type as GLenum,
@@ -2080,10 +3113,11 @@ unsafe fn present_renderbuffer_es2(
         };
         // AIR can draw into the host default framebuffer; copy before clearing it.
         let use_default = present_default_framebuffer && old_framebuffer == 0;
-        let use_bound_framebuffer = use_default || (old_framebuffer != 0
-            && attached_renderbuffer == renderbuffer
-            && attachment_type == gles2::RENDERBUFFER
-            && framebuffer_status == gles2::FRAMEBUFFER_COMPLETE);
+        let use_bound_framebuffer = use_default
+            || (old_framebuffer != 0
+                && attached_renderbuffer == renderbuffer
+                && attachment_type == gles2::RENDERBUFFER
+                && framebuffer_status == gles2::FRAMEBUFFER_COMPLETE);
         if !use_bound_framebuffer {
             // Resolve the guest's current draw target before switching to the
             // cached source FBO. Otherwise a tile-based driver can discard the
@@ -2120,13 +3154,22 @@ unsafe fn present_renderbuffer_es2(
         // above. Keep DRAW untouched on tiled GPUs, but select the drawable
         // as the copy source even when the guest left another READ bound.
         if use_bound_framebuffer && old_read_framebuffer.is_some() {
-            gles.BindFramebuffer(crate::gles::gles30_raw::READ_FRAMEBUFFER, old_framebuffer as _);
+            gles.BindFramebuffer(
+                crate::gles::gles30_raw::READ_FRAMEBUFFER,
+                old_framebuffer as _,
+            );
         }
         let source_read_buffer = if old_read_framebuffer.is_some() {
             let previous = get_int(gles, crate::gles::gles30_raw::READ_BUFFER) as GLenum;
-            gles.ReadBuffer(if use_default { gles2::BACK } else { gles2::COLOR_ATTACHMENT0 });
+            gles.ReadBuffer(if use_default {
+                gles2::BACK
+            } else {
+                gles2::COLOR_ATTACHMENT0
+            });
             Some(previous)
-        } else { None };
+        } else {
+            None
+        };
 
         // Copy into preallocated texture storage. CopyTexImage2D reallocates
         // that storage on every frame, while CopyTexSubImage2D does not.
@@ -2147,40 +3190,44 @@ unsafe fn present_renderbuffer_es2(
         gles.Disable(gles2::SCISSOR_TEST);
         gles.ActiveTexture(gles2::TEXTURE0);
         gles.BindTexture(gles2::TEXTURE_2D, present_objects.texture);
-        let texture_size = PRESENT_TEXTURE_SIZE.with(|cell| cell.get());
-        if texture_size != Some((width, height)) {
+        let allocated = PRESENT_TEXTURE_SIZE.with(|cell| cell.get());
+        let fits = matches!(allocated, Some((w, h)) if w >= width && h >= height);
+        if !fits {
+            // Allocate storage only when the renderbuffer no longer fits. A
+            // guest that presents several renderbuffers in a frame (game
+            // view, a smaller UI overlay, the game view again) would
+            // otherwise redefine the storage on every present; on a
+            // tile-based driver a redefinition between the guest's draws and
+            // the copy can force a mid-frame resolve. The copy below fills
+            // only the top-left `width`x`height` texels, and the present quad
+            // samples that sub-rectangle (uUVScale).
+            let (alloc_width, alloc_height) = match allocated {
+                Some((w, h)) => (w.max(width), h.max(height)),
+                None => (width, height),
+            };
             gles.TexImage2D(
                 gles2::TEXTURE_2D,
                 0,
                 gles2::RGBA as GLint,
-                width,
-                height,
+                alloc_width,
+                alloc_height,
                 0,
                 gles2::RGBA,
                 gles2::UNSIGNED_BYTE,
                 std::ptr::null(),
             );
-            PRESENT_TEXTURE_SIZE.with(|cell| cell.set(Some((width, height))));
+            PRESENT_TEXTURE_SIZE.with(|cell| cell.set(Some((alloc_width, alloc_height))));
         }
-        gles.CopyTexSubImage2D(
-            gles2::TEXTURE_2D,
-            0,
-            0,
-            0,
-            0,
-            0,
-            width,
-            height,
-        );
+        gles.CopyTexSubImage2D(gles2::TEXTURE_2D, 0, 0, 0, 0, 0, width, height);
         if es2_scissor_was_on {
             gles.Enable(gles2::SCISSOR_TEST);
         }
-        if let Some(buffer) = source_read_buffer { gles.ReadBuffer(buffer); }
+        if let Some(buffer) = source_read_buffer {
+            gles.ReadBuffer(buffer);
+        }
         restore_present_framebuffers(gles, old_framebuffer as _, old_read_framebuffer);
         static LOGGED: std::sync::Once = std::sync::Once::new();
-        LOGGED.call_once(|| {
-            log!("GLES2 presenter: cached FBO and glCopyTexSubImage2D fast path")
-        });
+        LOGGED.call_once(|| log!("GLES2 presenter: cached FBO and glCopyTexSubImage2D fast path"));
     }
 
     gles.ActiveTexture(gles2::TEXTURE0);
@@ -2194,7 +3241,8 @@ unsafe fn present_renderbuffer_es2(
     // path and preserve the guest's write-control state.
     // https://registry.khronos.org/OpenGL/extensions/EXT/EXT_sRGB_write_control.txt
     const FRAMEBUFFER_SRGB_EXT: GLenum = 0x8DB9;
-    let restore_srgb_write = present_default_framebuffer && old_framebuffer == 0
+    let restore_srgb_write = present_default_framebuffer
+        && old_framebuffer == 0
         && present_supports_srgb_write_control(gles)
         && gles.IsEnabled(FRAMEBUFFER_SRGB_EXT) != 0;
     if restore_srgb_write {
@@ -2275,18 +3323,23 @@ unsafe fn present_renderbuffer_es2(
         if scissor_was_on {
             gles.Enable(gles2::SCISSOR_TEST);
         }
-        if restore_srgb_write { gles.Enable(FRAMEBUFFER_SRGB_EXT); }
+        if restore_srgb_write {
+            gles.Enable(FRAMEBUFFER_SRGB_EXT);
+        }
         return;
     };
 
-    // The presenter only changes the two attributes it owns. Querying all 16
-    // slots on every frame is unnecessary driver traffic.
-    let attribute_slots = [program.a_pos as GLuint, program.a_uv as GLuint];
-    let attribute_state = attribute_slots.map(|attribute|
-        vertex_state::SavedAttribute::capture(gles, attribute));
+    // Engines cache attribute pointers between draws. Restoring only the
+    // enabled flags leaves their UV/position arrays pointing at our quad VBO.
+    let attrib_states = [program.a_pos as GLuint, program.a_uv as GLuint]
+        .map(|index| crate::gles::util::VertexAttribState::capture(gles, index));
 
     gles.UseProgram(program.program);
     gles.Uniform1i(program.u_tex, 0);
+    // Sample only the sub-rectangle the copy filled, when the cached storage
+    // is larger than this renderbuffer (see the grow-only allocation above).
+    let uv_scale = present_uv_scale(width, height, PRESENT_TEXTURE_SIZE.with(|cell| cell.get()));
+    gles.Uniform2f(program.u_uv_scale, uv_scale.0, uv_scale.1);
     // Keep rotation around the center of the texture. Applying a raw
     // 0..1-space rotation sends one or both axes negative for landscape
     // orientations; with CLAMP_TO_EDGE that samples only the border texel and
@@ -2334,6 +3387,7 @@ unsafe fn present_renderbuffer_es2(
     // drivers (Android), where the fixed-function GLES 1.x path is unusable.
     crate::gles::perf_overlay::draw_es2(gles, viewport, context_token);
     crate::trainer_ui::draw_es2(gles, viewport, context_token);
+    crate::quick_menu::draw_es2(gles, viewport, context_token);
 
     // Optional: virtual cursor.
     if let Some((cx, cy, pressed)) = virtual_cursor_visible_at {
@@ -2356,12 +3410,8 @@ unsafe fn present_renderbuffer_es2(
         let _ = pressed;
     }
 
-    // VertexAttribPointer captures the buffer binding as well as the pointer.
-    // Restore the complete descriptor, including disabled arrays: engines
-    // can re-enable an array next frame without submitting its pointer again.
-    // https://registry.khronos.org/OpenGL-Refpages/es2.0/xhtml/glVertexAttribPointer.xml
-    for (&attribute, saved) in attribute_slots.iter().zip(attribute_state) {
-        saved.restore(gles, attribute);
+    for state in &attrib_states {
+        state.restore(gles);
     }
 
     // Restore state we touched
@@ -2413,7 +3463,9 @@ unsafe fn present_renderbuffer_es2(
         gles.Enable(gles2::SCISSOR_TEST);
     }
 
-    if restore_srgb_write { gles.Enable(FRAMEBUFFER_SRGB_EXT); }
+    if restore_srgb_write {
+        gles.Enable(FRAMEBUFFER_SRGB_EXT);
+    }
 
     // The renderbuffer present is performed by us (the emulator), not by the
     // guest app. On a real iPhone OS device the equivalent work happens
@@ -2438,6 +3490,7 @@ struct PresentProgram {
     a_uv: GLint,
     u_tex: GLint,
     u_tex_mat: GLint,
+    u_uv_scale: GLint,
 }
 
 /// Reusable GL objects for the ES 2.0 present path. Allocating and freeing a
@@ -2447,13 +3500,40 @@ struct PresentProgram {
 /// the driver's ability to pipeline frames, which shows up as severe stutter
 /// in 60 FPS games (notably Unity titles, which present through this path).
 /// Caching the objects and reusing them across frames removes that per-frame
-/// churn entirely. Texture storage is allocated only when its dimensions
-/// change; steady-state frames use `glCopyTexSubImage2D`.
+/// churn entirely. Texture storage only ever grows; steady-state frames use
+/// `glCopyTexSubImage2D`.
 #[derive(Copy, Clone)]
 struct PresentObjects {
     framebuffer: GLuint,
     texture: GLuint,
     quad_vbo: GLuint,
+}
+
+/// The sub-rectangle of a present texture that holds the current frame, as a
+/// fraction of the allocated storage: `(width, height) / allocated`.
+///
+/// The presenters allocate texture storage at the largest size they have seen
+/// and copy a smaller renderbuffer into the top-left corner of it, so that a
+/// guest alternating between renderbuffer sizes never redefines storage
+/// mid-frame. Both presenters rotate in 0..1 space and apply this scale
+/// afterwards, which keeps the rotation centred on the frame itself.
+///
+/// shortcut: the last half texel of the frame blends with the stale storage
+/// beside it, a sub-pixel seam at the frame edge; upgrade if one is visible.
+fn present_uv_scale(width: GLint, height: GLint, allocated: Option<(GLint, GLint)>) -> (f32, f32) {
+    let Some((alloc_width, alloc_height)) = allocated else {
+        return (1.0, 1.0);
+    };
+    if width <= 0 || height <= 0 || alloc_width <= 0 || alloc_height <= 0 {
+        return (1.0, 1.0);
+    }
+    if alloc_width == width && alloc_height == height {
+        return (1.0, 1.0);
+    }
+    (
+        width as f32 / alloc_width as f32,
+        height as f32 / alloc_height as f32,
+    )
 }
 
 /// One flag per entry of [gles1_on_gl2::CAPABILITIES]: does the driver reject
@@ -2480,6 +3560,8 @@ thread_local! {
     // 1.1 present path.
     static PRESENT_ES1_REJECTED_CAPS: std::cell::Cell<Option<RejectedCaps>> =
         const { std::cell::Cell::new(None) };
+    static PRESENT_ES1_TEXTURE_UNITS: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
     /// GL object names are context-local unless contexts share a sharegroup.
     /// Keep every presenter cache tied to the EAGLContext host object so a game
     /// switching contexts cannot use another context's program/FBO/texture.
@@ -2504,13 +3586,28 @@ fn invalidate_present_cache_for_context(context_token: usize) {
         PRESENT_TEXTURE_SIZE.with(|cell| cell.set(None));
         PRESENT_ES1_TEXTURE.with(|cell| cell.set(None));
         PRESENT_ES1_REJECTED_CAPS.with(|cell| cell.set(None));
+        PRESENT_ES1_TEXTURE_UNITS.with(|cell| cell.set(None));
+        // The route memo is per-session too: comparing a new session's first
+        // frame against the previous session's route would report a route
+        // "change" that never happened within either session.
+        LAST_PRESENT_ROUTE.store(PRESENT_ROUTE_UNSET, Ordering::Relaxed);
         log!("EAGL presenter: invalidated cached GL objects after EAGL context switch");
     }
 }
 
+/// Both tests below call [invalidate_present_cache_for_context], which resets
+/// process-wide presenter state, so they must not run concurrently - the route
+/// memo is global while the context token it is compared against is
+/// thread-local, so one test would otherwise clear it under the other.
+#[cfg(test)]
+static PRESENT_CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 #[test]
 fn presenter_cache_is_invalidated_across_recreated_contexts() {
+    let _guard = PRESENT_CACHE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let first = crate::gles::perf_overlay::allocate_context_token();
     let second = crate::gles::perf_overlay::allocate_context_token();
     assert_ne!(first, second);
@@ -2519,6 +3616,51 @@ fn presenter_cache_is_invalidated_across_recreated_contexts() {
     PRESENT_ES1_TEXTURE.with(|cell| cell.set(Some((42, 1024, 768))));
     invalidate_present_cache_for_context(second);
     PRESENT_ES1_TEXTURE.with(|cell| assert_eq!(cell.get(), None));
+}
+
+#[cfg(test)]
+#[test]
+fn route_memo_survives_a_frame_but_not_a_context_change() {
+    let _guard = PRESENT_CACHE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let first = crate::gles::perf_overlay::allocate_context_token();
+    let second = crate::gles::perf_overlay::allocate_context_token();
+    let direct = present_route_code(PresentRoute::Direct);
+
+    invalidate_present_cache_for_context(first);
+    LAST_PRESENT_ROUTE.store(direct, Ordering::Relaxed);
+    // Every presented frame re-runs the invalidation with the same token; the
+    // memo has to survive that or a mid-session route change is never reported.
+    invalidate_present_cache_for_context(first);
+    assert_eq!(LAST_PRESENT_ROUTE.load(Ordering::Relaxed), direct);
+    // A recreated context is a new session, so comparisons start from scratch.
+    invalidate_present_cache_for_context(second);
+    assert_eq!(
+        LAST_PRESENT_ROUTE.load(Ordering::Relaxed),
+        PRESENT_ROUTE_UNSET
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn present_uv_scale_crops_to_the_filled_sub_rectangle() {
+    // Grow-only storage: the frame is copied into the top-left corner, so the
+    // quad samples that fraction of the texture.
+    assert_eq!(
+        present_uv_scale(320, 480, Some((1024, 768))),
+        (0.3125, 0.625)
+    );
+    assert_eq!(
+        present_uv_scale(128, 128, Some((1024, 1024))),
+        (0.125, 0.125)
+    );
+    // Steady state and unknown storage sample the whole texture.
+    assert_eq!(present_uv_scale(1024, 768, Some((1024, 768))), (1.0, 1.0));
+    assert_eq!(present_uv_scale(320, 480, None), (1.0, 1.0));
+    // Degenerate sizes must not produce NaN or a negative scale.
+    assert_eq!(present_uv_scale(0, 480, Some((1024, 768))), (1.0, 1.0));
+    assert_eq!(present_uv_scale(320, 480, Some((0, 0))), (1.0, 1.0));
 }
 
 /// Drain the GL error queue. Returns whether there was anything in it.
@@ -2576,6 +3718,167 @@ static DIRECT_PRESENT_PROBE_SUCCESSES: AtomicU32 = AtomicU32::new(0);
 /// Has the detector concluded that presenting on the GPU doesn't work here?
 fn direct_present_is_broken() -> bool {
     DIRECT_PRESENT_BROKEN.load(Ordering::Relaxed)
+}
+
+/// How a frame the app rendered into a fullscreen `CAEAGLLayer` reaches the
+/// screen.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum PresentRoute {
+    /// `glReadPixels()` the renderbuffer into system RAM, then let the Core
+    /// Animation compositor put it on the screen. It is the same technique the
+    /// `--force-composition` slow path uses, and the closest available model of
+    /// iOS, where `presentRenderbuffer:` hands the drawable to Core Animation
+    /// (Apple: "the contents of the renderbuffer are displayed when this
+    /// method returns").
+    Readback,
+    /// Copy the renderbuffer into a texture and draw it into the window
+    /// directly. Much cheaper, but it runs the copy through the same GL
+    /// context the app is using, so on strict drivers it can perturb state
+    /// that fixed-function 2D engines notice.
+    Direct,
+}
+
+impl PresentRoute {
+    /// Short description used in the presenter log.
+    fn describe(self) -> &'static str {
+        match self {
+            PresentRoute::Readback => "glReadPixels readback + compositor",
+            PresentRoute::Direct => "GPU copy (direct)",
+        }
+    }
+}
+
+/// A chosen route together with the reason it won, so the log explains the
+/// presentation setup instead of leaving the user to infer it.
+#[derive(Copy, Clone, Debug)]
+struct PresentDecision {
+    route: PresentRoute,
+    /// Why `route` was chosen. Never empty; the reason is part of the
+    /// diagnostic output for "this game renders wrong" reports.
+    reason: &'static str,
+}
+
+/// The host-state facts the presenter route depends on. Grouped so the
+/// decision function stays a pure function of explicit inputs and can be
+/// unit-tested without a GL context.
+#[derive(Copy, Clone, Debug)]
+struct PresentBackend {
+    /// The GLES 1.1-on-GLES 2.0 translator backend. Its `glDrawArrays` *is*
+    /// the fixed-function emulation, so it can't run either GPU presenter.
+    is_translator: bool,
+    /// A native OpenGL ES 1.1 driver (the normal Android ES 1.1 case).
+    is_native_es1: bool,
+    /// A real OpenGL ES 2.0/3.0 driver.
+    is_es2: bool,
+    /// The black-frame probe proved the GPU-copy presenter produces black
+    /// frames on this driver (see [direct_present_is_broken]).
+    direct_present_broken: bool,
+}
+
+/// Which route was used for the last fullscreen frame, so a change (for
+/// example the black-frame probe flipping `auto` to readback) is reported
+/// once instead of being invisible. [PRESENT_ROUTE_UNSET] until the first
+/// presented frame.
+///
+/// One record is enough per session because the route depends on
+/// `--present-mode` and the driver, not on the drawable; the probe result it
+/// can follow is global too. It is reset with the other presenter caches when
+/// the EAGL context changes (see [invalidate_present_cache_for_context]).
+static LAST_PRESENT_ROUTE: AtomicU8 = AtomicU8::new(PRESENT_ROUTE_UNSET);
+const PRESENT_ROUTE_UNSET: u8 = u8::MAX;
+
+fn present_route_code(route: PresentRoute) -> u8 {
+    match route {
+        PresentRoute::Direct => 0,
+        PresentRoute::Readback => 1,
+    }
+}
+
+fn present_route_from_code(code: u8) -> PresentRoute {
+    if code == 1 {
+        PresentRoute::Readback
+    } else {
+        PresentRoute::Direct
+    }
+}
+
+/// Report a change of presentation route. Silent on the first presented
+/// frame, because the one-shot "will be presented via" line already covers
+/// it; after that this prints exactly one line per route change.
+fn note_present_route(
+    decision: PresentDecision,
+    drawable: id,
+    present_mode: PresentMode,
+    backend: PresentBackend,
+) {
+    let current = present_route_code(decision.route);
+    let previous = LAST_PRESENT_ROUTE.swap(current, Ordering::Relaxed);
+    if previous == current || previous == PRESENT_ROUTE_UNSET {
+        return;
+    }
+    log!(
+        "EAGL presenter: layer {:?} presentation changed from {} to {}: {} \
+         [present_mode={:?}, probe_says_direct_is_black={}]",
+        drawable,
+        present_route_from_code(previous).describe(),
+        decision.route.describe(),
+        decision.reason,
+        present_mode,
+        backend.direct_present_broken,
+    );
+}
+
+/// Pick the presentation route for one fullscreen EAGL frame that is eligible
+/// for the fast path, and say why.
+///
+/// This is the policy that `presentRenderbuffer:` used to inline. It is a pure
+/// function of `--present-mode` and the backend so that it can be tested
+/// without a GL context; the behaviour is unchanged.
+///
+/// Note that a frame presented with `--force-composition` never reaches here:
+/// that option makes `find_fullscreen_eagl_layer()` return nil, so the whole
+/// fast-path branch is skipped and the slow path reads the renderbuffer back
+/// and composites it, whatever this function would have chosen. That is what
+/// makes the switch a workaround for rendering problems; on a backend whose
+/// `auto` policy already reads back, it changes nothing at all.
+fn select_present_route(present_mode: PresentMode, backend: PresentBackend) -> PresentDecision {
+    // The readback path speaks ES 1.1 (OES framebuffer entry points); the
+    // shader presenter is the only option on a real ES 2.0 driver.
+    let can_readback = !(backend.is_es2 && !backend.is_translator);
+    let decision = |route: PresentRoute, reason: &'static str| PresentDecision { route, reason };
+
+    match present_mode {
+        PresentMode::Readback if can_readback => {
+            decision(PresentRoute::Readback, "--present-mode=readback")
+        }
+        PresentMode::Readback => decision(
+            PresentRoute::Direct,
+            "--present-mode=readback is unavailable on an ES 2.0 driver",
+        ),
+        PresentMode::Direct => decision(PresentRoute::Direct, "--present-mode=direct"),
+        // Native ES 1.1 games keep the readback presenter by default. The
+        // GPU-copy path changes guest-visible fixed-function state in ways 2D
+        // engines (cocos2d etc.) notice - sprite blending/tinting breaks even
+        // though the frame is not black, so the automatic black-frame fallback
+        // never triggers. ES 2.0 backends keep the fast GPU path (its
+        // save/restore is exact, and that is where the 3D games live).
+        PresentMode::Auto if backend.is_translator => decision(
+            PresentRoute::Readback,
+            "auto: the ES 1.1-on-ES 2.0 translator cannot run a GPU presenter",
+        ),
+        PresentMode::Auto if backend.is_native_es1 => decision(
+            PresentRoute::Readback,
+            "auto: a native ES 1.1 driver reads back and composites by default",
+        ),
+        PresentMode::Auto if backend.is_es2 && backend.direct_present_broken => decision(
+            PresentRoute::Readback,
+            "auto: the GPU-copy presenter was proven to produce black frames here",
+        ),
+        PresentMode::Auto => decision(
+            PresentRoute::Direct,
+            "auto: a native ES 2.0 driver presents on the GPU",
+        ),
+    }
 }
 
 /// Should this frame be probed? Also advances the frame counter.
@@ -2694,10 +3997,11 @@ unsafe fn ensure_present_program(gles: &mut dyn GLES) -> Option<PresentProgram> 
         attribute vec2 aPos;\n\
         attribute vec2 aUV;\n\
         uniform mat4 uTexMat;\n\
+        uniform vec2 uUVScale;\n\
         varying vec2 vUV;\n\
         void main() {\n\
             gl_Position = vec4(aPos, 0.0, 1.0);\n\
-            vUV = (uTexMat * vec4(aUV, 0.0, 1.0)).xy;\n\
+            vUV = (uTexMat * vec4(aUV, 0.0, 1.0)).xy * uUVScale;\n\
         }\0";
     // Alpha is forced to 1.0: the window surface may have an alpha channel
     // that the OS compositor honours (Android SurfaceFlinger), and an app's
@@ -2781,6 +4085,7 @@ unsafe fn ensure_present_program(gles: &mut dyn GLES) -> Option<PresentProgram> 
     let a_uv = gles.GetAttribLocation(prog, b"aUV\0".as_ptr() as *const _);
     let u_tex = gles.GetUniformLocation(prog, b"uTex\0".as_ptr() as *const _);
     let u_tex_mat = gles.GetUniformLocation(prog, b"uTexMat\0".as_ptr() as *const _);
+    let u_uv_scale = gles.GetUniformLocation(prog, b"uUVScale\0".as_ptr() as *const _);
 
     let result = PresentProgram {
         program: prog,
@@ -2788,6 +4093,7 @@ unsafe fn ensure_present_program(gles: &mut dyn GLES) -> Option<PresentProgram> 
         a_uv,
         u_tex,
         u_tex_mat,
+        u_uv_scale,
     };
     PRESENT_PROGRAM.with(|c| c.set(Some(result)));
     Some(result)
@@ -2866,10 +4172,91 @@ unsafe fn ensure_present_objects(gles: &mut dyn GLES) -> PresentObjects {
     result
 }
 
+/// A presentation quad uses server and client texture unit zero. Both
+/// selectors are independent, and every enabled server unit participates
+/// in fixed-function drawing, even when no coordinate array is enabled.
+/// https://registry.khronos.org/OpenGL-Refpages/es1.1/xhtml/glActiveTexture.xml
+struct PresentTextureUnits {
+    server: GLenum,
+    client: GLenum,
+    enabled: Vec<GLenum>,
+}
+impl PresentTextureUnits {
+    unsafe fn capture(gles: &mut dyn GLES) -> Self {
+        let server = get_int(gles, gles11::ACTIVE_TEXTURE) as GLenum;
+        let client = get_int(gles, gles11::CLIENT_ACTIVE_TEXTURE) as GLenum;
+        let count = PRESENT_ES1_TEXTURE_UNITS.with(|cell| {
+            if let Some(count) = cell.get() {
+                return count;
+            }
+            let count = get_int(gles, gles11::MAX_TEXTURE_UNITS).max(1) as usize;
+            cell.set(Some(count));
+            count
+        });
+        let mut enabled = Vec::new();
+        for unit in 1..count {
+            let texture = gles11::TEXTURE0 + unit as GLenum;
+            gles.ActiveTexture(texture);
+            if gles.IsEnabled(gles11::TEXTURE_2D) != gles11::FALSE {
+                gles.Disable(gles11::TEXTURE_2D);
+                enabled.push(texture);
+            }
+        }
+        gles.ActiveTexture(gles11::TEXTURE0);
+        gles.ClientActiveTexture(gles11::TEXTURE0);
+        Self {
+            server,
+            client,
+            enabled,
+        }
+    }
+    unsafe fn restore(self, gles: &mut dyn GLES) {
+        for texture in self.enabled {
+            gles.ActiveTexture(texture);
+            gles.Enable(gles11::TEXTURE_2D);
+        }
+        gles.ActiveTexture(self.server);
+        gles.ClientActiveTexture(self.client);
+    }
+}
+
 /// Copies the pixels in a renderbuffer bound to `GL_RENDERBUFFER_BINDING_OES`
 /// (which should be provided by the app) to a texture and presents it with
 /// [present_frame], trying to avoid noticeably modifying OpenGL ES state while
 /// doing so. The front and back buffers are then swapped.
+/// The rotation the GPU presenter applies to a frame just before the swap.
+///
+/// A fullscreen `CAEAGLLayer` is normally presented straight into the window,
+/// bypassing Core Animation. Core Animation is also where UIKit's
+/// autorotation of the root view would have been applied, so the presenter
+/// has to reproduce it. `layer_rotation` is that autorotation measured from
+/// the layer tree; `window_rotation` is the same turn derived independently
+/// from the device orientation.
+///
+/// The renderbuffer is drawn in the layer's own space, and the layer is
+/// already turned by `layer_rotation` in screen space, so the presenter needs
+/// the screen rotation with that turn added back. An autorotated landscape
+/// view has `layer_rotation == -window_rotation` and its renderbuffer is
+/// already upright, so the answer is the identity. Using `layer_rotation`
+/// alone presented that case a quarter turn out; subtracting it presented it
+/// 180 degrees out.
+fn present_rotation_matrix(
+    window_rotation: crate::matrix::Matrix<2>,
+    skip_rotation: bool,
+    layer_rotation: f32,
+    override_given: bool,
+) -> crate::matrix::Matrix<2> {
+    // The iOS ES 2.0 direct presenter already draws in display orientation,
+    // so rotating again would turn the frame sideways.
+    if skip_rotation && !override_given {
+        crate::matrix::Matrix::<2>::identity()
+    } else if layer_rotation != 0.0 {
+        window_rotation.multiply(&crate::matrix::Matrix::z_rotation(layer_rotation))
+    } else {
+        window_rotation
+    }
+}
+
 unsafe fn present_renderbuffer(
     env: &mut Environment,
     renderbuffer: GLuint,
@@ -2877,6 +4264,9 @@ unsafe fn present_renderbuffer(
     options: EaglPresentOptions,
     context_token: usize,
 ) {
+    let _profile = crate::runtime_profile::scope(env.current_thread, "eagl.presentation");
+    crate::runtime_profile::report();
+
     // Capture this up front because the env borrow is moved into the GL
     // context machinery below.
     let trace_gl_errors = options.trace_gl_errors;
@@ -2898,27 +4288,24 @@ unsafe fn present_renderbuffer(
     // their drawing themselves, so we must NOT apply the extra rotation
     // for them.
     // By default, retain the legacy iPad/non-portrait heuristic. The opt-in
-    // `--rotation-fix` path instead checks whether UIKit actually applied the
-    // autorotation transform, avoiding an extra 180-degree turn for apps that
-    // do not rotate their root view.
+    // `--rotation-fix` path trusts the measured `layer_rotation` instead and
+    // never adds a blind half turn: the layer tree already says which way the
+    // app turned its view, so a second guess can only be wrong.
     //
     // This is only a fallback: `layer_rotation` is the rotation Core Animation
     // itself would apply, measured from the layer tree. An extra 180 degrees
     // cannot stand in for it, because the tree can be rotated by a quarter turn
     // (and the two answers differ by 90 degrees, not 0 or 180).
-    let rotation_compensation_trigger = if env.options.rotation_fix {
-        env.framework_state.uikit.autorotation_transform_applied
-    } else {
-        device_family.is_ipad()
-    };
+    let rotation_compensation_trigger = !env.options.rotation_fix && device_family.is_ipad();
     let needs_autorotation_compensation = rotation_compensation_trigger
         && !matches!(
             device_orientation,
             crate::window::DeviceOrientation::Portrait
         )
         && options.layer_rotation == 0.0;
-    // PERF: cached read-once flag; present_renderbuffer runs every frame.
-    let rotation_matrix = if crate::env_flag_cached!("TOUCHHLE_DISABLE_PRESENT_ROTATION") {
+    // `TOUCHHLE_DISABLE_PRESENT_ROTATION` wins over everything so a
+    // broken driver can be worked around without a rebuild.
+    let mut window_rotation = if crate::env_flag_cached!("TOUCHHLE_DISABLE_PRESENT_ROTATION") {
         log_once!(
             "TOUCHHLE_DISABLE_PRESENT_ROTATION=1: presenting EAGL renderbuffer without texture rotation"
         );
@@ -2932,34 +4319,34 @@ unsafe fn present_renderbuffer(
     } else {
         env.window.as_mut().unwrap().rotation_matrix()
     };
-    // Fixed present-rotation override: the `--present-rotate=N` option (per-app
-    // via the default options file) takes precedence, then the live
-    // TOUCHHLE_PRESENT_ROTATE env var, else the orientation-derived matrix.
+    // Fixed present-rotation override: `--present-rotate=N` (per-app via the
+    // default options file) or the live TOUCHHLE_PRESENT_ROTATE env var wins
+    // over the orientation-derived matrix.
     let rotate_override = env
         .options
         .present_rotate
         .map(|d| d.to_string())
         .or_else(|| crate::env_var_cached!("TOUCHHLE_PRESENT_ROTATE").map(|s| s.to_string()));
-    let rotation_matrix = match rotate_override.as_deref() {
-        Some("0") => crate::matrix::Matrix::<2>::identity(),
-        Some("90") => crate::matrix::Matrix::z_rotation(std::f32::consts::FRAC_PI_2),
-        Some("180") => crate::matrix::Matrix::z_rotation(std::f32::consts::PI),
-        Some("270") => crate::matrix::Matrix::z_rotation(-std::f32::consts::FRAC_PI_2),
-        _ => rotation_matrix,
-    };
+    match rotate_override.as_deref() {
+        Some("0") => window_rotation = crate::matrix::Matrix::<2>::identity(),
+        Some("90") => {
+            window_rotation = crate::matrix::Matrix::z_rotation(std::f32::consts::FRAC_PI_2)
+        }
+        Some("180") => window_rotation = crate::matrix::Matrix::z_rotation(std::f32::consts::PI),
+        Some("270") => {
+            window_rotation = crate::matrix::Matrix::z_rotation(-std::f32::consts::FRAC_PI_2)
+        }
+        _ => {}
+    }
     // The iOS ES 2.0 direct presenter bypasses Core Animation, which is where
     // the rotation would otherwise have been applied, and the guest has already
     // drawn in display orientation, so rotating again would turn it sideways.
-    let rotation_matrix = if options.skip_rotation && rotate_override.is_none() {
-        crate::matrix::Matrix::<2>::identity()
-    } else if options.layer_rotation != 0.0 && rotate_override.is_none() {
-        // The layer transform is what Core Animation would have applied, so
-        // compose it with the window's rotation instead of guessing.
-        // An explicit --present-rotate already specifies the final rotation.
-        rotation_matrix.multiply(&crate::matrix::Matrix::z_rotation(options.layer_rotation))
-    } else {
-        rotation_matrix
-    };
+    let rotation_matrix = present_rotation_matrix(
+        window_rotation,
+        options.skip_rotation,
+        options.layer_rotation,
+        rotate_override.is_some(),
+    );
     let virtual_cursor_visible_at = env.window.as_mut().unwrap().virtual_cursor_visible_at();
 
     if crate::env_flag_cached!("TOUCHHLE_TRACE_PRESENT") {
@@ -2987,7 +4374,7 @@ unsafe fn present_renderbuffer(
         // left to do here is skip the host-side composition step and pump
         // a single SDL swap so the window keeps animating. Without this
         // guard the emulator used to abort with the panic visible in
-        // HyperHLE log #5 (`opengles.rs:56` — Option::unwrap on a None
+        // AppleJuiceHLE log #5 (`opengles.rs:56` — Option::unwrap on a None
         // current_ctx).
         log!(
             "present_renderbuffer: no current GL context for thread {}; \
@@ -3003,6 +4390,7 @@ unsafe fn present_renderbuffer(
     let mut gles_boxed = gles_ctx.make_current(env.window.as_mut().unwrap());
     let gles = gles_boxed.as_mut();
 
+    unsafe { log_drawable_capabilities_once(gles) };
     invalidate_present_cache_for_context(context_token);
 
     // DIAG (TOUCHHLE_TRACE_PRESENT=1): dump the raw renderbuffer the game drew,
@@ -3092,7 +4480,10 @@ unsafe fn present_renderbuffer(
             options.present_default_framebuffer,
         );
         std::mem::drop(gles_boxed);
-        env.window.as_mut().unwrap().swap_window();
+        {
+            let _profile = crate::runtime_profile::scope(env.current_thread, "eagl.swap");
+            env.window.as_mut().unwrap().swap_window();
+        }
         return;
     }
     if gles.is_translator() {
@@ -3116,7 +4507,7 @@ unsafe fn present_renderbuffer(
     // draw to the default framebuffer via a textured quad, which can be
     // rotated, scaled or letterboxed as appropriate.
 
-    let (width, height) = get_renderbuffer_size(gles);
+    let (width, height) = get_renderbuffer_size(gles, renderbuffer);
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -3146,11 +4537,7 @@ unsafe fn present_renderbuffer(
     // To avoid confusing the guest app, we need to be able to undo any
     // state changes we make.
     let old_framebuffer: GLuint = get_int(gles, gles11::FRAMEBUFFER_BINDING_OES) as _;
-    let old_active_texture: GLuint = get_int(gles, gles11::ACTIVE_TEXTURE) as _;
-    // The present texture must be bound on unit 0: the guest may have left a
-    // different unit active, and binding to it would both draw the present
-    // quad with the wrong texture and corrupt the guest's unit binding.
-    gles.ActiveTexture(gles11::TEXTURE0);
+    let texture_units = PresentTextureUnits::capture(gles);
     let old_texture_2d: GLuint = get_int(gles, gles11::TEXTURE_BINDING_2D) as _;
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -3254,118 +4641,87 @@ unsafe fn present_renderbuffer(
     // drops it before it could be used by another EAGLContext). Steady-state
     // frames can then use CopyTexSubImage2D without object churn or storage
     // reallocation.
-    let (texture, storage_valid) =
-        if let Some((texture, cached_width, cached_height)) = PRESENT_ES1_TEXTURE.with(|c| c.get()) {
-            gles.BindTexture(gles11::TEXTURE_2D, texture);
-            (texture, cached_width == width && cached_height == height)
-        } else {
-            let mut texture = 0;
-            gles.GenTextures(1, &mut texture);
-            gles.BindTexture(gles11::TEXTURE_2D, texture);
+    let (texture, storage_valid) = if let Some((texture, cached_width, cached_height)) =
+        PRESENT_ES1_TEXTURE.with(|c| c.get())
+    {
+        gles.BindTexture(gles11::TEXTURE_2D, texture);
+        (texture, cached_width >= width && cached_height >= height)
+    } else {
+        let mut texture = 0;
+        gles.GenTextures(1, &mut texture);
+        gles.BindTexture(gles11::TEXTURE_2D, texture);
 
-            // Set the texture parameters before the first copy: the
-            // renderbuffer is typically non-power-of-two, and strict ES 1.1
-            // drivers reject CopyTexImage2D into a texture that still uses the
-            // GL_REPEAT default wrap mode.
-            gles.TexParameteri(
-                gles11::TEXTURE_2D,
-                gles11::TEXTURE_MIN_FILTER,
-                gles11::LINEAR as _,
-            );
-            gles.TexParameteri(
-                gles11::TEXTURE_2D,
-                gles11::TEXTURE_MAG_FILTER,
-                gles11::LINEAR as _,
-            );
-            gles.TexParameteri(
-                gles11::TEXTURE_2D,
-                gles11::TEXTURE_WRAP_S,
-                gles11::CLAMP_TO_EDGE as _,
-            );
-            gles.TexParameteri(
-                gles11::TEXTURE_2D,
-                gles11::TEXTURE_WRAP_T,
-                gles11::CLAMP_TO_EDGE as _,
-            );
-            (texture, false)
-        };
-    // glCopyTex(Sub)Image2D from the bound framebuffer is ordered after the
-    // app's draws into it by the driver; that's what the spec guarantees and
-    // what every driver we've seen honours. We used to glFinish() here
-    // regardless, on the suspicion that a Mali-G57 r32p1 "title menu renders
-    // as a uniform colour" bug was a missing tile resolve — it turned out to
-    // be mipmap-incomplete textures (see fix_texture_min_filter). A full
-    // pipeline drain every frame is the single most expensive thing a
-    // presenter can do on a tile-based GPU (it serialises CPU and GPU and
-    // defeats the driver's frame pipelining), so it is opt-in now:
-    // --present-finish / TOUCHHLE_PRESENT_FINISH=1.
-    // Tile-based GPUs resolve the app's draws to the renderbuffer's main
-    // memory at well-defined sync points. CopyTex(Sub)Image2D is spec-ordered
-    // after the app's draws, but real ES 1.1 surfaces (Adreno/Mali, native or
-    // over ANGLE) have historically needed an explicit drain for alpha-blended
-    // 2D scenes (many small quads): without it, the copy can race the tile
-    // resolve and produce partially-drawn / garbled frames, while 3D scenes
-    // (few big depth-tested draws) usually happen to be fine. Keep the full
-    // drain as the default on native ES 1.1 backends (it was unconditional
-    // before the GPU-present rework); on ES 2.0 shader backends the resolve
-    // is reliable, so it stays opt-in there.
-    let native_es1 = gles.is_native_es1();
-    let finish_before_copy = options.present_finish
-        || (native_es1 && !crate::env_flag_cached!("TOUCHHLE_NO_PRESENT_FINISH"));
-    if finish_before_copy && !options.present_finish {
-        log_once!(
-            "EAGL presenter: native ES1.1 backend - forcing glFinish before the \
-             renderbuffer copy (tile-resolve safety for 2D alpha-blended games; \
-             opt out with TOUCHHLE_NO_PRESENT_FINISH=1)."
+        // Set the texture parameters before the first copy: the
+        // renderbuffer is typically non-power-of-two, and strict ES 1.1
+        // drivers reject CopyTexImage2D into a texture that still uses the
+        // GL_REPEAT default wrap mode.
+        gles.TexParameteri(
+            gles11::TEXTURE_2D,
+            gles11::TEXTURE_MIN_FILTER,
+            gles11::LINEAR as _,
         );
-    }
+        gles.TexParameteri(
+            gles11::TEXTURE_2D,
+            gles11::TEXTURE_MAG_FILTER,
+            gles11::LINEAR as _,
+        );
+        gles.TexParameteri(
+            gles11::TEXTURE_2D,
+            gles11::TEXTURE_WRAP_S,
+            gles11::CLAMP_TO_EDGE as _,
+        );
+        gles.TexParameteri(
+            gles11::TEXTURE_2D,
+            gles11::TEXTURE_WRAP_T,
+            gles11::CLAMP_TO_EDGE as _,
+        );
+        (texture, false)
+    };
+    // Copies are ordered after draws. ANGLE's Vulkan path explicitly records
+    // source transfer reads and destination writes and closes the render pass;
+    // it needs no CPU/GPU pipeline drain. Retain the vendor-native ES1 option
+    // for older drivers, and the user's explicit --present-finish override.
+    // https://github.com/google/angle/blob/b7a90a6cc08e52857a6addc2bc2e569b7b01e9df/src/libANGLE/renderer/vulkan/TextureVk.cpp
+    let finish_before_copy = options.present_finish
+        || (gles.is_native_es1()
+            && !options.angle_backend
+            && !crate::env_flag_cached!("TOUCHHLE_NO_PRESENT_FINISH"));
     if finish_before_copy {
         gles.Finish();
     }
-    // A guest that renders 2D UI (level-select lists, HUD panels, ...) very
-    // commonly leaves GL_SCISSOR_TEST enabled at present time — iOS titles
-    // never notice because iOS's own present path ignores scissor when
-    // resolving the drawable. Our CopyTex(Sub)Image2D readout is NOT
-    // ignored: pixels outside the guest's scissor box are never copied, so
-    // every frame would present only the scissored sub-region while the
-    // rest of the texture keeps stale content from older frames (the
-    // "Geometry Dash glitched frame" symptom). Disable the test for the
-    // copy; the generic caps save/restore loop below puts the enable flag
-    // back for the guest after the present quad.
-    let old_scissor_box: [GLint; 4] = get_ints(gles, gles11::SCISSOR_BOX);
-    gles.Disable(gles11::SCISSOR_TEST);
-    // Same story for the pack alignment: glCopyTex(Sub)Image2D reads rows
-    // with GL_PACK_ALIGNMENT, and a guest that uploaded odd-stride data
-    // with a non-default alignment skews every copied row and mangles the
-    // presented image. RGBA8 rows are always 4-byte aligned, so alignment
-    // 1 is always valid here and never changes the image.
-    let old_pack_alignment: GLint = get_int(gles, gles11::PACK_ALIGNMENT);
-    gles.PixelStorei(gles11::PACK_ALIGNMENT, 1);
+    // CopyTex(Sub)Image2D is unaffected by scissor and pixel pack state.
+    // Save the guest enables below before disabling them for the quad.
+    // https://registry.khronos.org/OpenGL-Refpages/es1.1/xhtml/glCopyTexSubImage2D.xml
     if storage_valid {
         // Steady state: copy into the preallocated storage without
         // redefining it.
-        gles.CopyTexSubImage2D(
-            gles11::TEXTURE_2D,
-            0,
-            0,
-            0,
-            0,
-            0,
-            width,
-            height,
-        );
+        gles.CopyTexSubImage2D(gles11::TEXTURE_2D, 0, 0, 0, 0, 0, width, height);
     } else {
-        gles.CopyTexImage2D(
+        // Define storage at the largest size seen so far, then copy into its
+        // top-left corner. Redefining storage on every present is what a
+        // guest alternating between renderbuffer sizes would otherwise
+        // force, and on a tile-based driver that redefinition can resolve the
+        // source mid-frame. The present quad samples the sub-rectangle
+        // (present_uv_scale).
+        let (alloc_width, alloc_height) = match PRESENT_ES1_TEXTURE.with(|c| c.get()) {
+            Some((_, cached_width, cached_height)) => {
+                (cached_width.max(width), cached_height.max(height))
+            }
+            None => (width, height),
+        };
+        gles.TexImage2D(
             gles11::TEXTURE_2D,
             0,
             gles11::RGBA as _,
+            alloc_width,
+            alloc_height,
             0,
-            0,
-            width,
-            height,
-            0,
+            gles11::RGBA,
+            gles11::UNSIGNED_BYTE,
+            std::ptr::null(),
         );
-        PRESENT_ES1_TEXTURE.with(|c| c.set(Some((texture, width, height))));
+        gles.CopyTexSubImage2D(gles11::TEXTURE_2D, 0, 0, 0, 0, 0, width, height);
+        PRESENT_ES1_TEXTURE.with(|c| c.set(Some((texture, alloc_width, alloc_height))));
     }
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -3377,17 +4733,6 @@ unsafe fn present_renderbuffer(
             "after Finish + CopyTexImage2D",
         );
     }
-    // Restore the guest's pixel-store state now that the copy is done; the
-    // scissor box is restored too so a guest that reads pixels itself
-    // (screenshots) is unaffected. The scissor TEST stays disabled until
-    // the generic caps restore loop re-enables it after the present quad.
-    gles.PixelStorei(gles11::PACK_ALIGNMENT, old_pack_alignment);
-    gles.Scissor(
-        old_scissor_box[0],
-        old_scissor_box[1],
-        old_scissor_box[2],
-        old_scissor_box[3],
-    );
     // Black-frame detector, part 1: sample the source while the framebuffer
     // we copied from is still bound.
     let probe_source_max = if probe_active {
@@ -3486,9 +4831,39 @@ unsafe fn present_renderbuffer(
                 while gles.GetError() != 0 {}
                 v
             };
+            // ES 1.1 spells these `GL_BLEND_SRC`/`GL_BLEND_DST`, but ES 2.0
+            // (and ANGLE's ES 1.1 front end) only accept the per-channel
+            // `GL_BLEND_SRC_RGB`/`GL_BLEND_DST_RGB`, so try both spellings.
+            // Querying only the ES 1.1 names made every log show
+            // `src=0x0000 dst=0x0000`, which reads like a broken blend setup.
+            let qi_fallback = |gles: &mut dyn GLES, names: &[GLenum]| -> GLint {
+                let mut v: GLint = 0;
+                for &name in names {
+                    while gles.GetError() != 0 {}
+                    gles.GetIntegerv(name, &mut v);
+                    if gles.GetError() == 0 {
+                        return v;
+                    }
+                }
+                while gles.GetError() != 0 {}
+                0
+            };
+            // `get_ints` leaves a rejected query's error in the queue and its
+            // zeroed array reads like real state, so drain like `qf4` does.
+            let qi4 = |gles: &mut dyn GLES, name: GLenum| -> [GLint; 4] {
+                while gles.GetError() != 0 {}
+                let v = get_ints::<4>(gles, name);
+                while gles.GetError() != 0 {}
+                v
+            };
             let blend_on = qb(gles, gles11::BLEND);
-            let blend_src = qi(gles, gles11::BLEND_SRC) as u32;
-            let blend_dst = qi(gles, gles11::BLEND_DST) as u32;
+            let blend_src = qi_fallback(gles, &[gles11::BLEND_SRC, 0x80C9]) as u32;
+            let blend_dst = qi_fallback(gles, &[gles11::BLEND_DST, 0x80C8]) as u32;
+            let color_mask = qi4(gles, gles11::COLOR_WRITEMASK);
+            let scissor_on = qb(gles, gles11::SCISSOR_TEST);
+            let scissor_box = qi4(gles, gles11::SCISSOR_BOX);
+            let depth_func = qi(gles, 0x0B74 /* GL_DEPTH_FUNC */);
+            let depth_mask = qb(gles, 0x0B72 /* GL_DEPTH_WRITEMASK */);
             let depth_on = qb(gles, gles11::DEPTH_TEST);
             let alpha_on = qb(gles, gles11::ALPHA_TEST);
             let cull_on = qb(gles, gles11::CULL_FACE);
@@ -3510,6 +4885,8 @@ unsafe fn present_renderbuffer(
                  BLEND={} (src=0x{:04x} dst=0x{:04x}) DEPTH_TEST={} ALPHA_TEST={} \
                  CULL_FACE={} TEXTURE_2D={} \
                  vertex_arr={} color_arr={} texcoord_arr={} \
+                 color_mask=({},{},{},{}) scissor={} box=({},{},{},{}) \
+                 depth_func=0x{:04x} depth_mask={} \
                  clear_color=({:.3},{:.3},{:.3},{:.3}) current_color=({:.3},{:.3},{:.3},{:.3})",
                 count,
                 used_app_fbo,
@@ -3550,6 +4927,17 @@ unsafe fn present_renderbuffer(
                 varr_on,
                 carr_on,
                 tarr_on,
+                color_mask[0],
+                color_mask[1],
+                color_mask[2],
+                color_mask[3],
+                scissor_on,
+                scissor_box[0],
+                scissor_box[1],
+                scissor_box[2],
+                scissor_box[3],
+                depth_func,
+                depth_mask,
                 clear_color[0],
                 clear_color[1],
                 clear_color[2],
@@ -3860,10 +5248,18 @@ unsafe fn present_renderbuffer(
     }
 
     // Draw the quad
+    let uv_scale = present_uv_scale(
+        width,
+        height,
+        PRESENT_ES1_TEXTURE
+            .with(|c| c.get())
+            .map(|(_, w, h)| (w, h)),
+    );
     present_frame(
         gles,
         viewport,
         rotation_matrix,
+        uv_scale,
         virtual_cursor_visible_at,
         context_token,
     );
@@ -3888,15 +5284,6 @@ unsafe fn present_renderbuffer(
     // the app's previous texture, which also unbinds ours.
 
     // Restore all the state saved before rendering
-    for (&is_enabled, info) in old_arrays.iter().zip(gles1_on_gl2::ARRAYS.iter()) {
-        // Any non-zero GLboolean counts as enabled: a driver answering a
-        // query with garbage must not be able to panic the emulator here.
-        if is_enabled != gles11::FALSE {
-            gles.EnableClientState(info.name);
-        } else {
-            gles.DisableClientState(info.name);
-        }
-    }
     for (&saved, &name) in old_capabilities
         .iter()
         .zip(gles1_on_gl2::CAPABILITIES.iter())
@@ -3966,6 +5353,15 @@ unsafe fn present_renderbuffer(
         old_tex_coord_array_pointer,
     );
     gles.BindBuffer(gles11::ARRAY_BUFFER, old_array_buffer);
+    for (&is_enabled, info) in old_arrays.iter().zip(gles1_on_gl2::ARRAYS.iter()) {
+        // Any non-zero GLboolean counts as enabled: a driver answering a
+        // query with garbage must not be able to panic the emulator here.
+        if is_enabled != gles11::FALSE {
+            gles.EnableClientState(info.name);
+        } else {
+            gles.DisableClientState(info.name);
+        }
+    }
     gles.BlendFunc(old_blend_sfactor, old_blend_dfactor);
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -4013,7 +5409,7 @@ unsafe fn present_renderbuffer(
     // (see the ActiveTexture switch at the top), so restore both the unit
     // and the texture binding.
     gles.BindTexture(gles11::TEXTURE_2D, old_texture_2d);
-    gles.ActiveTexture(old_active_texture);
+    texture_units.restore(gles);
     gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, old_framebuffer);
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -4104,10 +5500,7 @@ fn attach_orphaned_eagl_view_to_root(env: &mut Environment, drawable: id) -> boo
     let view_superview: id = msg![env; view superview];
     let drawable_superlayer: id = msg![env; drawable superlayer];
     let view_hidden: bool = msg![env; view isHidden];
-    if view_layer != drawable
-        || view_superview != nil
-        || drawable_superlayer != nil
-        || view_hidden
+    if view_layer != drawable || view_superview != nil || drawable_superlayer != nil || view_hidden
     {
         return false;
     }
@@ -4176,7 +5569,10 @@ fn attach_orphaned_eagl_view_to_root(env: &mut Environment, drawable: id) -> boo
         let _: () = msg![env; parent addSubview:view];
         let attached_superview: id = msg![env; view superview];
         if attached_superview == parent {
-            log!("Attached detached full-screen EAGLView {:?} to window hierarchy.", view);
+            log!(
+                "Attached detached full-screen EAGLView {:?} to window hierarchy.",
+                view
+            );
             return true;
         }
     }
@@ -4203,7 +5599,7 @@ mod readback_buffer_tests {
 #[cfg(all(test, target_os = "windows"))]
 mod native_present_regression {
     use super::*;
-    use crate::gles::{gles3_native::GLES3NativeContext, gles30_raw as gl, GLESContext};
+    use crate::gles::{gles30_raw as gl, gles3_native::GLES3NativeContext, GLESContext};
 
     #[test]
     #[ignore = "Requires a real Windows GPU; run explicitly with --ignored"]
@@ -4226,8 +5622,17 @@ mod native_present_regression {
             gles.GenTextures(1, &mut texture);
             gles.BindTexture(gl::TEXTURE_2D, texture);
             let white = [255u8; 4];
-            gles.TexImage2D(gl::TEXTURE_2D, 0, gl::RGBA as _, 1, 1, 0,
-                gl::RGBA, gl::UNSIGNED_BYTE, white.as_ptr().cast());
+            gles.TexImage2D(
+                gl::TEXTURE_2D,
+                0,
+                gl::RGBA as _,
+                1,
+                1,
+                0,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                white.as_ptr().cast(),
+            );
             gles.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST as _);
             gles.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::NEAREST as _);
             gles.BlendFuncSeparate(gl::ONE, gl::ZERO, gl::ZERO, gl::ONE);
@@ -4235,26 +5640,51 @@ mod native_present_regression {
             gles.Enable(gl::SCISSOR_TEST);
             gles.Scissor(0, 0, 1, 1);
             gles.ColorMask(gl::FALSE, gl::FALSE, gl::FALSE, gl::FALSE);
-            crate::trainer_ui::draw_texture_es2(gles.as_mut(), (0, 0, 480, 320),
-                0, texture, (20.0, 20.0, 80.0, 80.0), (1.0, 1.0));
-            for (pname, expected) in [(gl::VERTEX_ATTRIB_ARRAY_SIZE, 3),
+            crate::trainer_ui::draw_texture_es2(
+                gles.as_mut(),
+                (0, 0, 480, 320),
+                0,
+                texture,
+                (20.0, 20.0, 80.0, 80.0),
+                (1.0, 1.0),
+            );
+            for (pname, expected) in [
+                (gl::VERTEX_ATTRIB_ARRAY_SIZE, 3),
                 (gl::VERTEX_ATTRIB_ARRAY_STRIDE, 20),
                 (gl::VERTEX_ATTRIB_ARRAY_ENABLED, 0),
-                (gl::VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, buffer as GLint)] {
+                (gl::VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, buffer as GLint),
+            ] {
                 let mut actual = 0;
                 gles.GetVertexAttribiv(2, pname, &mut actual);
                 assert_eq!(actual, expected);
             }
             assert_eq!(get_int(gles.as_mut(), gl::BLEND_SRC_RGB), gl::ONE as GLint);
-            assert_eq!(get_int(gles.as_mut(), gl::BLEND_SRC_ALPHA), gl::ZERO as GLint);
-            assert_eq!(get_int(gles.as_mut(), gl::BLEND_EQUATION_RGB), gl::FUNC_REVERSE_SUBTRACT as GLint);
+            assert_eq!(
+                get_int(gles.as_mut(), gl::BLEND_SRC_ALPHA),
+                gl::ZERO as GLint
+            );
+            assert_eq!(
+                get_int(gles.as_mut(), gl::BLEND_EQUATION_RGB),
+                gl::FUNC_REVERSE_SUBTRACT as GLint
+            );
             assert_ne!(gles.IsEnabled(gl::SCISSOR_TEST), 0);
             let mut mask = [gl::TRUE; 4];
             gles.GetBooleanv(gl::COLOR_WRITEMASK, mask.as_mut_ptr());
             assert_eq!(mask, [gl::FALSE; 4]);
             let mut pixel = [0u8; 4];
-            gles.ReadPixels(40, 280, 1, 1, gl::RGBA, gl::UNSIGNED_BYTE, pixel.as_mut_ptr().cast());
-            assert!(pixel[..3].iter().all(|&v| v > 240), "Overlay missing: {pixel:?}");
+            gles.ReadPixels(
+                40,
+                280,
+                1,
+                1,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                pixel.as_mut_ptr().cast(),
+            );
+            assert!(
+                pixel[..3].iter().all(|&v| v > 240),
+                "Overlay missing: {pixel:?}"
+            );
             assert_eq!(gles.GetError(), 0);
         }
     }
@@ -4273,41 +5703,102 @@ mod native_present_regression {
             let mut source = 0;
             gles.GenFramebuffers(1, &mut source);
             gles.BindFramebuffer(gl::FRAMEBUFFER, source);
-            gles.FramebufferRenderbuffer(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::RENDERBUFFER, rb);
-            assert_eq!(gles.CheckFramebufferStatus(gl::FRAMEBUFFER), gl::FRAMEBUFFER_COMPLETE);
+            gles.FramebufferRenderbuffer(
+                gl::FRAMEBUFFER,
+                gl::COLOR_ATTACHMENT0,
+                gl::RENDERBUFFER,
+                rb,
+            );
+            assert_eq!(
+                gles.CheckFramebufferStatus(gl::FRAMEBUFFER),
+                gl::FRAMEBUFFER_COMPLETE
+            );
             gles.ClearColor(1.0, 0.0, 0.0, 1.0);
             gles.Clear(gl::COLOR_BUFFER_BIT);
             // ES3 exposes independent read/draw bindings. The drawable's
             // draw FBO is correct while READ still refers to the host window.
             gles.BindFramebuffer(gl::READ_FRAMEBUFFER, 0);
             assert_eq!(gles.GetError(), 0);
-            present_renderbuffer_es2(gles.as_mut(), rb, 0, (0, 0, 16, 16),
-                crate::matrix::Matrix::identity(), None, false, 0, false);
-            assert_eq!(get_int(gles.as_mut(), gl::DRAW_FRAMEBUFFER_BINDING), source as GLint);
+            present_renderbuffer_es2(
+                gles.as_mut(),
+                rb,
+                0,
+                (0, 0, 16, 16),
+                crate::matrix::Matrix::identity(),
+                None,
+                false,
+                0,
+                false,
+            );
+            assert_eq!(
+                get_int(gles.as_mut(), gl::DRAW_FRAMEBUFFER_BINDING),
+                source as GLint
+            );
             assert_eq!(get_int(gles.as_mut(), gl::READ_FRAMEBUFFER_BINDING), 0);
             gles.BindFramebuffer(gl::READ_FRAMEBUFFER, 0);
             let mut pixel = [0u8; 4];
-            gles.ReadPixels(8, 8, 1, 1, gl::RGBA, gl::UNSIGNED_BYTE, pixel.as_mut_ptr().cast());
+            gles.ReadPixels(
+                8,
+                8,
+                1,
+                1,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                pixel.as_mut_ptr().cast(),
+            );
             assert_eq!(gles.GetError(), 0);
-            assert!(pixel[0] > 240 && pixel[1] < 10 && pixel[2] < 10,
-                "Presented drawable must be red, got {pixel:?}");
+            assert!(
+                pixel[0] > 240 && pixel[1] < 10 && pixel[2] < 10,
+                "Presented drawable must be red, got {pixel:?}"
+            );
             // Midtones expose extra sRGB encoding hidden by red/green tests.
             assert!(present_supports_srgb_write_control(gles.as_mut()));
             for enabled in [true, false] {
-                if enabled { gles.Enable(0x8DB9); } else { gles.Disable(0x8DB9); }
+                if enabled {
+                    gles.Enable(0x8DB9);
+                } else {
+                    gles.Disable(0x8DB9);
+                }
                 gles.BindFramebuffer(gl::FRAMEBUFFER, 0);
                 gles.ClearColor(0.15, 0.35, 0.65, 0.4);
                 gles.Clear(gl::COLOR_BUFFER_BIT);
                 let mut before = [0u8; 4];
-                gles.ReadPixels(8, 8, 1, 1, gl::RGBA, gl::UNSIGNED_BYTE, before.as_mut_ptr().cast());
-                present_renderbuffer_es2(gles.as_mut(), rb, 0, (0, 0, 16, 16),
-                    crate::matrix::Matrix::identity(), None, false, 0, true);
-                gles.ReadPixels(8, 8, 1, 1, gl::RGBA, gl::UNSIGNED_BYTE, pixel.as_mut_ptr().cast());
+                gles.ReadPixels(
+                    8,
+                    8,
+                    1,
+                    1,
+                    gl::RGBA,
+                    gl::UNSIGNED_BYTE,
+                    before.as_mut_ptr().cast(),
+                );
+                present_renderbuffer_es2(
+                    gles.as_mut(),
+                    rb,
+                    0,
+                    (0, 0, 16, 16),
+                    crate::matrix::Matrix::identity(),
+                    None,
+                    false,
+                    0,
+                    true,
+                );
+                gles.ReadPixels(
+                    8,
+                    8,
+                    1,
+                    1,
+                    gl::RGBA,
+                    gl::UNSIGNED_BYTE,
+                    pixel.as_mut_ptr().cast(),
+                );
                 assert_eq!(gles.GetError(), 0);
                 assert_eq!(gles.IsEnabled(0x8DB9) != 0, enabled);
                 for channel in 0..3 {
-                    assert!((before[channel] as i16 - pixel[channel] as i16).abs() <= 2,
-                        "Presentation changed midtones: {before:?} -> {pixel:?}");
+                    assert!(
+                        (before[channel] as i16 - pixel[channel] as i16).abs() <= 2,
+                        "Presentation changed midtones: {before:?} -> {pixel:?}"
+                    );
                 }
             }
             // The AIR compatibility mode must copy framebuffer zero before
@@ -4318,13 +5809,154 @@ mod native_present_regression {
             gles.BindFramebuffer(gl::FRAMEBUFFER, 0);
             gles.ClearColor(0.0, 1.0, 0.0, 1.0);
             gles.Clear(gl::COLOR_BUFFER_BIT);
-            present_renderbuffer_es2(gles.as_mut(), rb, 0, (0, 0, 16, 16),
-                crate::matrix::Matrix::identity(), None, false, 0, true);
-            gles.ReadPixels(8, 8, 1, 1, gl::RGBA, gl::UNSIGNED_BYTE, pixel.as_mut_ptr().cast());
+            present_renderbuffer_es2(
+                gles.as_mut(),
+                rb,
+                0,
+                (0, 0, 16, 16),
+                crate::matrix::Matrix::identity(),
+                None,
+                false,
+                0,
+                true,
+            );
+            gles.ReadPixels(
+                8,
+                8,
+                1,
+                1,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                pixel.as_mut_ptr().cast(),
+            );
             assert_eq!(gles.GetError(), 0);
-            assert!(pixel[0] < 10 && pixel[1] > 240 && pixel[2] < 10,
-                "Default framebuffer must stay green, got {pixel:?}");
+            assert!(
+                pixel[0] < 10 && pixel[1] > 240 && pixel[2] < 10,
+                "Default framebuffer must stay green, got {pixel:?}"
+            );
+        }
+    }
+}
+#[cfg(test)]
+mod frame_content_tests {
+    use super::frame_content_verdict;
 
+    #[test]
+    fn a_frame_that_is_entirely_black_is_its_own_verdict() {
+        // Black is the commonest "nothing rendered" report, so it must not be
+        // reported as merely "flat".
+        assert!(frame_content_verdict(10, 0, 10).starts_with("all black"));
+    }
+
+    #[test]
+    fn a_frame_of_one_flat_colour_is_flat_but_not_black() {
+        // Every pixel equals the centre sample, and none of them are black:
+        // the app drew a solid background and nothing else.
+        assert!(frame_content_verdict(10, 10, 0).starts_with("flat"));
+    }
+
+    #[test]
+    fn a_frame_with_varied_pixels_has_content() {
+        assert!(frame_content_verdict(10, 3, 2).starts_with("content present"));
+    }
+
+    #[test]
+    fn an_empty_sample_set_is_unknown_rather_than_flat() {
+        // `matching_centre == sampled` is trivially true when nothing was
+        // sampled; reporting that as "flat" would be a false positive.
+        assert!(frame_content_verdict(0, 0, 0).starts_with("unknown"));
+    }
+}
+
+#[cfg(test)]
+mod present_route_tests {
+    use super::{select_present_route, PresentBackend, PresentRoute};
+    use crate::options::PresentMode;
+
+    /// The normal Android ES 1.1 case: a native ES 1.1 driver, nothing else.
+    const NATIVE_ES1: PresentBackend = PresentBackend {
+        is_translator: false,
+        is_native_es1: true,
+        is_es2: false,
+        direct_present_broken: false,
+    };
+    const ES2: PresentBackend = PresentBackend {
+        is_translator: false,
+        is_native_es1: false,
+        is_es2: true,
+        direct_present_broken: false,
+    };
+    const TRANSLATOR: PresentBackend = PresentBackend {
+        is_translator: true,
+        is_native_es1: false,
+        is_es2: true,
+        direct_present_broken: false,
+    };
+    /// `ES2` on a driver where the black-frame probe fired.
+    const ES2_PRESENT_IS_BLACK: PresentBackend = PresentBackend {
+        is_translator: false,
+        is_native_es1: false,
+        is_es2: true,
+        direct_present_broken: true,
+    };
+    const ALL_BACKENDS: [PresentBackend; 4] = [NATIVE_ES1, ES2, TRANSLATOR, ES2_PRESENT_IS_BLACK];
+    const ALL_MODES: [PresentMode; 3] = [
+        PresentMode::Auto,
+        PresentMode::Direct,
+        PresentMode::Readback,
+    ];
+
+    fn route(mode: PresentMode, backend: PresentBackend) -> PresentRoute {
+        select_present_route(mode, backend).route
+    }
+
+    #[test]
+    fn auto_keeps_reading_back_on_es1_and_presents_on_the_gpu_on_es2() {
+        assert_eq!(route(PresentMode::Auto, NATIVE_ES1), PresentRoute::Readback);
+        assert_eq!(route(PresentMode::Auto, TRANSLATOR), PresentRoute::Readback);
+        assert_eq!(route(PresentMode::Auto, ES2), PresentRoute::Direct);
+        // A driver where the GPU presenter goes black keeps reading back.
+        assert_eq!(
+            route(PresentMode::Auto, ES2_PRESENT_IS_BLACK),
+            PresentRoute::Readback
+        );
+    }
+
+    #[test]
+    fn explicit_present_modes_are_honoured() {
+        for backend in ALL_BACKENDS {
+            // `--present-mode=direct` always presents on the GPU.
+            assert_eq!(route(PresentMode::Direct, backend), PresentRoute::Direct);
+        }
+        // Readback is unavailable on a real ES 2.0 driver - the readback path
+        // speaks ES 1.1 OES entry points - but works everywhere else.
+        assert_eq!(
+            route(PresentMode::Readback, NATIVE_ES1),
+            PresentRoute::Readback
+        );
+        assert_eq!(
+            route(PresentMode::Readback, TRANSLATOR),
+            PresentRoute::Readback
+        );
+        assert_eq!(route(PresentMode::Readback, ES2), PresentRoute::Direct);
+    }
+
+    #[test]
+    fn every_decision_explains_itself() {
+        // The reason ends up in bug reports and sits inside a single log
+        // line, so it must never be empty, contain a line break, or carry
+        // doubled spaces from an editing slip.
+        for backend in ALL_BACKENDS {
+            for mode in ALL_MODES {
+                let reason = select_present_route(mode, backend).reason;
+                assert!(!reason.is_empty());
+                assert!(!reason.contains("  "), "doubled space in {reason:?}");
+                assert!(!reason.contains('\n'), "stray newline in {reason:?}");
+                assert!(
+                    reason.chars().count() <= 80,
+                    "reason too long for one log line: {reason:?}"
+                );
+            }
         }
     }
 }
@@ -4511,5 +6143,139 @@ mod framebuffer_readback_tests {
         };
         assert!(unsafe { read_renderbuffer(&mut gl, 42, Vec::new()) }.is_some());
         assert_eq!((gl.draw, gl.read, gl.pack), (7, 7, 4));
+    }
+}
+
+#[cfg(test)]
+mod present_texture_unit_tests {
+    use super::*;
+
+    struct TextureUnits {
+        server: usize,
+        client: usize,
+        enabled: [bool; 4],
+    }
+    #[allow(non_snake_case)]
+    impl GLES for TextureUnits {
+        unsafe fn GetIntegerv(&mut self, name: GLenum, value: *mut GLint) {
+            *value = match name {
+                gles11::ACTIVE_TEXTURE => gles11::TEXTURE0 as GLint + self.server as GLint,
+                gles11::CLIENT_ACTIVE_TEXTURE => gles11::TEXTURE0 as GLint + self.client as GLint,
+                gles11::MAX_TEXTURE_UNITS => self.enabled.len() as GLint,
+                _ => panic!("Unexpected query: {name:#x}"),
+            };
+        }
+        unsafe fn ActiveTexture(&mut self, unit: GLenum) {
+            self.server = (unit - gles11::TEXTURE0) as usize;
+        }
+        unsafe fn ClientActiveTexture(&mut self, unit: GLenum) {
+            self.client = (unit - gles11::TEXTURE0) as usize;
+        }
+        unsafe fn IsEnabled(&mut self, name: GLenum) -> GLboolean {
+            assert_eq!(name, gles11::TEXTURE_2D);
+            self.enabled[self.server] as GLboolean
+        }
+        unsafe fn Enable(&mut self, name: GLenum) {
+            assert_eq!(name, gles11::TEXTURE_2D);
+            self.enabled[self.server] = true;
+        }
+        unsafe fn Disable(&mut self, name: GLenum) {
+            assert_eq!(name, gles11::TEXTURE_2D);
+            self.enabled[self.server] = false;
+        }
+    }
+
+    #[test]
+    fn presentation_isolates_unit_zero_and_restores_independent_selectors() {
+        invalidate_present_cache_for_context(crate::gles::perf_overlay::allocate_context_token());
+        let mut host = TextureUnits {
+            server: 2,
+            client: 3,
+            enabled: [true, false, true, true],
+        };
+        unsafe {
+            let saved = PresentTextureUnits::capture(&mut host);
+            assert_eq!(host.server, 0);
+            assert_eq!(host.client, 0);
+            assert_eq!(host.enabled, [true, false, false, false]);
+            saved.restore(&mut host);
+        }
+        assert_eq!(host.server, 2);
+        assert_eq!(host.client, 3);
+        assert_eq!(host.enabled, [true, false, true, true]);
+    }
+}
+
+#[cfg(test)]
+mod present_rotation_tests {
+    use super::present_rotation_matrix;
+    use crate::matrix::Matrix;
+
+    fn turn(angle: f32) -> Matrix<2> {
+        Matrix::<2>::z_rotation(angle)
+    }
+
+    fn quarter_turns(m: Matrix<2>) -> i32 {
+        // Compare the forward image of +x against the four quarter turns.
+        let [x, y] = m.transform([1.0, 0.0]);
+        for (turns, (ex, ey)) in [
+            (0, (1.0, 0.0)),
+            (1, (0.0, 1.0)),
+            (2, (-1.0, 0.0)),
+            (3, (0.0, -1.0)),
+        ] {
+            if (x - ex).abs() < 1e-4 && (y - ey).abs() < 1e-4 {
+                return turns;
+            }
+        }
+        -1
+    }
+
+    #[test]
+    fn an_autorotated_root_is_presented_upright() {
+        // A landscape game on a phone held in landscape: UIKit autorotated the
+        // root view by a quarter turn, and the device orientation reports the
+        // opposite quarter turn. The renderbuffer is already upright in the
+        // layer's own space, so presenting it must add nothing. Replacing the
+        // device rotation with the layer turn left it a quarter turn out;
+        // subtracting the two left it 180 degrees out.
+        let device = turn(std::f32::consts::FRAC_PI_2);
+        let layer = -std::f32::consts::FRAC_PI_2;
+        let result = present_rotation_matrix(device, false, layer, false);
+        assert_eq!(quarter_turns(result), 0);
+        // The two turns are measured from the same place, so when the guest
+        // never reported an orientation the layer turn is the only one left to
+        // undo.
+        let result = present_rotation_matrix(turn(0.0), false, layer, false);
+        assert_eq!(quarter_turns(result), 3);
+    }
+
+    #[test]
+    fn a_layer_without_a_transform_falls_back_to_the_device_orientation() {
+        // A game that draws its own landscape frame leaves the root view
+        // unrotated. Nothing in the layer tree can be used, so the device
+        // orientation is the only source and it must still be applied.
+        let device = turn(-std::f32::consts::FRAC_PI_2);
+        let result = present_rotation_matrix(device, false, 0.0, false);
+        assert_eq!(quarter_turns(result), 3);
+    }
+
+    #[test]
+    fn the_ios_direct_presenter_never_rotates() {
+        // That path draws in display orientation already.
+        let device = turn(std::f32::consts::PI);
+        let result = present_rotation_matrix(device, true, 0.0, false);
+        assert_eq!(quarter_turns(result), 0);
+    }
+
+    #[test]
+    fn an_explicit_override_only_replaces_the_device_orientation() {
+        // `--present-rotate` is folded into `window_rotation` by the caller, so
+        // it stands in for the device orientation and nothing more. An
+        // autorotated layer still wins, which is what keeps the option from
+        // fighting UIKit on an app whose root view UIKit already turned.
+        let override_matrix = turn(std::f32::consts::PI);
+        let result = present_rotation_matrix(override_matrix, false, 0.0, true);
+        assert_eq!(quarter_turns(result), 2);
     }
 }

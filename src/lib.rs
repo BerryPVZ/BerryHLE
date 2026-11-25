@@ -3,7 +3,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-//! touchHLE is a high-level emulator (HLE) for iPhone OS applications.
+//! touchHLE is a high-level emulator (HLE) for early iOS apps.
 //!
 //! In various places, the terms "guest" and "host" are used to distinguish
 //! between the emulated application (the "guest") and the emulator itself (the
@@ -26,24 +26,26 @@
 
 #[macro_use]
 mod log;
-mod env_flags;
-mod fastmap;
 mod abi;
 mod android_jni;
 mod android_media;
 mod android_web_view;
 mod audio;
 mod bundle;
+mod corrupt;
 mod cpu;
 mod crash_handler;
 mod debug;
 mod dyld;
+mod env_flags;
 mod environment;
+mod fastmap;
 pub mod font;
 mod frameworks;
 mod fs;
 mod gdb;
 mod gles;
+mod guest_clock;
 mod image;
 mod libc;
 mod mach_o;
@@ -53,8 +55,10 @@ mod objc;
 mod options;
 mod paths;
 mod perf_hints;
+mod quick_menu;
+mod runtime_profile;
 mod stack;
-mod guest_clock;
+mod stall_watchdog;
 mod trainer;
 mod trainer_ui;
 mod window;
@@ -69,9 +73,9 @@ use environment::{Environment, MutexId, MutexType, ThreadId, PTHREAD_MUTEX_DEFAU
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(target_os = "ios")]
 use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static ALLOCATION_METER_ENABLED: AtomicBool = AtomicBool::new(false);
 static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -133,7 +137,7 @@ static GLOBAL: CountingMiMalloc = CountingMiMalloc;
 
 pub use touchHLE_version::*;
 
-pub const DISPLAY_NAME: &str = "BerryHLE";
+pub const DISPLAY_NAME: &str = "AppleJuiceHLE";
 
 #[cfg(target_os = "ios")]
 static HOST_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -243,11 +247,11 @@ pub extern "C" fn SDL_main(
     match main([String::new()].into_iter()) {
         Ok(termination) => {
             let code = termination.map_or(0, |result| result.exit_code());
-            echo!("BerryHLE finished with status {code}");
+            echo!("AppleJuiceHLE finished with status {code}");
             code
         }
         Err(e) => {
-            echo!("BerryHLE errored: {e:?}");
+            echo!("AppleJuiceHLE errored: {e:?}");
             1
         }
     }
@@ -255,7 +259,7 @@ pub extern "C" fn SDL_main(
 
 const USAGE: &str = "\
 Usage:
-    touchHLE [PATH] [OPTIONS]
+    AppleJuiceHLE [PATH] [OPTIONS]
 
 PATH should be a path to a .app bundle or .ipa file.
 
@@ -273,6 +277,35 @@ Special options:
 pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<Option<GuestTermination>, String> {
     crash_handler::install();
     crash_handler::install_panic_hook();
+    let original_args: Vec<String> = args.collect();
+    let program = original_args.first().cloned().unwrap_or_default();
+    let mut next_args = original_args;
+    let mut returning_to_picker = false;
+    // A guest session can be followed by another one in the same process on
+    // both desktop and Android: the app picker already hands over to a game
+    // that way, and the quick menu's "Exit emulator" uses the reverse. iOS
+    // keeps its old behaviour, because there the forwarding entry point owns
+    // the UI window.
+    let can_return_to_picker = cfg!(not(target_os = "ios"));
+    loop {
+        let result = run_session(next_args.into_iter(), returning_to_picker)?;
+        if can_return_to_picker && matches!(result, Some(GuestTermination::ReturnToPicker)) {
+            next_args = vec![program.clone()];
+            returning_to_picker = true;
+        } else {
+            return Ok(result);
+        }
+    }
+}
+
+fn run_session<T: Iterator<Item = String>>(
+    mut args: T,
+    returning_to_picker: bool,
+) -> Result<Option<GuestTermination>, String> {
+    // Copy any legacy touchHLE_* user data forward before anything uses the
+    // renamed paths. Safe to call on every launch: it does nothing (or only
+    // logs) when the legacy paths don't exist.
+    paths::migrate_legacy_user_data();
     // Headless CI boxes have no sound devices; when asked, point OpenAL
     // Soft's wave writer at a capture file before any OpenAL call happens.
     if std::env::var_os("TOUCHHLE_CAPTURE_AUDIO").is_some()
@@ -283,7 +316,11 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<Option<GuestTermi
         // openal-soft's wave backend only reads its output path from the
         // config key `wave/file`; it does not honour an env override, so
         // generate a minimal config file and point ALSOFT_CONF at it.
-        std::fs::write(&conf, format!("[wave]\nfile = {}\n", path.to_string_lossy())).ok();
+        std::fs::write(
+            &conf,
+            format!("[wave]\nfile = {}\n", path.to_string_lossy()),
+        )
+        .ok();
         // SAFETY: runs before any thread spawn or OpenAL call in this process.
         unsafe {
             std::env::set_var("ALSOFT_DRIVERS", "wave");
@@ -311,7 +348,7 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<Option<GuestTermi
     }
 
     echo!(
-        "BerryHLE {}{}{}",
+        "AppleJuiceHLE {}{}{}",
         branding(),
         if branding().is_empty() { "" } else { " " },
         VERSION,
@@ -330,7 +367,7 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<Option<GuestTermi
 
     {
         let base_path = paths::user_data_base_path();
-        log!("Base path for touchHLE files: {}", base_path.display());
+        log!("Base path for AppleJuiceHLE files: {}", base_path.display());
         paths::prepopulate_user_data_dir();
         paths::remove_legacy_pvrtc_disk_cache();
     }
@@ -340,6 +377,7 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<Option<GuestTermi
     let mut bundle_path: Option<PathBuf> = None;
     let mut just_info = false;
     let mut option_args = Vec::new();
+    let mut picker_option_args = Vec::new();
     let mut options = options::Options::default();
     let mut app_args = None::<Vec<String>>;
     for arg in args {
@@ -391,8 +429,8 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<Option<GuestTermi
             "No app specified, opening app picker. Use the --help flag to see command-line usage."
         );
         let (bundle_path, mut extra_options) =
-            environment::app_picker::app_picker(options, true)?;
-        option_args.append(&mut extra_options);
+            environment::app_picker::app_picker(options, !returning_to_picker)?;
+        picker_option_args.append(&mut extra_options);
         bundle_path
     };
     // When PowerShell does tab-completion on a directory, for some reason it
@@ -416,17 +454,6 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<Option<GuestTermi
     };
 
     let app_id = bundle.bundle_identifier();
-
-    // Gangstar Rio is landscape-only. Keep UIScreen's point and pixel axes
-    // aligned with the active orientation; portrait axes leave its EAGL scene
-    // occupying only a small portion of the display.
-    if app_id == "com.gameloft.gangstar3"
-        && std::env::var_os("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS").is_none()
-    {
-        unsafe {
-            std::env::set_var("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS", "1");
-        }
-    }
 
     // ULTRAHLE_MINIONJUMP_SCREEN_BEGIN
     // Minion Jump / SheepEscape needs the iPad landscape identity/profile.
@@ -485,13 +512,11 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<Option<GuestTermi
     }
     // ULTRAHLE_POTATO_LANDSCAPE_END
 
-    // Mutant Fridge: the game is a landscape-only Cocos2d build. Report
-    // landscape UIScreen bounds and force the 480x320 landscape viewport so the
-    // menu and gameplay layers are laid out the way they are on a real device.
+    // Mutant Fridge: its options profile reports landscape UIScreen bounds; this
+    // also forces the 480x320 Cocos viewport used by the game on a real device.
     if app_id == "com.turner.mfm" {
         log!("Applying Mutant Fridge landscape screen and Cocos compatibility profile.");
         unsafe {
-            std::env::set_var("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS", "1");
             std::env::set_var("TOUCHHLE_FORCE_LANDSCAPE_VIEWPORT", "1");
             std::env::set_var("TOUCHHLE_COCOS_TOUCH_REMAP", "1");
             std::env::set_var("TOUCHHLE_COCOS_TOUCH_MODE", "identity");
@@ -563,7 +588,7 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<Option<GuestTermi
         // missing post-iOS-9 APIs becomes the rule rather than the exception.
         if major > 9 || (major == 9 && minor > 0) {
             echo!(
-                "Warning: app requires OS version {}. touchHLE currently aims \
+                "Warning: app requires OS version {}. AppleJuiceHLE currently aims \
                  for iOS 2.x–9.0; newer APIs may be missing.",
                 version
             );
@@ -572,7 +597,7 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<Option<GuestTermi
 
     if required_device_capabilities.contains(&"opengles-3") {
         echo!(
-            "Warning: app requires OpenGL ES 3.0+ support. HyperHLE now routes EAGL OpenGL ES 3 contexts to its GLES 3 backend."
+            "Warning: app requires OpenGL ES 3.0+ support. AppleJuiceHLE now routes EAGL OpenGL ES 3 contexts to its GLES 3 backend."
         );
     }
 
@@ -611,6 +636,13 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<Option<GuestTermi
         }
         Ok(())
     }
+    // App picker choices are applied before the file options, so this app's
+    // bundled compatibility defaults override them. Command-line options are
+    // reapplied last and still win.
+    for option_arg in &picker_option_args {
+        let parse_result = options.parse_argument(option_arg);
+        assert!(parse_result == Ok(true));
+    }
     let default_options_file = paths::default_options_file();
     let default_options_path = default_options_file.as_str();
     match paths::ResourceFile::open(default_options_path) {
@@ -632,13 +664,9 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<Option<GuestTermi
         let parse_result = options.parse_argument(&option_arg);
         assert!(parse_result == Ok(true));
     }
-    // Options that tweak the emulated device profile work by setting
-    // `TOUCHHLE_*` environment variables, and several subsystems cache those
-    // flags for the lifetime of the process. The app picker runs the same
-    // UIKit/OpenGL ES code as the app and can read them before this point
-    // (`UIScreen.bounds` reading `TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS`), so make
-    // every cached flag re-read the environment now that all options for this
-    // app are known.
+    // Some options update `TOUCHHLE_*` environment flags, and the app picker
+    // may have cached them before these options were applied. Refresh caches so
+    // consumers see the final app-specific settings.
     crate::env_flags::invalidate_caches();
 
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

@@ -1547,7 +1547,7 @@ dependencies = [
 
 [[package]]
 name = "touchHLE"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "bzip2",
  "caf",
@@ -1557,6 +1557,7 @@ dependencies = [
  "corosensei",
  "digest",
  "encoding_rs",
+ "getrandom 0.2.17",
  "gl_generator",
  "hound",
  "lazy_static",
@@ -1573,6 +1574,7 @@ dependencies = [
  "rusttype",
  "sdl2",
  "sdl2-sys",
+ "serde",
  "serde_json",
  "sha1",
  "sha2",
@@ -1584,7 +1586,9 @@ dependencies = [
  "touchHLE_pvrt_decompress_wrapper",
  "touchHLE_stb_image_wrapper",
  "touchHLE_version",
+ "unicode-linebreak",
  "unicode-normalization",
+ "unicode-segmentation",
  "ureq",
  "windows-sys 0.61.2",
  "zip",
@@ -1592,7 +1596,7 @@ dependencies = [
 
 [[package]]
 name = "touchHLE_dynarmic_wrapper"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "cc",
  "cmake",
@@ -1600,14 +1604,14 @@ dependencies = [
 
 [[package]]
 name = "touchHLE_gl_bindings"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "gl_generator",
 ]
 
 [[package]]
 name = "touchHLE_libxml2_wrapper"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "cc",
  "cmake",
@@ -1615,28 +1619,28 @@ dependencies = [
 
 [[package]]
 name = "touchHLE_openal_soft_wrapper"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "cmake",
 ]
 
 [[package]]
 name = "touchHLE_pvrt_decompress_wrapper"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "touchHLE_stb_image_wrapper"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "touchHLE_version"
-version = "0.2.3"
+version = "0.3.0"
 
 [[package]]
 name = "touchhle-ios-entry"
@@ -1664,6 +1668,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
+name = "unicode-linebreak"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b09c83c3c29d37506a3e260c08c03743a6bb66a9cd432c6934ab501a190571f"
+
+[[package]]
 name = "unicode-normalization"
 version = "0.1.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1671,6 +1681,12 @@ checksum = "5033c97c4262335cded6d6fc3e5c18ab755e1a3dc96376350f3d8e9f009ad956"
 dependencies = [
  "tinyvec",
 ]
+
+[[package]]
+name = "unicode-segmentation"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6ccf251212114b54433ec949fd6a7841275f9ada20dddd2f29e9ceea4501493"
 
 [[package]]
 name = "unicode-width"

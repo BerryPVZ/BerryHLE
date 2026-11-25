@@ -42,6 +42,83 @@ fn set_range(host: &mut NSIndexSetHostObject, location: NSUInteger, length: NSUI
     }
 }
 
+/// Adds one index, keeping the list sorted and de-duplicated.
+fn insert_index(host: &mut NSIndexSetHostObject, index: NSUInteger) {
+    if let Err(pos) = host.indexes.binary_search(&index) {
+        host.indexes.insert(pos, index);
+    }
+}
+
+/// Adds every index in `location..location + length`, merging with the
+/// existing sorted list in one pass.
+fn add_range(host: &mut NSIndexSetHostObject, location: NSUInteger, length: NSUInteger) {
+    if length == 0 {
+        return;
+    }
+    let start = location as u64;
+    let end = start.saturating_add(length as u64);
+    let old = std::mem::take(&mut host.indexes);
+    let mut merged = Vec::with_capacity(old.len().saturating_add(length as usize));
+    let mut next_new = start;
+    for index in old {
+        let index64 = index as u64;
+        while next_new < end && next_new < index64 {
+            merged.push(next_new as NSUInteger);
+            next_new += 1;
+        }
+        merged.push(index);
+        if index64 >= next_new {
+            next_new = index64 + 1;
+        }
+    }
+    while next_new < end {
+        merged.push(next_new as NSUInteger);
+        next_new += 1;
+    }
+    host.indexes = merged;
+}
+
+/// Removes every index in `location..location + length`.
+fn remove_range(host: &mut NSIndexSetHostObject, location: NSUInteger, length: NSUInteger) {
+    let start = location as u64;
+    let end = start.saturating_add(length as u64);
+    host.indexes
+        .retain(|&index| (index as u64) < start || (index as u64) >= end);
+}
+
+/// Copies the sorted indexes of another index set, used by the set algebra
+/// methods. A nil argument contributes nothing.
+fn indexes_of(env: &mut crate::Environment, other: id) -> Vec<NSUInteger> {
+    if other == nil {
+        Vec::new()
+    } else {
+        env.objc
+            .borrow::<NSIndexSetHostObject>(other)
+            .indexes
+            .clone()
+    }
+}
+
+/// Moves every index at or above `index` by `delta`. A negative shift can
+/// push an index below zero (Apple drops those) or past an index that stayed
+/// put, so the result is sorted again.
+fn shift_indexes(host: &mut NSIndexSetHostObject, index: NSUInteger, delta: NSInteger) {
+    let mut shifted = Vec::with_capacity(host.indexes.len());
+    for &i in &host.indexes {
+        if i < index {
+            shifted.push(i);
+            continue;
+        }
+        let moved = i as i64 + delta as i64;
+        if moved >= 0 {
+            shifted.push(moved as NSUInteger);
+        }
+    }
+    shifted.sort_unstable();
+    shifted.dedup();
+    host.indexes = shifted;
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -112,6 +189,32 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 // MARK: - Count / membership
+
+- (())enumerateIndexesUsingBlock:(id)block {
+    if block == nil {
+        return;
+    }
+    let invoke_ptr: u32 = env.mem.read(block.cast::<u32>() + 3u32);
+    if invoke_ptr == 0 {
+        log!("Warning: NSIndexSet block {:?} has no invoke pointer; skipping.", block);
+        return;
+    }
+    let indexes = env.objc.borrow::<NSIndexSetHostObject>(this).indexes.clone();
+    // BOOL *stop: one byte, but allocate a word so the guest store stays aligned.
+    let stop = env.mem.alloc(4);
+    env.mem.write(stop.cast::<u32>(), 0);
+    use crate::abi::CallFromHost;
+    let invoke = crate::abi::GuestFunction::from_addr_with_thumb_bit(invoke_ptr);
+    let block_arg: crate::mem::ConstVoidPtr =
+        crate::mem::Ptr::from_bits(block.to_bits()).cast_const();
+    for index in indexes {
+        let _: () = invoke.call_from_host(env, (block_arg, index, stop));
+        if env.mem.read(stop.cast::<u32>()) != 0 {
+            break;
+        }
+    }
+    env.mem.free(stop);
+}
 
 - (NSUInteger)count {
     env.objc.borrow::<NSIndexSetHostObject>(this).indexes.len() as NSUInteger
@@ -216,10 +319,42 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)mutableCopyWithZone:(NSZonePtr)_zone {
-    let new: id = msg_class![env; NSIndexSet alloc];
+    let new: id = msg_class![env; NSMutableIndexSet alloc];
     let idxs = env.objc.borrow::<NSIndexSetHostObject>(this).indexes.clone();
     env.objc.borrow_mut::<NSIndexSetHostObject>(new).indexes = idxs;
     autorelease(env, new)
+}
+
+// MARK: - NSCoding
+
+- (id)initWithCoder:(id)coder {
+    let key = crate::frameworks::foundation::ns_string::get_static_str(env, "NSIndexSetData");
+    let data: id = msg![env; coder decodeObjectForKey:key];
+    if data != nil {
+        let len: NSUInteger = msg![env; data length];
+        let count = len as usize / std::mem::size_of::<NSUInteger>();
+        let bytes_ptr: crate::mem::ConstVoidPtr = msg![env; data bytes];
+        let mut indexes = Vec::with_capacity(count);
+        for i in 0..count as u32 {
+            indexes.push(env.mem.read(bytes_ptr.cast::<NSUInteger>() + i));
+        }
+        indexes.sort_unstable();
+        indexes.dedup();
+        env.objc.borrow_mut::<NSIndexSetHostObject>(this).indexes = indexes;
+    }
+    this
+}
+
+- (())encodeWithCoder:(id)coder {
+    let host = env.objc.borrow::<NSIndexSetHostObject>(this);
+    let byte_len = (host.indexes.len() * std::mem::size_of::<NSUInteger>()) as NSUInteger;
+    let buf: crate::mem::MutVoidPtr = env.mem.alloc(byte_len as u32).cast();
+    for (i, &index) in host.indexes.iter().enumerate() {
+        env.mem.write(buf.cast::<NSUInteger>() + i as u32, index);
+    }
+    let data: id = msg_class![env; NSData dataWithBytesNoCopy:buf length:byte_len];
+    let key = crate::frameworks::foundation::ns_string::get_static_str(env, "NSIndexSetData");
+    () = msg![env; coder encodeObject:data forKey:key];
 }
 
 // MARK: - Description
@@ -234,4 +369,168 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @end
 
+// =========================================================================
+// MARK: - NSMutableIndexSet
+// =========================================================================
+
+@implementation NSMutableIndexSet: NSIndexSet
+
++ (id)allocWithZone:(NSZonePtr)_zone {
+    let host_object = Box::<NSIndexSetHostObject>::default();
+    env.objc.alloc_object(this, host_object, &mut env.mem)
+}
+
+// MARK: - Mutation
+
+- (())addIndex:(NSUInteger)index {
+    let host = env.objc.borrow_mut::<NSIndexSetHostObject>(this);
+    insert_index(host, index);
+}
+
+- (())addIndexesInRange:(NSRange)range {
+    let host = env.objc.borrow_mut::<NSIndexSetHostObject>(this);
+    add_range(host, range.location, range.length);
+}
+
+- (())addIndexes:(id)other { // NSIndexSet*
+    if other == nil {
+        return;
+    }
+    let indexes = {
+        let other = env.objc.borrow::<NSIndexSetHostObject>(other);
+        other.indexes.clone()
+    };
+    let host = env.objc.borrow_mut::<NSIndexSetHostObject>(this);
+    host.indexes.extend_from_slice(&indexes);
+    host.indexes.sort_unstable();
+    host.indexes.dedup();
+}
+
+- (())removeIndex:(NSUInteger)index {
+    let host = env.objc.borrow_mut::<NSIndexSetHostObject>(this);
+    if let Ok(pos) = host.indexes.binary_search(&index) {
+        host.indexes.remove(pos);
+    }
+}
+
+- (())removeIndexesInRange:(NSRange)range {
+    let host = env.objc.borrow_mut::<NSIndexSetHostObject>(this);
+    remove_range(host, range.location, range.length);
+}
+
+- (())removeIndexes:(id)other { // NSIndexSet*
+    let indexes = indexes_of(env, other);
+    let host = env.objc.borrow_mut::<NSIndexSetHostObject>(this);
+    host.indexes
+        .retain(|index| indexes.binary_search(index).is_err());
+}
+
+- (())intersectIndexes:(id)other { // NSIndexSet*
+    let keep = indexes_of(env, other);
+    let host = env.objc.borrow_mut::<NSIndexSetHostObject>(this);
+    host.indexes.retain(|index| keep.binary_search(index).is_ok());
+}
+
+- (())removeAllIndexes {
+    env.objc.borrow_mut::<NSIndexSetHostObject>(this).indexes.clear();
+}
+
+- (())shiftIndexesStartingAtIndex:(NSUInteger)index by:(NSInteger)delta {
+    let host = env.objc.borrow_mut::<NSIndexSetHostObject>(this);
+    shift_indexes(host, index, delta);
+}
+
+// MARK: - NSCopying
+
+- (id)copyWithZone:(NSZonePtr)_zone {
+    let indexes = env.objc.borrow::<NSIndexSetHostObject>(this).indexes.clone();
+    let new: id = msg_class![env; NSIndexSet alloc];
+    env.objc.borrow_mut::<NSIndexSetHostObject>(new).indexes = indexes;
+    autorelease(env, new)
+}
+
+- (id)mutableCopyWithZone:(NSZonePtr)_zone {
+    retain(env, this)
+}
+
+@end
+
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host(indexes: Vec<NSUInteger>) -> NSIndexSetHostObject {
+        NSIndexSetHostObject { indexes }
+    }
+
+    #[test]
+    fn insert_index_keeps_the_list_sorted_and_unique() {
+        let mut set = host(vec![1, 4]);
+        insert_index(&mut set, 3);
+        insert_index(&mut set, 4);
+        assert_eq!(set.indexes, vec![1, 3, 4]);
+    }
+
+    #[test]
+    fn add_range_merges_with_the_existing_indexes() {
+        let mut set = host(vec![1, 4]);
+        add_range(&mut set, 2, 3);
+        assert_eq!(set.indexes, vec![1, 2, 3, 4]);
+        add_range(&mut set, 4, 2);
+        assert_eq!(set.indexes, vec![1, 2, 3, 4, 5]);
+        add_range(&mut set, 0, 0);
+        assert_eq!(set.indexes, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn shift_moves_indexes_at_or_above_the_boundary() {
+        let mut set = host(vec![1, 2, 5]);
+        shift_indexes(&mut set, 2, 3);
+        assert_eq!(set.indexes, vec![1, 5, 8]);
+        shift_indexes(&mut set, 5, -4);
+        assert_eq!(set.indexes, vec![1, 4]);
+        shift_indexes(&mut set, 0, -5);
+        assert!(set.indexes.is_empty());
+    }
+
+    #[test]
+    fn remove_range_removes_only_the_indexes_inside_it() {
+        let mut set = host(vec![0, 1, 2, 3, 4]);
+        remove_range(&mut set, 1, 3);
+        assert_eq!(set.indexes, vec![0, 4]);
+        remove_range(&mut set, 0, 0);
+        assert_eq!(set.indexes, vec![0, 4]);
+    }
+
+    #[test]
+    fn keyed_archive_round_trips_a_mutable_index_set() {
+        let _lock = crate::environment::ENVIRONMENT_TEST_LOCK.lock().unwrap();
+        let mut environment = crate::environment::touch_test_environment();
+        let env = &mut environment;
+        let pool: id = msg_class![env; NSAutoreleasePool new];
+        let set: id = msg_class![env; NSMutableIndexSet indexSet];
+        () = msg![env; set addIndex:1];
+        () = msg![env; set addIndex:7];
+        let range = NSRange { location: 3, length: 2 };
+        () = msg![env; set addIndexesInRange:range];
+        let archived: id = msg_class![env; NSKeyedArchiver archivedDataWithRootObject:set];
+        assert_ne!(archived, nil);
+        let restored: id = msg_class![env; NSKeyedUnarchiver unarchiveObjectWithData:archived];
+        assert_ne!(restored, nil);
+        let equal: bool = msg![env; restored isEqualToIndexSet:set];
+        assert!(equal);
+        let count: NSUInteger = msg![env; restored count];
+        assert_eq!(count, 4);
+
+        let empty: id = msg_class![env; NSMutableIndexSet indexSet];
+        let archived_empty: id = msg_class![env; NSKeyedArchiver archivedDataWithRootObject:empty];
+        let restored_empty: id =
+            msg_class![env; NSKeyedUnarchiver unarchiveObjectWithData:archived_empty];
+        assert_ne!(restored_empty, nil);
+        let empty_count: NSUInteger = msg![env; restored_empty count];
+        assert_eq!(empty_count, 0);
+        () = msg![env; pool drain];
+    }
+}

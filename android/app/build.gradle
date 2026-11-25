@@ -83,12 +83,16 @@ android {
             }
         }
     }
+    buildFeatures {
+        // defaultConfig below sets APP_NAME and APP_ICON with buildConfigField.
+        buildConfig = true
+    }
     defaultConfig {
         def branding = getTouchHLEBranding()
         applicationId 'org.hyperhle.reborn'
         applicationIdSuffix(branding.isEmpty() ? null : '.' + branding.toLowerCase())
-        resValue 'string', 'app_name', join('BerryHLE', ' ', branding)
-        buildConfigField 'String', 'APP_NAME', ('"' + join('BerryHLE', ' ', branding) + '"')
+        resValue 'string', 'app_name', join('AppleJuiceHLE', ' ', branding)
+        buildConfigField 'String', 'APP_NAME', ('"' + join('AppleJuiceHLE', ' ', branding) + '"')
         manifestPlaceholders = [
                 icon: (branding.toLowerCase() == 'unofficial' ? '@drawable/icon' : join('@drawable/icon', '_', branding.toLowerCase()))
         ]
@@ -145,7 +149,7 @@ android {
         tasks["merge${variant.name.capitalize()}Assets"]
                 .dependsOn("externalNativeBuild${variant.name.capitalize()}")
         variant.outputs.all { output ->
-            outputFileName = "BerryHLE-${variant.name}.apk"
+            outputFileName = "AppleJuiceHLE-${variant.name}.apk"
         }
     }
 

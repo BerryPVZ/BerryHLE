@@ -1,6 +1,6 @@
-# HyperHLE app-fix Telegram bot
+# AppleJuiceHLE app-fix Telegram bot
 
-A Telegram bot that lets people **request an app be fixed in HyperHLE** without
+A Telegram bot that lets people **request an app be fixed in AppleJuiceHLE** without
 touching GitHub. It walks the user through the three things a fix actually needs:
 
 1. the **IPA link(s)** (a direct download for the `.ipa` / zipped `.app`) —
@@ -88,7 +88,7 @@ python -m bot.main
 | `FORWARD_CHAT_ID` | for forwarding | Numeric chat id to forward requests to (Tog991). |
 | `FORWARD_USERNAME` | no | Display handle, defaults to `@Tog991`. |
 | `GITHUB_TOKEN` | for auto-filing | Token with `repo` / `issues:write` + `contents:write` scope (the last is needed to upload log/media attachments). |
-| `GITHUB_OWNER` / `GITHUB_REPO` | no | Defaults to `HyperHLE` / `HyperHLE`. |
+| `GITHUB_OWNER` / `GITHUB_REPO` | no | Defaults to `AppleJuiceHLE` / `AppleJuiceHLE`. |
 | `GITHUB_ISSUE_LABELS` | no | Comma-separated labels, default `app fix request`. |
 | `UPLOAD_ATTACHMENTS` | no | Upload logs + screenshots/video to the issue. Default `true`; set `false` to disable. |
 | `GITHUB_ATTACHMENTS_BRANCH` | no | Branch attachments are committed to, default `telegram-bot-attachments` (created on first use). |
@@ -111,11 +111,11 @@ token also lifts the anonymous API rate limit on the latest-commit check.
 
 ## How the "latest version" check works
 
-HyperHLE logs identify their own build in the first two lines:
+AppleJuiceHLE logs identify their own build in the first two lines:
 
 ```
-touchHLE UNOFFICIAL 8d65eca
-Built from branch "trunk" of "HyperHLE/HyperHLE" by GitHub Actions workflow run https://github.com/HyperHLE/HyperHLE/actions/runs/27085497648.
+AppleJuiceHLE UNOFFICIAL 8d65eca
+Built from branch "trunk" of "HyperHLE/AppleJuiceHLE" by GitHub Actions workflow run https://github.com/HyperHLE/HyperHLE/actions/runs/27085497648.
 ```
 
 At submit time `bot/request.py` parses the commit hash, branch and workflow-run

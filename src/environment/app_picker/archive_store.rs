@@ -2108,7 +2108,7 @@ fn download_task_status(task: &DownloadTask) -> String {
             if task.already_present {
                 format!("Already installed • {name}")
             } else {
-                format!("Installed in touchHLE_apps • {name}")
+                format!("Installed in {} • {name}", crate::paths::APPS_DIR)
             }
         }
         TaskState::Failed => task
@@ -2323,7 +2323,7 @@ fn request_catalog(
 ) {
     let worker_sender = sender.clone();
     let spawn = std::thread::Builder::new()
-        .name("HyperHLE archive catalog".to_string())
+        .name("AppleJuiceHLE archive catalog".to_string())
         .spawn(move || {
             let result = network::fetch_catalog(scope, &query, page, rows, sort, fuzzy);
             let _ = worker_sender.send(StoreMessage::Catalog { generation, result });
@@ -2340,7 +2340,7 @@ fn request_artwork(sender: &Sender<StoreMessage>, identifier: String) {
     let worker_sender = sender.clone();
     let request_identifier = identifier.clone();
     let spawn = std::thread::Builder::new()
-        .name("HyperHLE archive artwork".to_string())
+        .name("AppleJuiceHLE archive artwork".to_string())
         .spawn(move || {
             let result = network::fetch_artwork(&request_identifier);
             let _ = worker_sender.send(StoreMessage::Artwork { identifier, result });
@@ -2356,7 +2356,7 @@ fn request_artwork(sender: &Sender<StoreMessage>, identifier: String) {
 fn request_details(sender: &Sender<StoreMessage>, generation: u64, identifier: String) {
     let worker_sender = sender.clone();
     let spawn = std::thread::Builder::new()
-        .name("HyperHLE archive metadata".to_string())
+        .name("AppleJuiceHLE archive metadata".to_string())
         .spawn(move || {
             let result = network::fetch_details(&identifier);
             let _ = worker_sender.send(StoreMessage::Details { generation, result });
@@ -2380,7 +2380,7 @@ fn request_download(
     let worker_sender = sender.clone();
     let progress_sender = sender.clone();
     let spawn = std::thread::Builder::new()
-        .name("HyperHLE IPA download".to_string())
+        .name("AppleJuiceHLE IPA download".to_string())
         .spawn(move || {
             let result = network::download_ipa(
                 &apps_dir,

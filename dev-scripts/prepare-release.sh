@@ -22,7 +22,7 @@ if [ "$PHASE" = "--prepare-files" ]; then
     rm new_release/touchHLE_fonts/README.md
 
     mkdir new_release/touchHLE_apps/
-    cp ../touchHLE_apps/README.txt new_release/touchHLE_apps/
+    cp ../HyperHLE_apps/README.txt new_release/touchHLE_apps/
 
     pandoc -s ../README.md -o new_release/README.html
 
@@ -33,7 +33,7 @@ if [ "$PHASE" = "--prepare-files" ]; then
     cp ../OPTIONS_HELP.txt new_release/
     cp ../touchHLE_default_options.txt new_release/
     cp ../touchHLE_wallpaper.png new_release/
-    cp ../touchHLE_options.txt new_release/
+    cp ../HyperHLE_options.txt new_release/touchHLE_options.txt
 elif [ "$PHASE" = "--create-zip-windows" ] || [ "$PHASE" = "--create-zip-linux" ] || [ "$PHASE" = "--create-zip-macos" ] || [ "$PHASE" = "--create-zip-android" ]; then
     shift
 

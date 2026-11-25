@@ -1,28 +1,32 @@
-name: Build BerryHLE
+name: Build AppleJuiceHLE
 
 on:
   workflow_dispatch:
     inputs:
       publish_hyperhle_release:
-        description: Publish a BerryHLE release (after all builds succeed)
+        description: Publish a AppleJuiceHLE release (after all builds succeed)
+        type: boolean
+        default: false
+      ci_timings:
+        description: Upload cargo --timings reports (CI performance work)
         type: boolean
         default: false
   push:
     branches: [ "trunk" ]
   pull_request:
     branches: [ "trunk" ]
-  create: # for tags
 
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  # Runs on trunk queue instead of cancelling each other: a cancelled run never
-  # publishes its release, so frequent pushes could otherwise hold releases
-  # back indefinitely. Queued runs start after the previous one finishes and
-  # so see any tag it published.
-  cancel-in-progress: ${{ github.ref != 'refs/heads/trunk' }}
+  # Queue instead of replacing pending runs. Non-trunk runs also queue rather
+  # than cancel stale CI runs; GitHub retains at most 100 pending per group.
+  queue: max
 
 jobs:
   build-linux:
@@ -34,7 +38,7 @@ jobs:
 
     steps:
       - name: Checkout touchHLE
-        uses: actions/checkout@main
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
         with:
           submodules: recursive
           fetch-depth: 0
@@ -68,11 +72,13 @@ jobs:
             libegl1-mesa-dev
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@master
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
       - name: Try to get cached copy of Boost
         id: cache-boost
-        uses: actions/cache@main
+        uses: actions/cache@3edfce9056124e459a23f683a21433670d47daca
         with:
           path: vendor/boost
           key: boost_1_81_0_linux
@@ -86,7 +92,7 @@ jobs:
         run: mkdir -p vendor && tar xzf boost_1_81_0.tar.gz -C vendor && mv vendor/boost_1_81_0 vendor/boost
 
       - name: Setup CMake
-        uses: lukka/get-cmake@latest
+        uses: lukka/get-cmake@30aea713799f46b5b60e60f5fa83f849abd52c22
         with:
           cmakeVersion: "~3.29.0"
 
@@ -96,9 +102,9 @@ jobs:
       - name: Create bundle
         run: cd dev-scripts && ./make-linux-bundle.sh ../target/release/touchHLE && mv touchHLE_linux_bundle/ ..
 
-      - uses: actions/upload-artifact@main
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: BerryHLE_Linux_x86_64
+          name: AppleJuiceHLE_Linux_x86_64
           path: touchHLE_linux_bundle/
 
   build-android:
@@ -106,14 +112,14 @@ jobs:
 
     steps:
     - name: Checkout touchHLE
-      uses: actions/checkout@main
+      uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
       with:
         submodules: recursive
         fetch-depth: 0
         fetch-tags: true
 
     - name: Cache Rust build artifacts
-      uses: actions/cache@main
+      uses: actions/cache@3edfce9056124e459a23f683a21433670d47daca
       with:
         path: |
           ~/.cargo/registry
@@ -125,7 +131,7 @@ jobs:
 
     - name: Try to get cached copy of Boost
       id: cache-boost
-      uses: actions/cache@main
+      uses: actions/cache@3edfce9056124e459a23f683a21433670d47daca
       with:
         path: vendor/boost
         key: boost_1_81_0
@@ -140,7 +146,7 @@ jobs:
 
     - name: Try to get cached copy of cmake
       id: cache-cmake
-      uses: actions/cache@main
+      uses: actions/cache@3edfce9056124e459a23f683a21433670d47daca
       with:
         path: vendor/cmake
         key: cmake_3_31_6_linux
@@ -161,7 +167,7 @@ jobs:
 
     - name: Try to get a cached copy of Gradle
       id: cache-gradle
-      uses: actions/cache@main
+      uses: actions/cache@3edfce9056124e459a23f683a21433670d47daca
       with:
         path: gradle
         key: gradle-8.11.1
@@ -176,10 +182,10 @@ jobs:
 
     - name: Try to get a cached copy of Android NDK
       id: cache-android-ndk
-      uses: actions/cache@main
+      uses: actions/cache@3edfce9056124e459a23f683a21433670d47daca
       with:
         path: android-ndk
-        key: android-ndk-r25c
+        key: android-ndk-r25c-unzip-v2
 
     - if: ${{ steps.cache-android-ndk.outputs.cache-hit != 'true' }}
       name: Download Android NDK
@@ -187,7 +193,18 @@ jobs:
 
     - if: ${{ steps.cache-android-ndk.outputs.cache-hit != 'true' }}
       name: Extract Android NDK
-      run: 7z -oandroid-ndk -snld x android-ndk-r25c-linux.zip
+      # NDK compiler/debugger aliases include chained Unix symlinks. Info-ZIP
+      # preserves them; 7-Zip rejects the chain with exit code 2.
+      run: unzip -q android-ndk-r25c-linux.zip -d android-ndk
+
+    - name: Validate NDK compiler and debugger symlinks
+      run: |
+        NDK_PREBUILT="$PWD/android-ndk/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64"
+        test -x "$NDK_PREBUILT/bin/clang"
+        test -x "$NDK_PREBUILT/bin/clang++"
+        test -x "$NDK_PREBUILT/bin/ld"
+        test -x "$NDK_PREBUILT/bin/ld.lld"
+        test -e "$NDK_PREBUILT/lib64/liblldb.so"
 
     - name: Link Android NDK
       run: ln -s $PWD'/android-ndk/android-ndk-r25c' $ANDROID_SDK_ROOT'/ndk/25.2.9519653'
@@ -196,17 +213,14 @@ jobs:
       run: echo 'sdk.dir='$ANDROID_SDK_ROOT > android/local.properties
 
     - name: Set up JDK 17
-      uses: actions/setup-java@v4
+      uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
       with:
         distribution: temurin
         java-version: '17'
 
     - name: Build for Android
-      run: cd android && ../gradle/gradle-8.11.1/bin/gradle assembleRelease && mv app/build/outputs/apk/release/BerryHLE-release.apk ../BerryHLE.apk
+      run: cd android && ../gradle/gradle-8.11.1/bin/gradle assembleRelease && mv app/build/outputs/apk/release/AppleJuiceHLE-release.apk ../AppleJuiceHLE.apk
       env:
-        HYPERHLE_KEYSTORE_B64: ${{ secrets.HYPERHLE_KEYSTORE_B64 }}
-        HYPERHLE_KEYSTORE_PASSWORD: ${{ secrets.HYPERHLE_KEYSTORE_PASSWORD }}
-        HYPERHLE_KEY_ALIAS: ${{ secrets.HYPERHLE_KEY_ALIAS }}
         ANDROID_NDK_ROOT: '/usr/local/lib/android/sdk/ndk/25.2.9519653'
         CMAKE: ${{ github.workspace }}/vendor/cmake/bin/cmake
 
@@ -235,18 +249,18 @@ jobs:
           --v2-signing-enabled true \
           --v3-signing-enabled true \
           --lineage "$LIN_TMP" \
-          BerryHLE.apk
+          AppleJuiceHLE.apk
 
     - uses: actions/upload-artifact@main
       with:
-        name: BerryHLE_Android_AArch64
-        path: BerryHLE.apk
+        name: AppleJuiceHLE_Android_AArch64
+        path: AppleJuiceHLE.apk
 
   test-app:
     runs-on: macos-latest
     steps:
       - name: Checkout touchHLE
-        uses: actions/checkout@main
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
         with:
           submodules: recursive
           # Full history and tags: the app version comes from the latest
@@ -256,7 +270,7 @@ jobs:
 
       - name: Try to get cached copy of Boost
         id: cache-boost
-        uses: actions/cache@main
+        uses: actions/cache@3edfce9056124e459a23f683a21433670d47daca
         with:
           path: vendor/boost
           key: boost_1_81_0_macos
@@ -270,7 +284,7 @@ jobs:
         run: mkdir -p vendor && tar xzf boost_1_81_0.tar.gz -C vendor && mv vendor/boost_1_81_0 vendor/boost
 
       - name: Setup CMake
-        uses: lukka/get-cmake@latest
+        uses: lukka/get-cmake@30aea713799f46b5b60e60f5fa83f849abd52c22
         with:
           cmakeVersion: "~3.29.0"
 
@@ -309,19 +323,26 @@ jobs:
     runs-on: windows-2022
     env:
       HYPERHLE_VERSION: ${{ needs.check-hyperhle-release.outputs.should_release == 'true' && needs.check-hyperhle-release.outputs.version || '' }}
+      # See the comment in build-osx: `cmake --build` without `--parallel`
+      # compiles SDL2/OpenAL Soft/libxml2/Dynarmic one file at a time. The
+      # `cmake` crate selects the Visual Studio generator here, and `--build`
+      # forwards this value to MSBuild as `/m`.
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
 
     steps:
     - name: Checkout touchHLE
-      uses: actions/checkout@main
+      uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
       with:
         submodules: recursive
 
     - name: Cache Rust build artifacts
-      uses: Swatinem/rust-cache@master
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+      with:
+        save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
     - name: Try to get cached copy of Boost
       id: cache-boost
-      uses: actions/cache@main
+      uses: actions/cache@3edfce9056124e459a23f683a21433670d47daca
       with:
         path: vendor\boost
         key: boost_1_81_0
@@ -335,7 +356,7 @@ jobs:
       run: 7z -ovendor x boost_1_81_0.7z && ren vendor\boost_1_81_0 boost
 
     - name: Setup CMake
-      uses: lukka/get-cmake@latest
+      uses: lukka/get-cmake@30aea713799f46b5b60e60f5fa83f849abd52c22
       with:
         cmakeVersion: "~3.29.0"
 
@@ -346,9 +367,9 @@ jobs:
       shell: bash
       run: cd dev-scripts && ./make-windows-bundle.sh ../target/release/touchHLE.exe && mv touchHLE_windows_bundle/ ..
 
-    - uses: actions/upload-artifact@main
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
       with:
-        name: BerryHLE_Windows_x86_64
+        name: AppleJuiceHLE_Windows_x86_64
         path: touchHLE_windows_bundle/
 
     - name: Build installer
@@ -379,16 +400,16 @@ jobs:
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     # Uploaded as-is rather than wrapped in a zip.
-    - uses: actions/upload-artifact@main
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
       with:
-        path: BerryHLE_Windows_x86_64_Setup.exe
+        path: AppleJuiceHLE_Windows_x86_64_Setup.exe
         archive: false
 
   check-hyperhle-release:
     runs-on: ubuntu-latest
     if: >-
-      (github.event_name == 'push' && github.ref == 'refs/heads/trunk') ||
-      github.event_name == 'workflow_dispatch'
+      github.ref == 'refs/heads/trunk' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     outputs:
       should_release: ${{ steps.check.outputs.should_release }}
       version: ${{ steps.check.outputs.version }}
@@ -396,11 +417,11 @@ jobs:
       changelog_limit: ${{ steps.check.outputs.changelog_limit }}
     steps:
       - name: Checkout touchHLE
-        uses: actions/checkout@main
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
         with:
           fetch-depth: 0
           fetch-tags: true
-      - name: Check whether a BerryHLE release is due
+      - name: Check whether a AppleJuiceHLE release is due
         id: check
         env:
           FORCE_HYPERHLE_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_hyperhle_release && 'true' || '' }}
@@ -409,10 +430,12 @@ jobs:
   publish-hyperhle-release:
     needs: [check-hyperhle-release, build-linux, build-android, build-win, test-app]
     if: >-
+      github.ref == 'refs/heads/trunk' &&
       needs.check-hyperhle-release.result == 'success' &&
       needs.check-hyperhle-release.outputs.should_release == 'true' &&
       needs.build-linux.result == 'success' &&
       needs.build-android.result == 'success' &&
+      needs.sign-android-release.result == 'success' &&
       needs.build-win.result == 'success' &&
       needs.test-app.result == 'success'
     runs-on: ubuntu-latest
@@ -420,34 +443,34 @@ jobs:
       contents: write
     steps:
       - name: Checkout touchHLE
-        uses: actions/checkout@main
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
         with:
           submodules: recursive
           fetch-depth: 0
           fetch-tags: true
       - name: Download Android artifact
-        uses: actions/download-artifact@main
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
-          name: BerryHLE_Android_AArch64
+          name: AppleJuiceHLE_Android_AArch64
           path: artifacts/android
       - name: Download Windows artifact
-        uses: actions/download-artifact@main
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
-          name: BerryHLE_Windows_x86_64
+          name: AppleJuiceHLE_Windows_x86_64
           path: artifacts/windows
       - name: Download Windows installer
-        uses: actions/download-artifact@main
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
-          name: BerryHLE_Windows_x86_64_Setup.exe
+          name: AppleJuiceHLE_Windows_x86_64_Setup.exe
           path: artifacts/windows-installer
       - name: Download Linux artifact
-        uses: actions/download-artifact@main
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
-          name: BerryHLE_Linux_x86_64
+          name: AppleJuiceHLE_Linux_x86_64
           path: artifacts/linux
       - name: Install packaging tools
         run: sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pandoc zip
-      - name: Package BerryHLE release files
+      - name: Package AppleJuiceHLE release files
         env:
           # Lets the changelog look up each commit author's GitHub username.
           GH_TOKEN: ${{ github.token }}
@@ -457,15 +480,15 @@ jobs:
           CHANGELOG_FROM: ${{ needs.check-hyperhle-release.outputs.changelog_from }}
           CHANGELOG_LIMIT: ${{ needs.check-hyperhle-release.outputs.changelog_limit }}
         run: ./dev-scripts/package-hyperhle-release.sh "$VERSION" "$CHANGELOG_FROM"
-      - name: Publish BerryHLE release
+      - name: Publish AppleJuiceHLE release
         uses: softprops/action-gh-release@master
         with:
           tag_name: ${{ needs.check-hyperhle-release.outputs.version }}
           # Tag the commit that was built, not whatever trunk points at by now.
           target_commitish: ${{ github.sha }}
-          name: BerryHLE ${{ needs.check-hyperhle-release.outputs.version }}
+          name: AppleJuiceHLE ${{ needs.check-hyperhle-release.outputs.version }}
           body_path: release/RELEASE_NOTES.md
           files: |
-            release/BerryHLE_*.zip
-            release/BerryHLE_Windows_x86_64_Setup.exe
+            release/AppleJuiceHLE_*.zip
+            release/AppleJuiceHLE_Windows_x86_64_Setup.exe
           fail_on_unmatched_files: true

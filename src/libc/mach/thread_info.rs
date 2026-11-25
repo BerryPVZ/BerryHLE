@@ -13,7 +13,7 @@ use crate::dyld::{export_c_func, FunctionExports};
 use crate::environment::ThreadBlock;
 use crate::libc::mach::core_types::{boolean_t, integer_t, natural_t};
 use crate::libc::mach::port::{mach_port_t, MACH_PORT_DEAD, MACH_PORT_NULL};
-use crate::mem::{guest_size_of, MutPtr, SafeRead};
+use crate::mem::{guest_size_of, MutPtr, MutVoidPtr, SafeRead};
 use crate::Environment;
 
 // TODO: Move these common definitions into separate modules
@@ -21,6 +21,9 @@ pub type kern_return_t = i32;
 pub const KERN_SUCCESS: kern_return_t = 0;
 /// Specified address is not currently valid.
 pub const KERN_INVALID_ADDRESS: kern_return_t = 1;
+/// The requested address range is not available, e.g. because there is no
+/// backing store left for it.
+pub const KERN_NO_SPACE: kern_return_t = 3;
 pub const KERN_INVALID_ARGUMENT: kern_return_t = 4;
 pub const KERN_INVALID_TASK: kern_return_t = 5;
 
@@ -129,7 +132,7 @@ fn thread_info(
                     },
                     cpu_usage: 0,
                     policy: POLICY_TIMESHARE, // no idea if this is realistic
-                    run_state: if thread.active {
+                    run_state: if thread.is_alive() {
                         match thread.blocked_by {
                             ThreadBlock::NotBlocked => TH_STATE_RUNNING,
                             ThreadBlock::Suspended(_, _) => TH_STATE_WAITING,
@@ -460,11 +463,40 @@ fn thread_get_exception_ports(
     KERN_SUCCESS
 }
 
+/// `kern_return_t thread_swap_exception_ports(thread_act_t thread,
+///     exception_mask_t exception_mask, mach_port_t new_port,
+///     exception_behavior_t behavior, thread_state_flavor_t new_flavor,
+///     exception_mask_array_t masks, mach_port_array_t old_ports,
+///     exception_behavior_array_t behaviors,
+///     thread_state_flavor_array_t flavors,
+///     mach_msg_type_number_t *masksCnt)` — AppleJuiceHLE never delivers Mach
+///     exceptions; accept the swap and report no old handlers.
+/// <https://web.mit.edu/darwin/src/modules/xnu/osfmk/man/thread_swap_exception_ports.html>
+fn thread_swap_exception_ports(
+    env: &mut Environment,
+    _thread: u32,
+    _exception_mask: u32,
+    _new_port: u32,
+    _behavior: u32,
+    _new_flavor: u32,
+    _masks: MutVoidPtr,
+    _old_ports: MutVoidPtr,
+    _behaviors: MutVoidPtr,
+    _flavors: MutVoidPtr,
+    masks_count: MutPtr<u32>,
+) -> kern_return_t {
+    if !masks_count.is_null() {
+        env.mem.write(masks_count, 0);
+    }
+    KERN_SUCCESS
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(thread_get_exception_ports(_, _, _, _, _, _, _)),
     export_c_func!(thread_info(_, _, _, _)),
     export_c_func!(thread_policy_set(_, _, _, _)),
     export_c_func!(thread_resume(_)),
     export_c_func!(thread_set_exception_ports(_, _, _, _, _)),
+    export_c_func!(thread_swap_exception_ports(_, _, _, _, _, _, _, _, _, _)),
     export_c_func!(thread_suspend(_)),
 ];

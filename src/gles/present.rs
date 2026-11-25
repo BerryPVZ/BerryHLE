@@ -18,8 +18,8 @@ pub struct FpsCounter {
     frames: u32,
 }
 
-// DIAG (TOUCHHLE_STALL_DIAG): epoch-millis of the last presented frame, updated
-// at the top of present_frame. The main run loop reads this to detect a guest
+// DIAG (TOUCHHLE_STALL_DIAG): epoch-millis of the last window swap. The
+// main run loop reads this to detect a guest
 // hang (frames stop being presented while the guest keeps burning CPU) and dump
 // the spinning thread's stack. 0 = nothing presented yet.
 static LAST_PRESENT_MS: AtomicU64 = AtomicU64::new(0);
@@ -29,6 +29,14 @@ fn epoch_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Track every presentation backend, including the direct GLES2 path that
+/// does not use `present_frame`. Keep clock reads out of normal runs.
+pub fn note_window_swap() {
+    if crate::env_flag_cached!("TOUCHHLE_STALL_DIAG") {
+        LAST_PRESENT_MS.store(epoch_ms(), Ordering::Relaxed);
+    }
 }
 
 /// Milliseconds since the last presented frame, or `None` if no frame has been
@@ -60,7 +68,7 @@ impl FpsCounter {
             #[cfg(target_os = "ios")]
             crate::report_host_fps(fps);
             if log_output {
-                echo!("touchHLE: {} FPS: {:.2}", label, fps);
+                echo!("AppleJuiceHLE: {} FPS: {:.2}", label, fps);
             }
         }
     }
@@ -84,6 +92,7 @@ pub unsafe fn present_frame(
     gles: &mut dyn GLES,
     viewport: (u32, u32, u32, u32),
     rotation_matrix: Matrix<2>,
+    uv_scale: (f32, f32),
     virtual_cursor_visible_at: Option<(f32, f32, bool)>,
     context_token: usize,
 ) {
@@ -93,9 +102,6 @@ pub unsafe fn present_frame(
     // so these need to be updated in tandem.
 
     use gles11::types::*;
-
-    // DIAG: record that a frame reached the present path.
-    LAST_PRESENT_MS.store(epoch_ms(), Ordering::Relaxed);
 
     // Draw the quad
     gles.Viewport(
@@ -140,8 +146,10 @@ pub unsafe fn present_frame(
     #[cfg(target_os = "ios")]
     for coords in tex_coords.chunks_exact_mut(2) {
         let transformed = rotation_matrix.transform([coords[0] - 0.5, coords[1] - 0.5]);
-        coords[0] = transformed[0] + 0.5;
-        coords[1] = transformed[1] + 0.5;
+        // Scale after centring so the sampled sub-rectangle starts at (0, 0),
+        // like the non-iOS TEXTURE matrix below.
+        coords[0] = (transformed[0] + 0.5) * uv_scale.0;
+        coords[1] = (transformed[1] + 0.5) * uv_scale.1;
     }
     gles.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
     gles.TexCoordPointer(2, gles11::FLOAT, 0, tex_coords.as_ptr() as *const GLvoid);
@@ -167,6 +175,13 @@ pub unsafe fn present_frame(
     // `from_center · r · to_center` we chain in the order
     // to_center.multiply(&r).multiply(&from_center).
     let centered_rotation = to_center.multiply(&r).multiply(&from_center);
+    // Sample only the sub-rectangle of the texture the presenter filled, when
+    // its storage is larger than the frame (see eagl::present_uv_scale).
+    // Applied after the rotation, so the frame still rotates around its own
+    // centre. (1.0, 1.0) leaves the matrix untouched.
+    let uv_scale_matrix =
+        Matrix::<4>::from(&Matrix::<2>::scale_2d(uv_scale.0, uv_scale.1));
+    let centered_rotation = centered_rotation.multiply(&uv_scale_matrix);
     gles.MatrixMode(gles11::TEXTURE);
     gles.LoadMatrixf(centered_rotation.columns().as_ptr() as *const _);
     }
@@ -211,6 +226,8 @@ pub unsafe fn present_frame(
     // Cheat Engine-style trainer overlay (floating button + panel). Drawn
     // last so it sits on top of everything, including the performance display.
     crate::trainer_ui::draw(gles, viewport);
+    // Quick menu button + panel (top-left corner).
+    crate::quick_menu::draw(gles, viewport);
 
     gles.ColorMask(gles11::TRUE, gles11::TRUE, gles11::TRUE, gles11::TRUE);
 }

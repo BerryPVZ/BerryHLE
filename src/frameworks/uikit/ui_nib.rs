@@ -57,6 +57,9 @@ struct UINibHostObject {
     /// `UINibExternalObjects` / `UINibProxiedObjectsKey`. Non-retained:
     /// the caller owns the dictionary for the duration of the call.
     external_objects: id,
+    /// Runtime replacements for archive proxies. These were supplied by the
+    /// caller, so they must not appear in the array of instantiated objects.
+    proxy_objects: Vec<id>,
 }
 impl HostObject for UINibHostObject {}
 
@@ -95,6 +98,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         bundle,
         file_owner: nil,
         external_objects: nil,
+        proxy_objects: Vec::new(),
     });
 
     let new = env.objc.alloc_object(this, host_object, &mut env.mem);
@@ -115,7 +119,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)instantiateWithOwner:(id)owner options:(id)options {
     if owner == nil {
-            log!("touchHLE Warning: UINib instantiateWithOwner:nil; continuing with nil File's Owner");
+            log!("AppleJuiceHLE Warning: UINib instantiateWithOwner:nil; continuing with nil File's Owner");
         }
 
     // Apple's UINib loading documentation: the only documented `options`
@@ -144,22 +148,6 @@ pub const CLASSES: ClassExports = objc_classes! {
         path = msg![env; bundle pathForResource:nib_name ofType:nil];
     }
 
-    // Фолбэк 2: Автоматический суффикс ~iphone (Universal Apps)
-    if path == nil {
-        let rust_nib_name = to_rust_string(env, nib_name);
-        let iphone_name = format!("{}~iphone", rust_nib_name);
-        let iphone_nss = ns_string::from_rust_string(env, iphone_name);
-        path = msg![env; bundle pathForResource:iphone_nss ofType:type_];
-    }
-
-    // Фолбэк 3: Автоматический суффикс ~ipad
-    if path == nil {
-        let rust_nib_name = to_rust_string(env, nib_name);
-        let ipad_name = format!("{}~ipad", rust_nib_name);
-        let ipad_nss = ns_string::from_rust_string(env, ipad_name);
-        path = msg![env; bundle pathForResource:ipad_nss ofType:type_];
-    }
-
     if path == nil {
         log!("Warning: UINib instantiateWithOwner: nib file {:?} not found", to_rust_string(env, nib_name));
         return nil;
@@ -171,6 +159,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         let host = env.objc.borrow_mut::<UINibHostObject>(this);
         host.file_owner = owner;
         host.external_objects = external_objects;
+        host.proxy_objects.clear();
     }
 
     let top_level_objects = if let Ok(unarchiver) = load_nib_file(env, this, GuestPathBuf::from(nib_path)) {
@@ -188,15 +177,26 @@ pub const CLASSES: ClassExports = objc_classes! {
             }
         }
 
-        // Удерживаем объекты ДО удаления анрайхиватора, иначе они могут
-        // вычиститься
-        release(env, unarchiver);
-
-        if objects != nil {
-            autorelease(env, objects)
+        // Compiled NIBArchive arrays also contain File's Owner and First
+        // Responder proxies. UIKit returns the objects instantiated by the
+        // nib, not the caller's owner or external placeholder replacements.
+        // https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/LoadingResources/CocoaNibs/CocoaNibs.html
+        let result = if objects != nil {
+            let proxies = env.objc.borrow::<UINibHostObject>(this).proxy_objects.clone();
+            let result: id = msg_class![env; NSMutableArray new];
+            let count: NSUInteger = msg![env; objects count];
+            for index in 0..count {
+                let object: id = msg![env; objects objectAtIndex:index];
+                if object != nil && !proxies.contains(&object) {
+                    () = msg![env; result addObject:object];
+                }
+            }
+            autorelease(env, result)
         } else {
             nil
-        }
+        };
+        release(env, unarchiver);
+        result
     } else {
         nil
     };
@@ -205,6 +205,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         let host = env.objc.borrow_mut::<UINibHostObject>(this);
         host.file_owner = nil;
         host.external_objects = nil;
+        host.proxy_objects.clear();
     }
     top_level_objects
 }
@@ -228,6 +229,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         if external != nil {
             let replacement: id = msg![env; external objectForKey:id_nss];
             if replacement != nil {
+                env.objc.borrow_mut::<UINibHostObject>(delegate).proxy_objects.push(replacement);
                 release(env, this);
                 return retain(env, replacement);
             }
@@ -245,20 +247,27 @@ pub const CLASSES: ClassExports = objc_classes! {
         if delegate != nil {
             let file_owner = env.objc.borrow::<UINibHostObject>(delegate).file_owner;
             if file_owner != nil {
+                env.objc.borrow_mut::<UINibHostObject>(delegate).proxy_objects.push(file_owner);
                 release(env, this);
                 return retain(env, file_owner);
             }
         }
 
-        log!("touchHLE Warning: {} requested but file_owner is nil! Returning dummy.", id);
+        log!("AppleJuiceHLE Warning: {} requested but file_owner is nil! Returning dummy.", id);
         let ns_object_class = env.objc.get_known_class("NSObject", &mut env.mem);
         let dummy: id = msg![env; ns_object_class alloc];
+        if delegate != nil {
+            env.objc.borrow_mut::<UINibHostObject>(delegate).proxy_objects.push(dummy);
+        }
         release(env, this);
         msg![env; dummy init]
     } else if id == "IBFirstResponder" {
         release(env, this);
         nil
     } else {
+        if delegate != nil {
+            env.objc.borrow_mut::<UINibHostObject>(delegate).proxy_objects.push(this);
+        }
         log!("TODO: UIProxyObject replacement for {}, instance {:?} left unreplaced", id, this);
         this
     }
@@ -443,7 +452,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         // заглушка NSObject
         if source_class == ns_object_class {
             let label_str = to_rust_string(env, label);
-            log!("touchHLE NIB: Skipping outlet '{}' connection because source is an unhandled NSObject", label_str);
+            log!("AppleJuiceHLE NIB: Skipping outlet '{}' connection because source is an unhandled NSObject", label_str);
             return;
         }
 
@@ -594,14 +603,22 @@ fn load_nib_file(env: &mut Environment, ui_nib: id, path: GuestPathBuf) -> Resul
     }
 
     if objects != nil {
-        let enumerator: id = msg![env; objects objectEnumerator];
-        if enumerator != nil {
-            loop {
-                let next: id = msg![env; enumerator nextObject];
-                if next == nil {
-                    break;
-                }
-                () = msg![env; next awakeFromNib];
+        // UIKit awakens only objects instantiated from the nib. Existing
+        // File's Owner/external replacements must keep their initialized
+        // state when they load a view or a reusable table-cell nib.
+        // https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/LoadingResources/CocoaNibs/CocoaNibs.html
+        let proxies = env
+            .objc
+            .borrow::<UINibHostObject>(ui_nib)
+            .proxy_objects
+            .clone();
+        let count: NSUInteger = msg![env; objects count];
+        for index in 0..count {
+            let object: id = msg![env; objects objectAtIndex:index];
+            // First Responder placeholders can decode to nil, including in
+            // the middle of this archive array. Do not stop at a placeholder.
+            if object != nil && !proxies.contains(&object) {
+                () = msg![env; object awakeFromNib];
             }
         }
     }

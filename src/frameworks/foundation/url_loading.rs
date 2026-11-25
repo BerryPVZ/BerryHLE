@@ -337,11 +337,23 @@ fn canonical_header_name(name: &str) -> String {
         .join("-")
 }
 
+/// The URL without its query/fragment: queries carry device and user
+/// identifiers, and this log is meant to be shareable in bug reports.
+fn redacted_url(url: &str) -> &str {
+    url.split(['?', '#']).next().unwrap_or(url)
+}
+
 fn perform_http_request(request: HttpRequest) -> HttpResult {
     validate_request(&request)?;
     let timeout = request
         .timeout
         .clamp(Duration::from_millis(100), MAX_TIMEOUT);
+    log!(
+        "HTTP {} {} (timeout {:?})",
+        request.method,
+        redacted_url(&request.url),
+        timeout
+    );
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(timeout)
         .timeout_read(timeout)
@@ -363,8 +375,22 @@ fn perform_http_request(request: HttpRequest) -> HttpResult {
         // loading system must still return their body and HTTP response; only
         // transport failures are NSError failures.
         Err(ureq::Error::Status(_, response)) => response,
-        Err(error) => return Err(transport_error(error)),
+        Err(error) => {
+            log!(
+                "HTTP {} {} -> error: {}",
+                request.method,
+                redacted_url(&request.url),
+                error
+            );
+            return Err(transport_error(error));
+        }
     };
+    log!(
+        "HTTP {} {} -> status {}",
+        request.method,
+        redacted_url(&request.url),
+        response.status()
+    );
     response_from_ureq(response)
 }
 
@@ -433,7 +459,7 @@ pub fn send_async(request: Result<HttpRequest, HttpError>, network_access: bool)
 
     let worker_sender = sender.clone();
     let spawn_result = std::thread::Builder::new()
-        .name("touchHLE HTTP request".to_string())
+        .name("AppleJuiceHLE HTTP request".to_string())
         .spawn(move || {
             let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 perform_http_request(request)

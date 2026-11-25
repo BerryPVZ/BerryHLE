@@ -17,7 +17,7 @@ use super::{
     NSComparisonResult, NSNotFound, NSOrderedAscending, NSOrderedDescending, NSOrderedSame,
     NSRange, NSUInteger,
 };
-use crate::abi::VaList;
+use crate::abi::{CallFromHost, GuestFunction, VaList};
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string;
 use crate::frameworks::uikit::ui_font::{
@@ -536,6 +536,157 @@ pub fn from_rust_ordering(ordering: std::cmp::Ordering) -> NSComparisonResult {
     }
 }
 
+/// Length in UTF-16 code units of the character starting at `index`.
+fn utf16_char_len(units: &[u16], index: usize) -> usize {
+    if let Some(&first) = units.get(index) {
+        if (0xd800..0xdc00).contains(&first) {
+            if let Some(&second) = units.get(index + 1) {
+                if (0xdc00..0xe000).contains(&second) {
+                    return 2;
+                }
+            }
+        }
+    }
+    1
+}
+
+/// Decodes the character starting at `index`, if it is well-formed.
+fn utf16_char_at(units: &[u16], index: usize) -> Option<char> {
+    let &first = units.get(index)?;
+    if (0xd800..0xdc00).contains(&first) {
+        let &second = units.get(index + 1)?;
+        if !(0xdc00..0xe000).contains(&second) {
+            return None;
+        }
+        let code_point =
+            0x10000 + (((first as u32) - 0xd800) << 10) + ((second as u32) - 0xdc00);
+        char::from_u32(code_point)
+    } else {
+        char::from_u32(first as u32)
+    }
+}
+
+/// True for Unicode combining marks that belong to the preceding composed
+/// character sequence (the ranges covered by the general categories Mn, Mc
+/// and Me, which are the ones UIKit treats as "not a new character").
+fn is_combining_mark(c: char) -> bool {
+    matches!(c as u32,
+        0x0300..=0x036f | 0x0483..=0x0489 | 0x0591..=0x05bd | 0x05bf..=0x05c7 |
+        0x0610..=0x061a | 0x064b..=0x065f | 0x0670..=0x0670 | 0x06d6..=0x06dc |
+        0x0e31..=0x0e31 | 0x0e34..=0x0e3a | 0x0e47..=0x0e4e |
+        0x1ab0..=0x1aff | 0x1dc0..=0x1dff | 0x20d0..=0x20ff | 0xfe20..=0xfe2f)
+}
+
+/// Splits `units[start..end]` into NSString enumeration units and returns
+/// their `(start, end)` pairs, both in UTF-16 code units.
+fn enumerate_string_units(
+    units: &[u16],
+    start: usize,
+    end: usize,
+    options: NSUInteger,
+) -> Vec<(usize, usize)> {
+    // NSStringEnumerationOptions: the low four bits select the unit type.
+    const BY_COMPOSED_CHARACTER_SEQUENCES: NSUInteger = 2;
+    const BY_WORDS: NSUInteger = 3;
+    const BY_SENTENCES: NSUInteger = 4;
+    let unit = options & 0xf;
+    let mut ranges = Vec::new();
+    let mut i = start;
+    while i < end {
+        let mut j;
+        match unit {
+            BY_COMPOSED_CHARACTER_SEQUENCES => {
+                j = i + utf16_char_len(units, i);
+                // A base character plus its combining marks is one unit.
+                while j < end {
+                    match utf16_char_at(units, j) {
+                        Some(c) if is_combining_mark(c) => {
+                            j += utf16_char_len(units, j);
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            BY_WORDS => {
+                // Keep whitespace runs and word runs separate, like Apple:
+                // a word is a run of non-whitespace code units.
+                let word = !utf16_char_at(units, i).map_or(false, char::is_whitespace);
+                j = i + utf16_char_len(units, i);
+                while j < end {
+                    let this_word = !utf16_char_at(units, j).map_or(false, char::is_whitespace);
+                    if this_word != word {
+                        break;
+                    }
+                    j += utf16_char_len(units, j);
+                }
+            }
+            BY_SENTENCES => {
+                j = i + utf16_char_len(units, i);
+                while j < end {
+                    let c = utf16_char_at(units, j);
+                    j += utf16_char_len(units, j);
+                    if matches!(c, Some('.' | '!' | '?')) {
+                        break;
+                    }
+                }
+            }
+            _ => {
+                // ByLines (0) and ByParagraphs (1), plus any unknown unit
+                // type, are treated as newline-delimited.
+                // A line/paragraph includes its terminator, which keeps the
+                // ranges contiguous. Treat a lone '\r' and "\r\n" as one
+                // terminator, like NSString does.
+                j = i + utf16_char_len(units, i);
+                while j < end {
+                    let c = utf16_char_at(units, j);
+                    j += utf16_char_len(units, j);
+                    match c {
+                        Some('\n') => break,
+                        Some('\r') => {
+                            if j < end && utf16_char_at(units, j) == Some('\n') {
+                                j += 1;
+                            }
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        ranges.push((i, j.min(end)));
+        i = j;
+    }
+    ranges
+}
+
+#[cfg(test)]
+mod enumeration_unit_tests {
+    use super::*;
+
+    fn units(text: &str, options: NSUInteger) -> Vec<(usize, usize)> {
+        let utf16: Vec<u16> = text.encode_utf16().collect();
+        let end = utf16.len();
+        enumerate_string_units(&utf16, 0, end, options)
+    }
+
+    #[test]
+    fn composed_character_sequences_are_one_unit_per_grapheme() {
+        assert_eq!(units("abc", 2), vec![(0, 1), (1, 2), (2, 3)]);
+        // A base letter plus a combining acute accent stays one unit.
+        assert_eq!(units("a\u{301}b", 2), vec![(0, 2), (2, 3)]);
+        // A character outside the BMP occupies two UTF-16 code units.
+        assert_eq!(units("\u{1f600}a", 2), vec![(0, 2), (2, 3)]);
+    }
+
+    #[test]
+    fn words_and_lines_split_like_nsstring() {
+        assert_eq!(units("ab cd", 3), vec![(0, 2), (2, 3), (3, 5)]);
+        assert_eq!(units("a\nb", 0), vec![(0, 2), (2, 3)]);
+        // "\r\n" is a single line terminator.
+        assert_eq!(units("a\r\nb", 0), vec![(0, 3), (3, 4)]);
+    }
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -914,7 +1065,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     // Apple's documentation says `[NSString compare:]` raises
     // `NSInvalidArgumentException` if `other` is nil, but real-world iPhone
-    // OS apps (e.g. Angry Birds Crystal init path — HyperHLE log shows
+    // OS apps (e.g. Angry Birds Crystal init path — AppleJuiceHLE log shows
     // `assertion 'left != right' failed; left: (null), right: (null)`)
     // pass nil and rely on a soft failure. touchHLE doesn't implement
     // Objective-C exceptions, so the closest "documented" behaviour is to
@@ -1184,6 +1335,85 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; ranged getCharacters:buffer]
 }
 
+// Apple's
+// <https://developer.apple.com/documentation/foundation/nsstring/1416774-enumeratesubstringsinrange>:
+// calls `void (^)(NSString *substring, NSRange substringRange,
+// NSRange enclosingRange, BOOL *stop)` once per enumeration unit (lines,
+// paragraphs, words, sentences or composed character sequences). Apps use it
+// to walk text one character at a time and rebuild a filtered copy; without
+// it a character-by-character validator silently sees no characters and
+// replaces the user's input with an empty string.
+//
+// `enclosingRange` is the enclosing paragraph/sentence/line for word and
+// sentence enumeration on iOS; this implementation walks units directly and
+// reports the unit itself, which is what the common validators use.
+- (())enumerateSubstringsInRange:(NSRange)range
+                        options:(NSUInteger)options
+                     usingBlock:(MutVoidPtr)block {
+    // NSStringEnumerationOptions bits that change the iteration itself.
+    const NS_ENUMERATION_REVERSE: NSUInteger = 1 << 8;
+    const NS_ENUMERATION_SUBSTRING_NOT_REQUIRED: NSUInteger = 1 << 9;
+    if block.is_null() {
+        return;
+    }
+    let invoke_ptr_addr: MutPtr<u32> = Ptr::from_bits(block.to_bits() + 12);
+    let invoke_addr: u32 = env.mem.read(invoke_ptr_addr);
+    if invoke_addr == 0 {
+        log!(
+            "Warning: enumerateSubstringsInRange:options:usingBlock: block at \
+             {:?} has NULL invoke pointer; skipping.",
+            block
+        );
+        return;
+    }
+    let invoke = GuestFunction::from_addr_with_thumb_bit(invoke_addr);
+    let block_arg: ConstVoidPtr = block.cast_const();
+
+    let text = to_rust_string(env, this);
+    let units: Vec<u16> = text.encode_utf16().collect();
+    // Ranges and lengths are in UTF-16 code units, like -[NSString length].
+    let text_len = units.len() as NSUInteger;
+    let location = range.location;
+    let length = range.length;
+    let start = location.min(text_len) as usize;
+    let end = location
+        .saturating_add(length)
+        .min(text_len) as usize;
+    let mut ranges = enumerate_string_units(&units, start, end, options);
+    if options & NS_ENUMERATION_REVERSE != 0 {
+        ranges.reverse();
+    }
+
+    let stop_allocation = env.mem.alloc(4);
+    let stop: MutPtr<u8> = stop_allocation.cast();
+    for (unit_start, unit_end) in ranges {
+        let substring = if options & NS_ENUMERATION_SUBSTRING_NOT_REQUIRED != 0 {
+            nil
+        } else {
+            let substring = String::from_utf16_lossy(&units[unit_start..unit_end]);
+            let substring = from_rust_string(env, substring);
+            autorelease(env, substring)
+        };
+        let substring_range = NSRange {
+            location: unit_start as NSUInteger,
+            length: (unit_end - unit_start) as NSUInteger,
+        };
+        env.mem.write(stop, 0u8);
+        <GuestFunction as CallFromHost<
+            (),
+            (ConstVoidPtr, id, NSRange, NSRange, MutPtr<u8>),
+        >>::call_from_host(
+            &invoke,
+            env,
+            (block_arg, substring, substring_range, substring_range, stop),
+        );
+        if env.mem.read(stop) != 0 {
+            break;
+        }
+    }
+    env.mem.free(stop_allocation);
+}
+
 - (())getCharacters:(MutPtr<unichar>)buffer {
     let host_object = env.objc.borrow_mut::<StringHostObject>(this);
     let (utf16, did_convert) = host_object.convert_to_utf16_inplace();
@@ -1444,6 +1674,32 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; file_manager fileExistsAtPath:path]
 }
 
+// Two more selectors from the same family of app-provided NSString
+// categories. Both are absent from Apple's public NSString API; apps ship
+// them as categories (often "NSString+UniqueId" or a model-object helper),
+// and partial IPA decryption can leave the category's selector names
+// unreadable, so the runtime falls through to us.
+//
+// `-uniqueId` must be stable for a given receiver and must not collide
+// between different objects. We derive it from the string contents plus the
+// object address, which keeps equal-but-distinct receivers distinct and
+// avoids introducing a retain cycle or a side table that would outlive the
+// string.
+- (id)uniqueId {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    to_rust_string(env, this).hash(&mut hasher);
+    let id = format!("{:016x}-{:08x}", hasher.finish(), this.to_bits());
+    let string = from_rust_string(env, id);
+    autorelease(env, string)
+}
+
+// The matching setter is a no-op: the value is only meaningful to the app's
+// own (missing) category, and returning nil/0 here would be no better than
+// the previous "does not respond" fallback. Keeping the selector implemented
+// suppresses the per-call warning without changing object lifetime.
+- (())setSignature:(id)_signature {}
+
 - (id)stringByAddingPercentEscapesUsingEncoding:(NSStringEncoding)encoding {
     let bytes = bytes_for_percent_escaping(env, this, encoding);
     let mut escaped = String::with_capacity(bytes.len());
@@ -1602,6 +1858,35 @@ pub const CLASSES: ClassExports = objc_classes! {
         font
     };
     ui_font::size_with_font(env, font, &text, None)
+}
+
+- (CGRect)boundingRectWithSize:(CGSize)size
+                       options:(NSUInteger)options
+                    attributes:(id)attributes
+                       context:(id)_context {
+    let text = to_rust_string(env, this);
+    let font_key = get_static_str(env, "NSFont");
+    let font: id = msg![env; attributes objectForKey:font_key];
+    let font: id = if font == nil {
+        msg_class![env; UIFont systemFontOfSize:12.0]
+    } else {
+        font
+    };
+    // NSStringDrawingUsesLineFragmentOrigin == 1: the size is a wrapping box.
+    let measured = if options & 1 != 0 {
+        ui_font::size_with_font(
+            env,
+            font,
+            &text,
+            Some((size, UILineBreakModeWordWrap)),
+        )
+    } else {
+        ui_font::size_with_font(env, font, &text, None)
+    };
+    CGRect {
+        origin: CGPoint { x: 0.0, y: 0.0 },
+        size: measured,
+    }
 }
 
 - (CGSize)sizeWithFont:(id)font forWidth:(CGFloat)width lineBreakMode:(UILineBreakMode)line_break_mode {
@@ -2156,6 +2441,36 @@ pub const CLASSES: ClassExports = objc_classes! {
     *env.objc.borrow_mut(this) = StringHostObject::Utf16(code_units);
     this
 }
+- (id)initWithCharactersNoCopy:(ConstPtr<unichar>)characters length:(NSUInteger)len freeWhenDone:(bool)free_when_done {
+    if characters.is_null() && len != 0 {
+        release(env, this);
+        return nil;
+    }
+    let code_units: Vec<u16> = if len == 0 {
+        Vec::new()
+    } else {
+        env.mem
+            .bytes_at(characters.cast(), len * 2)
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect()
+    };
+    *env.objc.borrow_mut(this) = StringHostObject::Utf16(code_units);
+    // The buffer belongs to the receiver when freeWhenDone is YES; we copied
+    // it into `StringHostObject`, so it can be released immediately.
+    if free_when_done {
+        env.mem.free(characters.cast_mut().cast());
+    }
+    this
+}
+
+// Not a Foundation selector: some apps (Dolphin's phone port among them) send
+// `-count` to a string, which real Foundation would reject. Answer it the only
+// sensible way for the compatibility path.
+- (NSUInteger)count {
+    msg![env; this length]
+}
+
 
 - (id)initWithContentsOfFile:(id)path {
     if path == nil {

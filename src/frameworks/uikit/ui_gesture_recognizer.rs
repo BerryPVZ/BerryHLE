@@ -5,16 +5,25 @@
  */
 //! `UIGestureRecognizer` and the tap/swipe recognizers available in iOS 3.2.
 
+use crate::frameworks::core_graphics::{CGFloat, CGPoint};
+use crate::frameworks::foundation::{NSInteger, NSUInteger};
+use crate::objc::{
+    id, msg, msg_class, msg_send, nil, objc_classes, release, retain, ClassExports, HostObject,
+    NSZonePtr, SEL,
+};
+use crate::Environment;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use crate::frameworks::core_graphics::{CGPoint, CGFloat};
-use crate::frameworks::foundation::{NSInteger, NSUInteger};
-use crate::objc::{id, msg, msg_class, msg_send, nil, release, retain, objc_classes, ClassExports, HostObject, NSZonePtr, SEL};
-use crate::Environment;
 
 pub type UIGestureRecognizerState = NSInteger;
 pub const UIGestureRecognizerStatePossible: UIGestureRecognizerState = 0;
+pub const UIGestureRecognizerStateBegan: UIGestureRecognizerState = 1;
+pub const UIGestureRecognizerStateChanged: UIGestureRecognizerState = 2;
+/// `UIGestureRecognizerStateRecognized` is `UIGestureRecognizerStateEnded`.
 pub const UIGestureRecognizerStateRecognized: UIGestureRecognizerState = 3;
+/// UIKit sends the action once more with this state when a system event
+/// (incoming call, touch cancellation) interrupts the gesture.
+pub const UIGestureRecognizerStateCancelled: UIGestureRecognizerState = 4;
 pub const UIGestureRecognizerStateFailed: UIGestureRecognizerState = 5;
 
 #[derive(Default)]
@@ -58,11 +67,20 @@ impl ActionBatch {
 }
 
 pub(super) fn begin_touch_dispatch(env: &mut Environment) {
-    env.framework_state.uikit.ui_gesture_recognizer.actions.begin();
+    env.framework_state
+        .uikit
+        .ui_gesture_recognizer
+        .actions
+        .begin();
 }
 
 pub(super) fn finish_touch_dispatch(env: &mut Environment) {
-    let pending = env.framework_state.uikit.ui_gesture_recognizer.actions.finish();
+    let pending = env
+        .framework_state
+        .uikit
+        .ui_gesture_recognizer
+        .actions
+        .finish();
     for recognizer in pending {
         let host = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer);
         if host.enabled && matches!(host.state, 1..=4) {
@@ -79,11 +97,14 @@ pub const UISwipeGestureRecognizerDirectionUp: UISwipeGestureRecognizerDirection
 pub const UISwipeGestureRecognizerDirectionDown: UISwipeGestureRecognizerDirection = 1 << 3;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum GestureKind {
+pub(super) enum GestureKind {
     Generic,
     Tap,
     Swipe,
     LongPress,
+    Pan,
+    Pinch,
+    Rotation,
 }
 
 pub(super) struct UIGestureRecognizerHostObject {
@@ -111,6 +132,27 @@ pub(super) struct UIGestureRecognizerHostObject {
     previous_tap: Option<(Instant, CGPoint)>,
     press_started: Option<Instant>,
     active_touches: HashMap<id, (CGPoint, CGPoint)>,
+    /// Recognizers that must fail before this one may recognize, in the
+    /// order `-requireGestureRecognizerToFail:` was called. UIKit does not
+    /// retain them (same as targets and the delegate).
+    required_to_fail: Vec<id>,
+    /// Translation and velocity tracked by `UIPanGestureRecognizer`, in the
+    /// recognizer view's coordinates. Pinch and rotation keep their values in
+    /// the same object so every recognizer subclass shares one host type.
+    pub(super) pan_translation: CGPoint,
+    pub(super) pan_velocity: CGPoint,
+    pub(super) pan_last_move: Option<Instant>,
+    pub(super) minimum_number_of_touches: NSUInteger,
+    pub(super) maximum_number_of_touches: NSUInteger,
+    pub(super) pinch_scale: CGFloat,
+    pub(super) pinch_velocity: CGFloat,
+    pub(super) pinch_start_distance: CGFloat,
+    pub(super) two_finger_last_move: Option<Instant>,
+    pub(super) two_finger_last_distance: CGFloat,
+    pub(super) two_finger_last_angle: CGFloat,
+    pub(super) rotation: CGFloat,
+    pub(super) rotation_velocity: CGFloat,
+    pub(super) rotation_start_angle: CGFloat,
 }
 impl HostObject for UIGestureRecognizerHostObject {}
 
@@ -130,7 +172,7 @@ impl UIGestureRecognizerHostObject {
         self.tracking = !self.active_touches.is_empty();
     }
 
-    fn new(kind: GestureKind) -> Self {
+    pub(super) fn new(kind: GestureKind) -> Self {
         Self {
             target: nil,
             action: None,
@@ -155,6 +197,21 @@ impl UIGestureRecognizerHostObject {
             previous_tap: None,
             press_started: None,
             active_touches: HashMap::new(),
+            required_to_fail: Vec::new(),
+            pan_translation: CGPoint { x: 0.0, y: 0.0 },
+            pan_velocity: CGPoint { x: 0.0, y: 0.0 },
+            pan_last_move: None,
+            minimum_number_of_touches: 1,
+            maximum_number_of_touches: NSUInteger::MAX,
+            pinch_scale: if kind == GestureKind::Pinch { 1.0 } else { 0.0 },
+            pinch_velocity: 0.0,
+            pinch_start_distance: 0.0,
+            two_finger_last_move: None,
+            two_finger_last_distance: 0.0,
+            two_finger_last_angle: 0.0,
+            rotation: 0.0,
+            rotation_velocity: 0.0,
+            rotation_start_angle: 0.0,
         }
     }
 }
@@ -173,8 +230,16 @@ fn init_with_target(env: &mut Environment, this: id, target: id, action: SEL) ->
 }
 
 fn send_action(env: &mut Environment, recognizer: id) {
-    if let Some(inserted) = env.framework_state.uikit.ui_gesture_recognizer.actions.defer(recognizer) {
-        if inserted { retain(env, recognizer); }
+    if let Some(inserted) = env
+        .framework_state
+        .uikit
+        .ui_gesture_recognizer
+        .actions
+        .defer(recognizer)
+    {
+        if inserted {
+            retain(env, recognizer);
+        }
         return;
     }
     let (target, action) = {
@@ -261,6 +326,18 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())touchesMoved:(id)_touches withEvent:(id)_event { }
 - (())touchesEnded:(id)_touches withEvent:(id)_event { }
 - (())touchesCancelled:(id)_touches withEvent:(id)_event { }
+// Apple: "Creates a dependency relationship between the receiver and
+// another gesture recognizer ... the receiver will not recognize until the
+// other recognizer fails." Recognition is driven per recognizer here, so we
+// record the dependency and consult it when the receiver would recognize.
+// <https://developer.apple.com/documentation/uikit/uigesturerecognizer/1624410-requiregesturerecognizertofail>
+- (())requireGestureRecognizerToFail:(id)other {
+    if other == nil || other == this { return; }
+    let mut host = env.objc.borrow_mut::<UIGestureRecognizerHostObject>(this);
+    if !host.required_to_fail.contains(&other) {
+        host.required_to_fail.push(other);
+    }
+}
 - (bool)isEnabled { env.objc.borrow::<UIGestureRecognizerHostObject>(this).enabled }
 - (())setEnabled:(bool)enabled {
     if !enabled { cancel_long_press(env, this); }
@@ -342,11 +419,45 @@ pub const CLASSES: ClassExports = objc_classes! {
 @implementation UIPanGestureRecognizer: UIGestureRecognizer
 
 + (id)allocWithZone:(NSZonePtr)_zone {
-    let host_object = Box::new(UIGestureRecognizerHostObject::new(GestureKind::Generic));
+    let host_object = Box::new(UIGestureRecognizerHostObject::new(GestureKind::Pan));
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
-// Chrome's gesture-driven UI creates pan recognizers from code; the base
-// class already covers target/action, state and touch plumbing.
+
+- (CGPoint)translationInView:(id)_view {
+    env.objc.borrow::<UIGestureRecognizerHostObject>(this).pan_translation
+}
+- (())setTranslation:(CGPoint)translation inView:(id)_view {
+    // UIKit treats this as "start counting again from here": the next
+    // translationInView: is measured from the new origin.
+    let host = env.objc.borrow_mut::<UIGestureRecognizerHostObject>(this);
+    host.initial_location = CGPoint {
+        x: host.initial_location.x + translation.x,
+        y: host.initial_location.y + translation.y,
+    };
+    host.pan_translation = CGPoint { x: 0.0, y: 0.0 };
+}
+- (CGPoint)velocityInView:(id)_view {
+    env.objc.borrow::<UIGestureRecognizerHostObject>(this).pan_velocity
+}
+- (NSUInteger)minimumNumberOfTouches {
+    env.objc.borrow::<UIGestureRecognizerHostObject>(this).minimum_number_of_touches
+}
+- (())setMinimumNumberOfTouches:(NSUInteger)count {
+    env.objc.borrow_mut::<UIGestureRecognizerHostObject>(this)
+        .minimum_number_of_touches = count;
+}
+- (NSUInteger)maximumNumberOfTouches {
+    env.objc.borrow::<UIGestureRecognizerHostObject>(this).maximum_number_of_touches
+}
+- (())setMaximumNumberOfTouches:(NSUInteger)count {
+    env.objc.borrow_mut::<UIGestureRecognizerHostObject>(this)
+        .maximum_number_of_touches = count;
+}
+- (NSUInteger)numberOfTouches {
+    env.objc.borrow::<UIGestureRecognizerHostObject>(this)
+        .active_touches
+        .len() as NSUInteger
+}
 
 @end
 
@@ -397,7 +508,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 pub(super) fn set_view(env: &mut Environment, recognizer: id, view: id) {
     retain(env, recognizer);
-    if env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).view != view {
+    if env
+        .objc
+        .borrow::<UIGestureRecognizerHostObject>(recognizer)
+        .view
+        != view
+    {
         cancel_long_press(env, recognizer);
     }
     env.objc
@@ -454,10 +570,26 @@ pub(super) fn touches_began(env: &mut Environment, view: id, touches: id, event:
         return;
     }
     let recognizers = recognizers_in_chain(env, view);
-    for &recognizer in &recognizers { retain(env, recognizer); }
     for &recognizer in &recognizers {
-        if env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).kind == GestureKind::LongPress {
+        retain(env, recognizer);
+    }
+    for &recognizer in &recognizers {
+        if env
+            .objc
+            .borrow::<UIGestureRecognizerHostObject>(recognizer)
+            .kind
+            == GestureKind::LongPress
+        {
             long_press_touches(env, recognizer, touches, 0);
+            continue;
+        }
+        if matches!(
+            env.objc
+                .borrow::<UIGestureRecognizerHostObject>(recognizer)
+                .kind,
+            GestureKind::Pinch | GestureKind::Rotation
+        ) {
+            two_finger_touches(env, recognizer, touches, 0);
             continue;
         }
         let (enabled, recognizer_view) = {
@@ -467,10 +599,20 @@ pub(super) fn touches_began(env: &mut Environment, view: id, touches: id, event:
         if !enabled || !delegate_allows_touch(env, recognizer, touch) {
             continue;
         }
-        let generic = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).kind == GestureKind::Generic;
-        let new_sequence = !env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).tracking;
+        let generic = env
+            .objc
+            .borrow::<UIGestureRecognizerHostObject>(recognizer)
+            .kind
+            == GestureKind::Generic;
+        let new_sequence = !env
+            .objc
+            .borrow::<UIGestureRecognizerHostObject>(recognizer)
+            .tracking;
         if generic && new_sequence {
-            let state = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).state;
+            let state = env
+                .objc
+                .borrow::<UIGestureRecognizerHostObject>(recognizer)
+                .state;
             // Do not call guest reset on a fresh recognizer or another finger
             // in a live sequence: reset can explicitly stop the app's hold.
             if state != UIGestureRecognizerStatePossible {
@@ -484,7 +626,8 @@ pub(super) fn touches_began(env: &mut Environment, view: id, touches: id, event:
             for i in 0..count {
                 let touch: id = msg![env; array objectAtIndex:i];
                 let point: CGPoint = msg![env; touch locationInView:recognizer_view];
-                env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer)
+                env.objc
+                    .borrow_mut::<UIGestureRecognizerHostObject>(recognizer)
                     .track_custom_touch(touch, point);
             }
         }
@@ -501,9 +644,16 @@ pub(super) fn touches_began(env: &mut Environment, view: id, touches: id, event:
             if matches!(host.state, 0..=2) {
                 () = msg![env; recognizer touchesBegan:touches withEvent:event];
             }
+        } else if host.kind == GestureKind::Pan {
+            host.active_touches.insert(touch, (location, location));
+            host.pan_translation = CGPoint { x: 0.0, y: 0.0 };
+            host.pan_velocity = CGPoint { x: 0.0, y: 0.0 };
+            host.pan_last_move = Some(Instant::now());
         }
     }
-    for recognizer in recognizers { release(env, recognizer); }
+    for recognizer in recognizers {
+        release(env, recognizer);
+    }
 }
 
 pub(super) fn touches_moved(env: &mut Environment, view: id, touches: id, event: id) {
@@ -515,10 +665,26 @@ pub(super) fn touches_moved(env: &mut Environment, view: id, touches: id, event:
         return;
     }
     let recognizers = recognizers_in_chain(env, view);
-    for &recognizer in &recognizers { retain(env, recognizer); }
     for &recognizer in &recognizers {
-        if env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).kind == GestureKind::LongPress {
+        retain(env, recognizer);
+    }
+    for &recognizer in &recognizers {
+        if env
+            .objc
+            .borrow::<UIGestureRecognizerHostObject>(recognizer)
+            .kind
+            == GestureKind::LongPress
+        {
             long_press_touches(env, recognizer, touches, 1);
+            continue;
+        }
+        if matches!(
+            env.objc
+                .borrow::<UIGestureRecognizerHostObject>(recognizer)
+                .kind,
+            GestureKind::Pinch | GestureKind::Rotation
+        ) {
+            two_finger_touches(env, recognizer, touches, 1);
             continue;
         }
         let (tracking, recognizer_view) = {
@@ -530,23 +696,51 @@ pub(super) fn touches_moved(env: &mut Environment, view: id, touches: id, event:
             env.objc
                 .borrow_mut::<UIGestureRecognizerHostObject>(recognizer)
                 .current_location = location;
-            if env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).kind == GestureKind::Generic {
-                let state_before_move = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).state;
+            if env
+                .objc
+                .borrow::<UIGestureRecognizerHostObject>(recognizer)
+                .kind
+                == GestureKind::Generic
+            {
+                let state_before_move = env
+                    .objc
+                    .borrow::<UIGestureRecognizerHostObject>(recognizer)
+                    .state;
                 if matches!(state_before_move, 0..=2) {
                     () = msg![env; recognizer touchesMoved:touches withEvent:event];
                     // A continuous recognizer must keep delivering updates
                     // after it begins, even when its guest movement hook is
                     // empty (Globbert's SQ1/SQ3/SQ5 recognizers). Otherwise
                     // the target sees only the initial squish position.
-                    let state = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).state;
+                    let state = env
+                        .objc
+                        .borrow::<UIGestureRecognizerHostObject>(recognizer)
+                        .state;
                     if matches!(state_before_move, 1 | 2) && matches!(state, 1 | 2) {
                         () = msg![env; recognizer setState:2];
                     }
                 }
             }
         }
+        let (tracking, recognizer_view, kind) = {
+            let host = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer);
+            (host.tracking, host.view, host.kind)
+        };
+        if !tracking {
+            continue;
+        }
+        if kind == GestureKind::Pan {
+            pan_touches_moved(env, recognizer, touch, recognizer_view);
+            continue;
+        }
+        let location: CGPoint = msg![env; touch locationInView:recognizer_view];
+        env.objc
+            .borrow_mut::<UIGestureRecognizerHostObject>(recognizer)
+            .current_location = location;
     }
-    for recognizer in recognizers { release(env, recognizer); }
+    for recognizer in recognizers {
+        release(env, recognizer);
+    }
 }
 
 pub(super) fn touches_ended(env: &mut Environment, view: id, touches: id, event: id) {
@@ -558,17 +752,37 @@ pub(super) fn touches_ended(env: &mut Environment, view: id, touches: id, event:
         return;
     }
     let recognizers = recognizers_in_chain(env, view);
-    for &recognizer in &recognizers { retain(env, recognizer); }
     for &recognizer in &recognizers {
-        if env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).kind == GestureKind::LongPress {
+        retain(env, recognizer);
+    }
+    for &recognizer in &recognizers {
+        if env
+            .objc
+            .borrow::<UIGestureRecognizerHostObject>(recognizer)
+            .kind
+            == GestureKind::LongPress
+        {
             long_press_touches(env, recognizer, touches, 2);
             continue;
         }
-        let (tracking, recognizer_view) = {
+        if matches!(
+            env.objc
+                .borrow::<UIGestureRecognizerHostObject>(recognizer)
+                .kind,
+            GestureKind::Pinch | GestureKind::Rotation
+        ) {
+            two_finger_touches(env, recognizer, touches, 2);
+            continue;
+        }
+        let (tracking, recognizer_view, kind) = {
             let host = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer);
-            (host.tracking, host.view)
+            (host.tracking, host.view, host.kind)
         };
         if !tracking {
+            continue;
+        }
+        if kind == GestureKind::Pan {
+            pan_touches_ended(env, recognizer, touch, recognizer_view);
             continue;
         }
         let location: CGPoint = msg![env; touch locationInView:recognizer_view];
@@ -582,8 +796,16 @@ pub(super) fn touches_ended(env: &mut Environment, view: id, touches: id, event:
             }
         }
 
-        if env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).kind == GestureKind::Generic {
-            let state = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer).state;
+        if env
+            .objc
+            .borrow::<UIGestureRecognizerHostObject>(recognizer)
+            .kind
+            == GestureKind::Generic
+        {
+            let state = env
+                .objc
+                .borrow::<UIGestureRecognizerHostObject>(recognizer)
+                .state;
             if matches!(state, 0..=2) {
                 () = msg![env; recognizer touchesEnded:touches withEvent:event];
             }
@@ -591,7 +813,8 @@ pub(super) fn touches_ended(env: &mut Environment, view: id, touches: id, event:
             let count: NSUInteger = msg![env; array count];
             for i in 0..count {
                 let touch: id = msg![env; array objectAtIndex:i];
-                env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer)
+                env.objc
+                    .borrow_mut::<UIGestureRecognizerHostObject>(recognizer)
                     .end_custom_touch(touch);
             }
             continue;
@@ -629,11 +852,42 @@ pub(super) fn touches_ended(env: &mut Environment, view: id, touches: id, event:
                         && cross_distance <= distance
                         && host.direction & direction != 0
                 }
-                GestureKind::Generic | GestureKind::LongPress => false,
+                GestureKind::Generic
+                | GestureKind::LongPress
+                | GestureKind::Pan
+                | GestureKind::Pinch
+                | GestureKind::Rotation => false,
             }
         };
 
-        if recognized && delegate_allows_begin(env, recognizer) {
+        // A recognizer gated by `-requireGestureRecognizerToFail:` may only
+        // recognize while none of its dependencies has begun or recognized.
+        let superseded = {
+            let required = env
+                .objc
+                .borrow::<UIGestureRecognizerHostObject>(recognizer)
+                .required_to_fail
+                .clone();
+            required.iter().any(|&other| {
+                env.objc
+                    .get_host_object(other)
+                    .and_then(|host| {
+                        host.as_any()
+                            .downcast_ref::<UIGestureRecognizerHostObject>()
+                    })
+                    .map(|host| {
+                        matches!(
+                            host.state,
+                            UIGestureRecognizerStateBegan
+                                | UIGestureRecognizerStateChanged
+                                | UIGestureRecognizerStateRecognized
+                        )
+                    })
+                    .unwrap_or(false)
+            })
+        };
+
+        if recognized && !superseded && delegate_allows_begin(env, recognizer) {
             env.objc
                 .borrow_mut::<UIGestureRecognizerHostObject>(recognizer)
                 .state = UIGestureRecognizerStateRecognized;
@@ -644,27 +898,40 @@ pub(super) fn touches_ended(env: &mut Environment, view: id, touches: id, event:
                 .state = UIGestureRecognizerStateFailed;
         }
     }
-    for recognizer in recognizers { release(env, recognizer); }
+    for recognizer in recognizers {
+        release(env, recognizer);
+    }
 }
 
 pub(super) fn touches_cancelled(env: &mut Environment, view: id, touches: id, event: id) {
     let recognizers = recognizers_in_chain(env, view);
-    for &recognizer in &recognizers { retain(env, recognizer); }
+    for &recognizer in &recognizers {
+        retain(env, recognizer);
+    }
     for &recognizer in &recognizers {
         let host = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer);
         if host.kind == GestureKind::LongPress {
             cancel_long_press(env, recognizer);
         } else if host.tracking {
             let generic = host.kind == GestureKind::Generic;
-            env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer).tracking = false;
-            env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer).active_touches.clear();
+            env.objc
+                .borrow_mut::<UIGestureRecognizerHostObject>(recognizer)
+                .tracking = false;
+            env.objc
+                .borrow_mut::<UIGestureRecognizerHostObject>(recognizer)
+                .active_touches
+                .clear();
             if generic {
                 () = msg![env; recognizer touchesCancelled:touches withEvent:event];
             }
-            env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer).state = UIGestureRecognizerStateFailed;
+            env.objc
+                .borrow_mut::<UIGestureRecognizerHostObject>(recognizer)
+                .state = UIGestureRecognizerStateFailed;
         }
     }
-    for recognizer in recognizers { release(env, recognizer); }
+    for recognizer in recognizers {
+        release(env, recognizer);
+    }
 }
 
 // A recognizer on a container observes touches hitting any descendant.
@@ -673,7 +940,9 @@ fn recognizers_in_chain(env: &mut Environment, mut view: id) -> Vec<id> {
     let mut seen = std::collections::HashSet::new();
     while view != nil && seen.insert(view) {
         for r in super::ui_view::gesture_recognizers(env, view) {
-            if !result.contains(&r) { result.push(r); }
+            if !result.contains(&r) {
+                result.push(r);
+            }
         }
         view = msg![env; view superview];
     }
@@ -681,7 +950,13 @@ fn recognizers_in_chain(env: &mut Environment, mut view: id) -> Vec<id> {
 }
 
 fn stop_press_timer(env: &mut Environment, recognizer: id) {
-    let timer = std::mem::replace(&mut env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer).press_timer, nil);
+    let timer = std::mem::replace(
+        &mut env
+            .objc
+            .borrow_mut::<UIGestureRecognizerHostObject>(recognizer)
+            .press_timer,
+        nil,
+    );
     if timer != nil {
         () = msg![env; timer invalidate];
         release(env, timer);
@@ -690,19 +965,140 @@ fn stop_press_timer(env: &mut Environment, recognizer: id) {
 
 fn cancel_long_press(env: &mut Environment, recognizer: id) {
     let h = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer);
-    if h.kind != GestureKind::LongPress { return; }
+    if h.kind != GestureKind::LongPress {
+        return;
+    }
     retain(env, recognizer);
     stop_press_timer(env, recognizer);
-    let h = env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
+    let h = env
+        .objc
+        .borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
     let active = matches!(h.state, 1 | 2);
-    h.state = if active { 4 } else { UIGestureRecognizerStateFailed };
+    h.state = if active {
+        4
+    } else {
+        UIGestureRecognizerStateFailed
+    };
     h.active_touches.clear();
     h.completed_taps = 0;
     h.previous_tap = None;
     h.press_started = None;
     h.tracking = false;
-    if active { send_action(env, recognizer); }
+    if active {
+        send_action(env, recognizer);
+    }
     release(env, recognizer);
+}
+
+fn pan_touches_moved(env: &mut Environment, recognizer: id, touch: id, view: id) {
+    let location: CGPoint = msg![env; touch locationInView:view];
+    let now = Instant::now();
+    let (enabled, start, state, last_move, previous, minimum, maximum) = {
+        let host = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer);
+        (
+            host.enabled,
+            host.initial_location,
+            host.state,
+            host.pan_last_move,
+            host.current_location,
+            host.minimum_number_of_touches as usize,
+            host.maximum_number_of_touches as usize,
+        )
+    };
+    if !enabled {
+        return;
+    }
+    let touches = {
+        let host = env
+            .objc
+            .borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
+        // A touch whose Began event predates this recognizer's tracking still
+        // counts towards the touch limits.
+        host.active_touches
+            .entry(touch)
+            .or_insert((location, location));
+        host.active_touches.len()
+    };
+    // More fingers than the recognizer accepts cancels it, as on iOS; fewer
+    // than its minimum keeps it Pending until enough have landed.
+    if touches > maximum {
+        let host = env
+            .objc
+            .borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
+        host.state = UIGestureRecognizerStateFailed;
+        host.tracking = false;
+        host.active_touches.clear();
+        host.pan_last_move = None;
+        return;
+    }
+    let translation = CGPoint {
+        x: location.x - start.x,
+        y: location.y - start.y,
+    };
+    // UIKit reports velocity in points per second since the previous event.
+    let velocity = CGPoint {
+        x: velocity_per_second(now, last_move, location.x - previous.x),
+        y: velocity_per_second(now, last_move, location.y - previous.y),
+    };
+    let began = state == UIGestureRecognizerStatePossible
+        && touches >= minimum
+        && (translation.x != 0.0 || translation.y != 0.0);
+    {
+        let host = env
+            .objc
+            .borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
+        host.current_location = location;
+        host.pan_translation = translation;
+        host.pan_velocity = velocity;
+        host.pan_last_move = Some(now);
+        host.state = if began {
+            UIGestureRecognizerStateBegan
+        } else {
+            UIGestureRecognizerStateChanged
+        };
+    }
+    send_action(env, recognizer);
+}
+
+fn pan_touches_ended(env: &mut Environment, recognizer: id, touch: id, view: id) {
+    let location: CGPoint = msg![env; touch locationInView:view];
+    let (active, remaining) = {
+        let host = env
+            .objc
+            .borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
+        host.active_touches.remove(&touch);
+        (
+            matches!(
+                host.state,
+                UIGestureRecognizerStateBegan | UIGestureRecognizerStateChanged
+            ),
+            host.active_touches.len(),
+        )
+    };
+    // Lifting one finger of a multi-touch pan keeps the gesture going.
+    if active && remaining > 0 {
+        return;
+    }
+    {
+        let host = env
+            .objc
+            .borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
+        host.pan_translation = CGPoint {
+            x: location.x - host.initial_location.x,
+            y: location.y - host.initial_location.y,
+        };
+        host.pan_velocity = CGPoint { x: 0.0, y: 0.0 };
+        host.pan_last_move = None;
+        host.tracking = false;
+        host.state = if active {
+            UIGestureRecognizerStateRecognized
+        } else {
+            UIGestureRecognizerStateFailed
+        };
+    }
+    if active {
+        send_action(env, recognizer);
+    }
 }
 
 fn movement_allowed(a: CGPoint, b: CGPoint, limit: CGFloat) -> bool {
@@ -711,26 +1107,230 @@ fn movement_allowed(a: CGPoint, b: CGPoint, limit: CGFloat) -> bool {
     dx * dx + dy * dy <= limit * limit
 }
 
+/// Routes a touch cancellation to the recognizers on `view`. UIKit moves a
+/// gesture that was already under way to `Cancelled` and sends its action one
+/// last time; a gesture that had not started simply fails.
+pub(super) fn cancel_builtin_recognizers(env: &mut Environment, view: id) {
+    if view == nil {
+        return;
+    }
+    let recognizers = recognizers_in_chain(env, view);
+    for &recognizer in &recognizers {
+        retain(env, recognizer);
+    }
+    for &recognizer in &recognizers {
+        let (was_active, was_touched) = {
+            let host = env
+                .objc
+                .borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
+            let active = matches!(
+                host.state,
+                UIGestureRecognizerStateBegan | UIGestureRecognizerStateChanged
+            );
+            // Recognizers that never saw these touches keep their state.
+            let touched = host.tracking || active;
+            if touched {
+                host.state = if active {
+                    UIGestureRecognizerStateCancelled
+                } else {
+                    UIGestureRecognizerStateFailed
+                };
+                host.tracking = false;
+                host.active_touches.clear();
+                host.press_started = None;
+                host.completed_taps = 0;
+                host.previous_tap = None;
+            }
+            (active, touched)
+        };
+        if was_touched {
+            stop_press_timer(env, recognizer);
+        }
+        if was_active {
+            send_action(env, recognizer);
+        }
+    }
+    for recognizer in recognizers {
+        release(env, recognizer);
+    }
+}
+
 fn long_press_timer(env: &mut Environment, recognizer: id, timer: id) {
     let h = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer);
-    if h.press_timer != timer { return; }
-    let ready = h.enabled && h.view != nil && h.tracking && h.state == 0
+    if h.press_timer != timer {
+        return;
+    }
+    let ready = h.enabled
+        && h.view != nil
+        && h.tracking
+        && h.state == 0
         && h.active_touches.len() == h.number_of_touches_required as usize;
     stop_press_timer(env, recognizer);
     if !ready || !delegate_allows_begin(env, recognizer) {
-        env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer).state = UIGestureRecognizerStateFailed;
+        env.objc
+            .borrow_mut::<UIGestureRecognizerHostObject>(recognizer)
+            .state = UIGestureRecognizerStateFailed;
         return;
     }
     // Delegate code may have detached or disabled the recognizer.
-    let h = env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
-    if !h.enabled || h.view == nil || !h.tracking { return; }
-    h.state = 1; // Began, while the finger is still down, not at release.
+    let h = env
+        .objc
+        .borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
+    if !h.enabled || h.view == nil || !h.tracking {
+        return;
+    }
+    h.state = UIGestureRecognizerStateBegan; // While the finger is still down.
     h.completed_taps = 0;
     h.previous_tap = None;
     let cancel = h.cancels_touches_in_view;
     let touches: Vec<id> = h.active_touches.keys().copied().collect();
-    if cancel { super::ui_touch::cancel_for_gesture(env, &touches); }
+    if cancel {
+        super::ui_touch::cancel_for_gesture(env, &touches);
+    }
     send_action(env, recognizer);
+}
+
+fn pair_distance_and_angle(a: CGPoint, b: CGPoint) -> (CGFloat, CGFloat) {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    ((dx * dx + dy * dy).sqrt(), dy.atan2(dx))
+}
+
+/// Wraps an angle into (-pi, pi], so a rotation past half a turn keeps the
+/// sign a guest expects instead of jumping by a full turn.
+fn wrapped_angle(angle: CGFloat) -> CGFloat {
+    let full_turn = 2.0 * std::f32::consts::PI;
+    let mut angle = angle % full_turn;
+    if angle > std::f32::consts::PI {
+        angle -= full_turn;
+    }
+    if angle < -std::f32::consts::PI {
+        angle += full_turn;
+    }
+    angle
+}
+
+/// Change per second since the previous event, clamped to a millisecond so a
+/// pair of events in the same tick cannot divide by zero.
+fn velocity_per_second(now: Instant, last: Option<Instant>, delta: CGFloat) -> CGFloat {
+    match last {
+        Some(last) => {
+            let seconds = now.duration_since(last).as_secs_f64().max(0.001) as CGFloat;
+            delta / seconds
+        }
+        None => 0.0,
+    }
+}
+
+fn two_finger_touches(env: &mut Environment, recognizer: id, touches: id, phase: u8) {
+    retain(env, recognizer);
+    two_finger_touches_inner(env, recognizer, touches, phase);
+    release(env, recognizer);
+}
+
+fn two_finger_touches_inner(env: &mut Environment, recognizer: id, touches: id, phase: u8) {
+    let h = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer);
+    if !h.enabled {
+        return;
+    }
+    let view = h.view;
+    let array: id = msg![env; touches allObjects];
+    let count: NSUInteger = msg![env; array count];
+    for i in 0..count {
+        let touch: id = msg![env; array objectAtIndex:i];
+        if phase == 0 && !delegate_allows_touch(env, recognizer, touch) {
+            continue;
+        }
+        let point: CGPoint = msg![env; touch locationInView:view];
+        let h = env
+            .objc
+            .borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
+        if phase == 0 {
+            h.active_touches.insert(touch, (point, point));
+        } else if let Some((_, current)) = h.active_touches.get_mut(&touch) {
+            *current = point;
+        }
+        if phase == 2 {
+            h.active_touches.remove(&touch);
+        }
+    }
+
+    let h = env
+        .objc
+        .borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
+    if h.active_touches.len() < 2 {
+        let was_active =
+            h.state == UIGestureRecognizerStateBegan || h.state == UIGestureRecognizerStateChanged;
+        if phase == 2 {
+            h.state = if was_active {
+                UIGestureRecognizerStateRecognized
+            } else {
+                UIGestureRecognizerStateFailed
+            };
+            h.active_touches.clear();
+            h.tracking = false;
+        }
+        let active = h.enabled && was_active && h.state == UIGestureRecognizerStateRecognized;
+        if active {
+            send_action(env, recognizer);
+        }
+        return;
+    }
+
+    // Two touches: use their distance and angle. Order the pair so the
+    // sign of the rotation does not flip between events.
+    let mut points: Vec<CGPoint> = h
+        .active_touches
+        .values()
+        .map(|&(_, current)| current)
+        .collect();
+    points.sort_by(|a, b| {
+        let (ax, ay) = (a.x, a.y);
+        let (bx, by) = (b.x, b.y);
+        ax.partial_cmp(&bx)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(ay.partial_cmp(&by).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    let (distance, angle) = pair_distance_and_angle(points[0], points[1]);
+    let now = Instant::now();
+    if phase == 0 {
+        h.pinch_scale = 1.0;
+        h.pinch_velocity = 0.0;
+        h.pinch_start_distance = distance;
+        h.rotation = 0.0;
+        h.rotation_velocity = 0.0;
+        h.rotation_start_angle = angle;
+        h.two_finger_last_move = Some(now);
+        h.two_finger_last_distance = distance;
+        h.two_finger_last_angle = angle;
+        h.state = UIGestureRecognizerStateBegan;
+        h.tracking = true;
+    } else if phase == 1 {
+        if h.pinch_start_distance > 0.0 {
+            h.pinch_scale = distance / h.pinch_start_distance;
+        }
+        h.rotation = wrapped_angle(angle - h.rotation_start_angle);
+        h.pinch_velocity = velocity_per_second(
+            now,
+            h.two_finger_last_move,
+            distance - h.two_finger_last_distance,
+        );
+        // The raw angles jump by a full turn at +-pi, so velocity uses the
+        // wrapped difference instead.
+        h.rotation_velocity = velocity_per_second(
+            now,
+            h.two_finger_last_move,
+            wrapped_angle(angle - h.two_finger_last_angle),
+        );
+        h.two_finger_last_move = Some(now);
+        h.two_finger_last_distance = distance;
+        h.two_finger_last_angle = angle;
+        h.state = UIGestureRecognizerStateChanged;
+    }
+    let dispatch = phase != 2;
+    if dispatch {
+        send_action(env, recognizer);
+    }
 }
 
 fn long_press_touches(env: &mut Environment, recognizer: id, touches: id, phase: u8) {
@@ -741,22 +1341,34 @@ fn long_press_touches(env: &mut Environment, recognizer: id, touches: id, phase:
 
 fn long_press_touches_inner(env: &mut Environment, recognizer: id, touches: id, phase: u8) {
     let h = env.objc.borrow::<UIGestureRecognizerHostObject>(recognizer);
-    if !h.enabled { return; }
+    if !h.enabled {
+        return;
+    }
     let view = h.view;
     let array: id = msg![env; touches allObjects];
     let count: NSUInteger = msg![env; array count];
     let mut failed = false;
     for i in 0..count {
         let touch: id = msg![env; array objectAtIndex:i];
-        if phase == 0 && !delegate_allows_touch(env, recognizer, touch) { continue; }
+        if phase == 0 && !delegate_allows_touch(env, recognizer, touch) {
+            continue;
+        }
         let point: CGPoint = msg![env; touch locationInView:view];
-        let h = env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
+        let h = env
+            .objc
+            .borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
         if phase == 0 {
             if h.active_touches.is_empty() {
-                let follows_tap = h.previous_tap.map(|(when, at)|
-                    when.elapsed() <= Duration::from_millis(300) && movement_allowed(at, point, h.allowable_movement)
-                ).unwrap_or(false);
-                if !follows_tap { h.completed_taps = 0; }
+                let follows_tap = h
+                    .previous_tap
+                    .map(|(when, at)| {
+                        when.elapsed() <= Duration::from_millis(300)
+                            && movement_allowed(at, point, h.allowable_movement)
+                    })
+                    .unwrap_or(false);
+                if !follows_tap {
+                    h.completed_taps = 0;
+                }
                 h.press_started = Some(Instant::now());
                 h.state = 0;
                 h.tracking = true;
@@ -765,40 +1377,74 @@ fn long_press_touches_inner(env: &mut Environment, recognizer: id, touches: id, 
         } else if let Some((start, current)) = h.active_touches.get_mut(&touch) {
             *current = point;
             // Once recognised, motion reports Changed rather than failing.
-            if h.state == 0 && !movement_allowed(*start, point, h.allowable_movement) { failed = true; }
+            if h.state == 0 && !movement_allowed(*start, point, h.allowable_movement) {
+                failed = true;
+            }
         }
-        if phase == 2 { h.active_touches.remove(&touch); }
+        if phase == 2 {
+            h.active_touches.remove(&touch);
+        }
     }
-    let h = env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
+    let h = env
+        .objc
+        .borrow_mut::<UIGestureRecognizerHostObject>(recognizer);
     let n = h.active_touches.len();
     if n > 0 {
-        let (x, y) = h.active_touches.values().fold((0.0, 0.0), |(x, y), (_, p)| (x + p.x, y + p.y));
-        h.current_location = CGPoint { x: x / n as f32, y: y / n as f32 };
+        let (x, y) = h
+            .active_touches
+            .values()
+            .fold((0.0, 0.0), |(x, y), (_, p)| (x + p.x, y + p.y));
+        h.current_location = CGPoint {
+            x: x / n as f32,
+            y: y / n as f32,
+        };
     }
-    if n > h.number_of_touches_required as usize { failed = true; }
+    if n > h.number_of_touches_required as usize {
+        failed = true;
+    }
     let active = matches!(h.state, 1 | 2);
     if failed {
         cancel_long_press(env, recognizer);
     } else if phase == 2 && n < h.number_of_touches_required as usize {
-        if !active && h.tracking && h.number_of_taps_required > 0
-            && h.press_started.map(|at| at.elapsed() <= Duration::from_millis(300)).unwrap_or(false) {
+        if !active
+            && h.tracking
+            && h.number_of_taps_required > 0
+            && h.press_started
+                .map(|at| at.elapsed() <= Duration::from_millis(300))
+                .unwrap_or(false)
+        {
             h.completed_taps = (h.completed_taps + 1).min(h.number_of_taps_required);
             h.previous_tap = Some((Instant::now(), h.current_location));
         }
         h.tracking = false;
-        h.state = if active { 3 } else { 5 };
+        h.state = if active {
+            UIGestureRecognizerStateRecognized
+        } else {
+            UIGestureRecognizerStateFailed
+        };
         stop_press_timer(env, recognizer);
-        if active { send_action(env, recognizer); }
+        if active {
+            send_action(env, recognizer);
+        }
     } else if active && phase == 1 {
-        h.state = 2; // Changed
+        h.state = UIGestureRecognizerStateChanged;
         send_action(env, recognizer);
-    } else if h.state == 0 && h.tracking && h.press_timer == nil && n == h.number_of_touches_required as usize
-        && h.completed_taps == h.number_of_taps_required {
+    } else if h.state == 0
+        && h.tracking
+        && h.press_timer == nil
+        && n == h.number_of_touches_required as usize
+        && h.completed_taps == h.number_of_taps_required
+    {
         let duration = h.minimum_press_duration;
-        let selector = env.objc.lookup_selector("_touchHLE_longPressTimer:").unwrap();
+        let selector = env
+            .objc
+            .lookup_selector("_touchHLE_longPressTimer:")
+            .unwrap();
         let timer: id = msg_class![env; NSTimer scheduledTimerWithTimeInterval:duration target:recognizer selector:selector userInfo:nil repeats:false];
         retain(env, timer);
-        env.objc.borrow_mut::<UIGestureRecognizerHostObject>(recognizer).press_timer = timer;
+        env.objc
+            .borrow_mut::<UIGestureRecognizerHostObject>(recognizer)
+            .press_timer = timer;
     }
 }
 
@@ -812,8 +1458,16 @@ mod long_press_tests {
         assert_eq!(h.number_of_taps_required, 0);
         assert_eq!(h.number_of_touches_required, 1);
         assert!(h.press_timer == nil);
-        assert!(movement_allowed(CGPoint { x: 0.0, y: 0.0 }, CGPoint { x: 6.0, y: 8.0 }, h.allowable_movement));
-        assert!(!movement_allowed(CGPoint { x: 0.0, y: 0.0 }, CGPoint { x: 6.0, y: 8.1 }, h.allowable_movement));
+        assert!(movement_allowed(
+            CGPoint { x: 0.0, y: 0.0 },
+            CGPoint { x: 6.0, y: 8.0 },
+            h.allowable_movement
+        ));
+        assert!(!movement_allowed(
+            CGPoint { x: 0.0, y: 0.0 },
+            CGPoint { x: 6.0, y: 8.1 },
+            h.allowable_movement
+        ));
     }
 }
 
@@ -874,5 +1528,54 @@ mod hold_tests {
         assert!(batch.finish().is_empty());
         assert_eq!(batch.finish(), vec![recognizer]);
         assert_eq!(batch.defer(recognizer), None);
+    }
+}
+
+#[cfg(test)]
+mod two_finger_tests {
+    use super::*;
+
+    #[test]
+    fn distance_and_angle_follow_the_touch_pair() {
+        let (distance, angle) =
+            pair_distance_and_angle(CGPoint { x: 0.0, y: 0.0 }, CGPoint { x: 3.0, y: 4.0 });
+        assert_eq!(distance, 5.0);
+        assert!((angle - 4.0f32.atan2(3.0)).abs() < 1e-6);
+
+        let (_, down) =
+            pair_distance_and_angle(CGPoint { x: 0.0, y: 0.0 }, CGPoint { x: 0.0, y: 1.0 });
+        assert!((down - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
+
+        // Swapping the pair flips the angle, hence the sort in the caller.
+        let (_, flipped) =
+            pair_distance_and_angle(CGPoint { x: 3.0, y: 4.0 }, CGPoint { x: 0.0, y: 0.0 });
+        assert!(flipped < 0.0);
+    }
+
+    #[test]
+    fn velocity_is_change_per_second_since_the_previous_event() {
+        let now = Instant::now();
+        let last = Some(now - Duration::from_secs(2));
+        assert_eq!(velocity_per_second(now, last, 4.0), 2.0);
+        assert_eq!(velocity_per_second(now, last, -4.0), -2.0);
+        // Two events in the same tick cannot produce an infinite velocity.
+        let last = Some(now);
+        assert!((velocity_per_second(now, last, 1.0) - 1000.0).abs() < 0.01);
+        assert_eq!(velocity_per_second(now, None, 1.0), 0.0);
+        // An angle crossing +-pi is a small step, not a whole turn.
+        let last = Some(now - Duration::from_secs(1));
+        let delta = wrapped_angle(-3.0 - 3.0);
+        assert!(
+            (velocity_per_second(now, last, delta) - (2.0 * std::f32::consts::PI - 6.0)).abs()
+                < 1e-4
+        );
+    }
+
+    #[test]
+    fn rotation_wraps_at_half_a_turn() {
+        let almost = std::f32::consts::PI - 0.1;
+        assert!((wrapped_angle(almost + 0.2) - (-(std::f32::consts::PI - 0.1))).abs() < 1e-5);
+        assert!((wrapped_angle(0.5) - 0.5).abs() < 1e-6);
+        assert!((wrapped_angle(-0.5) + 0.5).abs() < 1e-6);
     }
 }

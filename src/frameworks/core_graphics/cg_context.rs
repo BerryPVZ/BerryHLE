@@ -348,7 +348,7 @@ fn CGContextSetFlatness(env: &mut Environment, context: CGContextRef, flatness: 
 
 // MARK: - Blend mode / shadow
 
-fn CGContextSetBlendMode(env: &mut Environment, context: CGContextRef, mode: i32) {
+pub(crate) fn CGContextSetBlendMode(env: &mut Environment, context: CGContextRef, mode: i32) {
     if context.is_null() {
         return;
     }
@@ -604,6 +604,30 @@ fn CGContextMoveToPoint(env: &mut Environment, context: CGContextRef, x: CGFloat
 fn CGContextAddLineToPoint(env: &mut Environment, context: CGContextRef, x: CGFloat, y: CGFloat) {
     append_path_element(env, context, super::cg_path::PathElement::LineTo(CGPoint { x, y }));
 }
+/// `void CGContextStrokeLineSegments(CGContextRef c, const CGPoint points[],
+///     size_t count)` — each consecutive pair of points is an independent
+/// segment. Build them as one path and stroke once.
+fn CGContextStrokeLineSegments(
+    env: &mut Environment,
+    context: CGContextRef,
+    points: ConstPtr<CGPoint>,
+    count: usize,
+) {
+    if context.is_null() || points.is_null() || count < 2 {
+        return;
+    }
+    CGContextBeginPath(env, context);
+    let mut i = 0usize;
+    while i + 1 < count {
+        let a = env.mem.read(points + i as u32);
+        let b = env.mem.read(points + (i + 1) as u32);
+        CGContextMoveToPoint(env, context, a.x, a.y);
+        CGContextAddLineToPoint(env, context, b.x, b.y);
+        i += 2;
+    }
+    CGContextStrokePath(env, context);
+}
+
 fn CGContextAddLines(env: &mut Environment, context: CGContextRef, points: ConstPtr<CGPoint>, count: usize) {
     for i in 0..count as u32 {
         let p = env.mem.read(points + i);
@@ -771,8 +795,28 @@ pub fn CGContextGetClipBoundingBox(env: &mut Environment, context: CGContextRef)
     }
 }
 
+/// `void CGContextClip(CGContextRef c)` — intersects the clip with the
+/// current path. AppleJuiceHLE's bitmap contexts do not maintain a path for
+/// clipping, so this is a no-op like `CGContextClipToRect`'s sub-rect case.
+/// <https://developer.apple.com/documentation/coregraphics/1456148-cgcontextclip>
+fn CGContextClip(_env: &mut Environment, _context: CGContextRef) {
+    log_dbg!("CGContextClip: arbitrary path clipping is not implemented; ignoring.");
+}
+
 fn CGContextResetClip(_env: &mut Environment, _context: CGContextRef) {
     log_dbg!("CGContextResetClip: stubbed");
+}
+
+/// `void CGContextClip(CGContextRef c)` — intersects the clipping region
+/// with the current path. The software rasteriser only implements the
+/// full-bounds clip (see [CGContextClipToRect]), so the path is ignored
+/// rather than losing the whole context.
+/// `void CGContextEOClip(CGContextRef c)` — like [CGContextClip] but using the
+/// even-odd winding rule. Since path clipping is not implemented, the winding
+/// rule makes no difference:
+/// <https://developer.apple.com/documentation/coregraphics/1454747-cgcontexteoclip>
+fn CGContextEOClip(env: &mut Environment, context: CGContextRef) {
+    CGContextClip(env, context);
 }
 
 fn CGContextClipToMask(
@@ -894,6 +938,23 @@ pub fn CGContextDrawImage(
         return;
     } // ← closes if
     cg_bitmap_context::draw_image(env, context, rect, image);
+}
+
+/// Same as `CGContextDrawImage`, but only samples the `source` rectangle of
+/// the image (in image pixels). Nine-patch drawing uses it to blit one slice
+/// per call without a real clip path.
+pub(crate) fn draw_image_region(
+    env: &mut Environment,
+    context: CGContextRef,
+    rect: CGRect,
+    image: CGImageRef,
+    source: CGRect,
+) {
+    if context.is_null() {
+        log!("Warning: draw_image_region called with null context, skipping");
+        return;
+    }
+    cg_bitmap_context::draw_image_region(env, context, rect, image, Some(source));
 }
 
 /// `void CGContextDrawTiledImage(CGContextRef c, CGRect rect, CGImageRef image)`
@@ -1164,7 +1225,7 @@ fn CGContextSetTextDrawingMode(_env: &mut Environment, _context: CGContextRef, _
 fn CGContextSetCharacterSpacing(_env: &mut Environment, _context: CGContextRef, _spacing: CGFloat) {
 }
 
-fn CGContextSetTextMatrix(
+pub fn CGContextSetTextMatrix(
     env: &mut Environment,
     context: CGContextRef,
     transform: CGAffineTransform,
@@ -1212,7 +1273,7 @@ fn CGContextShowText(
 ) {
 }
 
-fn CGContextSetFontSize(env: &mut Environment, context: CGContextRef, size: CGFloat) {
+pub fn CGContextSetFontSize(env: &mut Environment, context: CGContextRef, size: CGFloat) {
     if context.is_null() {
         return;
     }
@@ -1221,11 +1282,11 @@ fn CGContextSetFontSize(env: &mut Environment, context: CGContextRef, size: CGFl
         .font_size = size;
 }
 
-fn CGContextSetFont(env: &mut Environment, context: CGContextRef, font: CGFontRef) {
+pub fn CGContextSetFont(env: &mut Environment, context: CGContextRef, font: CGFontRef) {
     if context.is_null() {
         return;
     }
-    // On real iOS, UIFont and CGFont are toll-free bridged. In HyperHLE they are
+    // On real iOS, UIFont and CGFont are toll-free bridged. In AppleJuiceHLE they are
     // separate types. Handle three cases:
     // 1. Already a _touchHLE_CGFont — use as-is.
     // 2. A live UIFont — wrap it in a _touchHLE_CGFont on the fly.
@@ -1267,7 +1328,7 @@ fn CGContextSetFont(env: &mut Environment, context: CGContextRef, font: CGFontRe
 
 /// `void CGContextShowGlyphsAtPoint(CGContextRef c, CGFloat x, CGFloat y,
 ///                                  const CGGlyph *glyphs, size_t count)`
-fn CGContextShowGlyphsAtPoint(
+pub fn CGContextShowGlyphsAtPoint(
     env: &mut Environment,
     context: CGContextRef,
     x: CGFloat,
@@ -1497,7 +1558,9 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGContextSetGrayFillColor(_, _, _)),
     export_c_func!(CGContextFillRect(_, _)),
     export_c_func!(CGContextClearRect(_, _)),
+    export_c_func!(CGContextClip(_)),
     export_c_func!(CGContextClipToRect(_, _)),
+    export_c_func!(CGContextEOClip(_)),
     export_c_func!(CGContextConcatCTM(_, _)),
     export_c_func!(CGContextGetCTM(_)),
     export_c_func!(CGContextRotateCTM(_, _)),
@@ -1545,6 +1608,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGContextAddArcToPoint(_, _, _, _, _, _)),
     export_c_func!(CGContextAddLineToPoint(_, _, _)),
     export_c_func!(CGContextAddLines(_, _, _)),
+    export_c_func!(CGContextStrokeLineSegments(_, _, _)),
     export_c_func!(CGContextMoveToPoint(_, _, _)),
     export_c_func!(CGContextAddCurveToPoint(_, _, _, _, _, _, _)),
     export_c_func!(CGContextAddQuadCurveToPoint(_, _, _, _, _)),

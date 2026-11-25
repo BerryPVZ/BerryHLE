@@ -4,7 +4,10 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 //! `NSPersistentStoreCoordinator` and related Core Data classes.
-//! These are stubbed — Core Data persistence is not implemented.
+//! Attribute models with SQLite and in-memory persistence.
+
+#[path = "core_data_runtime.rs"]
+mod runtime;
 
 use crate::dyld::{ConstantExports, HostConstant};
 use crate::frameworks::foundation::ns_string;
@@ -36,6 +39,7 @@ struct NSPersistentStoreHostObject {
     url: id,
     /// `NSDictionary*`
     options: id,
+    storage: Option<super::core_data_store::Store>,
     /// `NSPersistentStoreCoordinator*` — weak
     coordinator: id,
 }
@@ -60,6 +64,7 @@ struct NSManagedObjectContextHostObject {
     parent_context: id,
     undo_manager: id,
     merge_policy: id,
+    objects: Vec<id>,
 }
 impl HostObject for NSManagedObjectContextHostObject {}
 
@@ -79,6 +84,11 @@ struct NSManagedObjectHostObject {
     entity: id,
     /// `NSManagedObjectContext*` — weak
     managed_object_context: id,
+    values: std::collections::HashMap<String,id>,
+    row_id: i64,
+    inserted: bool,
+    dirty: bool,
+    deleted: bool,
 }
 impl HostObject for NSManagedObjectHostObject {}
 
@@ -112,6 +122,8 @@ struct NSFetchRequestHostObject {
     fetch_batch_size: u64,
     returns_objects_as_faults: bool,
     includes_subentities: bool,
+    result_type: NSUInteger,
+    unsupported_options: bool,
 }
 impl HostObject for NSFetchRequestHostObject {}
 
@@ -125,6 +137,7 @@ struct NSPropertyDescriptionHostObject {
     transient: bool,
     /// `NSDictionary*`
     user_info: id,
+    entity: id,
 }
 impl HostObject for NSPropertyDescriptionHostObject {}
 
@@ -132,13 +145,31 @@ impl HostObject for NSPropertyDescriptionHostObject {}
 
 #[derive(Default)]
 struct NSAttributeDescriptionHostObject {
+    superclass: NSPropertyDescriptionHostObject,
     /// NSAttributeType (integer enum)
     attribute_type: NSInteger,
     /// `id` default value
     default_value: id,
     allows_external_binary_data_storage: bool,
 }
-impl HostObject for NSAttributeDescriptionHostObject {}
+crate::impl_HostObject_with_superclass!(NSAttributeDescriptionHostObject);
+
+// MARK: - NSRelationshipDescription
+
+#[derive(Default)]
+struct NSRelationshipDescriptionHostObject {
+    superclass: NSPropertyDescriptionHostObject,
+    /// `NSEntityDescription*`
+    destination_entity: id,
+    /// `NSRelationshipDescription*`
+    inverse_relationship: id,
+    /// NSDeleteRule
+    delete_rule: NSInteger,
+    max_count: NSUInteger,
+    min_count: NSUInteger,
+    ordered: bool,
+}
+crate::impl_HostObject_with_superclass!(NSRelationshipDescriptionHostObject);
 
 // Apple Core Data — exported `NSString * const` identifiers used as
 // store-type tags, error-domain names, store-option keys, notification
@@ -426,31 +457,7 @@ pub const CLASSES: ClassExports = objc_classes! {
                               URL:(id)url            // NSURL*
                           options:(id)options        // NSDictionary*
                             error:(MutPtr<id>)_error {
-    let type_str = if store_type != nil {
-        ns_string::to_rust_string(env, store_type).into_owned()
-    } else {
-        "<nil>".to_string()
-    };
-    log!(
-        "NSPersistentStoreCoordinator addPersistentStoreWithType:{} URL:{:?} — stubbed",
-        type_str, url
-    );
-
-    // Allocate a stub store object.
-    let store: id = msg_class![env; NSPersistentStore alloc];
-    let store: id = msg![env; store initWithPersistentStoreCoordinator:this
-                                                     configurationName:nil
-                                                                   URL:url
-                                                               options:options];
-
-    let stores = env.objc.borrow::<NSPersistentStoreCoordinatorHostObject>(this).persistent_stores;
-    () = msg![env; stores addObject:store];
-    release(env, store);
-
-    // Return the store (retained by the array).
-    let stores = env.objc.borrow::<NSPersistentStoreCoordinatorHostObject>(this).persistent_stores;
-    let count: u32 = msg![env; stores count];
-    msg![env; stores objectAtIndex:(count - 1)]
+    runtime::add_store(env,this,store_type,url,options,_error)
 }
 
 - (bool)removePersistentStore:(id)store  // NSPersistentStore*
@@ -512,6 +519,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         type_: nil,
         url: nil,
         options: nil,
+        storage: None,
         coordinator: nil,
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
@@ -604,9 +612,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (id)mergedModelFromBundles:(id)_bundles { // NSArray<NSBundle*>*
-    log!("NSManagedObjectModel mergedModelFromBundles: stubbed -> empty model");
-    let model: id = msg_class![env; NSManagedObjectModel new];
-    autorelease(env, model)
+    runtime::merge_bundles(env,_bundles)
 }
 
 + (id)modelByMergingModels:(id)_models { // NSArray<NSManagedObjectModel*>*
@@ -620,8 +626,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)initWithContentsOfURL:(id)_url { // NSURL*
-    log!("NSManagedObjectModel initWithContentsOfURL: stubbed -> empty model");
-    this
+    let path:id=msg![env; _url path];
+    let path=ns_string::to_rust_string(env,path).into_owned();
+    let result=env.fs.read(crate::fs::GuestPath::new(&path)).map_err(|_|"Cannot read managed model".to_string())
+        .and_then(|bytes|runtime::load_model(env,this,&bytes));
+    if let Err(e)=result{log!("Core Data model: {}",e);release(env,this);nil}else{this}
 }
 
 - (())dealloc {
@@ -641,9 +650,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<NSManagedObjectModelHostObject>(this).entities = entities;
 }
 
-- (id)entitiesByName {
-    msg_class![env; NSDictionary new]
-}
+- (id)entitiesByName { runtime::entities_by_name(env,this) }
 
 - (id)configurations {
     msg_class![env; NSArray new]
@@ -672,6 +679,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         parent_context: nil,
         undo_manager: nil,
         merge_policy: nil,
+        objects: Vec::new(),
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -685,6 +693,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())dealloc {
+    runtime::reset(env,this);
     let host = env.objc.borrow::<NSManagedObjectContextHostObject>(this);
     let (psc, undo) = (host.persistent_store_coordinator, host.undo_manager);
     release(env, psc);
@@ -736,20 +745,21 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (bool)hasChanges {
-    false
+    env.objc.borrow::<NSManagedObjectContextHostObject>(this).objects.iter().any(|object|{
+        let o=env.objc.borrow::<NSManagedObjectHostObject>(*object); o.inserted || o.dirty || o.deleted
+    })
 }
 
 - (bool)save:(MutPtr<id>)_error {
-    log!("NSManagedObjectContext save: stubbed -> true");
-    true
+    runtime::save(env,this,_error)
 }
 
 - (())reset {
-    log!("NSManagedObjectContext reset: stubbed");
+    runtime::reset(env,this);
 }
 
 - (())rollback {
-    log!("NSManagedObjectContext rollback: stubbed");
+    runtime::rollback(env,this);
 }
 
 - (())undo {
@@ -762,14 +772,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)executeFetchRequest:(id)_request // NSFetchRequest*
                     error:(MutPtr<id>)_error {
-    log!("NSManagedObjectContext executeFetchRequest:error: stubbed -> empty array");
-    let arr: id = msg_class![env; NSArray new];
-    autorelease(env, arr)
+    runtime::fetch(env,this,_request,_error)
 }
 
 - (NSUInteger)countForFetchRequest:(id)_request // NSFetchRequest*
                               error:(MutPtr<id>)_error {
-    0
+    let results=runtime::fetch(env,this,_request,_error);
+    if results==nil{NSUInteger::MAX}else{msg![env; results count]}
 }
 
 - (id)existingObjectWithID:(id)_object_id // NSManagedObjectID*
@@ -787,11 +796,18 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())insertObject:(id)_object { // NSManagedObject*
-    log!("NSManagedObjectContext insertObject: stubbed");
+    let objects=&env.objc.borrow::<NSManagedObjectContextHostObject>(this).objects;
+    if !objects.contains(&_object){
+        retain(env,_object);
+        env.objc.borrow_mut::<NSManagedObjectContextHostObject>(this).objects.push(_object);
+        let host=env.objc.borrow_mut::<NSManagedObjectHostObject>(_object);
+        host.managed_object_context=this;host.inserted=true;host.dirty=true;
+        ()=msg![env; _object awakeFromInsert];
+    }
 }
 
 - (())deleteObject:(id)_object { // NSManagedObject*
-    log!("NSManagedObjectContext deleteObject: stubbed");
+    runtime::delete_object(env, _object);
 }
 
 - (())refreshObject:(id)_object mergeChanges:(bool)_merge {
@@ -846,6 +862,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let host_object = Box::new(NSManagedObjectHostObject {
         entity: nil,
         managed_object_context: nil,
+        ..Default::default()
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -856,6 +873,7 @@ insertIntoManagedObjectContext:(id)context {           // NSManagedObjectContext
     env.objc.borrow_mut::<NSManagedObjectHostObject>(this).entity = entity;
     // context is weak.
     env.objc.borrow_mut::<NSManagedObjectHostObject>(this).managed_object_context = context;
+    runtime::apply_defaults(env,this);
     if context != nil {
         () = msg![env; context insertObject:this];
     }
@@ -863,6 +881,8 @@ insertIntoManagedObjectContext:(id)context {           // NSManagedObjectContext
 }
 
 - (())dealloc {
+    let values=std::mem::take(&mut env.objc.borrow_mut::<NSManagedObjectHostObject>(this).values);
+    for value in values.into_values(){release(env,value);}
     let entity = env.objc.borrow::<NSManagedObjectHostObject>(this).entity;
     release(env, entity);
     env.objc.dealloc_object(this, &mut env.mem)
@@ -880,28 +900,44 @@ insertIntoManagedObjectContext:(id)context {           // NSManagedObjectContext
     nil
 }
 
-- (bool)isInserted   { true  }
-- (bool)isUpdated    { false }
-- (bool)isDeleted    { false }
+- (bool)isInserted {env.objc.borrow::<NSManagedObjectHostObject>(this).inserted}
+- (bool)isUpdated {let o=env.objc.borrow::<NSManagedObjectHostObject>(this);o.dirty && !o.inserted}
+- (bool)isDeleted {env.objc.borrow::<NSManagedObjectHostObject>(this).deleted}
 - (bool)isFault      { false }
-- (bool)hasChanges   { false }
+- (bool)hasChanges {let o=env.objc.borrow::<NSManagedObjectHostObject>(this);o.dirty || o.inserted || o.deleted}
 
 - (id)valueForKey:(id)_key {
-    log_dbg!("NSManagedObject valueForKey: stubbed -> nil");
-    nil
+    let key=ns_string::to_rust_string(env,_key).into_owned();
+    env.objc.borrow::<NSManagedObjectHostObject>(this).values.get(&key).copied().unwrap_or(nil)
 }
 
 - (())setValue:(id)_value forKey:(id)_key {
-    log_dbg!("NSManagedObject setValue:forKey: stubbed");
+    let key=ns_string::to_rust_string(env,_key).into_owned();
+    runtime::set_value(env,this,&key,_value);
 }
+
+- (id)mutableSetValueForKey:(id)_key {
+let key=ns_string::to_rust_string(env,_key).into_owned();
+let existing=env.objc.borrow::<NSManagedObjectHostObject>(this).values.get(&key).copied().unwrap_or(nil);
+if existing != nil {
+return existing;
+}
+// A to-many relationship is backed by a mutable set, so hand back an empty
+// one instead of nil and let the caller add to it.
+let set: id = msg_class![env; NSMutableSet new];
+runtime::set_value(env,this,&key,set);
+release(env,set);
+set
+}
+
 
 - (())willAccessValueForKey:(id)_key  {}
 - (())didAccessValueForKey:(id)_key   {}
 - (())willChangeValueForKey:(id)_key  {}
 - (())didChangeValueForKey:(id)_key   {}
 
-- (id)primitiveValueForKey:(id)_key   { nil }
-- (())setPrimitiveValue:(id)_value forKey:(id)_key {}
+- (id)primitiveValueForKey:(id)_key {msg![env; this valueForKey:_key]}
+- (())setPrimitiveValue:(id)_value forKey:(id)_key {()=msg![env; this setValue:_value forKey:_key];}
 
 - (id)changedValues         { msg_class![env; NSDictionary new] }
 - (id)changedValuesForCurrentEvent { msg_class![env; NSDictionary new] }
@@ -938,14 +974,13 @@ insertIntoManagedObjectContext:(id)context {           // NSManagedObjectContext
 
 + (id)entityForName:(id)_name                       // NSString*
     inManagedObjectContext:(id)_context {            // NSManagedObjectContext*
-    log!("NSEntityDescription entityForName: stubbed -> nil");
-    nil
+    runtime::entity(env,_context,_name)
 }
 
 + (id)insertNewObjectForEntityForName:(id)_name     // NSString*
              inManagedObjectContext:(id)_context {  // NSManagedObjectContext*
-    log!("NSEntityDescription insertNewObjectForEntityForName: stubbed -> nil");
-    nil
+    let entity=runtime::entity(env,_context,_name);
+    runtime::insert_new(env,entity,_context)
 }
 
 - (())dealloc {
@@ -991,7 +1026,7 @@ insertIntoManagedObjectContext:(id)context {           // NSManagedObjectContext
 }
 
 - (())setProperties:(id)_properties {
-    log!("NSEntityDescription setProperties: stubbed");
+    runtime::set_properties(env,this,_properties);
 }
 
 - (id)subentities   { msg_class![env; NSArray new] }
@@ -1019,6 +1054,8 @@ insertIntoManagedObjectContext:(id)context {           // NSManagedObjectContext
         fetch_batch_size: 0,
         returns_objects_as_faults: true,
         includes_subentities: true,
+        result_type: 0,
+        unsupported_options: false,
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -1046,6 +1083,9 @@ insertIntoManagedObjectContext:(id)context {           // NSManagedObjectContext
     release(env, sort);
     env.objc.dealloc_object(this, &mut env.mem)
 }
+
+- (NSUInteger)resultType {env.objc.borrow::<NSFetchRequestHostObject>(this).result_type}
+- (())setResultType:(NSUInteger)value {env.objc.borrow_mut::<NSFetchRequestHostObject>(this).result_type=value;}
 
 - (id)entity {
     env.objc.borrow::<NSFetchRequestHostObject>(this).entity
@@ -1125,22 +1165,21 @@ insertIntoManagedObjectContext:(id)context {           // NSManagedObjectContext
 }
 
 - (bool)includesPendingChanges    { true  }
-- (())setIncludesPendingChanges:(bool)_v {}
+- (())setIncludesPendingChanges:(bool)_v {if !_v {env.objc.borrow_mut::<NSFetchRequestHostObject>(this).unsupported_options=true;}}
 
 - (bool)returnsDistinctResults    { false }
-- (())setReturnsDistinctResults:(bool)_v {}
+- (())setReturnsDistinctResults:(bool)_v {if _v {env.objc.borrow_mut::<NSFetchRequestHostObject>(this).unsupported_options=true;}}
 
 - (id)propertiesToFetch           { nil }
-- (())setPropertiesToFetch:(id)_v {}
+- (())setPropertiesToFetch:(id)_v {if _v!=nil {env.objc.borrow_mut::<NSFetchRequestHostObject>(this).unsupported_options=true;}}
 
 - (id)propertiesToGroupBy         { nil }
-- (())setPropertiesToGroupBy:(id)_v {}
+- (())setPropertiesToGroupBy:(id)_v {if _v!=nil {env.objc.borrow_mut::<NSFetchRequestHostObject>(this).unsupported_options=true;}}
 
 - (id)havingPredicate             { nil }
-- (())setHavingPredicate:(id)_v   {}
+- (())setHavingPredicate:(id)_v {if _v!=nil {env.objc.borrow_mut::<NSFetchRequestHostObject>(this).unsupported_options=true;}}
 
-- (NSInteger)resultType           { 0 } // NSManagedObjectResultType
-- (())setResultType:(NSInteger)_v {}
+
 
 @end
 
@@ -1154,9 +1193,10 @@ insertIntoManagedObjectContext:(id)context {           // NSManagedObjectContext
 + (id)allocWithZone:(NSZonePtr)_zone {
     let host_object = Box::new(NSPropertyDescriptionHostObject {
         name: nil,
-        optional: true,
+        optional: false,
         transient: false,
         user_info: nil,
+        entity: nil,
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -1207,7 +1247,7 @@ insertIntoManagedObjectContext:(id)context {           // NSManagedObjectContext
     env.objc.borrow_mut::<NSPropertyDescriptionHostObject>(this).user_info = info;
 }
 
-- (id)entity { nil }
+- (id)entity {env.objc.borrow::<NSPropertyDescriptionHostObject>(this).entity}
 - (id)validationPredicates { msg_class![env; NSArray new] }
 - (id)validationWarnings { msg_class![env; NSArray new] }
 - (bool)isIndexed { false }
@@ -1229,6 +1269,7 @@ insertIntoManagedObjectContext:(id)context {           // NSManagedObjectContext
 
 + (id)allocWithZone:(NSZonePtr)_zone {
     let host_object = Box::new(NSAttributeDescriptionHostObject {
+        superclass: NSPropertyDescriptionHostObject::default(),
         attribute_type: 0, // NSUndefinedAttributeType
         default_value: nil,
         allows_external_binary_data_storage: false,
@@ -1239,7 +1280,7 @@ insertIntoManagedObjectContext:(id)context {           // NSManagedObjectContext
 - (())dealloc {
     let default_value = env.objc.borrow::<NSAttributeDescriptionHostObject>(this).default_value;
     release(env, default_value);
-    env.objc.dealloc_object(this, &mut env.mem)
+    ()=crate::objc::msg_super![env; this dealloc];
 }
 
 - (NSInteger)attributeType {
@@ -1283,19 +1324,86 @@ insertIntoManagedObjectContext:(id)context {           // NSManagedObjectContext
 
 @implementation NSRelationshipDescription: NSPropertyDescription
 
-- (id)destinationEntity { nil }
-- (())setDestinationEntity:(id)_entity {}
-- (id)inverseRelationship { nil }
-- (())setInverseRelationship:(id)_rel {}
-- (NSInteger)deleteRule { 0 } // NSNoActionDeleteRule
-- (())setDeleteRule:(NSInteger)_rule {}
-- (bool)isToMany { false }
-- (NSUInteger)maxCount { 0 }
-- (())setMaxCount:(NSUInteger)_count {}
-- (NSUInteger)minCount { 0 }
-- (())setMinCount:(NSUInteger)_count {}
-- (bool)isOrdered { false }
-- (())setOrdered:(bool)_v {}
++ (id)allocWithZone:(NSZonePtr)_zone {
+    let host_object = Box::new(NSRelationshipDescriptionHostObject {
+        superclass: NSPropertyDescriptionHostObject::default(),
+        destination_entity: nil,
+        inverse_relationship: nil,
+        // NSDeleteRuleNullify, matching the model editor's default.
+        delete_rule: 1,
+        // A to-one relationship is maxCount 1; 0 means unbounded (to-many).
+        max_count: 1,
+        min_count: 0,
+        ordered: false,
+    });
+    env.objc.alloc_object(this, host_object, &mut env.mem)
+}
+
+- (())dealloc {
+    let host = env.objc.borrow::<NSRelationshipDescriptionHostObject>(this);
+    let (destination, inverse) = (host.destination_entity, host.inverse_relationship);
+    release(env, destination);
+    release(env, inverse);
+    ()=crate::objc::msg_super![env; this dealloc];
+}
+
+- (id)destinationEntity {
+    env.objc.borrow::<NSRelationshipDescriptionHostObject>(this).destination_entity
+}
+
+- (())setDestinationEntity:(id)entity {
+    let old = env.objc.borrow::<NSRelationshipDescriptionHostObject>(this).destination_entity;
+    release(env, old);
+    retain(env, entity);
+    env.objc.borrow_mut::<NSRelationshipDescriptionHostObject>(this).destination_entity = entity;
+}
+
+- (id)inverseRelationship {
+    env.objc.borrow::<NSRelationshipDescriptionHostObject>(this).inverse_relationship
+}
+
+- (())setInverseRelationship:(id)relationship {
+    let old = env.objc.borrow::<NSRelationshipDescriptionHostObject>(this).inverse_relationship;
+    release(env, old);
+    retain(env, relationship);
+    env.objc.borrow_mut::<NSRelationshipDescriptionHostObject>(this).inverse_relationship = relationship;
+}
+
+- (NSInteger)deleteRule {
+    env.objc.borrow::<NSRelationshipDescriptionHostObject>(this).delete_rule
+}
+
+- (())setDeleteRule:(NSInteger)rule {
+    env.objc.borrow_mut::<NSRelationshipDescriptionHostObject>(this).delete_rule = rule;
+}
+
+- (bool)isToMany {
+    env.objc.borrow::<NSRelationshipDescriptionHostObject>(this).max_count != 1
+}
+
+- (NSUInteger)maxCount {
+    env.objc.borrow::<NSRelationshipDescriptionHostObject>(this).max_count
+}
+
+- (())setMaxCount:(NSUInteger)count {
+    env.objc.borrow_mut::<NSRelationshipDescriptionHostObject>(this).max_count = count;
+}
+
+- (NSUInteger)minCount {
+    env.objc.borrow::<NSRelationshipDescriptionHostObject>(this).min_count
+}
+
+- (())setMinCount:(NSUInteger)count {
+    env.objc.borrow_mut::<NSRelationshipDescriptionHostObject>(this).min_count = count;
+}
+
+- (bool)isOrdered {
+    env.objc.borrow::<NSRelationshipDescriptionHostObject>(this).ordered
+}
+
+- (())setOrdered:(bool)value {
+    env.objc.borrow_mut::<NSRelationshipDescriptionHostObject>(this).ordered = value;
+}
 
 @end
 

@@ -6,3 +6,10 @@
 /TestApp.ipa
 /stubs
 /common-3.0.sdk
+
+/AudioUnitThread.app/AudioUnitThread
+/AudioUnitThread.app/*.o
+
+/BundledDylib.app/BundledDylib
+/BundledDylib.app/Frameworks
+/BundledDylib.app/*.o

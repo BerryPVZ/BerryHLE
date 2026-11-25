@@ -16,7 +16,7 @@
 //! `/System/Library/Frameworks/MessageUI.framework/MessageUI`, touchHLE
 //! prints a `Warning: app binary depends on unimplemented or missing
 //! dylib …` at startup, which can spook users into reporting otherwise-
-//! fine apps as broken (e.g. HyperHLE appdb report #74, Smack It).
+//! fine apps as broken (e.g. AppleJuiceHLE appdb report #74, Smack It).
 //!
 //! `MFMailComposeViewController` (+canSendMail, etc.) is implemented in
 //! [crate::frameworks::media_player::mf_mail_compose_view_controller] and

@@ -16,19 +16,165 @@
 //!   <https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/CoreAnimation_guide/AdvancedAnimationTricks/AdvancedAnimationTricks.html>
 //! - Algorithm for choosing interpolation values
 //!   <https://developer.apple.com/documentation/quartzcore/cabasicanimation?language=objc>
-use std::ops::Sub;
+//! - Keyframe values, key times, and calculation modes
+//!   <https://developer.apple.com/documentation/quartzcore/cakeyframeanimation/values>
+//!   <https://developer.apple.com/documentation/quartzcore/cakeyframeanimation/keytimes>
+//!   <https://developer.apple.com/documentation/quartzcore/caanimationcalculationmode>
+use std::ops::{Add, Mul, Sub};
 
 use crate::frameworks::core_animation::ca_animation::{
-    get_animation_start_time, kCAFillModeBackwards, kCAFillModeBoth, kCAFillModeForwards,
-    CAMediaTimingFillMode,
+    get_animation_start_time, kCAAnimationDiscrete, kCAAnimationLinear, kCAFillModeBackwards,
+    kCAFillModeBoth, kCAFillModeForwards, CAMediaTimingFillMode,
 };
 use crate::frameworks::core_animation::ca_layer::remove_anonymous_animation;
+use crate::frameworks::core_animation::ca_transform3d::CATransform3D;
 use crate::frameworks::core_animation::{ca_layer::CALayerHostObject, CACurrentMediaTime};
 use crate::frameworks::core_foundation::time::CFTimeInterval;
 use crate::frameworks::core_graphics::cg_color::CGColorHostObject;
 use crate::frameworks::foundation::ns_string::{from_rust_string, to_rust_string};
 use crate::objc::{id, msg, nil, release, retain};
 use crate::Environment;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct KeyframeSegment {
+    from_index: usize,
+    to_index: usize,
+    amount: f32,
+}
+
+fn select_keyframe_segment(
+    progress: f32,
+    key_times: Option<&[f32]>,
+    value_count: usize,
+    discrete: bool,
+) -> Option<KeyframeSegment> {
+    if value_count == 0 {
+        return None;
+    }
+
+    let progress = if progress.is_finite() {
+        progress.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let times: Vec<f32> = match key_times {
+        Some(times)
+            if times.len() == value_count
+                && times.first().copied() == Some(0.0)
+                && times.last().copied() == Some(1.0)
+                && times.iter().all(|time| time.is_finite())
+                && times.windows(2).all(|pair| pair[0] < pair[1]) =>
+        {
+            times.to_vec()
+        }
+        _ if value_count == 1 => vec![0.0],
+        _ => (0..value_count)
+            .map(|index| index as f32 / (value_count - 1) as f32)
+            .collect(),
+    };
+
+    if value_count == 1 {
+        return Some(KeyframeSegment {
+            from_index: 0,
+            to_index: 0,
+            amount: 0.0,
+        });
+    }
+
+    if discrete {
+        let index = times
+            .iter()
+            .rposition(|time| *time <= progress)
+            .unwrap_or(0);
+        return Some(KeyframeSegment {
+            from_index: index,
+            to_index: index,
+            amount: 0.0,
+        });
+    }
+
+    let from_index = if progress >= 1.0 {
+        value_count - 1
+    } else {
+        times
+            .windows(2)
+            .position(|pair| progress < pair[1])
+            .unwrap_or(value_count - 2)
+    };
+    let to_index = (from_index + 1).min(value_count - 1);
+    let amount = if from_index == to_index {
+        0.0
+    } else {
+        ((progress - times[from_index]) / (times[to_index] - times[from_index])).clamp(0.0, 1.0)
+    };
+
+    Some(KeyframeSegment {
+        from_index,
+        to_index,
+        amount,
+    })
+}
+
+fn interpolate_keyframe<T>(from: T, to: T, amount: f32) -> T
+where
+    T: Copy + Add<Output = T> + Mul<f32, Output = T> + Sub<Output = T>,
+{
+    from + (to - from) * amount
+}
+
+fn interpolate_values<T>(
+    current: T,
+    basic_from: Option<T>,
+    basic_to: Option<T>,
+    basic_by: Option<T>,
+    keyframe_from: Option<T>,
+    keyframe_to: Option<T>,
+    amount: f32,
+) -> T
+where
+    T: Copy + Add<Output = T> + Mul<f32, Output = T> + Sub<Output = T>,
+{
+    if let Some(from) = keyframe_from {
+        interpolate_keyframe(from, keyframe_to.unwrap_or(from), amount)
+    } else {
+        let (from, by) = get_from_and_by_values(Some(current), basic_from, basic_to, basic_by);
+        from + by * amount
+    }
+}
+
+fn apply_keyframe_timing_function(
+    env: &mut Environment,
+    timing_functions: id,
+    segment: KeyframeSegment,
+    amount: f32,
+) -> f32 {
+    if timing_functions == nil || segment.amount == 0.0 || segment.amount == 1.0 {
+        return amount;
+    }
+
+    let function_count: usize = msg![env; timing_functions count];
+    if segment.from_index >= function_count {
+        return amount;
+    }
+
+    let function_index = segment.from_index;
+    let function: id = msg![env; timing_functions objectAtIndex:function_index];
+    let function_class = msg![env; function class];
+    let Some(timing_function_class) = env
+        .objc
+        .try_get_known_class("CAMediaTimingFunction", &mut env.mem)
+    else {
+        return amount;
+    };
+    if env
+        .objc
+        .class_is_subclass_of(function_class, timing_function_class)
+    {
+        msg![env; function _solveForInput: amount]
+    } else {
+        amount
+    }
+}
 
 #[derive(Default)]
 pub struct State {
@@ -52,6 +198,7 @@ impl State {
     ) -> CALayerHostObject {
         // Clone given layer
         let original = env.objc.borrow::<CALayerHostObject>(layer);
+        let model_transform = original.transform_3d;
         let mut presentation = original.clone();
 
         // Loop over all animations and set the presentation layer's values
@@ -156,12 +303,27 @@ impl State {
                 progress = ((progress * 2.0 - 1.0).abs() - 1.0).abs();
             }
 
-            let timing_function: id = msg![env; animation timingFunction];
-            let interpolation_amount: f32 = msg![env; timing_function _solveForInput: progress];
+            let animation_class = msg![env; animation class];
+            let is_keyframe = match env
+                .objc
+                .try_get_known_class("CAKeyframeAnimation", &mut env.mem)
+            {
+                Some(keyframe_class) => env
+                    .objc
+                    .class_is_subclass_of(animation_class, keyframe_class),
+                None => false,
+            };
+            let timing_function_amount = if is_keyframe {
+                progress
+            } else {
+                let timing_function: id = msg![env; animation timingFunction];
+                msg![env; timing_function _solveForInput: progress]
+            };
 
             if current_repeat >= effective_repeat_count {
                 let removed_on_completion: bool = msg![env; animation isRemovedOnCompletion];
-                if !self.sample_only && super::ca_animation::mark_completion_reported(env, animation)
+                if !self.sample_only
+                    && super::ca_animation::mark_completion_reported(env, animation)
                 {
                     // Delegates may remove/release this animation, or another
                     // layer scheduled later in this completion batch.
@@ -180,13 +342,87 @@ impl State {
                 }
             }
 
-            // Assuming all animations here are CABasicAnimation
-            // TODO: Handle other types of animations
-
-            let from_value: id = msg![env; animation fromValue];
-            let to_value: id = msg![env; animation toValue];
-            let by_value: id = msg![env; animation byValue];
-
+            let mut keyframe_from = None;
+            let mut keyframe_to = None;
+            let (from_value, to_value, by_value, interpolation_amount) = if is_keyframe {
+                let values: id = msg![env; animation values];
+                if values == nil {
+                    continue;
+                }
+                let value_count: usize = msg![env; values count];
+                let key_times: id = msg![env; animation keyTimes];
+                let key_times = if key_times == nil {
+                    None
+                } else {
+                    let count: usize = msg![env; key_times count];
+                    if count != value_count {
+                        None
+                    } else {
+                        Some(
+                            (0..count)
+                                .map(|index| {
+                                    let value: id = msg![env; key_times objectAtIndex:index];
+                                    msg![env; value floatValue]
+                                })
+                                .collect::<Vec<f32>>(),
+                        )
+                    }
+                };
+                let calculation_mode: id = msg![env; animation calculationMode];
+                let calculation_mode = if calculation_mode == nil {
+                    kCAAnimationLinear.to_owned()
+                } else {
+                    to_rust_string(env, calculation_mode).into_owned()
+                };
+                let calculation_mode = calculation_mode.as_str();
+                if calculation_mode != kCAAnimationDiscrete
+                    && calculation_mode != kCAAnimationLinear
+                {
+                    log_dbg!(
+                        "Skipping unsupported CAKeyframeAnimation calculation mode {:?}",
+                        calculation_mode
+                    );
+                    continue;
+                }
+                let discrete_mode = calculation_mode == kCAAnimationDiscrete;
+                let segment = match select_keyframe_segment(
+                    progress,
+                    key_times.as_deref(),
+                    value_count,
+                    discrete_mode,
+                ) {
+                    Some(segment) => segment,
+                    None => continue,
+                };
+                let segment_timing_functions: id = msg![env; animation timingFunctions];
+                if segment.from_index == segment.to_index {
+                    let index = segment.from_index;
+                    keyframe_from = Some(msg![env; values objectAtIndex:index]);
+                } else {
+                    let from_index = segment.from_index;
+                    let to_index = segment.to_index;
+                    keyframe_from = Some(msg![env; values objectAtIndex:from_index]);
+                    keyframe_to = Some(msg![env; values objectAtIndex:to_index]);
+                }
+                let amount = if discrete_mode {
+                    0.0
+                } else {
+                    apply_keyframe_timing_function(
+                        env,
+                        segment_timing_functions,
+                        segment,
+                        segment.amount,
+                    )
+                };
+                (nil, nil, nil, amount)
+            } else {
+                (
+                    msg![env; animation fromValue],
+                    msg![env; animation toValue],
+                    msg![env; animation byValue],
+                    timing_function_amount,
+                )
+            };
             // Update values only in the presentation layer
             let key_path: id = msg![env; animation keyPath];
             let key_path = to_rust_string(env, key_path);
@@ -198,13 +434,15 @@ impl State {
                         id_as_option(from_value).map(|obj| msg![env; obj CGPointValue]);
                     let to_value = id_as_option(to_value).map(|obj| msg![env; obj CGPointValue]);
                     let by_value = id_as_option(by_value).map(|obj| msg![env; obj CGPointValue]);
-                    let (from_value, by_value) = get_from_and_by_values(
-                        Some(presentation.anchor_point),
+                    presentation.anchor_point = interpolate_values(
+                        presentation.anchor_point,
                         from_value,
                         to_value,
                         by_value,
+                        keyframe_from.map(|value| msg![env; value CGPointValue]),
+                        keyframe_to.map(|value| msg![env; value CGPointValue]),
+                        interpolation_amount,
                     );
-                    presentation.anchor_point = from_value + by_value * interpolation_amount;
                 }
                 "backgroundColor" => {
                     let from_value = id_as_option(from_value)
@@ -213,38 +451,58 @@ impl State {
                         .map(|obj| *env.objc.borrow::<CGColorHostObject>(obj));
                     let by_value = id_as_option(by_value)
                         .map(|obj| *env.objc.borrow::<CGColorHostObject>(obj));
-                    let (from_value, by_value) = get_from_and_by_values(
-                        presentation.background_color,
-                        from_value,
-                        to_value,
-                        by_value,
-                    );
-                    presentation.background_color =
-                        Some(from_value + by_value * interpolation_amount)
+                    let keyframe_from_value =
+                        keyframe_from.map(|obj| *env.objc.borrow::<CGColorHostObject>(obj));
+                    let keyframe_to_value =
+                        keyframe_to.map(|obj| *env.objc.borrow::<CGColorHostObject>(obj));
+                    if let Some(from) = keyframe_from_value {
+                        presentation.background_color = Some(interpolate_keyframe(
+                            from,
+                            keyframe_to_value.unwrap_or(from),
+                            interpolation_amount,
+                        ));
+                    } else {
+                        let (from_value, by_value) = get_from_and_by_values(
+                            presentation.background_color,
+                            from_value,
+                            to_value,
+                            by_value,
+                        );
+                        presentation.background_color =
+                            Some(from_value + by_value * interpolation_amount);
+                    }
                 }
                 "bounds" => {
                     let from_value = id_as_option(from_value).map(|obj| msg![env; obj CGRectValue]);
                     let to_value = id_as_option(to_value).map(|obj| msg![env; obj CGRectValue]);
                     let by_value = id_as_option(by_value).map(|obj| msg![env; obj CGRectValue]);
-                    let (from_value, by_value) = get_from_and_by_values(
-                        Some(presentation.bounds),
+                    let keyframe_from_value = keyframe_from.map(|obj| msg![env; obj CGRectValue]);
+                    let keyframe_to_value = keyframe_to.map(|obj| msg![env; obj CGRectValue]);
+                    presentation.bounds = interpolate_values(
+                        presentation.bounds,
                         from_value,
                         to_value,
                         by_value,
+                        keyframe_from_value,
+                        keyframe_to_value,
+                        interpolation_amount,
                     );
-                    presentation.bounds = from_value + by_value * interpolation_amount;
                 }
                 "cornerRadius" => {
                     let from_value = id_as_option(from_value).map(|obj| msg![env; obj floatValue]);
                     let to_value = id_as_option(to_value).map(|obj| msg![env; obj floatValue]);
                     let by_value = id_as_option(by_value).map(|obj| msg![env; obj floatValue]);
-                    let (from_value, by_value) = get_from_and_by_values(
-                        Some(presentation.corner_radius),
+                    let keyframe_from_value = keyframe_from.map(|obj| msg![env; obj floatValue]);
+                    let keyframe_to_value = keyframe_to.map(|obj| msg![env; obj floatValue]);
+                    presentation.corner_radius = interpolate_values(
+                        presentation.corner_radius,
                         from_value,
                         to_value,
                         by_value,
+                        keyframe_from_value,
+                        keyframe_to_value,
+                        interpolation_amount,
                     );
-                    presentation.corner_radius = from_value + by_value * interpolation_amount;
                 }
                 "hidden" => {
                     let from_value = id_as_option(from_value)
@@ -256,38 +514,120 @@ impl State {
                     let by_value = id_as_option(by_value)
                         .map(|obj| msg![env; obj boolValue])
                         .map(|val: bool| val as i32 as f32);
-                    let (from_value, by_value) = get_from_and_by_values(
-                        Some(presentation.hidden as i32 as f32),
+                    let keyframe_from_value = keyframe_from
+                        .map(|obj| msg![env; obj boolValue])
+                        .map(|val: bool| val as i32 as f32);
+                    let keyframe_to_value = keyframe_to
+                        .map(|obj| msg![env; obj boolValue])
+                        .map(|val: bool| val as i32 as f32);
+                    presentation.hidden = interpolate_values(
+                        presentation.hidden as i32 as f32,
                         from_value,
                         to_value,
                         by_value,
-                    );
-                    presentation.hidden = (from_value + by_value * interpolation_amount) > 0.5;
+                        keyframe_from_value,
+                        keyframe_to_value,
+                        interpolation_amount,
+                    ) > 0.5;
                 }
                 "opacity" => {
                     let from_value = id_as_option(from_value).map(|obj| msg![env; obj floatValue]);
                     let to_value = id_as_option(to_value).map(|obj| msg![env; obj floatValue]);
                     let by_value = id_as_option(by_value).map(|obj| msg![env; obj floatValue]);
-                    let (from_value, by_value) = get_from_and_by_values(
-                        Some(presentation.opacity),
+                    let keyframe_from_value = keyframe_from.map(|obj| msg![env; obj floatValue]);
+                    let keyframe_to_value = keyframe_to.map(|obj| msg![env; obj floatValue]);
+                    presentation.opacity = interpolate_values(
+                        presentation.opacity,
                         from_value,
                         to_value,
                         by_value,
+                        keyframe_from_value,
+                        keyframe_to_value,
+                        interpolation_amount,
                     );
-                    presentation.opacity = from_value + by_value * interpolation_amount;
                 }
                 "position" => {
                     let from_value =
                         id_as_option(from_value).map(|obj| msg![env; obj CGPointValue]);
                     let to_value = id_as_option(to_value).map(|obj| msg![env; obj CGPointValue]);
                     let by_value = id_as_option(by_value).map(|obj| msg![env; obj CGPointValue]);
-                    let (from_value, by_value) = get_from_and_by_values(
-                        Some(presentation.position),
+                    let keyframe_from_value = keyframe_from.map(|obj| msg![env; obj CGPointValue]);
+                    let keyframe_to_value = keyframe_to.map(|obj| msg![env; obj CGPointValue]);
+                    presentation.position = interpolate_values(
+                        presentation.position,
                         from_value,
                         to_value,
                         by_value,
+                        keyframe_from_value,
+                        keyframe_to_value,
+                        interpolation_amount,
                     );
-                    presentation.position = from_value + by_value * interpolation_amount;
+                }
+                "transform" => {
+                    let from_value =
+                        id_as_option(from_value).map(|obj| msg![env; obj CATransform3DValue]);
+                    let to_value =
+                        id_as_option(to_value).map(|obj| msg![env; obj CATransform3DValue]);
+                    let by_value =
+                        id_as_option(by_value).map(|obj| msg![env; obj CATransform3DValue]);
+                    let keyframe_from_value =
+                        keyframe_from.map(|obj| msg![env; obj CATransform3DValue]);
+                    let keyframe_to_value =
+                        keyframe_to.map(|obj| msg![env; obj CATransform3DValue]);
+                    presentation.transform_3d = interpolate_transform(
+                        presentation.transform_3d,
+                        from_value,
+                        to_value,
+                        by_value,
+                        keyframe_from_value,
+                        keyframe_to_value,
+                        interpolation_amount,
+                    );
+                }
+                "transform.rotation" | "transform.rotation.z" => {
+                    let from_value = id_as_option(from_value).map(|obj| msg![env; obj floatValue]);
+                    let to_value = id_as_option(to_value).map(|obj| msg![env; obj floatValue]);
+                    let by_value = id_as_option(by_value).map(|obj| msg![env; obj floatValue]);
+                    let keyframe_from_value = keyframe_from.map(|obj| msg![env; obj floatValue]);
+                    let keyframe_to_value = keyframe_to.map(|obj| msg![env; obj floatValue]);
+                    let base_rotation = implicit_rotation_start(model_transform);
+                    let rotation = interpolate_values(
+                        base_rotation,
+                        from_value,
+                        to_value,
+                        by_value,
+                        keyframe_from_value,
+                        keyframe_to_value,
+                        interpolation_amount,
+                    );
+                    presentation.transform_3d = replace_z_rotation(model_transform, rotation);
+                }
+                "transform.scale" | "transform.scale.x" | "transform.scale.y" => {
+                    let from_value = id_as_option(from_value).map(|obj| msg![env; obj floatValue]);
+                    let to_value = id_as_option(to_value).map(|obj| msg![env; obj floatValue]);
+                    let by_value = id_as_option(by_value).map(|obj| msg![env; obj floatValue]);
+                    let keyframe_from_value = keyframe_from.map(|obj| msg![env; obj floatValue]);
+                    let keyframe_to_value = keyframe_to.map(|obj| msg![env; obj floatValue]);
+                    let model_scale = match &*key_path {
+                        "transform.scale.x" => implicit_scale_start(model_transform, Some(true)),
+                        "transform.scale.y" => implicit_scale_start(model_transform, Some(false)),
+                        _ => implicit_scale_start(model_transform, None),
+                    };
+                    let scale = interpolate_values(
+                        model_scale,
+                        from_value,
+                        to_value,
+                        by_value,
+                        keyframe_from_value,
+                        keyframe_to_value,
+                        interpolation_amount,
+                    );
+                    let (sx, sy) = match &*key_path {
+                        "transform.scale.x" => (Some(scale), None),
+                        "transform.scale.y" => (None, Some(scale)),
+                        _ => (Some(scale), Some(scale)),
+                    };
+                    presentation.transform_3d = scale_transform(model_transform, sx, sy);
                 }
                 _ => {
                     log_dbg!(
@@ -364,6 +704,411 @@ impl State {
     }
 }
 
+fn interpolate_transform(
+    current: CATransform3D,
+    basic_from: Option<CATransform3D>,
+    basic_to: Option<CATransform3D>,
+    basic_by: Option<CATransform3D>,
+    keyframe_from: Option<CATransform3D>,
+    keyframe_to: Option<CATransform3D>,
+    amount: f32,
+) -> CATransform3D {
+    let from = keyframe_from.or(basic_from).unwrap_or(current);
+    let to = keyframe_to.or(basic_to).unwrap_or_else(|| {
+        if let Some(by) = basic_by {
+            from.concat(by)
+        } else {
+            from
+        }
+    });
+    super::ca_transform3d::interpolate(from, to, amount)
+}
+
+// CATransform3D is row-major with row-vector composition. Scale the basis
+// vectors while keeping translation, perspective, and an unanimated axis.
+fn scale_transform(
+    mut model: CATransform3D,
+    requested_x: Option<f32>,
+    requested_y: Option<f32>,
+) -> CATransform3D {
+    let (m11, m12, m13) = (model.m11, model.m12, model.m13);
+    let (m21, m22, m23) = (model.m21, model.m22, model.m23);
+    let base_scale_x = (m11 * m11 + m12 * m12 + m13 * m13).sqrt();
+    let base_scale_y = (m21 * m21 + m22 * m22 + m23 * m23).sqrt();
+    let sx = requested_x.unwrap_or(base_scale_x);
+    let sy = requested_y.unwrap_or(base_scale_y);
+    let factor_x = if base_scale_x <= f32::EPSILON {
+        sx
+    } else {
+        sx / base_scale_x
+    };
+    let factor_y = if base_scale_y <= f32::EPSILON {
+        sy
+    } else {
+        sy / base_scale_y
+    };
+    model.scale(factor_x, factor_y, 1.0)
+}
+
+fn implicit_rotation_start(model: CATransform3D) -> f32 {
+    (model.m12 - model.m21).atan2(model.m11 + model.m22)
+}
+
+fn implicit_scale_start(model: CATransform3D, axis: Option<bool>) -> f32 {
+    let (m11, m12, m13) = (model.m11, model.m12, model.m13);
+    let (m21, m22, m23) = (model.m21, model.m22, model.m23);
+    let scale_x = (m11 * m11 + m12 * m12 + m13 * m13).sqrt();
+    let scale_y = (m21 * m21 + m22 * m22 + m23 * m23).sqrt();
+    match axis {
+        Some(true) => scale_x,
+        Some(false) => scale_y,
+        None => (scale_x + scale_y) * 0.5,
+    }
+}
+
+fn replace_z_rotation(model: CATransform3D, angle: f32) -> CATransform3D {
+    // Polar-decompose the 2D basis to separate its nearest rotation from
+    // scale/shear, then replace only that rotation. This avoids treating a
+    // scaled/skewed m11/m12 pair as a pure rotation.
+    let model_angle = (model.m12 - model.m21).atan2(model.m11 + model.m22);
+    let delta = angle - model_angle;
+    let (cosine, sine) = (delta.cos(), delta.sin());
+    let mut result = model;
+    let (m11, m12, m21, m22) = (model.m11, model.m12, model.m21, model.m22);
+    result.m11 = m11 * cosine - m12 * sine;
+    result.m12 = m11 * sine + m12 * cosine;
+    result.m21 = m21 * cosine - m22 * sine;
+    result.m22 = m21 * sine + m22 * cosine;
+    result
+}
+
+#[cfg(test)]
+mod keyframe_tests {
+    use super::{
+        implicit_rotation_start, implicit_scale_start, interpolate_keyframe, interpolate_transform,
+        replace_z_rotation, scale_transform, select_keyframe_segment,
+    };
+    use crate::frameworks::core_graphics::cg_color::CGColorHostObject;
+
+    #[test]
+    fn selects_evenly_spaced_linear_segment() {
+        assert_eq!(
+            select_keyframe_segment(0.25, None, 3, false),
+            Some(super::KeyframeSegment {
+                from_index: 0,
+                to_index: 1,
+                amount: 0.5,
+            })
+        );
+    }
+
+    #[test]
+    fn selects_explicit_key_times_and_discrete_holds() {
+        assert_eq!(
+            select_keyframe_segment(0.4, Some(&[0.0, 0.25, 1.0]), 3, false),
+            Some(super::KeyframeSegment {
+                from_index: 1,
+                to_index: 2,
+                amount: 0.2,
+            })
+        );
+        assert_eq!(
+            select_keyframe_segment(0.3, Some(&[0.0, 0.25, 1.0]), 3, true),
+            Some(super::KeyframeSegment {
+                from_index: 1,
+                to_index: 1,
+                amount: 0.0,
+            })
+        );
+    }
+
+    #[test]
+    fn falls_back_for_invalid_key_times_and_clamps_progress() {
+        assert_eq!(
+            select_keyframe_segment(-1.0, Some(&[0.0, 0.8]), 3, false),
+            Some(super::KeyframeSegment {
+                from_index: 0,
+                to_index: 1,
+                amount: 0.0,
+            })
+        );
+        assert_eq!(
+            select_keyframe_segment(2.0, None, 3, false),
+            Some(super::KeyframeSegment {
+                from_index: 2,
+                to_index: 2,
+                amount: 0.0,
+            })
+        );
+    }
+
+    #[test]
+    fn handles_segment_boundaries_and_single_values() {
+        assert_eq!(
+            select_keyframe_segment(0.5, Some(&[0.0, 0.5, 1.0]), 3, false),
+            Some(super::KeyframeSegment {
+                from_index: 1,
+                to_index: 2,
+                amount: 0.0,
+            })
+        );
+        assert_eq!(
+            select_keyframe_segment(0.5, None, 1, false),
+            Some(super::KeyframeSegment {
+                from_index: 0,
+                to_index: 0,
+                amount: 0.0,
+            })
+        );
+    }
+
+    #[test]
+    fn interpolates_core_animation_value_types() {
+        use crate::frameworks::core_graphics::cg_geometry::{CGPoint, CGRect, CGSize};
+
+        let point = interpolate_keyframe(
+            CGPoint { x: 0.0, y: 10.0 },
+            CGPoint { x: 20.0, y: 30.0 },
+            0.25,
+        );
+        assert_eq!(point, CGPoint { x: 5.0, y: 15.0 });
+
+        let rect = interpolate_keyframe(
+            CGRect {
+                origin: CGPoint { x: 0.0, y: 10.0 },
+                size: CGSize {
+                    width: 20.0,
+                    height: 30.0,
+                },
+            },
+            CGRect {
+                origin: CGPoint { x: 40.0, y: 50.0 },
+                size: CGSize {
+                    width: 60.0,
+                    height: 70.0,
+                },
+            },
+            0.5,
+        );
+        assert_eq!(
+            rect,
+            CGRect {
+                origin: CGPoint { x: 20.0, y: 30.0 },
+                size: CGSize {
+                    width: 40.0,
+                    height: 50.0
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn interpolates_rgba_colors() {
+        let from = CGColorHostObject {
+            color_space_name: "kCGColorSpaceGenericRGB",
+            r: 0.0,
+            g: 0.2,
+            b: 0.4,
+            a: 0.2,
+        };
+        let to = CGColorHostObject {
+            color_space_name: "kCGColorSpaceGenericRGB",
+            r: 1.0,
+            g: 0.8,
+            b: 0.6,
+            a: 1.0,
+        };
+
+        let midpoint = interpolate_keyframe(from, to, 0.5);
+
+        assert_eq!(midpoint.r, 0.5);
+        assert_eq!(midpoint.g, 0.5);
+        assert_eq!(midpoint.b, 0.5);
+        assert_eq!(midpoint.a, 0.6);
+    }
+
+    #[test]
+    fn interpolates_transform_matrix_and_rotation_scale_values() {
+        use crate::frameworks::core_animation::ca_transform3d::{
+            CATransform3D, CATransform3DIdentity,
+        };
+
+        let scaled = CATransform3D::make_scale(3.0, 3.0, 3.0).translate(10.0, 20.0, 30.0);
+        let transform = interpolate_transform(
+            CATransform3DIdentity,
+            None,
+            None,
+            None,
+            Some(CATransform3DIdentity),
+            Some(scaled),
+            0.5,
+        );
+        let (m11, m22, m41, m42, m43) = (
+            transform.m11,
+            transform.m22,
+            transform.m41,
+            transform.m42,
+            transform.m43,
+        );
+        assert_eq!((m11, m22, m41, m42, m43), (2.0, 2.0, 15.0, 30.0, 45.0));
+
+        let rotation = interpolate_keyframe(0.0_f32, std::f32::consts::PI, 0.5);
+        assert_eq!(rotation, std::f32::consts::FRAC_PI_2);
+        let halfway = CATransform3D::from(CATransform3D::make_rotation(rotation, 0.0, 0.0, 1.0));
+        assert!(halfway.m12.abs() > 0.999);
+        assert!(halfway.m21.abs() > 0.999);
+
+        let current = CATransform3D::make_rotation(0.5, 0.0, 0.0, 1.0);
+        let current = CATransform3D::from(current);
+        let current_angle = current.m12.atan2(current.m11);
+        let updated = CATransform3D::from(replace_z_rotation(current, 1.0));
+        assert!((updated.m12.atan2(updated.m11) - 1.0).abs() < 0.0001);
+
+        let current = CATransform3D::make_scale(2.0, 3.0, 1.0);
+        let updated = CATransform3D::from(scale_transform(current, Some(1.5), Some(1.5)));
+        assert!((updated.m11 - 1.5).abs() < 0.0001);
+        assert!((updated.m22 - 1.5).abs() < 0.0001);
+    }
+
+    #[test]
+    fn transform_scale_is_rebuilt_from_model_transform_each_frame() {
+        use crate::frameworks::core_animation::ca_transform3d::CATransform3D;
+
+        let mut model = CATransform3D::from(CATransform3D::make_scale(2.0, 3.0, 1.0));
+        model.m12 = 0.5;
+        model.m41 = 40.0;
+        model.m44 = 2.0;
+        let scale_at_progress = |progress: f32| {
+            let target = interpolate_keyframe(0.0_f32, 1.0_f32, progress);
+            scale_transform(model, Some(target), Some(target))
+        };
+
+        let first = CATransform3D::from(scale_at_progress(0.5));
+        let second = CATransform3D::from(scale_at_progress(0.5));
+        let (first_x, first_y, second_x, second_y) = (first.m11, first.m22, second.m11, second.m22);
+        let (first_skew, second_skew) = (first.m12, second.m12);
+        let (translation, perspective) = (first.m41, first.m44);
+        let (first_x_len, first_y_len) = (
+            (first_x * first_x + first_skew * first_skew).sqrt(),
+            (first_y * first_y + first.m21 * first.m21).sqrt(),
+        );
+
+        assert_eq!((first_x, first_y), (second_x, second_y));
+        assert!((first_x_len - 0.5).abs() < 0.0001);
+        assert!((first_y_len - 0.5).abs() < 0.0001);
+        assert_eq!(first_skew, second_skew);
+        assert_ne!(first_skew, 0.0);
+        assert_eq!((translation, perspective), (40.0, 2.0));
+    }
+
+    #[test]
+    fn transform_rotation_replaces_model_angle_and_preserves_translation() {
+        use crate::frameworks::core_animation::ca_transform3d::{
+            CATransform3D, CATransform3DIdentity,
+        };
+
+        let mut model = CATransform3D::from(CATransform3D::make_rotation(0.5, 0.0, 0.0, 1.0));
+        model.m41 = 32.0;
+        model.m44 = 2.0;
+        let rotation_at_progress = |progress: f32| {
+            let target = interpolate_keyframe(implicit_rotation_start(model), 1.0_f32, progress);
+            replace_z_rotation(model, target)
+        };
+
+        let first = CATransform3D::from(rotation_at_progress(0.5));
+        let again = CATransform3D::from(rotation_at_progress(0.5));
+        let first_angle = first.m12.atan2(first.m11);
+        let again_angle = again.m12.atan2(again.m11);
+        assert!((first_angle - 0.75).abs() < 0.0001);
+        assert!((again_angle - first_angle).abs() < 0.0001);
+        assert_eq!((first.m41, first.m44), (32.0, 2.0));
+    }
+
+    #[test]
+    fn transform_rotation_preserves_nonuniform_scale_and_skew() {
+        use crate::frameworks::core_animation::ca_transform3d::CATransform3D;
+
+        let mut model = CATransform3D::make_rotation(0.4, 0.0, 0.0, 1.0).scale(2.0, 3.0, 1.0);
+        model.m12 += 0.25; // Add a small skew to the XY basis.
+        model.m41 = 17.0;
+        model.m44 = 2.0;
+        let changed = CATransform3D::from(replace_z_rotation(model, 1.2));
+        let expected = CATransform3D::from(model);
+        let (a11, a12, a21, a22) = (expected.m11, expected.m12, expected.m21, expected.m22);
+        let (b11, b12, b21, b22) = (changed.m11, changed.m12, changed.m21, changed.m22);
+        // Right-multiplying by a pure rotation preserves the basis row lengths
+        // and dot product (the scale and skew), while replacing its orientation.
+        let before_x = a11 * a11 + a12 * a12;
+        let before_y = a21 * a21 + a22 * a22;
+        let before_dot = a11 * a21 + a12 * a22;
+        let after_x = b11 * b11 + b12 * b12;
+        let after_y = b21 * b21 + b22 * b22;
+        let after_dot = b11 * b21 + b12 * b22;
+        assert!((before_x - after_x).abs() < 0.0001);
+        assert!((before_y - after_y).abs() < 0.0001);
+        assert!((before_dot - after_dot).abs() < 0.0001);
+        assert_eq!((changed.m41, changed.m44), (17.0, 2.0));
+        let angle = (changed.m12 - changed.m21).atan2(changed.m11 + changed.m22);
+        assert!((angle - 1.2).abs() < 0.0001);
+        assert!(implicit_rotation_start(model).is_finite());
+    }
+
+    #[test]
+    fn transform_axis_scale_preserves_other_model_axis() {
+        use crate::frameworks::core_animation::ca_transform3d::CATransform3D;
+
+        let model = CATransform3D::make_scale(2.0, 3.0, 1.0);
+        let x_only = CATransform3D::from(scale_transform(model, Some(0.5), None));
+        let y_only = CATransform3D::from(scale_transform(model, None, Some(0.5)));
+        assert_eq!((x_only.m11, x_only.m22), (0.5, 3.0));
+        assert_eq!((y_only.m11, y_only.m22), (2.0, 0.5));
+    }
+
+    #[test]
+    fn transform_implicit_start_values_come_from_model_transform() {
+        use crate::frameworks::core_animation::ca_transform3d::CATransform3D;
+
+        let model = CATransform3D::make_rotation(0.5, 0.0, 0.0, 1.0).scale(2.0, 3.0, 1.0);
+        assert!((implicit_rotation_start(model) - 0.5).abs() < 0.0001);
+        assert!((implicit_scale_start(model, Some(true)) - 2.0).abs() < 0.0001);
+        assert!((implicit_scale_start(model, Some(false)) - 3.0).abs() < 0.0001);
+        assert!((implicit_scale_start(model, None) - 2.5).abs() < 0.0001);
+    }
+
+    #[test]
+    fn interpolates_scalar_values() {
+        assert_eq!(interpolate_keyframe(0.2, 1.0, 0.5), 0.6);
+    }
+
+    #[test]
+    fn discrete_mode_selects_the_held_value() {
+        assert_eq!(
+            select_keyframe_segment(0.499, Some(&[0.0, 0.5, 1.0]), 3, true)
+                .unwrap()
+                .from_index,
+            0
+        );
+        assert_eq!(
+            select_keyframe_segment(0.5, Some(&[0.0, 0.5, 1.0]), 3, true)
+                .unwrap()
+                .from_index,
+            1
+        );
+        assert_eq!(
+            select_keyframe_segment(1.0, Some(&[0.0, 0.5, 1.0]), 3, true)
+                .unwrap()
+                .from_index,
+            2
+        );
+        assert_eq!(
+            select_keyframe_segment(1.0, None, 3, false)
+                .unwrap()
+                .from_index,
+            2
+        );
+    }
+}
+
 #[allow(clippy::eq_op)]
 fn get_from_and_by_values<T>(
     current_value: Option<T>,
@@ -384,6 +1129,7 @@ where
                  ignoring byValue"
             );
         }
+
         let by_value = to_value - from_value.to_owned();
         (from_value, by_value)
     } else if let (Some(from_value), Some(by_value)) = (from_value, by_value) {

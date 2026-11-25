@@ -21,7 +21,9 @@ use crate::objc::{
 };
 use crate::Environment;
 
+pub mod modal_transition;
 pub mod ui_navigation_controller;
+
 
 pub type UIModalTransitionStyle = i32;
 pub type UIModalPresentationStyle = i32;
@@ -82,7 +84,16 @@ pub(crate) struct UIViewControllerHostObject {
     modal_transition_style: UIModalTransitionStyle,
     modal_presentation_style: UIModalPresentationStyle,
     editing: bool,
+    wants_full_screen_layout: bool,
     is_being_presented: bool,
+    is_being_dismissed: bool,
+    /// Interface orientation the controller last rotated to, kept so
+    /// `-willRotateToInterfaceOrientation:duration:` can be told the
+    /// orientation being left. `None` until the first rotation.
+    pub(crate) interface_orientation: Option<UIInterfaceOrientation>,
+    /// Guards against a rotation re-entering itself: the rotation callbacks
+    /// can mount (and thus try to rotate) the controller's view again.
+    pub(crate) autorotation_in_progress: bool,
     /// When non-empty, the path (relative to the bundle resource path)
     /// at which the storyboardc directory lives. Storyboard-instantiated
     /// view controllers store the path so `-loadView` knows to load the
@@ -402,6 +413,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     if new_view != nil {
         retain(env, new_view);
     }
+    // The window owns and sizes the controller's current view, so replacing
+    // the view (including replacing the placeholder after launch) has to swap
+    // it in the window's subviews and carry the rotation transform over.
+    // https://developer.apple.com/documentation/uikit/uiwindow/rootviewcontroller
+    if old_view != new_view {
+        super::ui_view::ui_window::replace_controller_root_view(env, this, old_view, new_view);
+    }
     if old_view != nil {
         release(env, old_view);
     }
@@ -460,13 +478,27 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())setTitle:(id)title {
     let old_title = env.objc.borrow::<UIViewControllerHostObject>(this).title;
-    if old_title != nil {
-        release(env, old_title);
-    }
+    // Retain before releasing: a screen may set the title it already has, and
+    // releasing first would free the object before the retain.
     if title != nil {
         retain(env, title);
     }
-    env.objc.borrow_mut::<UIViewControllerHostObject>(this).title = title;
+    if old_title != nil {
+        release(env, old_title);
+    }
+    let (item, tab_item) = {
+        let host = env.objc.borrow_mut::<UIViewControllerHostObject>(this);
+        host.title = title;
+        (host.navigation_item, host.tab_bar_item)
+    };
+    // The navigation bar and the tab bar both display this title, so the
+    // items follow it once they exist.
+    if item != nil {
+        () = msg![env; item setTitle:title];
+    }
+    if tab_item != nil {
+        () = msg![env; tab_item setTitle:title];
+    }
 }
 
 - (())setEditing:(bool)editing {
@@ -478,16 +510,17 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (bool)isBeingPresented {
     env.objc.borrow::<UIViewControllerHostObject>(this).is_being_presented
 }
+- (bool)isBeingDismissed {
+    env.objc.borrow::<UIViewControllerHostObject>(this).is_being_dismissed
+}
 
-- (())setWantsFullScreenLayout:(bool)_wants {
-    // Apple docs: When set to YES, the view controller's view extends
-    // underneath the status bar and navigation bar. On real iOS this
-    // affects layout insets. In touchHLE we always render full-screen,
-    // so this is effectively a no-op but we accept it silently.
+- (())setWantsFullScreenLayout:(bool)wants {
+    // Legacy UIKit's default is NO. Containers also consider bar opacity
+    // before extending the content view under their bars.
+    env.objc.borrow_mut::<UIViewControllerHostObject>(this).wants_full_screen_layout = wants;
 }
 - (bool)wantsFullScreenLayout {
-    // Always report YES since touchHLE renders games full-screen.
-    true
+    env.objc.borrow::<UIViewControllerHostObject>(this).wants_full_screen_layout
 }
 - (())setExtendedLayoutIncludesOpaqueBars:(bool)value {
     // iOS 7+ layout hint: whether the extended layout includes the area
@@ -556,16 +589,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)title {
-    let stored_title = env.objc.borrow::<UIViewControllerHostObject>(this).title;
-    if stored_title != nil {
-        stored_title
-    } else {
-        let class: Class = msg![env; this class];
-        // The class-name string is newly created (+1); autorelease it so
-        // the getter respects the +0 return convention.
-        let class_name = NSStringFromClass(env, class);
-        autorelease(env, class_name)
+    // UIKit keeps the controller title and its navigation item in sync,
+    // so a screen that sets either one reads the same value back.
+    let item = env.objc.borrow::<UIViewControllerHostObject>(this).navigation_item;
+    if item != nil {
+        let item_title: id = msg![env; item title];
+        if item_title != nil {
+            return item_title;
+        }
     }
+    env.objc.borrow::<UIViewControllerHostObject>(this).title
 }
 
 - (bool)isViewLoaded {
@@ -772,16 +805,36 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc
         .borrow_mut::<UIViewControllerHostObject>(modal_vc)
         .is_being_presented = true;
+    // UIKit sizes a full-screen modal to its presentation container, not to
+    // the design-time frame in its nib. UIWindow applies orientation below.
+    // https://developer.apple.com/library/archive/featuredarticles/ViewControllerPGforiPhoneOS/PresentingaViewController.html
+    let style: UIModalPresentationStyle = msg![env; modal_vc modalPresentationStyle];
+    if style == 0 {
+        let bounds: CGRect = msg![env; window bounds];
+        () = msg![env; modal_view setFrame:bounds];
+    }
     () = msg![env; modal_vc viewWillAppear:animated];
     // UIWindow's -addSubview: applies the auto-rotation transform when the
     // view has an associated UIViewController and posts the appropriate
     // appearance hooks for the new view, so we route through the window
     // directly instead of adding the view to the presenter's view.
     () = msg![env; window addSubview:modal_view];
-    () = msg![env; modal_vc viewDidAppear:animated];
-    env.objc
-        .borrow_mut::<UIViewControllerHostObject>(modal_vc)
-        .is_being_presented = false;
+    () = msg![env; modal_vc viewWillLayoutSubviews];
+    () = msg![env; modal_view layoutSubviews];
+    () = msg![env; modal_vc viewDidLayoutSubviews];
+    let style = env
+        .objc
+        .borrow::<UIViewControllerHostObject>(modal_vc)
+        .modal_transition_style;
+    // Cover-vertical (0) slides, cross-dissolve (2) fades. Any
+    // other style has no renderer yet, so it settles immediately.
+    if animated && style == 0 {
+        modal_transition::animate(env, this, modal_vc, false);
+    } else if animated && style == 2 {
+        modal_transition::animate_fade(env, this, modal_vc, false);
+    } else {
+        modal_transition::complete(env, this, modal_vc, false, animated);
+    }
 
 
     // The modal hierarchy is now fully attached to a window. Any UIWebView
@@ -841,22 +894,30 @@ pub const CLASSES: ClassExports = objc_classes! {
         return;
     }
 
-    () = msg![env; presented viewWillDisappear:animated];
-
-    let presented_view: id = msg![env; presented view];
-    if presented_view != nil {
-        () = msg![env; presented_view removeFromSuperview];
+    if env
+    .objc
+    .borrow::<UIViewControllerHostObject>(presented)
+    .is_being_dismissed
+    {
+    return;
     }
-
-    () = msg![env; presented viewDidDisappear:animated];
-
     env.objc
-        .borrow_mut::<UIViewControllerHostObject>(presented)
-        .presenting_view_controller = nil;
-    env.objc
-        .borrow_mut::<UIViewControllerHostObject>(this)
-        .presented_view_controller = nil;
-    release(env, presented);
+    .borrow_mut::<UIViewControllerHostObject>(presented)
+    .is_being_dismissed = true;
+    () = msg![env; presented viewWillDisappear:animated];
+    let style = env
+        .objc
+        .borrow::<UIViewControllerHostObject>(presented)
+        .modal_transition_style;
+    // Cover-vertical (0) slides, cross-dissolve (2) fades. Any
+    // other style has no renderer yet, so it settles immediately.
+    if animated && style == 0 {
+        modal_transition::animate(env, this, presented, true);
+    } else if animated && style == 2 {
+        modal_transition::animate_fade(env, this, presented, true);
+    } else {
+        modal_transition::complete(env, this, presented, true, animated);
+    }
     invoke_void_block(env, completion);
 }
 
@@ -960,19 +1021,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     if existing != nil {
         return existing;
     }
-    // Match Apple: lazily create an item whose title is the controller's
-    // current `title` (falling back to the class name when unset). Retain it
-    // on the host object so subsequent property writes (e.g.
-    // `self.navigationItem.rightBarButtonItem = ...`) are not lost.
+    // Match Apple: the item starts with the controller's current title, which
+    // is nil until the app sets one. Retain it on the host object so later
+    // property writes (e.g. `self.navigationItem.rightBarButtonItem = ...`)
+    // are not lost.
     let title: id = msg![env; this title];
-    let init_title = if title != nil {
-        title
-    } else {
-        let class: Class = msg![env; this class];
-        NSStringFromClass(env, class)
-    };
     let item: id = msg_class![env; UINavigationItem alloc];
-    let item: id = msg![env; item initWithTitle:init_title];
+    let item: id = msg![env; item initWithTitle:title];
     env.objc.borrow_mut::<UIViewControllerHostObject>(this).navigation_item = item;
     item
 }
@@ -1009,6 +1064,9 @@ pub const CLASSES: ClassExports = objc_classes! {
                               duration:(f64)_duration {
 }
 
+- (())willAnimateRotationToInterfaceOrientation:(UIInterfaceOrientation)_orientation
+                                       duration:(f64)_duration {
+}
 - (())didRotateFromInterfaceOrientation:(UIInterfaceOrientation)_orientation {
 }
 
@@ -1217,25 +1275,14 @@ fn check_and_resolve_nib(env: &mut Environment, bundle: id, base_name: id) -> id
     }
     let type_: id = get_static_str(env, "nib");
     let base_name_str = to_rust_string(env, base_name);
-    // Перебираем варианты регистра и суффиксов
-    let bases = [base_name_str.to_string(), base_name_str.to_lowercase()];
-    let suffixes = [
-        "", "~iphone", "~ipad", "-iPhone", "-iPad", "_iPhone", "_iPad",
-    ];
-    for base in &bases {
-        for suffix in &suffixes {
-            let candidate = format!("{}{}", base, suffix);
-            let candidate_ns: id = from_rust_string(env, candidate);
-
-            // Проверяем существование файла
-            let path: id = msg![env; bundle pathForResource:candidate_ns ofType:type_];
-            if path != nil {
-                release(env, path);
-                return autorelease(env, candidate_ns);
-            }
-            release(env, candidate_ns);
-        }
+    let candidate_ns = from_rust_string(env, base_name_str.into_owned());
+    // NSBundle handles localization and the current device's ~iphone/~ipad
+    // resource variant. Do not load the other device's nib as a fallback.
+    let path: id = msg![env; bundle pathForResource:candidate_ns ofType:type_];
+    if path != nil {
+        return autorelease(env, candidate_ns);
     }
+    release(env, candidate_ns);
     nil
 }
 
@@ -1244,13 +1291,10 @@ fn resolve_nib_name_from_class(env: &mut Environment, bundle: id, class_name: id
         return nil;
     }
 
-    // 1. Пробуем полное имя класса (напр. MainViewController)
-    let res = check_and_resolve_nib(env, bundle, class_name);
-    if res != nil {
-        return res;
-    }
-
-    // 2. Пробуем имя без суффикса "Controller" (напр. MainView)
+    // UIKit checks the class name without "Controller" first, then the full
+    // class name. Choosing the full name first can load an unrelated nib.
+    // https://developer.apple.com/documentation/uikit/uiviewcontroller/nibname
+    // https://github.com/touchHLE/touchHLE/blob/trunk/src/frameworks/uikit/ui_view_controller.rs
     let class_str = to_rust_string(env, class_name);
     if let Some(short_name) = class_str.strip_suffix("Controller") {
         let short_ns = from_rust_string(env, short_name.to_string());
@@ -1261,7 +1305,7 @@ fn resolve_nib_name_from_class(env: &mut Environment, bundle: id, class_name: id
         }
     }
 
-    nil
+    check_and_resolve_nib(env, bundle, class_name)
 }
 
 // Helpers used by `ui_storyboard.rs` to attach storyboard state to a

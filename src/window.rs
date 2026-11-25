@@ -18,11 +18,12 @@ mod native_aspect_ratio;
 use crate::gles::present::present_frame;
 use crate::gles::{
     create_gles1_ctx_no_parent_stack, create_gles2_ctx_no_parent_stack, GLESContext,
-    LoggingGLESContext, GLES,
+    GLESImplementation, LoggingGLESContext, GLES,
 };
 use crate::image::Image;
 use crate::matrix::Matrix;
-use crate::options::{Options, PerformanceOverlayCorner, PerformanceOverlayMode, VsyncMode};
+use crate::options::{Options, RendererMode};
+use crate::options::{PerformanceOverlayCorner, PerformanceOverlayMode, VsyncMode};
 use crate::Environment;
 use sdl2::mouse::MouseButton;
 use sdl2::pixels::PixelFormatEnum;
@@ -44,9 +45,9 @@ pub fn angle_backend_available() -> bool {
     !cfg!(target_os = "android") || !ANDROID_ANGLE_UNAVAILABLE.load(Ordering::Relaxed)
 }
 
-#[cfg(target_os = "android")]
-fn should_attempt_android_angle(gles_native: bool, angle_unavailable: bool) -> bool {
-    !gles_native && !angle_unavailable
+#[cfg(any(target_os = "android", test))]
+fn should_attempt_android_angle(renderer_mode: RendererMode, angle_unavailable: bool) -> bool {
+    renderer_mode == RendererMode::Angle && !angle_unavailable
 }
 
 fn swap_interval_for_mode(mode: VsyncMode, is_android: bool) -> Option<sdl2::video::SwapInterval> {
@@ -55,6 +56,201 @@ fn swap_interval_for_mode(mode: VsyncMode, is_android: bool) -> Option<sdl2::vid
         VsyncMode::Off => Some(sdl2::video::SwapInterval::Immediate),
         VsyncMode::Auto if is_android => Some(sdl2::video::SwapInterval::VSync),
         VsyncMode::Auto => None,
+    }
+}
+
+/// A swap slower than this means the app missed two display refreshes.
+///
+/// With display sync on, a swap returns on a refresh boundary, so the
+/// intervals are quantised to 16.7, 33.3, 50 ms and so on. A 30 FPS app
+/// (Unity's default `targetFrameRate` on mobile) already takes two refreshes
+/// (~33 ms at 60 Hz) and is perfectly smooth, so only a three-refresh cadence
+/// means the app cannot keep up.
+const ADAPTIVE_VSYNC_SLOW_INTERVAL: Duration = Duration::from_millis(45);
+/// A swap faster than this means the app can hold a two-refresh cadence, so
+/// display sync is worth restoring. A 30 FPS app swaps at ~33 ms when
+/// unsynced, so the threshold sits just above that.
+const ADAPTIVE_VSYNC_FAST_INTERVAL: Duration = Duration::from_millis(36);
+/// Consecutive slow swaps before display sync is dropped.
+const ADAPTIVE_VSYNC_SLOW_SWAPS: u32 = 30;
+/// Consecutive fast swaps before display sync is restored.
+const ADAPTIVE_VSYNC_FAST_SWAPS: u32 = 120;
+/// A gap this long means the app was idle or paused, not that it is slow.
+const ADAPTIVE_VSYNC_PAUSE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Drops display sync while the app cannot keep up with it, and restores it
+/// once the app is comfortably fast again.
+///
+/// With `VsyncMode::Auto` on Android the swap interval is 1. An app that
+/// misses the display deadline then waits for the *next* refresh, so a game
+/// that renders at 25 FPS is shown at 20, and one at 35 FPS at 30: the frame
+/// rate becomes a staircase and input latency jumps by a whole refresh. Letting
+/// such an app run unsynced trades tearing for a steady frame rate and lower
+/// latency. Explicit `--vsync=on`/`off` never uses this.
+struct AdaptiveVsync {
+    synced: bool,
+    last_swap: Option<Instant>,
+    slow_swaps: u32,
+    fast_swaps: u32,
+}
+
+impl AdaptiveVsync {
+    fn new() -> Self {
+        Self {
+            synced: true,
+            last_swap: None,
+            slow_swaps: 0,
+            fast_swaps: 0,
+        }
+    }
+
+    /// Call after every swap. Returns the new sync choice when it should
+    /// change.
+    fn observe(&mut self, now: Instant) -> Option<bool> {
+        let last = self.last_swap.replace(now)?;
+        let elapsed = now.duration_since(last);
+        if elapsed >= ADAPTIVE_VSYNC_PAUSE_INTERVAL {
+            // The app was paused or idle; that says nothing about its frame
+            // rate, so start the measurement over instead of counting it.
+            self.slow_swaps = 0;
+            self.fast_swaps = 0;
+            return None;
+        }
+        if elapsed >= ADAPTIVE_VSYNC_SLOW_INTERVAL {
+            self.fast_swaps = 0;
+            self.slow_swaps += 1;
+            if self.synced && self.slow_swaps >= ADAPTIVE_VSYNC_SLOW_SWAPS {
+                self.slow_swaps = 0;
+                self.synced = false;
+                return Some(false);
+            }
+        } else if elapsed < ADAPTIVE_VSYNC_FAST_INTERVAL {
+            self.slow_swaps = 0;
+            // Only a run of fast swaps while unsynced can restore sync, so
+            // the counter does not need to grow while it is already on.
+            if !self.synced {
+                self.fast_swaps += 1;
+                if self.fast_swaps >= ADAPTIVE_VSYNC_FAST_SWAPS {
+                    self.fast_swaps = 0;
+                    self.synced = true;
+                    return Some(true);
+                }
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod adaptive_vsync_tests {
+    use super::{AdaptiveVsync, ADAPTIVE_VSYNC_FAST_SWAPS, ADAPTIVE_VSYNC_SLOW_SWAPS};
+    use std::time::{Duration, Instant};
+
+    /// Swaps `count` times at a fixed interval and returns the last decision.
+    fn swap_n(
+        vsync: &mut AdaptiveVsync,
+        now: &mut Instant,
+        interval_ms: u64,
+        count: u32,
+    ) -> Option<bool> {
+        let mut change = None;
+        for _ in 0..count {
+            *now += Duration::from_millis(interval_ms);
+            if let Some(new) = vsync.observe(*now) {
+                change = Some(new);
+            }
+        }
+        change
+    }
+
+    #[test]
+    fn drops_sync_only_after_a_sustained_slow_run() {
+        let mut now = Instant::now();
+        let mut vsync = AdaptiveVsync::new();
+        // The first swap only starts the measurement.
+        assert_eq!(swap_n(&mut vsync, &mut now, 50, 1), None);
+        assert_eq!(
+            swap_n(&mut vsync, &mut now, 50, ADAPTIVE_VSYNC_SLOW_SWAPS - 1),
+            None
+        );
+        assert_eq!(swap_n(&mut vsync, &mut now, 50, 1), Some(false));
+    }
+
+    #[test]
+    fn a_fast_swap_resets_the_slow_run() {
+        let mut now = Instant::now();
+        let mut vsync = AdaptiveVsync::new();
+        assert_eq!(
+            swap_n(&mut vsync, &mut now, 50, ADAPTIVE_VSYNC_SLOW_SWAPS),
+            None
+        );
+        assert_eq!(swap_n(&mut vsync, &mut now, 16, 1), None);
+        assert_eq!(
+            swap_n(&mut vsync, &mut now, 50, ADAPTIVE_VSYNC_SLOW_SWAPS - 1),
+            None
+        );
+        assert_eq!(swap_n(&mut vsync, &mut now, 50, 1), Some(false));
+    }
+
+    #[test]
+    fn restores_sync_after_a_sustained_fast_run() {
+        let mut now = Instant::now();
+        let mut vsync = AdaptiveVsync::new();
+        assert_eq!(
+            swap_n(&mut vsync, &mut now, 50, ADAPTIVE_VSYNC_SLOW_SWAPS + 1),
+            Some(false)
+        );
+        assert_eq!(
+            swap_n(&mut vsync, &mut now, 16, ADAPTIVE_VSYNC_FAST_SWAPS - 1),
+            None
+        );
+        assert_eq!(swap_n(&mut vsync, &mut now, 16, 1), Some(true));
+    }
+
+    #[test]
+    fn a_steady_sixty_hertz_never_changes_anything() {
+        let mut now = Instant::now();
+        let mut vsync = AdaptiveVsync::new();
+        assert_eq!(swap_n(&mut vsync, &mut now, 16, 1000), None);
+    }
+
+    #[test]
+    fn a_thirty_hertz_cadence_keeps_sync() {
+        let mut now = Instant::now();
+        let mut vsync = AdaptiveVsync::new();
+        // Synced, a 30 FPS app swaps on every second refresh (~33.3 ms).
+        assert_eq!(swap_n(&mut vsync, &mut now, 34, 1000), None);
+    }
+
+    #[test]
+    fn a_thirty_hertz_cadence_restores_sync() {
+        let mut now = Instant::now();
+        let mut vsync = AdaptiveVsync::new();
+        assert_eq!(
+            swap_n(&mut vsync, &mut now, 50, ADAPTIVE_VSYNC_SLOW_SWAPS + 1),
+            Some(false)
+        );
+        // Unsynced, the same app runs at its own ~33.3 ms cadence.
+        assert_eq!(
+            swap_n(&mut vsync, &mut now, 34, ADAPTIVE_VSYNC_FAST_SWAPS),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_pause_does_not_count_as_a_slow_swap() {
+        let mut now = Instant::now();
+        let mut vsync = AdaptiveVsync::new();
+        assert_eq!(swap_n(&mut vsync, &mut now, 50, 1), None);
+        // A second-long gap (backgrounded app, loading screen).
+        now += Duration::from_secs(2);
+        assert_eq!(vsync.observe(now), None);
+        // The slow run restarts from zero, so it takes the full count again.
+        assert_eq!(
+            swap_n(&mut vsync, &mut now, 50, ADAPTIVE_VSYNC_SLOW_SWAPS - 1),
+            None
+        );
+        assert_eq!(swap_n(&mut vsync, &mut now, 50, 1), Some(false));
     }
 }
 
@@ -85,17 +281,38 @@ mod swap_interval_tests {
     }
 }
 
+/// Why ANGLE must not be used on this host, or `None` if it may be used.
+/// The decision is based on the `GL_VERSION / GL_VENDOR / GL_RENDERER`
+/// string captured at context creation; callers treat `Some(_)` exactly like
+/// a failed ANGLE startup and fall back to the native OpenGL ES driver.
 #[cfg(any(target_os = "android", test))]
-fn angle_backend_unsafe_on_power_vr_bxm_8_256(description: &str) -> bool {
+fn angle_backend_unsafe(description: &str) -> Option<&'static str> {
     let description = description.to_ascii_lowercase();
-    description.contains("angle")
-        && description.contains("vulkan")
-        && description.contains("bxm-8-256")
+    if !description.contains("angle") {
+        return None;
+    }
+    if description.contains("vulkan") && description.contains("bxm-8-256") {
+        // Startup crash on this part, observed with ANGLE's Vulkan backend.
+        return Some(
+            "ANGLE's Vulkan backend is disabled for PowerVR BXM-8-256 after its startup crash",
+        );
+    }
+    // Adreno 610 (e.g. "OpenGL ES 1.1 (ANGLE 2.1.1 git hash: 4a5ccd7b61e6) /
+    // Google Inc. (Qualcomm) / ANGLE (Qualcomm, Vulkan 1.1.87 (Adreno (TM)
+    // 610 (0x06010000)), Qualcomm-512.378.0)"): ANGLE is not to be used on
+    // this GPU; the native OpenGL ES driver is preferred instead. The
+    // "adreno" requirement keeps Mali-G610+ANGLE configurations unaffected.
+    if description.contains("adreno") && description.contains("610") {
+        return Some("ANGLE is disabled for Adreno 610 in favor of the native OpenGL ES driver");
+    }
+    None
 }
 
 #[cfg(test)]
 mod android_angle_fallback_tests {
-    use super::angle_backend_unsafe_on_power_vr_bxm_8_256;
+    use super::angle_backend_unsafe;
+    use super::should_attempt_android_angle;
+    use crate::options::RendererMode;
 
     #[test]
     fn rejects_power_vr_bxm_8_256_vulkan_angle() {
@@ -103,28 +320,74 @@ mod android_angle_fallback_tests {
             "OpenGL ES 1.1 (ANGLE) / Google Inc. (Imagination Technologies) / ",
             "ANGLE (Vulkan 1.1.170 (PowerVR BXM-8-256 (0x35010101)))",
         );
-        assert!(angle_backend_unsafe_on_power_vr_bxm_8_256(renderer));
+        assert!(angle_backend_unsafe(renderer).is_some());
+    }
+
+    #[test]
+    fn rejects_adreno_610_angle() {
+        // Verbatim GL strings reported by a device whose Adreno 610 ANGLE
+        // backend (Vulkan 1.1.87, Qualcomm-512.378.0) is disabled.
+        let renderer = concat!(
+            "OpenGL ES 1.1 (ANGLE 2.1.1 git hash: 4a5ccd7b61e6) / Google Inc. (Qualcomm) / ",
+            "ANGLE (Qualcomm, Vulkan 1.1.87 (Adreno (TM) 610 (0x06010000)), Qualcomm-512.378.0)",
+        );
+        assert!(angle_backend_unsafe(renderer).is_some());
+    }
+
+    #[test]
+    fn accepts_angle_on_other_adreno() {
+        assert!(angle_backend_unsafe(
+            "OpenGL ES 3.2 (ANGLE) / Google Inc. (Qualcomm) / ANGLE (Vulkan 1.3 (Adreno (TM) 740))"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn accepts_mali_g610_angle() {
+        // "610" shows up here too, but this is not an Adreno part.
+        assert!(angle_backend_unsafe(
+            "OpenGL ES 3.2 (ANGLE) / Google Inc. (ARM) / ANGLE (Vulkan 1.1 (Mali-G610 MC4))"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn accepts_native_adreno_610_renderer() {
+        assert!(angle_backend_unsafe("OpenGL ES 3.2 / Qualcomm / Adreno (TM) 610").is_none());
     }
 
     #[test]
     fn accepts_other_angle_renderers() {
-        assert!(!angle_backend_unsafe_on_power_vr_bxm_8_256(
+        assert!(angle_backend_unsafe(
             "OpenGL ES 3.2 (ANGLE) / Google Inc. (Qualcomm) / ANGLE (Vulkan 1.3 (Adreno))"
-        ));
+        )
+        .is_none());
     }
 
     #[test]
     fn accepts_other_power_vr_vulkan_renderers() {
-        assert!(!angle_backend_unsafe_on_power_vr_bxm_8_256(
+        assert!(angle_backend_unsafe(
             "OpenGL ES 3.2 (ANGLE) / Google Inc. (Imagination Technologies) / ANGLE (Vulkan 1.1 (PowerVR Rogue GE8320))"
-        ));
+        )
+        .is_none());
     }
 
     #[test]
     fn accepts_native_power_vr_bxm_8_256_renderer() {
-        assert!(!angle_backend_unsafe_on_power_vr_bxm_8_256(
+        assert!(angle_backend_unsafe(
             "OpenGL ES 3.2 / Imagination Technologies / PowerVR BXM-8-256"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn selects_angle_only_when_requested_and_available() {
+        assert!(should_attempt_android_angle(RendererMode::Angle, false));
+        assert!(!should_attempt_android_angle(
+            RendererMode::NativeGles,
+            false
         ));
+        assert!(!should_attempt_android_angle(RendererMode::Angle, true));
     }
 }
 
@@ -304,36 +567,45 @@ impl DeviceFamily {
     /// model.
     pub fn physical_memory(&self) -> u64 {
         const MIB: u64 = 1024 * 1024;
+        // Grouped by the RAM Apple shipped them with, not by generation: the
+        // generations differ wildly here (the iPhone 4 has the same 512 MiB as
+        // the 4S, while the 4S's successor has twice that), and every profile
+        // that reports the wrong amount misleads the guest twice over — the
+        // memory-budgeting engines size their pools from it, and the Default
+        // heap ceiling is derived from it (see `default_guest_heap_cap`).
+        // Figures are the ones published for the hardware, e.g.
+        // <https://en.wikipedia.org/wiki/List_of_iOS_and_iPadOS_devices>.
         match self {
-            // Early devices shipped with 128 MiB of RAM.
+            // 128 MiB: the first two iPhone and iPod touch generations.
             DeviceFamily::iPhone
             | DeviceFamily::iPhone3G
             | DeviceFamily::iPodTouch
-            | DeviceFamily::iPodTouch2
-            | DeviceFamily::iPodTouch3 => 128 * MIB,
-            // iPhone 3GS / 4, iPad 1, iPod touch 4 shipped with 256 MiB.
+            | DeviceFamily::iPodTouch2 => 128 * MIB,
+            // 256 MiB: iPhone 3GS, the first iPad and the 3rd/4th iPod touch.
             DeviceFamily::iPhone3GS
-            | DeviceFamily::iPhone4
             | DeviceFamily::iPad
+            | DeviceFamily::iPodTouch3
             | DeviceFamily::iPodTouch4 => 256 * MIB,
-            // iPhone 4S / 5 / 5c, iPad 2/3/4/mini, iPod touch 5 shipped with
-            // 512 MiB.
-            DeviceFamily::iPhone4s
-            | DeviceFamily::iPhone5
-            | DeviceFamily::iPhone5c
+            // 512 MiB: iPhone 4 and 4S, iPad 2, iPad mini, iPod touch 5.
+            DeviceFamily::iPhone4
+            | DeviceFamily::iPhone4s
             | DeviceFamily::iPad2
-            | DeviceFamily::iPad3
-            | DeviceFamily::iPad4
             | DeviceFamily::iPadMini
             | DeviceFamily::iPodTouch5 => 512 * MIB,
-            // iPhone 6 and the Retina iPad minis shipped with 1 GiB. We
-            // intentionally cap this at 1 GiB even though the address space is
-            // 4 GiB, leaving headroom for the guest heap, stacks and mapped
-            // libraries.
-            DeviceFamily::iPhone6
-            | DeviceFamily::iPad5
+            // 1 GiB: iPhone 5, 5c and 6, iPad 3 and 4, Retina iPad minis.
+            // This is capped at 1 GiB even though the address space is 4 GiB,
+            // leaving headroom for the guest heap, stacks and mapped libraries.
+            DeviceFamily::iPhone5
+            | DeviceFamily::iPhone5c
+            | DeviceFamily::iPhone6
+            | DeviceFamily::iPad3
+            | DeviceFamily::iPad4
             | DeviceFamily::iPadMini2
             | DeviceFamily::iPadMini3 => 1024 * MIB,
+            // 2 GiB: the iPad 5 (iPad6,11), a 2017 iPad rather than an iPad
+            // Air. Two of the 4 GiB guest address space is still comfortable
+            // for the heap; the Default ceiling stays half of this.
+            DeviceFamily::iPad5 => 2048 * MIB,
         }
     }
 
@@ -562,8 +834,12 @@ fn set_sdl2_orientation(orientation: DeviceOrientation) {
     // side. Let Android choose the upright landscape on phones AND tablets
     // whose natural display orientation is landscape.
     // https://developer.android.com/reference/android/content/pm/ActivityInfo#SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-    if cfg!(target_os = "android") && matches!(orientation,
-        DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight) {
+    if cfg!(target_os = "android")
+        && matches!(
+            orientation,
+            DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight
+        )
+    {
         sdl2::hint::set("SDL_IOS_ORIENTATIONS", "LandscapeLeft LandscapeRight");
         return;
     }
@@ -756,6 +1032,18 @@ pub enum GLVersion {
     GL33Core,
 }
 
+impl std::fmt::Display for GLVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            GLVersion::GLES11 => "OpenGL ES 1.1",
+            GLVersion::GLES20 => "OpenGL ES 2.0",
+            GLVersion::GLES30 => "OpenGL ES 3.0",
+            GLVersion::GL21Compat => "OpenGL 2.1 compatibility",
+            GLVersion::GL33Core => "OpenGL 3.3 core",
+        })
+    }
+}
+
 pub struct GLContext(sdl2::video::GLContext);
 
 impl GLContext {
@@ -872,7 +1160,7 @@ fn configure_android_angle_driver(use_angle: bool) -> bool {
         // bundled ANGLE; SDL will use Android's system OpenGL ES driver.
         env::remove_var("SDL_VIDEO_EGL_DRIVER");
         env::remove_var("SDL_VIDEO_GL_DRIVER");
-        log!("GLES Native requested; using the Android system OpenGL ES driver.");
+        log!("Native GLES requested; using the Android system OpenGL ES driver.");
         return false;
     }
     const CANDIDATES: &[(&str, &str, &str)] = &[
@@ -962,6 +1250,9 @@ pub struct Window {
     host_screen_size: Option<(u32, u32)>,
     internal_gl_ins: Option<Box<dyn GLESContext>>,
     perf_context_token: usize,
+    /// Host window damage and input can change emulator overlays even when
+    /// UIKit's layer tree and the guest's last EAGL frame stay unchanged.
+    presentation_revision: u64,
     /// Cached `GL_VERSION / GL_VENDOR / GL_RENDERER` string of the internal
     /// OpenGL ES context, captured at window creation. Used to detect the host
     /// GLES driver (e.g. whether we are running through ANGLE or on a vendor's
@@ -970,12 +1261,12 @@ pub struct Window {
     gl_driver_description: String,
     host_framebuffer: u32,
     splash_image: Option<Image>,
-    /// Whether the selected image already targets the startup orientation.
-    splash_image_is_orientation_specific: bool,
     device_family: DeviceFamily,
     device_orientation: DeviceOrientation,
     controller_ctx: sdl2::GameControllerSubsystem,
     controllers: Vec<sdl2::controller::GameController>,
+    #[cfg(target_os = "windows")]
+    active_controller_touches: HashMap<i64, Coords>,
     dpad_state: DpadState,
     stick_active: bool,
     _sensor_ctx: sdl2::SensorSubsystem,
@@ -989,6 +1280,9 @@ pub struct Window {
     /// Host scheduling / power-management hints for the emulator thread
     /// (Android). Fed once per presented frame from [Window::swap_window].
     perf_hints: crate::perf_hints::PerfHints,
+    /// Drops and restores display sync for `VsyncMode::Auto` on Android. `None`
+    /// when the mode is explicit or the platform syncs swaps in hardware.
+    adaptive_vsync: Option<AdaptiveVsync>,
     /// Whether or not we are on the "main" environment stack (rather than
     /// a coroutine stack). Checked in various functions to make sure that
     /// certain SDL functions (that call JNI functions) are on the main
@@ -1001,14 +1295,25 @@ fn base_window_title() -> String {
     if crate::branding().is_empty() {
         format!("{} {}", crate::DISPLAY_NAME, crate::VERSION)
     } else {
-        format!("{} {} {}", crate::DISPLAY_NAME, crate::branding(), crate::VERSION)
+        format!(
+            "{} {} {}",
+            crate::DISPLAY_NAME,
+            crate::branding(),
+            crate::VERSION
+        )
     }
 }
 
 impl Window {
     #[cfg(test)]
     pub(crate) fn graphics_test_window() -> Result<Self, String> {
-        let mut window = Self::new("BerryHLE graphics regression", None, None, &Options::default())?;
+        let mut window = Self::new(
+            "AppleJuiceHLE graphics regression",
+            None,
+            None,
+            &Options::default(),
+            false,
+        )?;
         window.window.hide();
         Ok(window)
     }
@@ -1062,14 +1367,15 @@ impl Window {
     pub fn new(
         title: &str,
         icon: Option<Image>,
-        launch_image: Option<(Image, bool)>,
+        launch_image: Option<Image>,
         options: &Options,
+        is_app_picker: bool,
     ) -> Result<Window, String> {
-        crate::gles::perf_overlay::configure_from_options(options);
+        crate::gles::perf_overlay::configure_from_options(options, is_app_picker);
         #[cfg(target_os = "android")]
         {
             let angle_unavailable = ANDROID_ANGLE_UNAVAILABLE.load(Ordering::Relaxed);
-            if should_attempt_android_angle(options.gles_native, angle_unavailable) {
+            if should_attempt_android_angle(options.renderer_mode, angle_unavailable) {
                 if configure_android_angle_driver(true) {
                     match Self::new_with_configured_driver(
                         title,
@@ -1136,7 +1442,7 @@ impl Window {
                     });
             }
 
-            if !options.gles_native && angle_unavailable {
+            if options.renderer_mode == RendererMode::Angle && angle_unavailable {
                 log!(
                     "Bundled ANGLE was previously unavailable; using the Android native GLES driver."
                 );
@@ -1150,7 +1456,7 @@ impl Window {
     fn new_with_configured_driver(
         title: &str,
         icon: Option<Image>,
-        launch_image: Option<(Image, bool)>,
+        launch_image: Option<Image>,
         options: &Options,
     ) -> Result<Window, String> {
         let sdl_ctx = sdl2::init().map_err(|err| format!("SDL initialization failed: {}", err))?;
@@ -1163,15 +1469,26 @@ impl Window {
         // drivers because they cause duplicated controllers on macOS
         // (https://github.com/libsdl-org/SDL/issues/7479). Once that's fixed,
         // remove this (https://github.com/touchHLE/touchHLE/issues/85).
-        sdl2::hint::set("SDL_JOYSTICK_HIDAPI", "0");
+        if env::consts::OS == "macos" {
+            sdl2::hint::set("SDL_JOYSTICK_HIDAPI", "0");
+        } else if env::consts::OS == "windows" {
+            sdl2::hint::set("SDL_JOYSTICK_HIDAPI", "1");
+        }
 
-        if env::consts::OS == "android" {
+        if env::consts::OS == "android"
+            || matches!(
+                options.gles1_implementation,
+                Some(GLESImplementation::GLES1Native)
+            )
+        {
             // It's important to set context version BEFORE window creation
             // ref. https://wiki.libsdl.org/SDL2/SDL_GLattr
             let attr = video_ctx.gl_attr();
             attr.set_context_version(1, 1);
             attr.set_context_profile(sdl2::video::GLProfile::GLES);
+        }
 
+        if env::consts::OS == "android" {
             // Disable blocking of event loop when app is paused.
             sdl2::hint::set("SDL_ANDROID_BLOCK_ON_PAUSE", "0");
         }
@@ -1348,9 +1665,7 @@ impl Window {
             size_for_orientation_from_size(portrait_screen_size, device_orientation, scale_hack),
         );
 
-        let (splash_image, splash_image_is_orientation_specific) = launch_image
-            .map(|(image, orientation_specific)| (Some(image), orientation_specific))
-            .unwrap_or((None, false));
+        let splash_image = launch_image;
 
         let mut window = Window {
             _sdl_ctx: sdl_ctx,
@@ -1391,14 +1706,16 @@ impl Window {
             host_screen_size,
             internal_gl_ins: None,
             perf_context_token: crate::gles::perf_overlay::allocate_context_token(),
+            presentation_revision: 0,
             gl_driver_description: String::new(),
             host_framebuffer: 0,
             splash_image,
-            splash_image_is_orientation_specific,
             device_family,
             device_orientation,
             controller_ctx,
             controllers: Vec::new(),
+            #[cfg(target_os = "windows")]
+            active_controller_touches: HashMap::new(),
             dpad_state: DpadState {
                 left: false,
                 right: false,
@@ -1423,6 +1740,8 @@ impl Window {
                     .unwrap_or(Duration::from_micros(16_667)),
                 options.affinity.as_deref(),
             ),
+            adaptive_vsync: (options.vsync == VsyncMode::Auto && env::consts::OS == "android")
+                .then(AdaptiveVsync::new),
             on_main_stack: true,
         };
 
@@ -1476,11 +1795,8 @@ impl Window {
         window.internal_gl_ins = Some(gl_ins);
 
         #[cfg(target_os = "android")]
-        if angle_backend_unsafe_on_power_vr_bxm_8_256(&window.gl_driver_description) {
-            return Err(format!(
-                "ANGLE's Vulkan backend is disabled for PowerVR BXM-8-256 after its startup crash: {}",
-                window.gl_driver_description
-            ));
+        if let Some(reason) = angle_backend_unsafe(&window.gl_driver_description) {
+            return Err(format!("{}: {}", reason, window.gl_driver_description));
         }
 
         // The Android surface requests a 60 Hz mode, matching the default
@@ -1551,8 +1867,9 @@ impl Window {
             } else {
                 log!(
                     "GPU backend: Qualcomm Adreno native OpenGL ES driver. \
-                     Bundled ANGLE could not be loaded; the native ES 1.1 path \
-                     can render some early iPhone OS games as a black screen. \
+                     Bundled ANGLE is not in use here (unavailable, or disabled \
+                     for this GPU); the native ES 1.1 path can render some \
+                     early iPhone OS games as a black screen. \
                      Adreno rendering workarounds (--fix-texture-min-filter) \
                      are auto-enabled to mitigate this."
                 );
@@ -1596,9 +1913,11 @@ impl Window {
             self.arrow_tilt_sample.set((0, 0));
         }
         if self.arrow_tilt_feedback.replace(false) && self.window.has_input_focus() {
-            if !self.controllers.iter_mut().any(|controller| {
-                controller.set_rumble(0, 12_000, 30).is_ok()
-            }) {
+            if !self
+                .controllers
+                .iter_mut()
+                .any(|controller| controller.set_rumble(0, 12_000, 30).is_ok())
+            {
                 #[cfg(target_os = "android")]
                 unsafe {
                     SDL_AndroidSendMessage(TILT_HAPTIC_COMMAND, 0);
@@ -1606,6 +1925,7 @@ impl Window {
             }
         }
 
+        let landscape_bounds_enabled = options.landscape_uiscreen_bounds_enabled();
         fn transform_input_coords(
             window: &Window,
             options: &Options,
@@ -1624,9 +1944,12 @@ impl Window {
             };
             // Clamp touches in letterbox bars to the nearest visible edge.
             let (x, y) = geometry::normalize_viewport_coords((in_x, in_y), (vx, vy, vw, vh));
-            if options.landscape_uiscreen_bounds && options.present_rotate == Some(0)
-                && matches!(window.device_orientation,
-                    DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight)
+            if options.landscape_uiscreen_bounds_enabled()
+                && options.present_rotate == Some(0)
+                && matches!(
+                    window.device_orientation,
+                    DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight
+                )
             {
                 let (width, height) = window.size_unrotated_unscaled();
                 return geometry::normalized_to_screen((x, y), (height, width));
@@ -1640,9 +1963,11 @@ impl Window {
             // interface space: the touch must be mapped into that same space,
             // without the portrait-space rotation below, and scaled by the
             // interface size rather than the portrait one.
-            let interface_space = crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS");
+            let interface_space = options.landscape_uiscreen_bounds_enabled();
             if interface_space {
-                log_once!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS=1: mapping touches in interface space");
+                log_once!(
+                    "TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS=1: mapping touches in interface space"
+                );
             }
             // rotate
             //
@@ -1660,7 +1985,9 @@ impl Window {
             } else if crate::env_flag_cached!("TOUCHHLE_DISABLE_PRESENT_ROTATION")
                 || crate::env_flag_cached!("TOUCHHLE_DISABLE_TOUCH_ROTATION")
             {
-                log_once!("TOUCHHLE_DISABLE_TOUCH_ROTATION: not rotating touch hit-test coordinates");
+                log_once!(
+                    "TOUCHHLE_DISABLE_TOUCH_ROTATION: not rotating touch hit-test coordinates"
+                );
                 [x, y]
             } else {
                 let matrix = window.rotation_matrix().inverse().unwrap();
@@ -1756,6 +2083,28 @@ impl Window {
                 break;
             };
 
+            // SDL may discard the front buffer on expose/restore, and host
+            // menus react to input before UIKit sees it. Invalidate cached
+            // composition without tying redraws to sensor event frequency.
+            // https://wiki.libsdl.org/SDL2/SDL_WindowEventID
+            if matches!(
+                &event,
+                E::Window { .. }
+                    | E::AppDidEnterForeground { .. }
+                    | E::MouseButtonDown { .. }
+                    | E::MouseButtonUp { .. }
+                    | E::MouseMotion { .. }
+                    | E::FingerDown { .. }
+                    | E::FingerUp { .. }
+                    | E::FingerMotion { .. }
+                    | E::KeyDown { .. }
+                    | E::KeyUp { .. }
+                    | E::ControllerButtonDown { .. }
+                    | E::ControllerButtonUp { .. }
+            ) {
+                self.presentation_revision = self.presentation_revision.wrapping_add(1);
+            }
+
             // Virtual accelerometer
             match event {
                 E::MouseButtonDown {
@@ -1800,10 +2149,17 @@ impl Window {
                     ..
                 } => {
                     let abs_coords = self.mouse_drawable_coords((x, y));
+                    if crate::quick_menu::touch_down(abs_coords, self.viewport()) {
+                        continue;
+                    }
                     if crate::trainer_ui::touch_down(abs_coords, self.viewport()) {
                         continue;
                     }
-                    let coords = transform_input_coords(self, options, abs_coords, false);
+                    let coords = transform_input_coords(
+                        self, options,
+                        abs_coords,
+                        false,
+                    );
                     log_dbg!("MouseButtonDown x {}, y {}, coords {:?}", x, y, coords);
                     if crate::env_flag_cached!("TOUCHHLE_TRACE_TOUCHES") {
                         log!("SDL mouse-down delivered at ({}, {}) -> {:?}", x, y, coords);
@@ -1814,10 +2170,17 @@ impl Window {
                     x, y, mousestate, ..
                 } if mousestate.left() => {
                     let abs_coords = self.mouse_drawable_coords((x, y));
+                    if crate::quick_menu::touch_motion(abs_coords, self.viewport()) {
+                        continue;
+                    }
                     if crate::trainer_ui::touch_motion(abs_coords, self.viewport()) {
                         continue;
                     }
-                    let coords = transform_input_coords(self, options, abs_coords, false);
+                    let coords = transform_input_coords(
+                        self, options,
+                        abs_coords,
+                        false,
+                    );
                     log_dbg!("MouseMotion x {}, y {}, coords {:?}", x, y, coords);
                     Event::TouchesMove(HashMap::from([(FingerId::Mouse, coords)]))
                 }
@@ -1828,10 +2191,17 @@ impl Window {
                     ..
                 } => {
                     let abs_coords = self.mouse_drawable_coords((x, y));
+                    if crate::quick_menu::touch_up(abs_coords, self.viewport()) {
+                        continue;
+                    }
                     if crate::trainer_ui::touch_up(abs_coords, self.viewport()) {
                         continue;
                     }
-                    let coords = transform_input_coords(self, options, abs_coords, false);
+                    let coords = transform_input_coords(
+                        self, options,
+                        abs_coords,
+                        false,
+                    );
                     log_dbg!("MouseButtonUp x {}, y {}, coords {:?}", x, y, coords);
                     Event::TouchesUp(HashMap::from([(FingerId::Mouse, coords)]))
                 }
@@ -1910,7 +2280,11 @@ impl Window {
                         }
 
                         // Final coords: center + movement
-                        let coords = transform_input_coords(self, options, (cx + dx, cy + dy), true);
+                        let coords = transform_input_coords(
+                            self, options,
+                            (cx + dx, cy + dy),
+                            true,
+                            );
 
                         // Send TouchDown if any dpad is held, TouchUp if none
                         let any_held = self.dpad_state.left
@@ -1938,14 +2312,22 @@ impl Window {
                         };
                         match event {
                             E::ControllerButtonUp { .. } => {
-                                let coords = transform_input_coords(self, options, (x, y), true);
+                                let coords = transform_input_coords(
+                                    self, options,
+                                    (x, y),
+                                    true,
+                                            );
                                 Event::TouchesUp(HashMap::from([(
                                     FingerId::ButtonToTouch(button),
                                     coords,
                                 )]))
                             }
                             E::ControllerButtonDown { .. } => {
-                                let coords = transform_input_coords(self, options, (x, y), true);
+                                let coords = transform_input_coords(
+                                    self, options,
+                                    (x, y),
+                                    true,
+                                            );
                                 Event::TouchesDown(HashMap::from([(
                                     FingerId::ButtonToTouch(button),
                                     coords,
@@ -1978,7 +2360,7 @@ impl Window {
                                 y + ((stick_y + 1.0) / 2.0) * h,
                             ),
                             true,
-                        );
+                            );
                         if stick_x.abs() < options.deadzone && stick_y.abs() < options.deadzone {
                             if !self.stick_active {
                                 // Ignore deadzone events when stick is inactive
@@ -2056,20 +2438,32 @@ impl Window {
                     // TODO: handle out of order touches
                     let curr_timestamp = timestamp;
                     let abs_coords = finger_absolute_coords(self, (x, y));
-                    // The trainer overlay (Cheat Engine-style) gets first
-                    // dibs on touches that land on its button or panel.
-                    let trainer_consumed = match event {
+                    // The quick menu's button and panel get first dibs,
+                    // then the trainer overlay (Cheat Engine-style).
+                    let quick_menu_consumed = match event {
                         E::FingerDown { .. } => {
-                            crate::trainer_ui::touch_down(abs_coords, self.viewport())
+                            crate::quick_menu::touch_down(abs_coords, self.viewport())
                         }
-                        E::FingerUp { .. } => {
-                            crate::trainer_ui::touch_up(abs_coords, self.viewport())
-                        }
-                        _ => crate::trainer_ui::touch_motion(abs_coords, self.viewport()),
+                        E::FingerUp { .. } => crate::quick_menu::touch_up(abs_coords, self.viewport()),
+                        _ => crate::quick_menu::touch_motion(abs_coords, self.viewport()),
                     };
-                    let coords = transform_input_coords(self, options, abs_coords, false);
+                    let trainer_consumed = !quick_menu_consumed
+                        && match event {
+                            E::FingerDown { .. } => {
+                                crate::trainer_ui::touch_down(abs_coords, self.viewport())
+                            }
+                            E::FingerUp { .. } => {
+                                crate::trainer_ui::touch_up(abs_coords, self.viewport())
+                            }
+                            _ => crate::trainer_ui::touch_motion(abs_coords, self.viewport()),
+                        };
+                    let coords = transform_input_coords(
+                        self, options,
+                        abs_coords,
+                        false,
+                    );
                     log_dbg!("Finger event x {}, y {}, coords {:?}", x, y, coords);
-                    let mut map = if trainer_consumed {
+                    let mut map = if quick_menu_consumed || trainer_consumed {
                         HashMap::new()
                     } else {
                         HashMap::from([(FingerId::Touch(finger_id), coords)])
@@ -2102,19 +2496,29 @@ impl Window {
                                 ..
                             } if timestamp == curr_timestamp && next.is_same_kind_as(&event) => {
                                 let abs_coords = finger_absolute_coords(self, (x, y));
-                                let trainer_consumed = match next {
+                                let quick_menu_consumed = match next {
                                     E::FingerDown { .. } => {
-                                        crate::trainer_ui::touch_down(abs_coords, self.viewport())
+                                        crate::quick_menu::touch_down(abs_coords, self.viewport())
                                     }
-                                    E::FingerUp { .. } => {
-                                        crate::trainer_ui::touch_up(abs_coords, self.viewport())
-                                    }
-                                    _ => {
-                                        crate::trainer_ui::touch_motion(abs_coords, self.viewport())
-                                    }
+                                    E::FingerUp { .. } => crate::quick_menu::touch_up(abs_coords, self.viewport()),
+                                    _ => crate::quick_menu::touch_motion(abs_coords, self.viewport()),
                                 };
-                                let coords = transform_input_coords(self, options, abs_coords, false);
-                                if !trainer_consumed {
+                                let trainer_consumed = !quick_menu_consumed
+                                    && match next {
+                                        E::FingerDown { .. } => {
+                                            crate::trainer_ui::touch_down(abs_coords, self.viewport())
+                                        }
+                                        E::FingerUp { .. } => {
+                                            crate::trainer_ui::touch_up(abs_coords, self.viewport())
+                                        }
+                                        _ => crate::trainer_ui::touch_motion(abs_coords, self.viewport()),
+                                    };
+                                let coords = transform_input_coords(
+                                    self, options,
+                                    abs_coords,
+                                    false,
+                                            );
+                                if !quick_menu_consumed && !trainer_consumed {
                                     map.insert(FingerId::Touch(finger_id), coords);
                                 }
                             }
@@ -2131,6 +2535,9 @@ impl Window {
                                 break;
                             }
                         }
+                    }
+                    if map.is_empty() {
+                        continue;
                     }
                     log_dbg!("Finishing multi-touch for {:?} with {:?}", event, map);
                     match event {
@@ -2171,9 +2578,11 @@ impl Window {
                     repeat: false,
                     ..
                 } => {
-                    let enabled = !crate::gles::present::onscreen_fps_enabled();
-                    self.set_show_fps_counter(enabled);
-                    echo!("Performance display {}", if enabled { "enabled" } else { "disabled" });
+                    if !crate::gles::perf_overlay::is_app_picker() {
+                        let enabled = !crate::gles::present::onscreen_fps_enabled();
+                        self.set_show_fps_counter(enabled);
+                        echo!("Performance display {}", if enabled { "enabled" } else { "disabled" });
+                    }
                     continue;
                 }
                 E::KeyDown {
@@ -2181,8 +2590,10 @@ impl Window {
                     repeat: false,
                     ..
                 } => {
-                    let corner = crate::gles::present::cycle_onscreen_fps_corner();
-                    echo!("Performance display moved to {corner}");
+                    if !crate::gles::perf_overlay::is_app_picker() {
+                        let corner = crate::gles::present::cycle_onscreen_fps_corner();
+                        echo!("Performance display moved to {corner}");
+                    }
                     continue;
                 }
                 E::KeyDown {
@@ -2226,22 +2637,123 @@ impl Window {
                 _ => continue,
             })
         }
+        #[cfg(target_os = "windows")]
+        {
+            use sdl2::sys as sdl;
 
+            let mut current_touches: HashMap<i64, Coords> = HashMap::new();
+            for controller in &self.controllers {
+                let instance_id = controller.instance_id();
+                let raw_controller =
+                    unsafe { sdl::SDL_GameControllerFromInstanceID(instance_id as i32) };
+                if raw_controller.is_null() {
+                    continue;
+                }
+
+                let touchpad_count =
+                    unsafe { sdl::SDL_GameControllerGetNumTouchpads(raw_controller) };
+                if touchpad_count <= 0 {
+                    continue;
+                }
+
+                // The DualSense exposes one large touchpad. Iterate every
+                // reported touchpad/finger so this remains compatible with
+                // other controllers that SDL maps in the same way.
+                for touchpad in 0..touchpad_count {
+                    let finger_count = unsafe {
+                        sdl::SDL_GameControllerGetNumTouchpadFingers(raw_controller, touchpad)
+                    };
+                    for finger in 0..finger_count {
+                        let mut state = 0u8;
+                        let mut x = 0.0f32;
+                        let mut y = 0.0f32;
+                        let mut pressure = 0.0f32;
+                        let result = unsafe {
+                            sdl::SDL_GameControllerGetTouchpadFinger(
+                                raw_controller,
+                                touchpad,
+                                finger,
+                                &mut state,
+                                &mut x,
+                                &mut y,
+                                &mut pressure,
+                            )
+                        };
+                        if result != 0 || state == 0 {
+                            continue;
+                        }
+                        // Negative IDs cannot collide with the positive IDs
+                        // supplied by SDL's ordinary touchscreen events.
+                        let finger_id = i64::MIN
+                            + ((instance_id as i64) << 16)
+                            + ((touchpad as i64) << 8)
+                            + finger as i64;
+                        let abs_coords =
+                            finger_absolute_coords(self, (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)));
+                        let coords = transform_input_coords(self, options, abs_coords, false);
+                        current_touches.insert(finger_id, coords);
+                    }
+                }
+            }
+
+            let mut down = HashMap::new();
+            let mut moved = HashMap::new();
+            let mut up = HashMap::new();
+            for (&finger_id, &coords) in &current_touches {
+                match self.active_controller_touches.get(&finger_id) {
+                    None => {
+                        down.insert(FingerId::Touch(finger_id), coords);
+                    }
+                    Some(previous) if *previous != coords => {
+                        moved.insert(FingerId::Touch(finger_id), coords);
+                    }
+                    Some(_) => {}
+                }
+            }
+            for (&finger_id, &coords) in &self.active_controller_touches {
+                if !current_touches.contains_key(&finger_id) {
+                    up.insert(FingerId::Touch(finger_id), coords);
+                }
+            }
+            self.active_controller_touches = current_touches;
+
+            if !down.is_empty() {
+                self.event_queue.push_back(Event::TouchesDown(down));
+            }
+            if !moved.is_empty() {
+                self.event_queue.push_back(Event::TouchesMove(moved));
+            }
+            if !up.is_empty() {
+                self.event_queue.push_back(Event::TouchesUp(up));
+            }
+        }
         if controller_updated {
             let (new_x, new_y, pressed, pressed_changed, moved) =
                 self.update_virtual_cursor(options);
             self.event_queue
                 .push_back(match (pressed, pressed_changed, moved) {
                     (true, true, _) => {
-                        let coords = transform_input_coords(self, options, (new_x, new_y), false);
+                        let coords = transform_input_coords(
+                            self, options,
+                            (new_x, new_y),
+                            false,
+                            );
                         Event::TouchesDown(HashMap::from([(FingerId::VirtualCursor, coords)]))
                     }
                     (false, true, _) => {
-                        let coords = transform_input_coords(self, options, (new_x, new_y), false);
+                        let coords = transform_input_coords(
+                            self, options,
+                            (new_x, new_y),
+                            false,
+                            );
                         Event::TouchesUp(HashMap::from([(FingerId::VirtualCursor, coords)]))
                     }
                     (true, _, true) => {
-                        let coords = transform_input_coords(self, options, (new_x, new_y), false);
+                        let coords = transform_input_coords(
+                            self, options,
+                            (new_x, new_y),
+                            false,
+                            );
                         Event::TouchesMove(HashMap::from([(FingerId::VirtualCursor, coords)]))
                     }
                     _ => return,
@@ -2254,7 +2766,10 @@ impl Window {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub fn close_requested(&self) -> bool {
         matches!(self.high_priority_event.as_ref(), Some(Event::CloseWindow))
-            || self.event_queue.iter().any(|event| matches!(event, Event::CloseWindow))
+            || self
+                .event_queue
+                .iter()
+                .any(|event| matches!(event, Event::CloseWindow))
     }
 
     pub fn pop_event(&mut self) -> Option<Event> {
@@ -2626,7 +3141,73 @@ impl Window {
     }
 
     pub fn create_gl_context(&self, version: GLVersion) -> Result<GLContext, String> {
-        let attr = self.video_ctx.gl_attr();
+        self.create_gl_context_with(version, |_attr| {})
+    }
+
+    /// Like [Window::create_gl_context], with a hook to adjust the requested
+    /// attributes first. Used for retry ladders that relax optional settings.
+    fn create_gl_context_with(
+        &self,
+        version: GLVersion,
+        tweak: impl FnOnce(&sdl2::video::gl_attr::GLAttr<'_>),
+    ) -> Result<GLContext, String> {
+        let version_name = version.to_string();
+        let attr = Self::set_gl_attr_version(self.video_ctx.gl_attr(), version);
+        tweak(&attr);
+
+        // SDL reports eglCreateContext failures as typed EGL errors (e.g.
+        // EGL_BAD_MATCH when the display only offers another API); keep that
+        // detail so backend fallbacks can log why an attempt was rejected.
+        let mut errors = Vec::new();
+        let first = self.window.gl_create_context().map_err(|err| {
+            errors.push(err.to_string());
+        });
+        let attempt = match first {
+            Ok(gl_ctx) => Ok(gl_ctx),
+            Err(()) => {
+                // Retry without multisampling: some drivers (notably ANGLE and old
+                // Android GPUs) reject MSAA configs for the requested API.
+                attr.set_multisample_buffers(0);
+                attr.set_multisample_samples(0);
+                self.window
+                    .gl_create_context()
+                    .map_err(|err| errors.push(err.to_string()))
+            }
+        };
+
+        attempt.map(GLContext).map_err(|_| {
+            format!(
+                "{} context creation failed: {}",
+                version_name,
+                errors.join("; ")
+            )
+        })
+    }
+
+    /// Request an ES 2.0 context, widening the profile only when the display
+    /// rejects an ES-only one.
+    ///
+    /// Some hosts (and ANGLE configurations) only expose a desktop-GL display,
+    /// so requesting `GLProfile::GLES` fails with EGL_BAD_MATCH even though
+    /// ES 2.0 entry points work through the desktop driver. Real iOS apps only
+    /// ask for ES 2.0, so this retry keeps the guest behavior unchanged.
+    pub fn create_gles2_gl_context(&self) -> Result<GLContext, String> {
+        self.create_gl_context_with(GLVersion::GLES20, |_attr| {})
+            .or_else(|first_err| {
+                log!(
+                    "ES 2.0 request failed ({}); retrying with a desktop-GL profile",
+                    first_err
+                );
+                self.create_gl_context_with(GLVersion::GLES20, |attr| {
+                    attr.set_context_profile(sdl2::video::GLProfile::Compatibility);
+                })
+            })
+    }
+
+    fn set_gl_attr_version(
+        attr: sdl2::video::gl_attr::GLAttr<'_>,
+        version: GLVersion,
+    ) -> sdl2::video::gl_attr::GLAttr<'_> {
         match version {
             GLVersion::GLES11 => {
                 attr.set_context_version(1, 1);
@@ -2649,10 +3230,7 @@ impl Window {
                 attr.set_context_profile(sdl2::video::GLProfile::Core);
             }
         }
-
-        let gl_ctx = self.window.gl_create_context()?;
-
-        Ok(GLContext(gl_ctx))
+        attr
     }
 
     pub fn gl_get_proc_address(&self, procname: &str) -> *const std::ffi::c_void {
@@ -2674,7 +3252,7 @@ impl Window {
     /// Make the internal OpenGL ES context (for splash screen and UI rendering)
     /// current.
     #[must_use]
-    pub fn make_internal_gl_ctx_current<'win>(&'win mut self) -> Box<dyn GLES + 'win> {
+    pub fn make_internal_gl_ctx_current<'win>(&'win mut self) -> crate::gles::CurrentGLES<'win> {
         // The invariant is held up here - since the instance we return is
         // bound to the lifetime of window, it can't outlive the internal GL
         // context and can't outlive the window.
@@ -2696,26 +3274,28 @@ impl Window {
         let image = self.splash_image.as_ref().unwrap();
         let (image_width, image_height) = image.dimensions();
 
-        // Legacy iPhone landscape launch images are stored in a portrait-sized
-        // Default.png with their content already rotated. Applying the normal
-        // framebuffer rotation to such an image turns it upside down, so use
-        // the inverse rotation for that case. Native landscape-sized launch
-        // images and portrait launch images use the regular transform.
-        let is_landscape = matches!(
+        // Turn the launch image only when its shape disagrees with the window.
+        // A landscape image in a landscape window is already the right way up,
+        // and turning it would show the splash a quarter turn away from the
+        // app; a portrait image in a landscape window needs the quarter turn.
+        //
+        // OpenGL ES expects bottom-to-top row order for image data, but our
+        // image data will be top-to-bottom. A reflection transform compensates.
+        let image_is_landscape = image_width > image_height;
+        let window_is_landscape = matches!(
             self.device_orientation,
             DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight
         );
-        let rotation = if self.splash_image_is_orientation_specific {
-            Matrix::identity()
-        } else if is_landscape && image_height > image_width {
-            self.rotation_matrix().inverse().unwrap()
+        let already_upright = image_is_landscape == window_is_landscape
+            && !matches!(
+                self.device_orientation,
+                DeviceOrientation::PortraitUpsideDown
+            );
+        let matrix = if already_upright {
+            Matrix::y_flip()
         } else {
-            self.rotation_matrix()
+            self.rotation_matrix().multiply(&Matrix::y_flip())
         };
-
-        // OpenGL ES expects bottom-to-top row order for image data, but our
-        // image data will be top-to-bottom. A reflection transform compensates.
-        let matrix = rotation.multiply(&Matrix::y_flip());
         let (vx, vy, vw, vh) = self.viewport();
         let viewport = (vx, vy + self.viewport_y_offset(), vw, vh);
 
@@ -2760,6 +3340,7 @@ impl Window {
                 gl_ctx.as_mut(),
                 viewport,
                 matrix,
+                /* uv_scale: */ (1.0, 1.0),
                 /* virtual_cursor_visible_at: */ None,
                 self.perf_context_token,
             );
@@ -2776,7 +3357,32 @@ impl Window {
     /// Swap front-buffer and back-buffer so the result of OpenGL rendering is
     /// presented.
     pub fn swap_window(&mut self) {
+        let change = self
+            .adaptive_vsync
+            .as_mut()
+            .and_then(|adaptive| adaptive.observe(Instant::now()));
+        if let Some(synced) = change {
+            let interval = if synced {
+                sdl2::video::SwapInterval::VSync
+            } else {
+                sdl2::video::SwapInterval::Immediate
+            };
+            match self.video_ctx.gl_set_swap_interval(interval) {
+                Ok(()) => log!(
+                    "Vsync {} (swap interval {}): the app {}.",
+                    if synced { "enabled" } else { "disabled" },
+                    if synced { 1 } else { 0 },
+                    if synced {
+                        "caught up with the display"
+                    } else {
+                        "cannot sustain display refresh, running unsynced"
+                    }
+                ),
+                Err(e) => log!("Warning: could not change vsync: {}", e),
+            }
+        }
         self.window.gl_swap_window();
+        crate::gles::present::note_window_swap();
         self.perf_hints.frame_presented();
         crate::gles::perf_overlay::record_host_present();
 
@@ -2793,6 +3399,10 @@ impl Window {
     /// content appears upright. On a mobile device, this might do something
     /// else, because the user can physically rotate the screen.
     pub fn rotate_device(&mut self, new_orientation: DeviceOrientation) {
+        self.rotate_device_impl(new_orientation, /* redraw_splash: */ true);
+    }
+
+    fn rotate_device_impl(&mut self, new_orientation: DeviceOrientation, redraw_splash: bool) {
         if !self.on_main_stack {
             log!("Warning: rotate_device called off main stack, skipping");
             return;
@@ -2872,7 +3482,7 @@ impl Window {
             ),
         );
 
-        if self.splash_image.is_some() {
+        if redraw_splash && self.splash_image.is_some() {
             self.display_splash();
         }
     }
@@ -2930,6 +3540,16 @@ impl Window {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             let drawable_size = self.window.drawable_size();
+            if self.fullscreen {
+                // Fullscreen keeps the desktop aspect-ratio setting: fit and
+                // centre with bars, or stretch to the screen when the user
+                // asked for no aspect-ratio preservation.
+                return if self.preserve_aspect_ratio {
+                    geometry::fit_viewport((app_width, app_height), drawable_size)
+                } else {
+                    (0, 0, drawable_size.0, drawable_size.1)
+                };
+            }
             let native_ratio_matches = {
                 let lhs = drawable_size.0 as u64 * app_height as u64;
                 let rhs = drawable_size.1 as u64 * app_width as u64;
@@ -3010,6 +3630,10 @@ impl Window {
 
     pub fn host_framebuffer(&self) -> u32 {
         self.host_framebuffer
+    }
+
+    pub(crate) fn presentation_revision(&self) -> u64 {
+        self.presentation_revision
     }
 
     pub(crate) fn perf_context_token(&self) -> usize {
@@ -3100,7 +3724,9 @@ impl Window {
     pub fn set_show_fps_counter(&mut self, enabled: bool) {
         crate::gles::perf_overlay::set_enabled(enabled);
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        if !enabled || crate::gles::perf_overlay::mode() != crate::options::PerformanceOverlayMode::TitleBar {
+        if !enabled
+            || crate::gles::perf_overlay::mode() != crate::options::PerformanceOverlayMode::TitleBar
+        {
             let _ = self.window.set_title(&base_window_title());
         }
     }
@@ -3215,10 +3841,13 @@ pub fn launch_ipa_picker(env: &mut Environment) -> Result<(), String> {
 pub fn launch_wallpaper_picker(env: &mut Environment) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
-        let result = env.on_parent_stack_in_coroutine(|_, _| unsafe {
-            SDL_AndroidSendMessage(0x8002, 0)
-        });
-        return if result == 0 { Ok(()) } else { Err("Couldn't open wallpaper chooser".into()) };
+        let result =
+            env.on_parent_stack_in_coroutine(|_, _| unsafe { SDL_AndroidSendMessage(0x8002, 0) });
+        return if result == 0 {
+            Ok(())
+        } else {
+            Err("Couldn't open wallpaper chooser".into())
+        };
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -3237,14 +3866,20 @@ pub fn launch_wallpaper_picker(env: &mut Environment) -> Result<(), String> {
             .output();
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let output = std::process::Command::new("zenity")
-            .args(["--file-selection", "--title=Change wallpaper", "--file-filter=Images | *.png *.jpg *.jpeg *.bmp"])
+            .args([
+                "--file-selection",
+                "--title=Change wallpaper",
+                "--file-filter=Images | *.png *.jpg *.jpeg *.bmp",
+            ])
             .output();
         let output = output.map_err(|e| format!("Couldn't open wallpaper chooser: {e}"))?;
-        if !output.status.success() || output.stdout.is_empty() { return Ok(()); }
+        if !output.status.success() || output.stdout.is_empty() {
+            return Ok(());
+        }
         let filename = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
         let bytes = std::fs::read(filename.trim()).map_err(|e| e.to_string())?;
         crate::image::Image::from_bytes(&bytes)?;
-        let destination = crate::paths::user_data_base_path().join("BerryHLE_wallpaper.custom");
+        let destination = crate::paths::user_data_base_path().join("AppleJuiceHLE_wallpaper.custom");
         let temporary = destination.with_extension("pending");
         std::fs::write(&temporary, bytes).map_err(|e| e.to_string())?;
         // Windows rename cannot replace a file. Copy the fully written temp
@@ -3269,7 +3904,7 @@ pub fn show_error_messagebox(window: Option<&Window>, error_message: &str) {
         messagebox::ButtonData {
             flags: messagebox::MessageBoxButtonFlag::NOTHING,
             button_id: 0,
-            text: "Open touchHLE directory",
+            text: "Open AppleJuiceHLE directory",
         },
         messagebox::ButtonData {
             flags: messagebox::MessageBoxButtonFlag::NOTHING,
@@ -3281,13 +3916,13 @@ pub fn show_error_messagebox(window: Option<&Window>, error_message: &str) {
     let Ok(clicked_button) = messagebox::show_message_box(
         messagebox::MessageBoxFlag::ERROR,
         &mbox,
-        "touchHLE crashed!",
-        &format!("touchHLE crashed with the following error: {error_message}"),
+        "AppleJuiceHLE crashed!",
+        &format!("AppleJuiceHLE crashed with the following error: {error_message}"),
         window.map(|win| &win.window),
         None,
     ) else {
         log!("Warning: Failed to show error message box; falling back to stderr only.");
-        eprintln!("touchHLE crashed: {}", error_message);
+        eprintln!("AppleJuiceHLE crashed: {}", error_message);
         return;
     };
 
@@ -3463,7 +4098,6 @@ pub fn show_alert_dialog(
     })
 }
 
-
 #[cfg(test)]
 mod device_family_tests {
     use super::DeviceFamily;
@@ -3488,10 +4122,51 @@ mod device_family_tests {
         assert!(!family.is_ipod_touch());
     }
 
+    /// The RAM the hardware actually shipped with, which both the guest's
+    /// memory-reporting APIs and the Default heap ceiling are derived from.
+    /// <https://en.wikipedia.org/wiki/List_of_iOS_and_iPadOS_devices>
+    #[test]
+    fn every_model_reports_the_ram_it_shipped_with() {
+        const MIB: u64 = 1024 * 1024;
+        for (family, mib) in [
+            (DeviceFamily::iPhone, 128),
+            (DeviceFamily::iPhone3G, 128),
+            (DeviceFamily::iPhone3GS, 256),
+            (DeviceFamily::iPhone4, 512),
+            (DeviceFamily::iPhone4s, 512),
+            (DeviceFamily::iPhone5, 1024),
+            (DeviceFamily::iPhone5c, 1024),
+            (DeviceFamily::iPhone6, 1024),
+            (DeviceFamily::iPad, 256),
+            (DeviceFamily::iPad2, 512),
+            (DeviceFamily::iPad3, 1024),
+            (DeviceFamily::iPad4, 1024),
+            (DeviceFamily::iPad5, 2048),
+            (DeviceFamily::iPadMini, 512),
+            (DeviceFamily::iPadMini2, 1024),
+            (DeviceFamily::iPadMini3, 1024),
+            (DeviceFamily::iPodTouch, 128),
+            (DeviceFamily::iPodTouch2, 128),
+            (DeviceFamily::iPodTouch3, 256),
+            (DeviceFamily::iPodTouch4, 256),
+            (DeviceFamily::iPodTouch5, 512),
+        ] {
+            assert_eq!(
+                family.physical_memory(),
+                mib * MIB,
+                "{} should report {mib} MiB",
+                family.option_name()
+            );
+        }
+    }
+
     #[test]
     fn every_selectable_model_round_trips_through_its_option_name() {
         for family in DeviceFamily::ALL_SELECTABLE {
-            assert_eq!(DeviceFamily::try_from(family.option_name()).unwrap(), *family);
+            assert_eq!(
+                DeviceFamily::try_from(family.option_name()).unwrap(),
+                *family
+            );
         }
     }
 
@@ -3512,10 +4187,7 @@ mod device_family_tests {
         assert_eq!(DeviceFamily::for_tag(5), Some(DeviceFamily::iPhone5));
         assert_eq!(DeviceFamily::for_tag(6), Some(DeviceFamily::iPhone5c));
         assert_eq!(DeviceFamily::for_tag(7), Some(DeviceFamily::iPad));
-        assert_eq!(
-            DeviceFamily::for_tag(19),
-            Some(DeviceFamily::iPodTouch5)
-        );
+        assert_eq!(DeviceFamily::for_tag(19), Some(DeviceFamily::iPodTouch5));
         assert_eq!(DeviceFamily::for_tag(20), Some(DeviceFamily::iPhone6));
         assert_eq!(DeviceFamily::iPhone6.tag(), Some(20));
         assert_eq!(DeviceFamily::for_tag(21), None);

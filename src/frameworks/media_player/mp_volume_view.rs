@@ -141,6 +141,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     let host = std::mem::take(env.objc.borrow_mut::<MPVolumeViewHostObject>(this));
+    // Preserve superclass ownership until its own deallocator runs.
+    env.objc.borrow_mut::<MPVolumeViewHostObject>(this).superclass = host.superclass;
     release_images(env, host.volume_thumb_images);
     release_images(env, host.minimum_volume_slider_images);
     release_images(env, host.maximum_volume_slider_images);

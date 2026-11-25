@@ -10,20 +10,34 @@ use crate::frameworks::core_graphics::cg_bitmap_context::{
     CGBitmapContextCreate, CGBitmapContextCreateImage,
 };
 use crate::frameworks::core_graphics::cg_context::{
-    CGContextRef, CGContextRelease, CGContextRetain, CGContextScaleCTM, CGContextTranslateCTM,
+    CGContextClearRect, CGContextClipToRect, CGContextFillRect, CGContextRef, CGContextRelease,
+    CGContextRestoreGState, CGContextRetain, CGContextSaveGState, CGContextScaleCTM,
+    CGContextSetBlendMode, CGContextTranslateCTM,
 };
-use crate::frameworks::core_graphics::{CGFloat, CGRect, CGSize};
 use crate::frameworks::core_graphics::cg_image::{
     kCGImageAlphaNoneSkipLast, kCGImageAlphaPremultipliedLast, kCGImageByteOrder32Big,
 };
-use crate::mem::MutVoidPtr;
+use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
+use crate::mem::{MutVoidPtr, Ptr};
 use crate::objc::{id, msg_class, nil};
 use crate::Environment;
 
 #[derive(Default)]
 pub(super) struct State {
     pub(super) context_stack: Vec<CGContextRef>,
+    /// Page size while a PDF context is open; `None` otherwise.
+    pub(super) pdf_bounds: Option<CGRect>,
 }
+
+/// `kCGBlendModeClear` and `kCGBlendModeCopy`. Clear replaces the rect with
+/// transparency; Copy replaces it with the fill colour. Other modes still
+/// draw normally because the renderer only distinguishes Copy from the rest.
+const kCGBlendModeClear: i32 = 16;
+const kCGBlendModeCopy: i32 = 17;
+
+/// Largest offscreen bitmap we will allocate (256 MiB). A garbage size from
+/// the guest must not exhaust host memory.
+const MAX_IMAGE_BYTES: f64 = 256.0 * 1024.0 * 1024.0;
 
 // MARK: - Context stack
 
@@ -65,21 +79,31 @@ fn UIGraphicsBeginImageContextWithOptions(
     opaque: bool,
     scale: CGFloat,
 ) {
-    let effective_scale = if scale == 0.0 { 1.0 } else { scale };
-    let width = (size.width * effective_scale).ceil() as u32;
-    let height = (size.height * effective_scale).ceil() as u32;
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let w = (size.width as f64 * scale as f64).ceil();
+    let h = (size.height as f64 * scale as f64).ceil();
 
-    if width == 0 || height == 0 {
+    // `!(x >= 1.0)` also rejects NaN. The byte cap keeps `width * 4` and
+    // `bytes_per_row * height` far below u32::MAX, so no overflow is possible.
+    if !(w >= 1.0 && h >= 1.0) || w * h * 4.0 > MAX_IMAGE_BYTES {
         log!(
-            "Warning: UIGraphicsBeginImageContextWithOptions: zero size ({}, {}), skipping",
-            width,
-            height
+            "Warning: UIGraphicsBeginImageContextWithOptions: unusable size ({}, {}), skipping",
+            w,
+            h
         );
         return;
     }
-
+    let (width, height) = (w as u32, h as u32);
     let bytes_per_row = width * 4;
-    let data = MutVoidPtr::null();
+
+    // NULL data lets CGBitmapContextCreate allocate the buffer and own it, so
+    // it is freed together with the context. Passing a buffer of our own
+    // would leak it, because CG only frees buffers it allocated itself.
+    let data: MutVoidPtr = Ptr::null();
 
     // Use a valid RGBA bitmap format and let the context own its storage.
     let context = CGBitmapContextCreate(
@@ -104,10 +128,10 @@ fn UIGraphicsBeginImageContextWithOptions(
     }
 
     CGContextTranslateCTM(env, context, 0.0, height as CGFloat);
-    CGContextScaleCTM(env, context, effective_scale, -effective_scale);
+    CGContextScaleCTM(env, context, scale, -scale);
     UIGraphicsPushContext(env, context);
-    // CGBitmapContextCreate returns a +1 ref; we transferred ownership to the
-    // stack via push (which also retains), so release the creation ref.
+    // CGBitmapContextCreate returns a +1 ref; the push retained it, so drop
+    // the creation ref. The stack now holds the only reference.
     CGContextRelease(env, context);
 }
 
@@ -115,7 +139,8 @@ fn UIGraphicsBeginImageContext(env: &mut Environment, size: CGSize) {
     UIGraphicsBeginImageContextWithOptions(env, size, false, 1.0);
 }
 
-/// Snapshot the current image context as a UIImage, then pop it.
+/// Snapshot the current image context as an autoreleased UIImage. This does
+/// not pop the context: `UIGraphicsEndImageContext` does that.
 fn UIGraphicsGetImageFromCurrentImageContext(env: &mut Environment) -> id {
     let context = UIGraphicsGetCurrentContext(env);
     if context.is_null() {
@@ -146,33 +171,48 @@ fn UIGraphicsEndImageContext(env: &mut Environment) {
     UIGraphicsPopContext(env);
 }
 
-// MARK: - PDF context (stub)
+// MARK: - PDF context (stubs: no PDF is ever produced)
 
 fn UIGraphicsBeginPDFContextToFile(
-    _env: &mut Environment,
+    env: &mut Environment,
     _path: id, // NSString*
-    _bounds: CGRect,
+    bounds: CGRect,
     _document_info: id, // NSDictionary*
-) -> bool {
-    log!("UIGraphicsBeginPDFContextToFile: stubbed, returning false");
-    false
+) {
+    log_dbg!("UIGraphicsBeginPDFContextToFile: unsupported, drawing offscreen");
+    begin_pdf_context(env, bounds);
 }
 
 fn UIGraphicsBeginPDFContextToData(
-    _env: &mut Environment,
+    env: &mut Environment,
     _data: id, // NSMutableData*
-    _bounds: CGRect,
+    bounds: CGRect,
     _document_info: id, // NSDictionary*
 ) {
-    log!("UIGraphicsBeginPDFContextToData: stubbed");
+    log_dbg!("UIGraphicsBeginPDFContextToData: unsupported, drawing offscreen");
+    begin_pdf_context(env, bounds);
 }
 
-fn UIGraphicsEndPDFContext(_env: &mut Environment) {
-    log!("UIGraphicsEndPDFContext: stubbed");
+/// Push a detached bitmap so PDF drawing cannot land on the screen.
+fn begin_pdf_context(env: &mut Environment, bounds: CGRect) {
+    env.framework_state.uikit.ui_graphics.pdf_bounds = None;
+    UIGraphicsBeginImageContextWithOptions(env, bounds.size, false, 1.0);
+    if UIGraphicsGetCurrentContext(env).is_null() {
+        return;
+    }
+    env.framework_state.uikit.ui_graphics.pdf_bounds = Some(bounds);
+}
+
+fn UIGraphicsEndPDFContext(env: &mut Environment) {
+    log_dbg!("UIGraphicsEndPDFContext: unsupported");
+    let state = &mut env.framework_state.uikit.ui_graphics;
+    if state.pdf_bounds.take().is_some() {
+        UIGraphicsEndImageContext(env);
+    }
 }
 
 fn UIGraphicsBeginPDFPage(_env: &mut Environment) {
-    log!("UIGraphicsBeginPDFPage: stubbed");
+    log_dbg!("UIGraphicsBeginPDFPage: unsupported");
 }
 
 fn UIGraphicsBeginPDFPageWithInfo(
@@ -180,45 +220,120 @@ fn UIGraphicsBeginPDFPageWithInfo(
     _bounds: CGRect,
     _page_info: id, // NSDictionary*
 ) {
-    log!("UIGraphicsBeginPDFPageWithInfo: stubbed");
+    log_dbg!("UIGraphicsBeginPDFPageWithInfo: unsupported");
 }
 
-fn UIGraphicsGetPDFContextBounds(_env: &mut Environment) -> CGRect {
-    CGRect {
-        origin: crate::frameworks::core_graphics::CGPoint { x: 0.0, y: 0.0 },
-        size: CGSize {
-            width: 0.0,
-            height: 0.0,
-        },
-    }
+fn UIGraphicsGetPDFContextBounds(env: &mut Environment) -> CGRect {
+    env.framework_state
+        .uikit
+        .ui_graphics
+        .pdf_bounds
+        .unwrap_or_default()
 }
 
-// MARK: - Convenience rect fill / clip (commonly called without a full context
-// setup)
+// Annotation calls: with no PDF being produced there is nothing to annotate.
 
-fn UIRectFill(env: &mut Environment, rect: CGRect) {
+fn UIGraphicsSetPDFContextURLForRect(
+    _env: &mut Environment,
+    _url: id, // NSURL*
+    _rect: CGRect,
+) {
+    log_dbg!("UIGraphicsSetPDFContextURLForRect: unsupported");
+}
+
+fn UIGraphicsAddPDFContextDestinationAtPoint(
+    _env: &mut Environment,
+    _name: id, // NSString*
+    _point: CGPoint,
+) {
+    log_dbg!("UIGraphicsAddPDFContextDestinationAtPoint: unsupported");
+}
+
+fn UIGraphicsSetPDFContextDestinationForRect(
+    _env: &mut Environment,
+    _name: id, // NSString*
+    _rect: CGRect,
+) {
+    log_dbg!("UIGraphicsSetPDFContextDestinationForRect: unsupported");
+}
+
+// MARK: - Rect helpers
+
+/// Fills, or clears for `kCGBlendModeClear`, using the current context.
+fn paint_rect(env: &mut Environment, rect: CGRect, blend_mode: i32) {
     let ctx = UIGraphicsGetCurrentContext(env);
     if ctx.is_null() {
         return;
     }
-    crate::frameworks::core_graphics::cg_context::CGContextFillRect(env, ctx, rect);
+    if blend_mode == kCGBlendModeClear {
+        CGContextClearRect(env, ctx, rect);
+    } else if blend_mode == kCGBlendModeCopy {
+        // Copy must replace the destination, not alpha-blend over it.
+        CGContextSaveGState(env, ctx);
+        CGContextSetBlendMode(env, ctx, kCGBlendModeCopy);
+        CGContextFillRect(env, ctx, rect);
+        CGContextRestoreGState(env, ctx);
+    } else {
+        CGContextFillRect(env, ctx, rect);
+    }
+}
+
+/// The 1-point-wide bands that make up a frame drawn inside `rect`. The side
+/// bands stop short of the corners so no pixel is painted twice (which would
+/// show with a translucent colour). Empty for a rect with no area.
+fn frame_bands(rect: CGRect) -> Vec<CGRect> {
+    let (x, y) = (rect.origin.x, rect.origin.y);
+    let (w, h) = (rect.size.width, rect.size.height);
+    // `!(w > 0.0)` also rejects NaN.
+    if !(w > 0.0 && h > 0.0) {
+        return Vec::new();
+    }
+    let r = |x: CGFloat, y: CGFloat, w: CGFloat, h: CGFloat| CGRect {
+        origin: CGPoint { x, y },
+        size: CGSize {
+            width: w,
+            height: h,
+        },
+    };
+    // Too thin to hold a hollow frame: paint the whole rect.
+    if w <= 2.0 || h <= 2.0 {
+        return vec![r(x, y, w, h)];
+    }
+    vec![
+        r(x, y, w, 1.0),
+        r(x, y + h - 1.0, w, 1.0),
+        r(x, y + 1.0, 1.0, h - 2.0),
+        r(x + w - 1.0, y + 1.0, 1.0, h - 2.0),
+    ]
+}
+
+fn UIRectFill(env: &mut Environment, rect: CGRect) {
+    paint_rect(env, rect, 0);
 }
 
 fn UIRectFillUsingBlendMode(
     env: &mut Environment,
     rect: CGRect,
-    _blend_mode: i32, // CGBlendMode
+    blend_mode: i32, // CGBlendMode
 ) {
-    // Ignore blend mode — just fill.
-    UIRectFill(env, rect);
+    paint_rect(env, rect, blend_mode);
 }
 
+/// Draws a 1-point frame inside `rect` in the current fill colour.
 fn UIRectFrame(env: &mut Environment, rect: CGRect) {
-    let ctx = UIGraphicsGetCurrentContext(env);
-    if ctx.is_null() {
-        return;
+    for band in frame_bands(rect) {
+        paint_rect(env, band, 0);
     }
-    crate::frameworks::core_graphics::cg_context::CGContextClearRect(env, ctx, rect);
+}
+
+fn UIRectFrameUsingBlendMode(
+    env: &mut Environment,
+    rect: CGRect,
+    blend_mode: i32, // CGBlendMode
+) {
+    for band in frame_bands(rect) {
+        paint_rect(env, band, blend_mode);
+    }
 }
 
 fn UIRectClip(env: &mut Environment, rect: CGRect) {
@@ -226,7 +341,7 @@ fn UIRectClip(env: &mut Environment, rect: CGRect) {
     if ctx.is_null() {
         return;
     }
-    crate::frameworks::core_graphics::cg_context::CGContextClipToRect(env, ctx, rect);
+    CGContextClipToRect(env, ctx, rect);
 }
 
 pub const FUNCTIONS: FunctionExports = &[
@@ -246,9 +361,50 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(UIGraphicsBeginPDFPage()),
     export_c_func!(UIGraphicsBeginPDFPageWithInfo(_, _)),
     export_c_func!(UIGraphicsGetPDFContextBounds()),
+    export_c_func!(UIGraphicsSetPDFContextURLForRect(_, _)),
+    export_c_func!(UIGraphicsAddPDFContextDestinationAtPoint(_, _)),
+    export_c_func!(UIGraphicsSetPDFContextDestinationForRect(_, _)),
     // Rect helpers
     export_c_func!(UIRectFill(_)),
     export_c_func!(UIRectFillUsingBlendMode(_, _)),
     export_c_func!(UIRectFrame(_)),
+    export_c_func!(UIRectFrameUsingBlendMode(_, _)),
     export_c_func!(UIRectClip(_)),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::frame_bands;
+    use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> CGRect {
+        CGRect {
+            origin: CGPoint { x, y },
+            size: CGSize {
+                width: w,
+                height: h,
+            },
+        }
+    }
+
+    #[test]
+    fn frame_bands_trace_the_inside_edge() {
+        let bands = frame_bands(rect(0.0, 0.0, 10.0, 8.0));
+        assert_eq!(bands.len(), 4);
+        assert_eq!((bands[0].origin.x, bands[0].origin.y), (0.0, 0.0));
+        assert_eq!((bands[0].size.width, bands[0].size.height), (10.0, 1.0));
+        assert_eq!((bands[1].origin.x, bands[1].origin.y), (0.0, 7.0));
+        assert_eq!((bands[2].origin.x, bands[2].origin.y), (0.0, 1.0));
+        assert_eq!((bands[2].size.width, bands[2].size.height), (1.0, 6.0));
+        assert_eq!((bands[3].origin.x, bands[3].origin.y), (9.0, 1.0));
+    }
+
+    #[test]
+    fn frame_bands_degenerate_rects() {
+        // Too thin for a hollow frame: fill the whole rect instead.
+        assert_eq!(frame_bands(rect(0.0, 0.0, 2.0, 5.0)).len(), 1);
+        assert!(frame_bands(rect(0.0, 0.0, 0.0, 5.0)).is_empty());
+        assert!(frame_bands(rect(0.0, 0.0, -1.0, 5.0)).is_empty());
+        assert!(frame_bands(rect(0.0, 0.0, f32::NAN, 5.0)).is_empty());
+    }
+}

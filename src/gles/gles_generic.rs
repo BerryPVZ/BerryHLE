@@ -396,7 +396,7 @@ pub trait GLESContext {
     fn make_current<'gl_ctx, 'win: 'gl_ctx>(
         &'gl_ctx mut self,
         window: &'win mut Window,
-    ) -> Box<dyn GLES + 'gl_ctx>;
+    ) -> crate::gles::CurrentGLES<'gl_ctx>;
 
     /// Make this context (and any underlying context) the active OpenGL
     /// context, without checking if it is the only context. You shouldn't use
@@ -411,7 +411,7 @@ pub trait GLESContext {
         &'gl_ctx mut self,
         make_current_fn: &mut dyn FnMut(&GLContext),
         loader_fn: &mut dyn FnMut(&'static str) -> *const std::ffi::c_void,
-    ) -> Box<dyn GLES + 'gl_ctx>;
+    ) -> crate::gles::CurrentGLES<'gl_ctx>;
 }
 
 /// An active GLES context that can be used.
@@ -819,6 +819,32 @@ pub trait GLES {
         // Backends that lack `GL_ARB_point_parameters`-like per-vertex
         // sizing fall back to the scalar `glPointSize` value, which is the
         // closest sensible behaviour available.
+    }
+
+    /// Whether this backend can actually honour `GL_OES_matrix_palette`.
+    ///
+    /// The guest-visible `GL_EXTENSIONS` string advertises the extension (the
+    /// real iPhone 3GS PowerVR SGX does), so an animated 3D game feature-tests
+    /// it and then submits skinned meshes through the palette entry points
+    /// below instead of transforming vertices itself. A backend that accepted
+    /// the entry points but dropped them on the floor would let every skinned
+    /// mesh keep its bind-pose (or collapse it to garbage, since palette-space
+    /// vertex data is only meaningful after the weighted transform) — the
+    /// result is a game whose characters, and anything textured with their
+    /// materials, render as black or "x-ray" silhouettes while the rest of the
+    /// scene looks fine.
+    ///
+    /// Backends that implement palette skinning (the ES1-on-ES2 and
+    /// ES1-on-GL2 translators) can keep the default. Backends that only
+    /// forward to a host driver must report whether that driver advertises
+    /// the extension, so the guest can fall back to its own CPU skinning path
+    /// instead of taking a route that silently produces wrong geometry.
+    ///
+    /// Reference: `GL_OES_matrix_palette` (Khronos), where the weighted
+    /// transform is `eye = sum_i w_i * (palette[index_i] * object)`:
+    /// https://registry.khronos.org/OpenGL/extensions/OES/OES_matrix_palette.txt
+    fn supports_matrix_palette(&self) -> bool {
+        true
     }
 
     /// `GL_OES_matrix_palette` / `GL_ARB_matrix_palette`.
@@ -2146,6 +2172,11 @@ pub trait GLES {
     }
 
     // -- Buffer object operations (3.0) --
+    /// Whether range mappings can use a real driver data store. Older ES
+    /// drivers use the guest buffer mirror instead.
+    fn supports_map_buffer_range(&self) -> bool {
+        false
+    }
     unsafe fn MapBufferRange(
         &mut self,
         _target: GLenum,
@@ -3224,13 +3255,15 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
+    #[derive(Clone, Copy, Default)]
     struct ProfileBackend {
         es2: bool,
         es3: bool,
         translator: bool,
         native_es1: bool,
         gles1_on_gl2: bool,
+        pvrtc: bool,
+        vao: bool,
     }
 
     impl GLES for ProfileBackend {
@@ -3253,11 +3286,18 @@ mod tests {
         fn is_gles1_on_gl2(&self) -> bool {
             self.gles1_on_gl2
         }
+
+        fn pvrtc_native(&self) -> bool {
+            self.pvrtc
+        }
+
+        fn supports_vao_oes(&self) -> bool {
+            self.vao
+        }
     }
 
-    #[test]
-    fn diagnostic_profile_identifies_guest_gles_version() {
-        let profiles = [
+    fn profile_backends() -> [(ProfileBackend, &'static str); 6] {
+        [
             (
                 ProfileBackend {
                     es2: true,
@@ -3296,10 +3336,53 @@ mod tests {
                 "OpenGL ES 1.1 emulated on desktop OpenGL 2.1",
             ),
             (ProfileBackend::default(), "unknown GLES profile"),
-        ];
+        ]
+    }
 
-        for (backend, expected) in profiles {
+    #[test]
+    fn diagnostic_profile_identifies_guest_gles_version() {
+        for (backend, expected) in profile_backends() {
             assert_eq!(backend.diagnostic_profile(), expected);
+        }
+    }
+
+    // ES 2/3 contexts need the shader presenter; ES 1 translation has its
+    // own path. Tracing must preserve that choice and the guest API version.
+    // https://developer.apple.com/library/archive/documentation/3DDrawing/Conceptual/OpenGLES_ProgrammingGuide/OpenGLESontheiPhone/OpenGLESontheiPhone.html
+    #[test]
+    fn logging_wrapper_preserves_rendering_profile() {
+        for (backend, profile) in profile_backends() {
+            for verbose in [false, true] {
+                let wrapped = crate::gles::LoggingGLES {
+                    inner: Box::new(backend).into(),
+                    verbose,
+                };
+                assert_eq!(
+                    wrapped.is_es2() && !wrapped.is_translator(),
+                    backend.is_es2() && !backend.is_translator(),
+                    "tracing changed the presenter for {profile}"
+                );
+                assert_eq!(wrapped.is_es3(), backend.is_es3());
+                assert_eq!(wrapped.diagnostic_profile(), profile);
+            }
+        }
+    }
+
+    #[test]
+    fn logging_wrapper_preserves_texture_and_vertex_array_support() {
+        for pvrtc in [false, true] {
+            for vao in [false, true] {
+                let wrapped = crate::gles::LoggingGLES {
+                    inner: Box::new(ProfileBackend {
+                        pvrtc,
+                        vao,
+                        ..Default::default()
+                    }).into(),
+                    verbose: false,
+                };
+                assert_eq!(wrapped.pvrtc_native(), pvrtc);
+                assert_eq!(wrapped.supports_vao_oes(), vao);
+            }
         }
     }
 

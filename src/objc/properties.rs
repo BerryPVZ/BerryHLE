@@ -48,12 +48,12 @@ unsafe impl SafeRead for ivar_list_t {}
 ///
 /// The name, field names and field layout are based on what Ghidra outputs.
 #[repr(C, packed)]
-struct ivar_t {
-    offset: ConstPtr<GuestUSize>,
-    name: ConstPtr<u8>,
-    type_: ConstPtr<u8>,
-    alignment: u32,
-    size: u32,
+pub(super) struct ivar_t {
+    pub(super) offset: ConstPtr<GuestUSize>,
+    pub(super) name: ConstPtr<u8>,
+    pub(super) type_: ConstPtr<u8>,
+    pub(super) alignment: u32,
+    pub(super) size: u32,
 }
 unsafe impl SafeRead for ivar_t {}
 
@@ -73,8 +73,8 @@ unsafe impl SafeRead for property_list_t {}
 /// opaque `objc_property_t`.
 #[repr(C, packed)]
 pub(super) struct property_t {
-    name: ConstPtr<u8>,
-    attributes: ConstPtr<u8>,
+    pub(super) name: ConstPtr<u8>,
+    pub(super) attributes: ConstPtr<u8>,
 }
 unsafe impl SafeRead for property_t {}
 
@@ -480,6 +480,44 @@ pub fn class_getInstanceVariable(
         .unwrap_or_else(MutVoidPtr::null)
 }
 
+/// Returns the byte offset of an Objective-C instance variable.
+/// https://developer.apple.com/documentation/objectivec/ivar_getoffset(_:)
+pub fn ivar_getOffset(env: &mut Environment, ivar: MutVoidPtr) -> GuestISize {
+    if ivar.is_null() {
+        return 0;
+    }
+    let Some(bytes) = env.mem.get_bytes_fallible(ivar.cast_const(), 4) else {
+        return 0;
+    };
+    let offset_pointer = ConstPtr::<GuestUSize>::from_bits(u32::from_le_bytes(
+        bytes.try_into().unwrap(),
+    ));
+    if offset_pointer.is_null() {
+        return 0;
+    }
+    let Some(bytes) = env.mem.get_bytes_fallible(offset_pointer.cast(), 4) else {
+        return 0;
+    };
+    i32::from_le_bytes(bytes.try_into().unwrap())
+}
+
+/// Returns the name pointer stored in Objective-C instance-variable metadata.
+pub fn ivar_getName(env: &mut Environment, ivar: MutVoidPtr) -> ConstPtr<u8> {
+    if ivar.is_null() {
+        return ConstPtr::null();
+    }
+    let Some(name_addr) = ivar.to_bits().checked_add(4) else {
+        return ConstPtr::null();
+    };
+    let Some(bytes) = env
+        .mem
+        .get_bytes_fallible(ConstVoidPtr::from_bits(name_addr), 4)
+    else {
+        return ConstPtr::null();
+    };
+    ConstPtr::from_bits(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
 /// Reads an object reference from the specified ivar, returning nil for nil or invalid inputs.
 pub fn object_getIvar(env: &mut Environment, object: id, ivar: MutVoidPtr) -> id {
     let class_name = if object == nil {
@@ -502,6 +540,56 @@ pub fn object_getIvar(env: &mut Environment, object: id, ivar: MutVoidPtr) -> id
         class_name, object, ivar, offset, value
     ));
     value
+}
+
+/// `Ivar object_getInstanceVariable(id obj, const char *name, void **outValue)`
+///
+/// Classic runtime lookup: finds the named ivar, stores the pointer-sized
+/// value at its offset in `*outValue`, and returns the ivar metadata (or NULL
+/// if the class does not declare it). Used by code that reads outlets through
+/// runtime metadata instead of a compile-time ivar reference.
+/// <https://developer.apple.com/documentation/objectivec/1418639-object_getinstancevariable>
+pub fn object_getInstanceVariable(
+    env: &mut Environment,
+    object: id,
+    name: ConstPtr<u8>,
+    out_value: MutPtr<MutVoidPtr>,
+) -> MutVoidPtr {
+    if !out_value.is_null() {
+        env.mem.write(out_value, MutVoidPtr::null());
+    }
+    if object == nil || name.is_null() {
+        return MutVoidPtr::null();
+    }
+    let class = ObjC::read_isa(object, &env.mem);
+    let ivar = class_getInstanceVariable(env, class, name);
+    if ivar.is_null() {
+        return ivar;
+    }
+    let value = object_ivar_value(&env.objc, &env.mem, object, ivar.cast_const()).unwrap_or(nil);
+    if !out_value.is_null() {
+        env.mem.write(out_value, value.cast());
+    }
+    ivar
+}
+
+/// The named form of object_setIvar, also used for MonoTouch's peer handle.
+/// https://github.com/apple-oss-distributions/objc4/blob/objc4-532.2/runtime/objc-class.mm
+pub fn object_setInstanceVariable(
+    env: &mut Environment,
+    object: id,
+    name: ConstPtr<u8>,
+    value: MutVoidPtr,
+) -> MutVoidPtr {
+    if object == nil || name.is_null() {
+        return Ptr::null();
+    }
+    let class = ObjC::read_isa(object, &env.mem);
+    let ivar = class_getInstanceVariable(env, class, name);
+    if !ivar.is_null() {
+        object_setIvar(env, object, ivar, value.cast());
+    }
+    ivar
 }
 
 /// `void object_setIvar(id obj, Ivar ivar, id value)`
@@ -922,6 +1010,172 @@ macro_rules! todo_objc_setter {
 }
 pub use crate::todo_objc_setter;
 
+/// The layout of one declared property attribute, as passed to
+/// `class_addProperty` and returned by `property_copyAttributeList`.
+/// https://developer.apple.com/documentation/objectivec/objc_property_attribute_t
+#[repr(C)]
+pub(super) struct objc_property_attribute_t {
+    pub(super) name: ConstPtr<u8>,
+    pub(super) value: ConstPtr<u8>,
+}
+unsafe impl SafeRead for objc_property_attribute_t {}
+
+/// Splits an attribute string such as `T@"NSString",&,N,V_name` into
+/// `(code, value)` pairs. Commas inside a quoted type encoding do not
+/// separate entries.
+fn split_property_attributes(attributes: &[u8]) -> Vec<(u8, Vec<u8>)> {
+    let mut entries = Vec::new();
+    let mut current: Vec<u8> = Vec::new();
+    let mut quoted = false;
+    for &byte in attributes {
+        match byte {
+            b'"' => {
+                quoted = !quoted;
+                current.push(byte);
+            }
+            b',' if !quoted => {
+                if !current.is_empty() {
+                    entries.push(current.clone());
+                    current.clear();
+                }
+            }
+            _ => current.push(byte),
+        }
+    }
+    if !current.is_empty() {
+        entries.push(current);
+    }
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            let (&code, value) = entry.split_first()?;
+            Some((code, value.to_vec()))
+        })
+        .collect()
+}
+
+/// `objc_property_attribute_t *property_copyAttributeList(objc_property_t
+/// property, unsigned int *outCount)` — the caller owns the array and every
+/// string in it and frees them with `free()`.
+///
+/// Per Apple's Objective-C Runtime Reference
+/// (<https://developer.apple.com/documentation/objectivec/1418605-property_copyattributelist>):
+///
+/// > Returns the attribute descriptors of a property. [...] the caller must
+/// > free the returned array.
+///
+/// Our `property_t` entries store the attribute string from the app binary
+/// (or from `class_addProperty`), so this parses that string back into the
+/// descriptor array.
+pub fn property_copyAttributeList(
+    env: &mut Environment,
+    property: ConstVoidPtr,
+    out_count: MutPtr<u32>,
+) -> MutPtr<objc_property_attribute_t> {
+    if !out_count.is_null() {
+        env.mem.write(out_count, 0);
+    }
+    if property.is_null() {
+        return Ptr::null();
+    }
+    let prop_ptr: ConstPtr<property_t> = property.cast();
+    let property_t { attributes, .. } = env.mem.read(prop_ptr);
+    if attributes.is_null() {
+        return Ptr::null();
+    }
+    let Ok(raw) = env.mem.cstr_at_utf8(attributes) else {
+        return Ptr::null();
+    };
+    let entries = split_property_attributes(raw.as_bytes());
+    if entries.is_empty() {
+        return Ptr::null();
+    }
+    let entry_size = guest_size_of::<objc_property_attribute_t>();
+    let array: MutPtr<objc_property_attribute_t> =
+        env.mem.alloc(entry_size * entries.len() as GuestUSize).cast();
+    for (index, (code, value)) in entries.iter().enumerate() {
+        let name = env.mem.alloc_and_write_cstr(&[*code]).cast_const();
+        let value = if value.is_empty() {
+            Ptr::null()
+        } else {
+            env.mem.alloc_and_write_cstr(value).cast_const()
+        };
+        env.mem.write(
+            array + index as GuestUSize,
+            objc_property_attribute_t { name, value },
+        );
+    }
+    if !out_count.is_null() {
+        env.mem.write(out_count, entries.len() as u32);
+    }
+    array
+}
+
+/// `void class_addProperty(Class cls, const char *name, const
+/// objc_property_attribute_t *attributes, unsigned int attributeCount)`.
+///
+/// The runtime stores a single attribute string per property, so the
+/// descriptors are joined into one comma-separated string here, which
+/// `property_getAttributes`, `class_copyPropertyList` and
+/// `property_copyAttributeList` then report as Apple's runtime does.
+/// https://developer.apple.com/documentation/objectivec/1418638-class_addproperty
+pub fn class_addProperty(
+    env: &mut Environment,
+    cls: Class,
+    name: ConstPtr<u8>,
+    attributes: ConstPtr<objc_property_attribute_t>,
+    count: u32,
+) {
+    if cls.is_null() || name.is_null() {
+        return;
+    }
+    let is_metaclass = match env.objc.get_host_object(cls) {
+        Some(object) => match object.as_any().downcast_ref::<ClassHostObject>() {
+            Some(class_obj) => class_obj.is_metaclass,
+            None => return,
+        },
+        None => return,
+    };
+    if is_metaclass {
+        return;
+    }
+    let Ok(name_string) = env.mem.cstr_at_utf8(name) else {
+        return;
+    };
+    let name_string = name_string.to_owned();
+    let mut attribute_string = Vec::new();
+    for index in 0..count {
+        let entry = env.mem.read(attributes + index);
+        if entry.name.is_null() {
+            continue;
+        }
+        if !attribute_string.is_empty() {
+            attribute_string.push(b',');
+        }
+        if let Ok(code) = env.mem.cstr_at_utf8(entry.name) {
+            attribute_string.extend_from_slice(code.as_bytes());
+        }
+        if !entry.value.is_null() {
+            if let Ok(value) = env.mem.cstr_at_utf8(entry.value) {
+                attribute_string.extend_from_slice(value.as_bytes());
+            }
+        }
+    }
+    let attributes_ptr = env.mem.alloc_and_write_cstr(&attribute_string).cast_const();
+    let property_ptr: ConstVoidPtr = env
+        .mem
+        .alloc_and_write(property_t {
+            name,
+            attributes: attributes_ptr,
+        })
+        .cast_const()
+        .cast();
+    env.objc
+        .borrow_mut::<ClassHostObject>(cls)
+        .properties
+        .insert(name_string, property_ptr);
+}
+
 #[cfg(test)]
 mod trainer_metadata_tests {
     use super::*;
@@ -1098,5 +1352,30 @@ mod trainer_metadata_tests {
             host.add_ivars_from_bin(list.cast_const(), &mem);
             assert_eq!(host.scalar_ivars.contains_key("_money"), expected);
         }
+    }
+
+    #[test]
+    fn ivar_getters_read_runtime_metadata_and_accept_null() {
+        let mut env = crate::environment::touch_test_environment();
+        let offset = env.mem.alloc_and_write(0xffff_fff0u32).cast_const();
+        let name = env.mem.alloc_and_write_cstr(b"_sample").cast_const();
+        let type_ = env.mem.alloc_and_write_cstr(b"i").cast_const();
+        let metadata: MutPtr<ivar_t> = env.mem.alloc(guest_size_of::<ivar_t>()).cast();
+        env.mem.write(
+            metadata,
+            ivar_t {
+                offset,
+                name,
+                type_,
+                alignment: 2,
+                size: 4,
+            },
+        );
+
+        let metadata = MutVoidPtr::from_bits(metadata.to_bits());
+        assert_eq!(ivar_getOffset(&mut env, metadata), -16);
+        assert_eq!(ivar_getName(&mut env, metadata), name);
+        assert_eq!(ivar_getOffset(&mut env, MutVoidPtr::null()), 0);
+        assert!(ivar_getName(&mut env, MutVoidPtr::null()).is_null());
     }
 }
